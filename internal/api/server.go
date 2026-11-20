@@ -218,7 +218,7 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 	}
 	chatHub := chat.NewHub(bus)
 	if st != nil {
-		chatHub.SetSessionCheck(func(ctx context.Context, userID, sessionHash string) bool {
+		chatHub.SetSessionCheck(func(ctx context.Context, userID, sessionHash string) (bool, error) {
 			return chatSessionValid(ctx, st, userID, sessionHash)
 		})
 	}

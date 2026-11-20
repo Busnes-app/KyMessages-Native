@@ -3,6 +3,7 @@ package chat
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -301,9 +302,12 @@ func TestHubSessionCheckClosesRevokedSocket(t *testing.T) {
 	defer hub.Close()
 	hub.pingInterval = 20 * time.Millisecond
 	var revoked sync.Map
-	hub.SetSessionCheck(func(_ context.Context, userID, sessionHash string) bool {
+	hub.SetSessionCheck(func(_ context.Context, userID, sessionHash string) (bool, error) {
+		if sessionHash == "flaky" {
+			return false, errors.New("database is locked")
+		}
 		_, gone := revoked.Load(sessionHash)
-		return userID == "alice" && !gone
+		return userID == "alice" && !gone, nil
 	})
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -316,8 +320,8 @@ func TestHubSessionCheckClosesRevokedSocket(t *testing.T) {
 	defer srv.Close()
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 
-	kept, dropped := dialTestWS(t, wsURL+"?s=keep"), dialTestWS(t, wsURL+"?s=drop")
-	for _, c := range []*websocket.Conn{kept, dropped} {
+	kept, flaky, dropped := dialTestWS(t, wsURL+"?s=keep"), dialTestWS(t, wsURL+"?s=flaky"), dialTestWS(t, wsURL+"?s=drop")
+	for _, c := range []*websocket.Conn{kept, flaky, dropped} {
 		if ev := readEvent(t, c); ev.Type != EventHello {
 			t.Fatalf("first frame = %+v, want hello", ev)
 		}
@@ -334,7 +338,8 @@ func TestHubSessionCheckClosesRevokedSocket(t *testing.T) {
 	}
 
 	time.Sleep(100 * time.Millisecond) // several ticks
-	if clients, _, _ := hub.Stats(); clients != 1 {
-		t.Fatalf("live clients = %d, want only the valid session", clients)
+	// A failing lookup is not a revocation: that socket stays up.
+	if clients, _, _ := hub.Stats(); clients != 2 {
+		t.Fatalf("live clients = %d, want the valid and the unverifiable session", clients)
 	}
 }

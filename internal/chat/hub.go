@@ -27,8 +27,8 @@ type Hub struct {
 	byRoom  map[string]map[*Client]struct{}
 
 	// sessionValid, when set, is re-checked on every ping so a socket never outlives
-	// its session, whichever path revoked or expired it.
-	sessionValid func(ctx context.Context, userID, sessionHash string) bool
+	// its session, whichever path revoked or expired it. An error skips that tick.
+	sessionValid func(ctx context.Context, userID, sessionHash string) (bool, error)
 	pingInterval time.Duration
 }
 
@@ -75,7 +75,7 @@ func NewHub(bus EventBus) *Hub {
 }
 
 // SetSessionCheck registers the per-ping session check. Call it before serving connections.
-func (h *Hub) SetSessionCheck(fn func(ctx context.Context, userID, sessionHash string) bool) {
+func (h *Hub) SetSessionCheck(fn func(ctx context.Context, userID, sessionHash string) (bool, error)) {
 	h.sessionValid = fn
 }
 
@@ -453,9 +453,10 @@ func (c *Client) writeLoop(ctx context.Context, cancel context.CancelFunc) {
 		case <-ticker.C:
 			if c.hub.sessionValid != nil {
 				vctx, vcancel := context.WithTimeout(ctx, clientWriteTimeout)
-				valid := c.hub.sessionValid(vctx, c.userID, c.sessionHash)
+				valid, err := c.hub.sessionValid(vctx, c.userID, c.sessionHash)
 				vcancel()
-				if !valid {
+				// A store outage must not sign everyone out: only a definite answer revokes.
+				if err == nil && !valid {
 					frame, _ := json.Marshal(Event{Type: EventAuthRevoked})
 					c.tryEnqueue(frame)
 					c.kick(websocket.StatusPolicyViolation, "session revoked")

@@ -949,11 +949,15 @@ func (s *Server) handleChatIncomingWebhook(w http.ResponseWriter, r *http.Reques
 	// A webhook carries its creator's authority: it stops when they are offboarded,
 	// leave the room, or stop moderating it.
 	creator, err := s.store.Users().GetUserByID(r.Context(), wh.CreatedBy)
-	if err != nil || creator.Status != "active" {
-		s.writeError(w, http.StatusForbidden, "Webhook creator no longer has access to this room")
+	var member *store.RoomMember
+	if err == nil {
+		member, err = s.store.Chat().GetRoomMember(r.Context(), wh.TenantID, wh.RoomID, creator.ID)
+	}
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		s.writeError(w, http.StatusInternalServerError, "Failed to verify webhook creator")
 		return
 	}
-	if m, err := s.store.Chat().GetRoomMember(r.Context(), wh.TenantID, wh.RoomID, creator.ID); err != nil || !isRoomModerator(m, creator) {
+	if err != nil || creator.Status != "active" || !isRoomModerator(member, creator) {
 		s.writeError(w, http.StatusForbidden, "Webhook creator no longer has access to this room")
 		return
 	}
