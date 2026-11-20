@@ -68,6 +68,7 @@ func TestInstallerLiveActivationRolesAndSignedRevocation(t *testing.T) {
 	}
 	defer closeSetup()
 	defer srv.CloseChat()
+	startChatBus(t, srv)
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 	report, err = applysetup.CallLocal(ctx, socket, raw, true)
