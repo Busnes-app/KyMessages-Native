@@ -1,17 +1,23 @@
 import React, { useState } from 'react';
-import { Smartphone, LogOut, Users, Settings as SettingsIcon, LayoutDashboard, Archive, MessageSquare, Activity, ScrollText, Hash, Bot } from 'lucide-react';
+import { Smartphone, LogOut, Users, Settings as SettingsIcon, LayoutDashboard, Archive, MessageSquare, MessagesSquare, Activity, ScrollText, Hash, Bot } from 'lucide-react';
 import { ThemeSwitcher } from './ThemeSwitcher';
 import { QRPairingModal } from './QRPairingModal';
+import type { SessionUser } from '../dto';
 
 interface AppHeaderProps {
   appName: string;
   activeTab: string;
   onTabChange: (tab: string) => void;
-  user: any;
+  user: SessionUser | null;
   onLogout: () => void;
 }
 
+const memberItems = [
+  { id: 'chat', label: 'Chat', icon: MessagesSquare },
+];
+
 const adminItems = [
+  { id: 'chat', label: 'Chat', icon: MessagesSquare },
   { id: 'dashboard', label: 'Overview', icon: LayoutDashboard },
   { id: 'users', label: 'Users', icon: MessageSquare },
   { id: 'agents', label: 'Agents', icon: Bot },
@@ -24,7 +30,7 @@ const adminItems = [
 ];
 // Admin pages are refused server-side for non-admins; navigation only mirrors that.
 export function navItemsFor(role: string) {
-  return role === 'admin' ? adminItems : [];
+  return role === 'admin' ? adminItems : memberItems;
 }
 
 export const AppHeader: React.FC<AppHeaderProps> = ({ appName, activeTab, onTabChange, user, onLogout }) => {

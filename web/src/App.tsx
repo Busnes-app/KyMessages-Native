@@ -13,7 +13,7 @@ import { Health } from './pages/Health';
 import { Audit } from './pages/Audit';
 import { ConfirmItsYou } from './components/ConfirmItsYou';
 import { TwoFactorSetup } from './components/TwoFactorSetup';
-import { MemberHome } from './pages/MemberHome';
+import { Chat } from './pages/Chat';
 import './styles/theme.css';
 import './ky-ui/tokens.css';
 import './ky-ui/navigation.css';
@@ -26,7 +26,7 @@ export const App: React.FC = () => {
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState<boolean>(true);
-  const [activeTab, setActiveTab] = useState<string>('dashboard');
+  const [activeTab, setActiveTab] = useState<string>('chat');
   const [settings, setSettings] = useState<SiteSettings | null>(null);
 
   useEffect(() => {
@@ -112,12 +112,13 @@ export const App: React.FC = () => {
   }
 
   const isAdmin = user.role === 'admin';
+  const currentTab = isAdmin ? activeTab : 'chat';
 
   return (
     <div className="app-shell">
       <AppHeader
         appName={settings?.app_name || 'KyMessages'}
-        activeTab={activeTab}
+        activeTab={currentTab}
         onTabChange={(t) => setActiveTab(t)}
         user={user}
         onLogout={handleLogout}
@@ -125,11 +126,17 @@ export const App: React.FC = () => {
 
       {isAdmin && <ConfirmItsYou />}
 
-      {errorAlert}
-
       <main className="app-main">
-        <ErrorBoundary key={activeTab}>
-        {!isAdmin && <MemberHome user={user} chatUrl={settings?.chat_url ?? ''} onLogout={handleLogout} />}
+        {errorAlert}
+        <ErrorBoundary key={currentTab}>
+        {currentTab === 'chat' && (
+          <Chat
+            onAuthRevoked={() => {
+              setUser(null);
+              setNotice('Your session ended. Sign in again to continue.');
+            }}
+          />
+        )}
         {isAdmin && activeTab === 'dashboard' && <Dashboard settings={settings} user={user} onNavigate={(t) => setActiveTab(t)} />}
         {isAdmin && activeTab === 'users' && <Users />}
         {isAdmin && activeTab === 'agents' && <Agents />}

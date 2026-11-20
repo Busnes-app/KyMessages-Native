@@ -7,10 +7,19 @@ const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { sta
 const member = { username: 'bob', display_name: 'Bob', role: 'user', must_change_password: false };
 
 function stubServer(logout: () => Promise<Response>, me: unknown = { authenticated: true, user: member }) {
+  vi.stubGlobal('WebSocket', class { close() {} send() {} });
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
     if (url === '/api/auth/me') return json(me);
     if (url === '/api/settings') return json({ app_name: 'KyMessages', chat_url: '' });
+    if (url === '/api/v1/bootstrap') {
+      return json({
+        user: { id: 'u_bob', username: 'bob', display_name: 'Bob', role: 'user' },
+        tenant: { id: 'default', slug: 'default', display_name: 'KyMessages', plan: 'self_hosted' },
+        rooms: [],
+      });
+    }
+    if (url === '/api/v1/users') return json({ users: [{ id: 'u_bob', username: 'bob', display_name: 'Bob' }] });
     if (url === '/api/auth/logout') return logout();
     return json({ error: 'not stubbed' }, 404);
   }));
@@ -23,7 +32,7 @@ it('stays signed in and says so when the server refuses sign-out', async () => {
   render(<App />);
   fireEvent.click((await screen.findAllByRole('button', { name: 'Sign out' }))[0]);
   expect((await screen.findByRole('alert')).textContent).toContain('You are still signed in: Invalid CSRF token');
-  expect(screen.getByRole('heading', { name: 'Bob' })).toBeTruthy();
+  expect(screen.getByText('Bob')).toBeTruthy();
 });
 
 it('stays signed in when sign-out cannot reach the server', async () => {
@@ -31,7 +40,7 @@ it('stays signed in when sign-out cannot reach the server', async () => {
   render(<App />);
   fireEvent.click((await screen.findAllByRole('button', { name: 'Sign out' }))[0]);
   expect((await screen.findByRole('alert')).textContent).toContain('You are still signed in');
-  expect(screen.getByRole('heading', { name: 'Bob' })).toBeTruthy();
+  expect(screen.getByText('Bob')).toBeTruthy();
 });
 
 it('returns to sign-in only after the server confirms sign-out', async () => {
