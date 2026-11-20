@@ -77,6 +77,7 @@ type ServerConfig struct {
 type DatabaseConfig struct {
 	Driver          string        `json:"driver"` // "sqlite", "postgres", "mysql"
 	DSN             string        `json:"dsn"`    // Connection string or file path
+	ReadReplicaDSN  string        `json:"-"`      // Optional read-only PostgreSQL replica DSN
 	DataDir         string        `json:"data_dir"`
 	MaxOpenConns    int           `json:"max_open_conns"`
 	MaxIdleConns    int           `json:"max_idle_conns"`
@@ -255,6 +256,7 @@ func LoadFromEnv() (*Config, error) {
 		Database: DatabaseConfig{
 			Driver:          driver,
 			DSN:             dsn,
+			ReadReplicaDSN:  getEnv("KY_DB_READ_REPLICA_DSN", ""),
 			DataDir:         dataDir,
 			MaxOpenConns:    getEnvInt("KY_DB_MAX_OPEN_CONNS", 25),
 			MaxIdleConns:    getEnvInt("KY_DB_MAX_IDLE_CONNS", 5),

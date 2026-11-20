@@ -250,6 +250,8 @@ ALTER TABLE mfa_challenges ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';`,
 	{Version: 21, Name: "drop_messaging", SQLite: dropMessaging, Postgres: dropMessaging},
 	// Chat agent accounts. The token lives only in MAS; session_id names its personal session.
 	{Version: 22, Name: "agents", SQLite: agentsSchema("DATETIME"), Postgres: agentsSchema("TIMESTAMPTZ")},
+	// Native multi-tenant chat, calls, meetings, and webhooks schema.
+	{Version: 23, Name: "native_chat", SQLite: nativeChatSchemaSQLite, Postgres: nativeChatSchemaPostgres},
 }
 
 func agentsSchema(timestamp string) string {

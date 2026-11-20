@@ -14,6 +14,8 @@ var (
 	ErrUsernameTaken  = fmt.Errorf("username is taken: %w", ErrAlreadyExists)
 	ErrSessionExpired = errors.New("session expired")
 	ErrPairingExpired = errors.New("pairing session expired")
+	ErrRoomClosed     = errors.New("room is closed")
+	ErrForbidden      = errors.New("forbidden")
 )
 
 // Store defines the unified storage contract implemented across SQLite, PostgreSQL, and MySQL.
@@ -30,6 +32,10 @@ type Store interface {
 	Audit() AuditStore
 	Settings() SettingsStore
 	Agents() AgentStore
+	Chat() ChatStore
+
+	// Notify emits a PostgreSQL NOTIFY on channel with payload (no-op on SQLite).
+	Notify(ctx context.Context, channel, payload string) error
 
 	InvalidateRestoredGrants(context.Context) error
 	Driver() string
@@ -160,4 +166,43 @@ type AgentStore interface {
 	// unless the agent still holds fromSession, so a concurrent change is never overwritten.
 	SetAgentToken(ctx context.Context, id, fromSession, deviceID, sessionID, state string) error
 	DeleteAgent(ctx context.Context, id string) error
+}
+
+// ChatStore handles multi-tenant native KyMessages tenants, rooms, messages, reactions, and webhooks.
+type ChatStore interface {
+	// Tenants
+	CreateTenant(ctx context.Context, t *Tenant) error
+	GetTenant(ctx context.Context, tenantID string) (*Tenant, error)
+
+	// Rooms & Membership
+	CreateRoom(ctx context.Context, r *Room, initialMemberIDs []string) error
+	GetOrCreateDM(ctx context.Context, tenantID, userA, userB string) (*Room, bool, error)
+	GetRoom(ctx context.Context, tenantID, roomID string) (*Room, error)
+	ListUserRooms(ctx context.Context, tenantID, userID string) ([]*RoomSummary, error)
+	ListUserRoomIDs(ctx context.Context, tenantID, userID string) ([]string, error)
+	UpdateRoom(ctx context.Context, tenantID, roomID, name, topic string) (*Room, error)
+	CloseRoom(ctx context.Context, tenantID, roomID string) (*Room, error)
+
+	AddRoomMember(ctx context.Context, m *RoomMember) error
+	RemoveRoomMember(ctx context.Context, tenantID, roomID, userID string) error
+	GetRoomMember(ctx context.Context, tenantID, roomID, userID string) (*RoomMember, error)
+	ListRoomMembers(ctx context.Context, tenantID, roomID string) ([]*RoomMember, error)
+	UpdateReadCursor(ctx context.Context, tenantID, roomID, userID string, seq int64) (int64, error)
+
+	// Messages & Reactions
+	CreateMessage(ctx context.Context, p CreateMessageParams) (*Message, bool, error)
+	GetMessage(ctx context.Context, tenantID, roomID, messageID string) (*Message, error)
+	ListMessages(ctx context.Context, q MessagePageQuery) ([]*Message, bool, error)
+	EditMessage(ctx context.Context, tenantID, roomID, messageID, actorID, newBody string) (*Message, error)
+	DeleteMessage(ctx context.Context, tenantID, roomID, messageID, actorID string, allowModerator bool) (*Message, error)
+	SearchMessages(ctx context.Context, tenantID, userID, roomID, query string, limit int) ([]*Message, error)
+
+	AddReaction(ctx context.Context, tenantID, roomID, messageID, userID, emoji string) error
+	RemoveReaction(ctx context.Context, tenantID, roomID, messageID, userID, emoji string) error
+
+	// Webhooks
+	CreateRoomWebhook(ctx context.Context, w *RoomWebhook) error
+	GetRoomWebhook(ctx context.Context, webhookID string) (*RoomWebhook, error)
+	ListRoomWebhooks(ctx context.Context, tenantID, roomID string) ([]*RoomWebhook, error)
+	RevokeRoomWebhook(ctx context.Context, tenantID, roomID, webhookID string) error
 }

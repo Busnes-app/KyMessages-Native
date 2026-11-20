@@ -22,7 +22,7 @@ func Open(ctx context.Context, cfg config.DatabaseConfig) (Store, error) {
 	case "sqlite", "sqlite3", "":
 		return openSQLite(ctx, cfg.DSN)
 	case "postgres", "postgresql", "pgx":
-		return openPostgres(ctx, cfg.DSN, cfg.MaxOpenConns, cfg.MaxIdleConns, cfg.ConnMaxLifetime)
+		return openPostgres(ctx, cfg.DSN, cfg.ReadReplicaDSN, cfg.MaxOpenConns, cfg.MaxIdleConns, cfg.ConnMaxLifetime)
 	default:
 		return nil, fmt.Errorf("unsupported database driver: %q (supported: sqlite, postgres)", cfg.Driver)
 	}
@@ -71,10 +71,10 @@ func openSQLite(ctx context.Context, dsn string) (Store, error) {
 		return nil, fmt.Errorf("failed to ping sqlite database: %w", err)
 	}
 
-	return newSQLStore(ctx, db, "sqlite")
+	return newSQLStore(ctx, db, nil, "sqlite")
 }
 
-func openPostgres(ctx context.Context, dsn string, maxOpen, maxIdle int, maxLifetime time.Duration) (Store, error) {
+func openPostgres(ctx context.Context, dsn, readReplicaDSN string, maxOpen, maxIdle int, maxLifetime time.Duration) (Store, error) {
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open postgres database: %w", err)
@@ -99,5 +99,22 @@ func openPostgres(ctx context.Context, dsn string, maxOpen, maxIdle int, maxLife
 		return nil, fmt.Errorf("failed to ping postgres database: %w", err)
 	}
 
-	return newSQLStore(ctx, db, "postgres")
+	var readDB *sql.DB
+	if strings.TrimSpace(readReplicaDSN) != "" {
+		readDB, err = sql.Open("pgx", readReplicaDSN)
+		if err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("failed to open postgres read replica: %w", err)
+		}
+		readDB.SetMaxOpenConns(maxOpen)
+		readDB.SetMaxIdleConns(maxIdle)
+		readDB.SetConnMaxLifetime(maxLifetime)
+		if err := readDB.PingContext(ctx); err != nil {
+			_ = readDB.Close()
+			_ = db.Close()
+			return nil, fmt.Errorf("failed to ping postgres read replica: %w", err)
+		}
+	}
+
+	return newSQLStore(ctx, db, readDB, "postgres")
 }

@@ -15,6 +15,7 @@ import (
 // SQLStore implements Store on top of database/sql.
 type SQLStore struct {
 	db       *sql.DB
+	readDB   *sql.DB
 	driver   string
 	users    *userStore
 	sessions *sessionStore
@@ -23,22 +24,31 @@ type SQLStore struct {
 	audit    *auditStore
 	settings *settingsStore
 	agents   *agentStore
+	chat     *chatStore
 }
 
 // newSQLStore creates and initializes a SQLStore, running migrations automatically.
-func newSQLStore(ctx context.Context, db *sql.DB, driver string) (*SQLStore, error) {
+func newSQLStore(ctx context.Context, db, readDB *sql.DB, driver string) (*SQLStore, error) {
 	driver = strings.ToLower(driver)
 	if driver == "postgresql" {
 		driver = "postgres"
 	}
 
 	if err := migrations.Run(ctx, db, driver); err != nil {
+		if readDB != nil && readDB != db {
+			_ = readDB.Close()
+		}
 		_ = db.Close()
 		return nil, fmt.Errorf("migration failure on driver %s: %w", driver, err)
 	}
 
+	if readDB == nil {
+		readDB = db
+	}
+
 	s := &SQLStore{
 		db:     db,
+		readDB: readDB,
 		driver: driver,
 	}
 
@@ -49,6 +59,7 @@ func newSQLStore(ctx context.Context, db *sql.DB, driver string) (*SQLStore, err
 	s.audit = &auditStore{store: s}
 	s.settings = &settingsStore{store: s}
 	s.agents = &agentStore{store: s}
+	s.chat = &chatStore{store: s}
 
 	return s, nil
 }
@@ -60,10 +71,32 @@ func (s *SQLStore) Groups() GroupStore      { return s.groups }
 func (s *SQLStore) Audit() AuditStore       { return s.audit }
 func (s *SQLStore) Settings() SettingsStore { return s.settings }
 func (s *SQLStore) Agents() AgentStore      { return s.agents }
+func (s *SQLStore) Chat() ChatStore         { return s.chat }
+
+func (s *SQLStore) read() *sql.DB {
+	if s.readDB != nil {
+		return s.readDB
+	}
+	return s.db
+}
+
+func (s *SQLStore) Notify(ctx context.Context, channel, payload string) error {
+	if s.driver != "postgres" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `SELECT pg_notify($1, $2)`, channel, payload)
+	return err
+}
 
 func (s *SQLStore) Driver() string                 { return s.driver }
 func (s *SQLStore) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
-func (s *SQLStore) Close() error                   { return s.db.Close() }
+func (s *SQLStore) Close() error {
+	var err error
+	if s.readDB != nil && s.readDB != s.db {
+		err = s.readDB.Close()
+	}
+	return errors.Join(err, s.db.Close())
+}
 
 // rebind converts '?' placeholders to '$1, $2, ...' for Postgres
 func (s *SQLStore) rebind(query string) string {
