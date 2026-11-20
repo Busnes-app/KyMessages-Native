@@ -957,7 +957,9 @@ func (s *Server) handleChatIncomingWebhook(w http.ResponseWriter, r *http.Reques
 		s.writeError(w, http.StatusInternalServerError, "Failed to verify webhook creator")
 		return
 	}
-	if err != nil || creator.Status != "active" || !isRoomModerator(member, creator) {
+	// Membership comes first, as on every moderator route: no one, a global admin
+	// included, keeps a webhook in a room they have left.
+	if errors.Is(err, store.ErrNotFound) || creator.Status != "active" || !isRoomModerator(member, creator) {
 		s.writeError(w, http.StatusForbidden, "Webhook creator no longer has access to this room")
 		return
 	}

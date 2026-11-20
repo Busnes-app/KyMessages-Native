@@ -15,6 +15,7 @@ func TestChatWebhookStopsWhenCreatorLosesAccess(t *testing.T) {
 
 	alice, aliceTok := createChatTestUser(t, st, "usr_wh_alice", "wh_alice", "user")
 	bob, bobTok := createChatTestUser(t, st, "usr_wh_bob", "wh_bob", "user")
+	root, rootTok := createChatTestUser(t, st, "usr_wh_root", "wh_root", "admin")
 
 	rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", aliceTok, map[string]any{"name": "ops", "is_private": true}, nil)
 	var roomResp struct {
@@ -24,6 +25,9 @@ func TestChatWebhookStopsWhenCreatorLosesAccess(t *testing.T) {
 	room := "/api/v1/rooms/" + roomResp.Room.ID
 	if rec = doBearerJSON(t, srv, http.MethodPost, room+"/members", aliceTok, map[string]any{"user_id": bob.ID, "role": "admin"}, nil); rec.Code != http.StatusCreated {
 		t.Fatalf("add admin = %d (%s)", rec.Code, rec.Body)
+	}
+	if rec = doBearerJSON(t, srv, http.MethodPost, room+"/members", aliceTok, map[string]any{"user_id": root.ID}, nil); rec.Code != http.StatusCreated {
+		t.Fatalf("add global admin = %d (%s)", rec.Code, rec.Body)
 	}
 
 	type hook struct {
@@ -42,9 +46,17 @@ func TestChatWebhookStopsWhenCreatorLosesAccess(t *testing.T) {
 	post := func(h hook) int {
 		return doBearerJSON(t, srv, http.MethodPost, "/api/v1/webhooks/in/"+h.Webhook.ID, h.Token, map[string]any{"text": "hi"}, nil).Code
 	}
-	aliceHook, bobHook := create(aliceTok), create(bobTok)
-	if a, b := post(aliceHook), post(bobHook); a != http.StatusCreated || b != http.StatusCreated {
-		t.Fatalf("posts while creators moderate = %d, %d", a, b)
+	aliceHook, bobHook, rootHook := create(aliceTok), create(bobTok), create(rootTok)
+	if a, b, r := post(aliceHook), post(bobHook), post(rootHook); a != http.StatusCreated || b != http.StatusCreated || r != http.StatusCreated {
+		t.Fatalf("posts while creators moderate = %d, %d, %d", a, b, r)
+	}
+
+	// A global admin gets no exception once they leave.
+	if rec = doBearerJSON(t, srv, http.MethodDelete, room+"/members/"+root.ID, rootTok, nil, nil); rec.Code != http.StatusOK {
+		t.Fatalf("global admin leaves = %d", rec.Code)
+	}
+	if code := post(rootHook); code != http.StatusForbidden {
+		t.Fatalf("webhook of departed global admin = %d, want 403", code)
 	}
 
 	// Leaving the room ends the creator's webhook; the other stays.
