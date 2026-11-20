@@ -217,6 +217,11 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 		bus = chat.NewPostgresBus(cfg.Database.DSN, st)
 	}
 	chatHub := chat.NewHub(bus)
+	if st != nil {
+		chatHub.SetSessionCheck(func(ctx context.Context, userID, sessionHash string) bool {
+			return chatSessionValid(ctx, st, userID, sessionHash)
+		})
+	}
 	revokeUser := func(ctx context.Context, userID string) {
 		_ = chatHub.RevokeUser(ctx, userID)
 	}

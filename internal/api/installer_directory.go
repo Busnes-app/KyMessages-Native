@@ -63,9 +63,13 @@ func (s *Server) handleInstallerDirectory(w http.ResponseWriter, r *http.Request
 	}
 	sum := sha256.Sum256(append([]byte(event.Type+"\x00"), raw...))
 	digest := hex.EncodeToString(sum[:])
-	if err = s.store.ApplyInstallerDirectory(r.Context(), s.config.SSO.KyIdentityIssuer, subject, event.Type, revision, digest, active, admin); err != nil {
+	revoked, err := s.store.ApplyInstallerDirectory(r.Context(), s.config.SSO.KyIdentityIssuer, subject, event.Type, revision, digest, active, admin)
+	if err != nil {
 		s.writeError(w, 422, "Directory revision or assigned identity refused")
 		return
+	}
+	if revoked != "" && s.chatHub != nil {
+		_ = s.chatHub.RevokeUser(r.Context(), revoked)
 	}
 	if s.directoryChanged != nil {
 		s.directoryChanged()

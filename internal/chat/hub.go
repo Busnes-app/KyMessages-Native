@@ -25,6 +25,11 @@ type Hub struct {
 	clients map[*Client]struct{}
 	byUser  map[string]map[*Client]struct{}
 	byRoom  map[string]map[*Client]struct{}
+
+	// sessionValid, when set, is re-checked on every ping so a socket never outlives
+	// its session, whichever path revoked or expired it.
+	sessionValid func(ctx context.Context, userID, sessionHash string) bool
+	pingInterval time.Duration
 }
 
 // Client represents one authenticated WebSocket connection.
@@ -60,11 +65,18 @@ func NewHub(bus EventBus) *Hub {
 		clients: make(map[*Client]struct{}),
 		byUser:  make(map[string]map[*Client]struct{}),
 		byRoom:  make(map[string]map[*Client]struct{}),
+
+		pingInterval: clientPingInterval,
 	}
 	if mb, ok := bus.(*MemoryBus); ok {
 		mb.SetHandler(h.Dispatch)
 	}
 	return h
+}
+
+// SetSessionCheck registers the per-ping session check. Call it before serving connections.
+func (h *Hub) SetSessionCheck(fn func(ctx context.Context, userID, sessionHash string) bool) {
+	h.sessionValid = fn
 }
 
 // Run starts consuming events from the EventBus and dispatching them until ctx is canceled.
@@ -401,7 +413,7 @@ func (c *Client) kick(code websocket.StatusCode, reason string) {
 }
 
 func (c *Client) writeLoop(ctx context.Context, cancel context.CancelFunc) {
-	ticker := time.NewTicker(clientPingInterval)
+	ticker := time.NewTicker(c.hub.pingInterval)
 	defer ticker.Stop()
 
 	flushFinal := func() {
@@ -439,6 +451,17 @@ func (c *Client) writeLoop(ctx context.Context, cancel context.CancelFunc) {
 				return
 			}
 		case <-ticker.C:
+			if c.hub.sessionValid != nil {
+				vctx, vcancel := context.WithTimeout(ctx, clientWriteTimeout)
+				valid := c.hub.sessionValid(vctx, c.userID, c.sessionHash)
+				vcancel()
+				if !valid {
+					frame, _ := json.Marshal(Event{Type: EventAuthRevoked})
+					c.tryEnqueue(frame)
+					c.kick(websocket.StatusPolicyViolation, "session revoked")
+					continue // the stop case flushes the frame and closes
+				}
+			}
 			pctx, pcancel := context.WithTimeout(ctx, clientWriteTimeout)
 			err := c.conn.Ping(pctx)
 			pcancel()

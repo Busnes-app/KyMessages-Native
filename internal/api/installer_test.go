@@ -17,8 +17,10 @@ import (
 	"github.com/Busnes-app/ky_server_base/internal/api"
 	"github.com/Busnes-app/ky_server_base/internal/auth"
 	"github.com/Busnes-app/ky_server_base/internal/backup"
+	"github.com/Busnes-app/ky_server_base/internal/chat"
 	"github.com/Busnes-app/ky_server_base/internal/config"
 	"github.com/Busnes-app/ky_server_base/internal/matrixsync"
+	"github.com/coder/websocket"
 	"log"
 	"strings"
 )
@@ -65,6 +67,9 @@ func TestInstallerLiveActivationRolesAndSignedRevocation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer closeSetup()
+	defer srv.CloseChat()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
 	report, err = applysetup.CallLocal(ctx, socket, raw, true)
 	if err != nil || len(report.Present) != 3 || len(report.Pending) != 0 {
 		t.Fatal(report, err)
@@ -75,8 +80,20 @@ func TestInstallerLiveActivationRolesAndSignedRevocation(t *testing.T) {
 			t.Fatal(err)
 		}
 		login := httptest.NewRecorder()
-		if _, _, err = auth.NewSessionManager(st, cfg.Security).IssueSession(ctx, login, httptest.NewRequest("GET", "/", nil), user); err != nil {
+		_, token, err := auth.NewSessionManager(st, cfg.Security).IssueSession(ctx, login, httptest.NewRequest("GET", "/", nil), user)
+		if err != nil {
 			t.Fatal(err)
+		}
+		// A live chat socket must close when the directory offboards its user.
+		ws, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.URL, "http")+"/api/v1/ws", &websocket.DialOptions{
+			HTTPHeader: http.Header{"Authorization": {"Bearer " + token}, "Origin": {cfg.Server.AppURL}},
+		})
+		if err != nil {
+			t.Fatal(sub, "ws dial", err)
+		}
+		defer ws.CloseNow()
+		if ev := readWSEvent(t, ws); ev.Type != chat.EventHello {
+			t.Fatal(sub, "first frame", ev)
 		}
 		request := func() *httptest.ResponseRecorder {
 			r := httptest.NewRequest(http.MethodGet, "/api/backup/status", nil)
@@ -108,6 +125,9 @@ func TestInstallerLiveActivationRolesAndSignedRevocation(t *testing.T) {
 		}
 		if w := request(); w.Code != 401 {
 			t.Fatal("inactive identity retained session", sub, w.Code)
+		}
+		if ev := readWSEvent(t, ws); ev.Type != chat.EventAuthRevoked {
+			t.Fatal(sub, "offboarded socket got", ev)
 		}
 	}
 }

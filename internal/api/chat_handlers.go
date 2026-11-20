@@ -946,6 +946,17 @@ func (s *Server) handleChatIncomingWebhook(w http.ResponseWriter, r *http.Reques
 		s.writeError(w, http.StatusUnauthorized, "Invalid webhook token")
 		return
 	}
+	// A webhook carries its creator's authority: it stops when they are offboarded,
+	// leave the room, or stop moderating it.
+	creator, err := s.store.Users().GetUserByID(r.Context(), wh.CreatedBy)
+	if err != nil || creator.Status != "active" {
+		s.writeError(w, http.StatusForbidden, "Webhook creator no longer has access to this room")
+		return
+	}
+	if m, err := s.store.Chat().GetRoomMember(r.Context(), wh.TenantID, wh.RoomID, creator.ID); err != nil || !isRoomModerator(m, creator) {
+		s.writeError(w, http.StatusForbidden, "Webhook creator no longer has access to this room")
+		return
+	}
 	if !s.allowAccountAttempt("wh:"+wh.ID, 60, time.Minute) {
 		s.writeError(w, http.StatusTooManyRequests, "Webhook rate limit exceeded")
 		return

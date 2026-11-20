@@ -295,3 +295,46 @@ func TestHub500ConcurrentClientsMemoryGate(t *testing.T) {
 		t.Fatalf("heap delta %.2f MiB exceeded 100 MiB Phase 1 gate", deltaMiB)
 	}
 }
+
+func TestHubSessionCheckClosesRevokedSocket(t *testing.T) {
+	hub := NewHub(NewMemoryBus())
+	defer hub.Close()
+	hub.pingInterval = 20 * time.Millisecond
+	var revoked sync.Map
+	hub.SetSessionCheck(func(_ context.Context, userID, sessionHash string) bool {
+		_, gone := revoked.Load(sessionHash)
+		return userID == "alice" && !gone
+	})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		hub.ServeConn(r.Context(), conn, "default", "alice", r.URL.Query().Get("s"), nil)
+	}))
+	defer srv.Close()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	kept, dropped := dialTestWS(t, wsURL+"?s=keep"), dialTestWS(t, wsURL+"?s=drop")
+	for _, c := range []*websocket.Conn{kept, dropped} {
+		if ev := readEvent(t, c); ev.Type != EventHello {
+			t.Fatalf("first frame = %+v, want hello", ev)
+		}
+	}
+	// Revoked out of band (expiry, CLI reset): no hub call, only the store changes.
+	revoked.Store("drop", true)
+	if ev := readEvent(t, dropped); ev.Type != EventAuthRevoked {
+		t.Fatalf("revoked socket got %+v, want auth.revoked", ev)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, _, err := dropped.Read(ctx); websocket.CloseStatus(err) != websocket.StatusPolicyViolation {
+		t.Fatalf("revoked socket close = %v, want policy violation", err)
+	}
+
+	time.Sleep(100 * time.Millisecond) // several ticks
+	if clients, _, _ := hub.Stats(); clients != 1 {
+		t.Fatalf("live clients = %d, want only the valid session", clients)
+	}
+}

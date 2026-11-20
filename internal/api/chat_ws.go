@@ -31,6 +31,21 @@ func (s *Server) CloseChat() {
 	}
 }
 
+// chatSessionValid repeats AuthenticateRequest's checks for a live socket: the session
+// still exists and is unexpired, and its user is active, allowed and not restricted.
+func chatSessionValid(ctx context.Context, st store.Store, userID, sessionHash string) bool {
+	sess, err := st.Sessions().GetSession(ctx, sessionHash)
+	if err != nil || sess.UserID != userID {
+		return false
+	}
+	user, err := st.Users().GetUserByID(ctx, userID)
+	if err != nil || user.Status != "active" || user.MustChangePassword {
+		return false
+	}
+	allowed, err := st.InstallerUserAllowed(ctx, user)
+	return err == nil && allowed
+}
+
 func hasBearerAuth(r *http.Request) bool {
 	return strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ")
 }
