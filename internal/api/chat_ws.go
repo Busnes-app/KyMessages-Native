@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -29,6 +30,33 @@ func (s *Server) CloseChat() {
 	if s.chatHub != nil {
 		s.chatHub.Close()
 	}
+}
+
+// chatSessionValid repeats AuthenticateRequest's checks for a live socket: the session
+// still exists and is unexpired, and its user is active, allowed and not restricted.
+// A lookup failure is returned as an error, never as a revocation.
+func chatSessionValid(ctx context.Context, st store.Store, userID, sessionHash string) (bool, error) {
+	sess, err := st.Sessions().GetSession(ctx, sessionHash)
+	if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrSessionExpired) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if sess.UserID != userID {
+		return false, nil
+	}
+	user, err := st.Users().GetUserByID(ctx, userID)
+	if errors.Is(err, store.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if user.Status != "active" || user.MustChangePassword {
+		return false, nil
+	}
+	return st.InstallerUserAllowed(ctx, user)
 }
 
 func hasBearerAuth(r *http.Request) bool {

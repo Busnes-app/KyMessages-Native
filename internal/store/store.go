@@ -23,7 +23,7 @@ type Store interface {
 	ApplyInstaller(context.Context, applysetup.Common, bool) (applysetup.Report, error)
 	InstallerIdentity(context.Context, string, string) (bool, bool, error)
 	InstallerUserAllowed(context.Context, *User) (bool, error)
-	ApplyInstallerDirectory(context.Context, string, string, string, string, string, bool, bool) error
+	ApplyInstallerDirectory(context.Context, string, string, string, string, string, bool, bool) (string, error)
 
 	Users() UserStore
 	Sessions() SessionStore

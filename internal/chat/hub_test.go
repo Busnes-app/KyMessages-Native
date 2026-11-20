@@ -3,6 +3,7 @@ package chat
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -293,5 +294,52 @@ func TestHub500ConcurrentClientsMemoryGate(t *testing.T) {
 	t.Logf("500 concurrent WS clients heap delta: %.2f MiB (total heap: %.2f MiB)", deltaMiB, float64(after.HeapAlloc)/(1024*1024))
 	if deltaMiB > 100.0 {
 		t.Fatalf("heap delta %.2f MiB exceeded 100 MiB Phase 1 gate", deltaMiB)
+	}
+}
+
+func TestHubSessionCheckClosesRevokedSocket(t *testing.T) {
+	hub := NewHub(NewMemoryBus())
+	defer hub.Close()
+	hub.pingInterval = 20 * time.Millisecond
+	var revoked sync.Map
+	hub.SetSessionCheck(func(_ context.Context, userID, sessionHash string) (bool, error) {
+		if sessionHash == "flaky" {
+			return false, errors.New("database is locked")
+		}
+		_, gone := revoked.Load(sessionHash)
+		return userID == "alice" && !gone, nil
+	})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		hub.ServeConn(r.Context(), conn, "default", "alice", r.URL.Query().Get("s"), nil)
+	}))
+	defer srv.Close()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	kept, flaky, dropped := dialTestWS(t, wsURL+"?s=keep"), dialTestWS(t, wsURL+"?s=flaky"), dialTestWS(t, wsURL+"?s=drop")
+	for _, c := range []*websocket.Conn{kept, flaky, dropped} {
+		if ev := readEvent(t, c); ev.Type != EventHello {
+			t.Fatalf("first frame = %+v, want hello", ev)
+		}
+	}
+	// Revoked out of band (expiry, CLI reset): no hub call, only the store changes.
+	revoked.Store("drop", true)
+	if ev := readEvent(t, dropped); ev.Type != EventAuthRevoked {
+		t.Fatalf("revoked socket got %+v, want auth.revoked", ev)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, _, err := dropped.Read(ctx); websocket.CloseStatus(err) != websocket.StatusPolicyViolation {
+		t.Fatalf("revoked socket close = %v, want policy violation", err)
+	}
+
+	time.Sleep(100 * time.Millisecond) // several ticks
+	// A failing lookup is not a revocation: that socket stays up.
+	if clients, _, _ := hub.Stats(); clients != 2 {
+		t.Fatalf("live clients = %d, want the valid and the unverifiable session", clients)
 	}
 }

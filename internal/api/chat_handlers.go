@@ -946,6 +946,23 @@ func (s *Server) handleChatIncomingWebhook(w http.ResponseWriter, r *http.Reques
 		s.writeError(w, http.StatusUnauthorized, "Invalid webhook token")
 		return
 	}
+	// A webhook carries its creator's authority: it stops when they are offboarded,
+	// leave the room, or stop moderating it.
+	creator, err := s.store.Users().GetUserByID(r.Context(), wh.CreatedBy)
+	var member *store.RoomMember
+	if err == nil {
+		member, err = s.store.Chat().GetRoomMember(r.Context(), wh.TenantID, wh.RoomID, creator.ID)
+	}
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		s.writeError(w, http.StatusInternalServerError, "Failed to verify webhook creator")
+		return
+	}
+	// Membership comes first, as on every moderator route: no one, a global admin
+	// included, keeps a webhook in a room they have left.
+	if errors.Is(err, store.ErrNotFound) || creator.Status != "active" || !isRoomModerator(member, creator) {
+		s.writeError(w, http.StatusForbidden, "Webhook creator no longer has access to this room")
+		return
+	}
 	if !s.allowAccountAttempt("wh:"+wh.ID, 60, time.Minute) {
 		s.writeError(w, http.StatusTooManyRequests, "Webhook rate limit exceeded")
 		return
