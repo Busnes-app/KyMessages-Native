@@ -31,6 +31,8 @@ type KyIdentityClient struct {
 	syncMu sync.Mutex
 	// rejects counts refused deliveries since start, in memory only.
 	rejects rejectCounter
+	// onUserRevoked fires after a user's sessions are revoked (deactivation, role change, deletion).
+	onUserRevoked func(ctx context.Context, userID string)
 }
 
 func NewKyIdentityClient(cfg config.SSOConfig, st store.Store) *KyIdentityClient {
@@ -39,6 +41,11 @@ func NewKyIdentityClient(cfg config.SSOConfig, st store.Store) *KyIdentityClient
 		store:  st,
 		flow:   newOAuthFlow(cfg.KyIdentityIssuer, cfg.KyIdentityClientID, cfg.KyIdentitySecret),
 	}
+}
+
+// OnUserRevoked registers a callback invoked immediately when directory sync revokes or deletes a user.
+func (k *KyIdentityClient) OnUserRevoked(fn func(ctx context.Context, userID string)) {
+	k.onUserRevoked = fn
 }
 
 // BuildAuthURL generates the authorization code URL with PKCE for KyIdentity.
@@ -194,7 +201,10 @@ func (k *KyIdentityClient) applySyncWebhook(ctx context.Context, headers syncaut
 		if err != nil {
 			return event.Type, err
 		}
-		_, err = k.store.Users().DeleteDirectoryUser(ctx, existing, ev)
+		applied, err := k.store.Users().DeleteDirectoryUser(ctx, existing, ev)
+		if err == nil && applied && existing.ID != "" && k.onUserRevoked != nil {
+			k.onUserRevoked(ctx, existing.ID)
+		}
 		return event.Type, err
 	}
 	return event.Type, nil // other event types (groups) are not for this product
@@ -245,7 +255,12 @@ func (k *KyIdentityClient) upsertDirectoryUser(ctx context.Context, in Directory
 		return err
 	}
 	if existing.Role != role || existing.Status != status {
-		return k.store.Sessions().DeleteUserSessions(ctx, existing.ID)
+		if err := k.store.Sessions().DeleteUserSessions(ctx, existing.ID); err != nil {
+			return err
+		}
+		if k.onUserRevoked != nil {
+			k.onUserRevoked(ctx, existing.ID)
+		}
 	}
 	return nil
 }

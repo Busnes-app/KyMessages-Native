@@ -15,6 +15,7 @@ import (
 	"github.com/Busnes-app/ky-primitives/recoveryclient"
 	"github.com/Busnes-app/ky-primitives/syncauth"
 	"github.com/Busnes-app/ky_server_base/internal/auth"
+	"github.com/Busnes-app/ky_server_base/internal/chat"
 	"github.com/Busnes-app/ky_server_base/internal/config"
 	"github.com/Busnes-app/ky_server_base/internal/devices"
 	"github.com/Busnes-app/ky_server_base/internal/health"
@@ -73,6 +74,7 @@ type Server struct {
 	kyidentity       *sso.KyIdentityClient
 	directoryChanged func()
 	scim             *scim.Server
+	chatHub          *chat.Hub
 	recovery         recoveryClient
 	rtc              *matrixrtc.Client
 	mas              MatrixAdmin // nil when Matrix is off
@@ -210,6 +212,17 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 	scimSrv := scim.NewServer(st, cfg.SCIM, cfg.Server.AppURL)
 	recovery := recoveryclient.NewClient(recoveryclient.Options{AllowPrivate: cfg.Backup.AllowPrivateRecovery})
 
+	var bus chat.EventBus = chat.NewMemoryBus()
+	if st != nil && st.Driver() == "postgres" && cfg.Database.DSN != "" {
+		bus = chat.NewPostgresBus(cfg.Database.DSN, st)
+	}
+	chatHub := chat.NewHub(bus)
+	revokeUser := func(ctx context.Context, userID string) {
+		_ = chatHub.RevokeUser(ctx, userID)
+	}
+	kyidentity.OnUserRevoked(revokeUser)
+	scimSrv.OnUserRevoked(revokeUser)
+
 	s := &Server{
 		config:          cfg,
 		store:           st,
@@ -217,6 +230,7 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 		pairing:         pairing,
 		kyidentity:      kyidentity,
 		scim:            scimSrv,
+		chatHub:         chatHub,
 		recovery:        recovery,
 		matrixTargets:   health.ComposeTargets,
 		probeHTTP:       health.NewHTTPClient(),
@@ -402,6 +416,28 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("DELETE /api/admin/federation/servers/{name}", s.tracked(s.requireAdmin(s.handleFederationRemoveServer)))
 	s.mux.HandleFunc("PUT /api/admin/federation/presets/{name}", s.tracked(s.requireAdmin(s.handleFederationPreset)))
 
+	// Native KyMessages v1 Chat & Real-Time API
+	s.mux.HandleFunc("GET /api/v1/bootstrap", s.requireAuthenticated(s.handleChatBootstrap))
+	s.mux.HandleFunc("GET /api/v1/rooms", s.requireAuthenticated(s.handleChatListRooms))
+	s.mux.HandleFunc("POST /api/v1/rooms", s.requireAuthenticated(s.handleChatCreateRoom))
+	s.mux.HandleFunc("GET /api/v1/rooms/{id}", s.requireAuthenticated(s.handleChatGetRoom))
+	s.mux.HandleFunc("PATCH /api/v1/rooms/{id}", s.requireAuthenticated(s.handleChatUpdateRoom))
+	s.mux.HandleFunc("POST /api/v1/rooms/{id}/members", s.requireAuthenticated(s.handleChatAddMember))
+	s.mux.HandleFunc("DELETE /api/v1/rooms/{id}/members/{uid}", s.requireAuthenticated(s.handleChatRemoveMember))
+	s.mux.HandleFunc("GET /api/v1/rooms/{id}/messages", s.requireAuthenticated(s.handleChatListMessages))
+	s.mux.HandleFunc("POST /api/v1/rooms/{id}/messages", s.requireAuthenticated(s.handleChatSendMessage))
+	s.mux.HandleFunc("PATCH /api/v1/rooms/{id}/messages/{mid}", s.requireAuthenticated(s.handleChatEditMessage))
+	s.mux.HandleFunc("DELETE /api/v1/rooms/{id}/messages/{mid}", s.requireAuthenticated(s.handleChatDeleteMessage))
+	s.mux.HandleFunc("PUT /api/v1/rooms/{id}/messages/{mid}/reactions/{emoji}", s.requireAuthenticated(s.handleChatAddReaction))
+	s.mux.HandleFunc("DELETE /api/v1/rooms/{id}/messages/{mid}/reactions/{emoji}", s.requireAuthenticated(s.handleChatRemoveReaction))
+	s.mux.HandleFunc("POST /api/v1/rooms/{id}/read", s.requireAuthenticated(s.handleChatMarkRead))
+	s.mux.HandleFunc("GET /api/v1/search", s.requireAuthenticated(s.handleChatSearch))
+	s.mux.HandleFunc("GET /api/v1/rooms/{id}/webhooks", s.requireAuthenticated(s.handleChatListWebhooks))
+	s.mux.HandleFunc("POST /api/v1/rooms/{id}/webhooks", s.requireAuthenticated(s.handleChatCreateWebhook))
+	s.mux.HandleFunc("DELETE /api/v1/rooms/{id}/webhooks/{wid}", s.requireAuthenticated(s.handleChatRevokeWebhook))
+	s.mux.HandleFunc("POST /api/v1/webhooks/in/{id}", s.handleChatIncomingWebhook)
+	s.mux.HandleFunc("GET /api/v1/ws", s.handleChatWS)
+
 	// SCIM 2.0 routes
 	s.scim.RegisterRoutes(s.mux)
 
@@ -515,7 +551,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Vary", "Origin")
 	}
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-CSRF-Token, "+syncauth.HeaderSignature)
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-CSRF-Token, Idempotency-Key, "+syncauth.HeaderSignature)
 
 	// Matrix discovery is public: any client origin may preflight it.
 	if r.Method == http.MethodOptions && (r.URL.Path == wellKnownMatrixClient || r.URL.Path == wellKnownMatrixServer) {
@@ -560,7 +596,10 @@ func isUnsafeMethod(method string) bool {
 }
 
 func csrfExempt(path string) bool {
-	return path == "/api/auth/login" || strings.HasPrefix(path, "/api/auth/mfa/") || path == "/api/sso/kyidentity/sync"
+	return path == "/api/auth/login" ||
+		strings.HasPrefix(path, "/api/auth/mfa/") ||
+		path == "/api/sso/kyidentity/sync" ||
+		strings.HasPrefix(path, "/api/v1/webhooks/in/")
 }
 
 func mintsSession(path string) bool {

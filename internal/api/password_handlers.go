@@ -70,5 +70,8 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = s.sessions.RevokeSession(r.Context(), w, r)
+	if s.chatHub != nil {
+		_ = s.chatHub.RevokeUser(r.Context(), user.ID)
+	}
 	s.writeJSON(w, http.StatusOK, map[string]bool{"password_changed": true, "login_required": true})
 }

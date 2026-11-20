@@ -296,7 +296,11 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
 	}
+	_, sess, _ := s.sessions.AuthenticateRequest(r)
 	_ = s.sessions.RevokeSession(r.Context(), w, r)
+	if sess != nil && s.chatHub != nil {
+		s.chatHub.RevokeSession(sess.TokenHash)
+	}
 	s.writeJSON(w, http.StatusOK, map[string]bool{"logged_out": true})
 }
 

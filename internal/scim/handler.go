@@ -1,6 +1,7 @@
 package scim
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -19,8 +20,9 @@ import (
 )
 
 type Server struct {
-	config   config.SCIMConfig
-	protocol http.Handler
+	config      config.SCIMConfig
+	protocol    http.Handler
+	userHandler *userResourceHandler
 }
 
 func NewServer(st store.Store, cfg config.SCIMConfig, appURL string) *Server {
@@ -38,11 +40,18 @@ func NewServer(st store.Store, cfg config.SCIMConfig, appURL string) *Server {
 		},
 	}, protocol.WithBaseURL(strings.TrimRight(appURL, "/")+"/scim/v2"))
 	if err != nil {
-		return &Server{config: cfg, protocol: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		return &Server{config: cfg, userHandler: userHandler, protocol: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			http.Error(w, "SCIM initialization failed", http.StatusInternalServerError)
 		})}
 	}
-	return &Server{config: cfg, protocol: server}
+	return &Server{config: cfg, protocol: server, userHandler: userHandler}
+}
+
+// OnUserRevoked registers a callback invoked immediately when SCIM deletes or deactivates a user.
+func (s *Server) OnUserRevoked(fn func(ctx context.Context, userID string)) {
+	if s.userHandler != nil {
+		s.userHandler.onUserRevoked = fn
+	}
 }
 
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
@@ -81,7 +90,10 @@ func writeAuthError(w http.ResponseWriter, status int, detail string) {
 	_ = json.NewEncoder(w).Encode(protocolErrors.ScimError{Status: status, Detail: detail})
 }
 
-type userResourceHandler struct{ store store.Store }
+type userResourceHandler struct {
+	store         store.Store
+	onUserRevoked func(ctx context.Context, userID string)
+}
 
 func (h *userResourceHandler) Create(r *http.Request, attrs protocol.ResourceAttributes) (protocol.Resource, error) {
 	username, _ := attrs["userName"].(string)
@@ -175,7 +187,13 @@ func (h *userResourceHandler) Delete(r *http.Request, id string) error {
 	if _, err := h.ownedUser(r, id); err != nil {
 		return err
 	}
-	return scimStoreError(h.store.Users().DeleteUser(r.Context(), id), id)
+	if err := h.store.Users().DeleteUser(r.Context(), id); err != nil {
+		return scimStoreError(err, id)
+	}
+	if h.onUserRevoked != nil {
+		h.onUserRevoked(r.Context(), id)
+	}
+	return nil
 }
 
 func (h *userResourceHandler) Patch(r *http.Request, id string, operations []protocol.PatchOperation) (protocol.Resource, error) {
@@ -219,6 +237,9 @@ func (h *userResourceHandler) Patch(r *http.Request, id string, operations []pro
 func (h *userResourceHandler) revokeIfPrivilegesChanged(r *http.Request, user *store.User, oldRole, oldStatus string) {
 	if user.Role != oldRole || user.Status != oldStatus {
 		_ = h.store.Sessions().DeleteUserSessions(r.Context(), user.ID)
+		if h.onUserRevoked != nil {
+			h.onUserRevoked(r.Context(), user.ID)
+		}
 	}
 }
 

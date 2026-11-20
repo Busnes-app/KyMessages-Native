@@ -112,6 +112,11 @@ func runServer() {
 	}
 
 	srv := api.NewServer(cfg, st)
+	chatBusDone := make(chan struct{})
+	go func() {
+		defer close(chatBusDone)
+		_ = srv.RunChatBus(ctx)
+	}()
 	backupDone := make(chan struct{})
 	go backupLoop(ctx, cfg, st, backupDone)
 	maintenanceDone := make(chan struct{})
@@ -141,7 +146,7 @@ func runServer() {
 		close(maintenanceDone)
 	}()
 	backgroundDone := make(chan struct{})
-	go func() { defer close(backgroundDone); <-backupDone; <-maintenanceDone; <-matrixDone }()
+	go func() { defer close(backgroundDone); <-backupDone; <-maintenanceDone; <-matrixDone; <-chatBusDone }()
 
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
 	httpServer := &http.Server{
@@ -179,6 +184,7 @@ func runServer() {
 
 	<-stop
 	log.Println("[KYMESSAGES] Shutting down gracefully...")
+	srv.CloseChat()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer shutdownCancel()
