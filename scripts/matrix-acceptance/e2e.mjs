@@ -172,12 +172,23 @@ async function invite(page, who) {
 }
 
 async function openRoom(page, id, invited) {
-  await page.goto(`${CHAT}/#/room/${id}`);
-  if (invited) {
-    // "Start chatting" for a DM, "Accept" for a room.
-    await page.getByRole('button', { name: /^(Accept|Start chatting)$/ }).click();
+  for (let attempt = 1; ; attempt++) {
+    await page.goto(`${CHAT}/#/room/${id}`);
+    if (invited && attempt === 1) {
+      // "Start chatting" for a DM, "Accept" for a room.
+      await page.getByRole('button', { name: /^(Accept|Start chatting)$/ }).click();
+    }
+    try {
+      await composer(page).waitFor();
+      return;
+    } catch (err) {
+      // Element drops a room change that lands while it is still leaving a call
+      // ("Cannot dispatch in the middle of a dispatch"); the hash already matches,
+      // so route away and back.
+      if (attempt === 3) throw err;
+      await page.goto(`${CHAT}/#/home`);
+    }
   }
-  await composer(page).waitFor();
 }
 
 async function prove() {
