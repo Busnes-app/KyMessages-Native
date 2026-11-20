@@ -58,6 +58,35 @@ func (s *Server) requireRoomMember(w http.ResponseWriter, r *http.Request, tenan
 	return m, true
 }
 
+type chatDirectoryUser struct {
+	ID          string `json:"id"`
+	Username    string `json:"username"`
+	DisplayName string `json:"display_name"`
+}
+
+func (s *Server) resolveDMRoomNames(r *http.Request, tenantID, selfID string, rooms []*store.RoomSummary) {
+	ctx := r.Context()
+	for _, rm := range rooms {
+		if rm.Kind != store.RoomKindDM || rm.Name != "" {
+			continue
+		}
+		members, err := s.store.Chat().ListRoomMembers(ctx, tenantID, rm.ID)
+		if err != nil {
+			continue
+		}
+		peerID := selfID
+		for _, m := range members {
+			if m.UserID != selfID {
+				peerID = m.UserID
+				break
+			}
+		}
+		if peer, err := s.store.Users().GetUserByID(ctx, peerID); err == nil {
+			rm.Name = displayNameFor(peer)
+		}
+	}
+}
+
 // GET /api/v1/bootstrap
 func (s *Server) handleChatBootstrap(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
@@ -77,11 +106,38 @@ func (s *Server) handleChatBootstrap(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusInternalServerError, "Failed to load rooms")
 		return
 	}
+	s.resolveDMRoomNames(r, tenantID, user.ID, rooms)
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"user":   user,
 		"tenant": tenant,
 		"rooms":  rooms,
 	})
+}
+
+// GET /api/v1/users
+func (s *Server) handleChatListUsers(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if _, _, ok := s.currentUser(r); !ok {
+		s.writeError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+	users, _, err := s.store.Users().ListUsers(r.Context(), 0, 500, store.UserFilter{})
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "Failed to list directory")
+		return
+	}
+	dir := make([]chatDirectoryUser, 0, len(users))
+	for _, u := range users {
+		if u.Status != "" && u.Status != "active" {
+			continue
+		}
+		dir = append(dir, chatDirectoryUser{
+			ID:          u.ID,
+			Username:    u.Username,
+			DisplayName: displayNameFor(u),
+		})
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"users": dir})
 }
 
 // GET /api/v1/rooms
@@ -97,6 +153,7 @@ func (s *Server) handleChatListRooms(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusInternalServerError, "Failed to list rooms")
 		return
 	}
+	s.resolveDMRoomNames(r, store.DefaultTenantID, user.ID, rooms)
 	s.writeJSON(w, http.StatusOK, map[string]any{"rooms": rooms})
 }
 

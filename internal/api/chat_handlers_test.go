@@ -401,3 +401,56 @@ func TestChatSecurityCSWSHWebhooksAndInstantRevocation(t *testing.T) {
 	}
 	_ = api.NewServer // ensure api import stays used
 }
+
+func TestChatUsersDirectoryAndDMDisplayNames(t *testing.T) {
+	srv, st, _ := setupTestServer(t)
+	defer srv.CloseChat()
+	alice, aliceTok := createChatTestUser(t, st, "usr_dir_alice", "alice_dir", "user")
+	bob, bobTok := createChatTestUser(t, st, "usr_dir_bob", "bob_dir", "user")
+
+	// GET /api/v1/users exposes minimal active directory entries.
+	dirRec := doBearerJSON(t, srv, http.MethodGet, "/api/v1/users", aliceTok, nil, nil)
+	if dirRec.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/users = %d, body=%s", dirRec.Code, dirRec.Body.String())
+	}
+	var dirResp struct {
+		Users []struct {
+			ID          string `json:"id"`
+			Username    string `json:"username"`
+			DisplayName string `json:"display_name"`
+		} `json:"users"`
+	}
+	if err := json.Unmarshal(dirRec.Body.Bytes(), &dirResp); err != nil {
+		t.Fatalf("decode users: %v", err)
+	}
+	if len(dirResp.Users) < 2 {
+		t.Fatalf("expected at least 2 active directory users, got %d", len(dirResp.Users))
+	}
+
+	// Create DM between Alice and Bob; Alice should see Bob's display name and Bob should see Alice's.
+	dmRec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", aliceTok, map[string]any{
+		"kind":       "dm",
+		"dm_user_id": bob.ID,
+	}, nil)
+	if dmRec.Code != http.StatusCreated {
+		t.Fatalf("create DM = %d, body=%s", dmRec.Code, dmRec.Body.String())
+	}
+
+	aliceRooms := doBearerJSON(t, srv, http.MethodGet, "/api/v1/rooms", aliceTok, nil, nil)
+	var aResp struct {
+		Rooms []store.RoomSummary `json:"rooms"`
+	}
+	_ = json.Unmarshal(aliceRooms.Body.Bytes(), &aResp)
+	if len(aResp.Rooms) != 1 || aResp.Rooms[0].Name != bob.DisplayName {
+		t.Fatalf("Alice DM name = %+v, want %q", aResp.Rooms, bob.DisplayName)
+	}
+
+	bobBoot := doBearerJSON(t, srv, http.MethodGet, "/api/v1/bootstrap", bobTok, nil, nil)
+	var bResp struct {
+		Rooms []store.RoomSummary `json:"rooms"`
+	}
+	_ = json.Unmarshal(bobBoot.Body.Bytes(), &bResp)
+	if len(bResp.Rooms) != 1 || bResp.Rooms[0].Name != alice.DisplayName {
+		t.Fatalf("Bob DM name = %+v, want %q", bResp.Rooms, alice.DisplayName)
+	}
+}

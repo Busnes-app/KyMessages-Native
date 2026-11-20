@@ -423,6 +423,7 @@ func (s *Server) routes() {
 
 	// Native KyMessages v1 Chat & Real-Time API
 	s.mux.HandleFunc("GET /api/v1/bootstrap", s.requireAuthenticated(s.handleChatBootstrap))
+	s.mux.HandleFunc("GET /api/v1/users", s.requireAuthenticated(s.handleChatListUsers))
 	s.mux.HandleFunc("GET /api/v1/rooms", s.requireAuthenticated(s.handleChatListRooms))
 	s.mux.HandleFunc("POST /api/v1/rooms", s.requireAuthenticated(s.handleChatCreateRoom))
 	s.mux.HandleFunc("GET /api/v1/rooms/{id}", s.requireAuthenticated(s.handleChatGetRoom))
