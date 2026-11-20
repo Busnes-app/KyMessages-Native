@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -37,13 +38,22 @@ func ShardChannel(roomID string) string {
 type PostgresBus struct {
 	dsn      string
 	notifier Notifier
+
+	readyOnce sync.Once
+	ready     chan struct{}
 }
 
 func NewPostgresBus(dsn string, notifier Notifier) *PostgresBus {
 	return &PostgresBus{
 		dsn:      dsn,
 		notifier: notifier,
+		ready:    make(chan struct{}),
 	}
+}
+
+// Ready returns a channel closed once the initial LISTEN subscriptions are active.
+func (b *PostgresBus) Ready() <-chan struct{} {
+	return b.ready
 }
 
 func encodeNotifyPayload(ev Event) (string, error) {
@@ -133,6 +143,7 @@ func (b *PostgresBus) listenOnce(ctx context.Context, onEvent func(Event)) error
 	if _, err := conn.Exec(ctx, "LISTEN "+UserBusChannel); err != nil {
 		return fmt.Errorf("listen user bus: %w", err)
 	}
+	b.readyOnce.Do(func() { close(b.ready) })
 
 	for {
 		notif, err := conn.WaitForNotification(ctx)

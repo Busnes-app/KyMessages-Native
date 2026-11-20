@@ -88,8 +88,28 @@ func readWSEvent(t *testing.T, conn *websocket.Conn) chat.Event {
 	return ev
 }
 
+func startChatBus(t *testing.T, srv *api.Server) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = srv.RunChatBus(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	readyCtx, readyCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer readyCancel()
+	if err := srv.ChatHub().WaitReady(readyCtx); err != nil {
+		t.Fatalf("wait for chat bus ready: %v", err)
+	}
+}
+
 func TestChatEndToEndRESTAndWebSocket(t *testing.T) {
 	srv, st, cfg := setupTestServer(t)
+	startChatBus(t, srv)
 	defer srv.CloseChat()
 
 	ts := httptest.NewServer(srv)
@@ -251,6 +271,7 @@ func TestChatEndToEndRESTAndWebSocket(t *testing.T) {
 
 func TestChatSecurityCSWSHWebhooksAndInstantRevocation(t *testing.T) {
 	srv, st, cfg := setupTestServer(t)
+	startChatBus(t, srv)
 	defer srv.CloseChat()
 
 	ts := httptest.NewServer(srv)

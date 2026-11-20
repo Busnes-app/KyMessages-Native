@@ -72,6 +72,21 @@ func (h *Hub) Run(ctx context.Context) error {
 	return h.bus.Run(ctx, h.Dispatch)
 }
 
+// WaitReady blocks until the backing EventBus is subscribed and ready to deliver events,
+// or until ctx is canceled. In-memory buses return immediately.
+func (h *Hub) WaitReady(ctx context.Context) error {
+	r, ok := h.bus.(interface{ Ready() <-chan struct{} })
+	if !ok {
+		return nil
+	}
+	select {
+	case <-r.Ready():
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // PublishRoom emits a room-scoped event onto the bus (all pods).
 func (h *Hub) PublishRoom(ctx context.Context, roomID string, ev Event) error {
 	return h.bus.PublishRoom(ctx, roomID, ev)
