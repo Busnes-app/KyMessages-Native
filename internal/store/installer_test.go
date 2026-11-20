@@ -164,8 +164,11 @@ func TestInstallerMFAResetFencesInFlightPairing(t *testing.T) {
 	if err = st.Devices().ConsumePairing(ctx, "in-flight", "phone", "android", ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = st.ApplyInstallerDirectory(ctx, b.SSO.IssuerURL, "daily", "user.mfa_reset", "1", "reset", true, false); err != nil {
-		t.Fatal(err)
+	if revoked, err := st.ApplyInstallerDirectory(ctx, b.SSO.IssuerURL, "daily", "user.mfa_reset", "1", "reset", true, false); err != nil || revoked != u.ID {
+		t.Fatalf("MFA reset revoked %q, want %q: %v", revoked, u.ID, err)
+	}
+	if revoked, err := st.ApplyInstallerDirectory(ctx, b.SSO.IssuerURL, "daily", "user.mfa_reset", "1", "reset", true, false); err != nil || revoked != "" {
+		t.Fatalf("replayed MFA reset revoked %q: %v", revoked, err)
 	}
 	sess := &store.Session{TokenHash: "derived", UserID: u.ID, CreatedAt: now, ExpiresAt: now.Add(time.Hour)}
 	if err = st.Sessions().CreateSession(ctx, sess, snapshot.PasswordHash); err == nil {

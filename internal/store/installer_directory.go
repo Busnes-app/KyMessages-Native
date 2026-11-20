@@ -15,8 +15,8 @@ import (
 
 // ApplyInstallerDirectory receives authenticated, narrowed directory desired state.
 // It updates only an owned subject and preserves role, local credentials and tickets.
-// It returns the user ID whose access the event revokes, also on an idempotent replay,
-// so callers can end live connections; "" when the event leaves access in place.
+// It returns the user ID whose access the event revokes, so callers can end live
+// connections; "" when access stays, including a replayed MFA reset.
 func (s *SQLStore) ApplyInstallerDirectory(ctx context.Context, issuer, subject, event, version, digest string, active, administrator bool) (string, error) {
 	revision, err := strconv.ParseUint(version, 10, 64)
 	if err != nil || revision == 0 || strconv.FormatUint(revision, 10) != version {
@@ -79,6 +79,11 @@ func (s *SQLStore) ApplyInstallerDirectory(ctx context.Context, issuer, subject,
 		if prev.Revision == revision {
 			if prev.Digest != digest {
 				return "", errors.New("conflicting directory revision")
+			}
+			// A replayed MFA reset must not end sessions signed in since the first
+			// delivery; the per-ping check already covers the sessions it deleted.
+			if status == "active" {
+				return "", nil
 			}
 			return revoked, nil
 		}
