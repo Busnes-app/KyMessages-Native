@@ -59,6 +59,7 @@ type ClientFrame struct {
 	Audio       *bool           `json:"audio,omitempty"`
 	Video       *bool           `json:"video,omitempty"`
 	ScreenShare *bool           `json:"screen_share,omitempty"`
+	ProtectIP   *bool           `json:"protect_ip,omitempty"`
 	Data        json.RawMessage `json:"data,omitempty"`
 }
 

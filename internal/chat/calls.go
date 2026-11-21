@@ -583,6 +583,9 @@ func (m *CallManager) handleMediaUpdate(ctx context.Context, userID string, fram
 	if frame.ScreenShare != nil {
 		sender.ScreenShare = *frame.ScreenShare
 	}
+	if frame.ProtectIP != nil && (!*frame.ProtectIP || m.livekit != nil) {
+		sender.ProtectIP = *frame.ProtectIP
+	}
 
 	desiredMode, reason, _ := evaluateCallMode(c.tenant, c.session.SFUSticky, c.peers)
 	escalated := false
