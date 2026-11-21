@@ -52,10 +52,3 @@ export async function errorMessage(res: Response, fallback: string): Promise<str
   const error = typeof body === 'object' && body !== null ? (body as { error?: unknown }).error : undefined;
   return typeof error === 'string' && error ? error : `${fallback} (HTTP ${res.status})`;
 }
-
-/** True for the 404 the Matrix routes answer when chat is not set up. */
-export async function isMatrixDisabled(res: Response): Promise<boolean> {
-  if (res.status !== 404) return false;
-  const body: unknown = await res.clone().json().catch(() => null);
-  return typeof body === 'object' && body !== null && (body as { code?: unknown }).code === 'matrix_disabled';
-}

@@ -5,15 +5,14 @@ import { arr, bool, obj, oneOf, str } from '../dto';
 import { NetworkCheck } from '../components/NetworkCheck';
 
 export interface HealthComponent { name: string; status: 'up' | 'down'; version: string; pinned: string; mismatch: boolean; source: string; error: string }
-export interface HealthReport { matrix: boolean; components: HealthComponent[] }
+export interface HealthReport { components: HealthComponent[] }
 
 // Only the upstream repos the server links to; anything else is dropped.
-const SOURCE = /^https:\/\/github\.com\/(element-hq|postgres)\/[A-Za-z0-9._-]+\/tree\/[A-Za-z0-9._-]+$/;
+const SOURCE = /^https:\/\/github\.com\/(Busnes-app|postgres)\/[A-Za-z0-9._-]+\/tree\/[A-Za-z0-9._-]+$/;
 
 export function parseHealth(v: unknown): HealthReport {
   const h = obj(v);
   return {
-    matrix: bool(h.matrix),
     components: arr(h.components).map((x) => {
       const c = obj(x);
       const source = str(c.source, 512);
@@ -26,11 +25,11 @@ export function parseHealth(v: unknown): HealthReport {
 }
 
 const LABEL: Record<string, string> = {
-  'synapse-admin': 'Synapse admin access (console)',
-  kymessages: 'KyMessages', database: 'KyMessages database', synapse: 'Synapse',
-  mas: 'Matrix Authentication Service', element: 'Element Web', postgres: 'PostgreSQL (Matrix)',
+  kymessages: 'KyMessages',
+  database: 'Database',
+  postgres: 'PostgreSQL',
 };
-const VERSIONLESS = new Set(['database', 'synapse-admin']);
+const VERSIONLESS = new Set(['database']);
 
 export const Health: React.FC = () => {
   const [report, setReport] = useState<HealthReport | null>(null);
@@ -65,7 +64,6 @@ export const Health: React.FC = () => {
         </button>
       </div>
       {error && <div className="dr-alert dr-alert-error" role="alert"><XCircle size={16} /><span>{error}</span></div>}
-      {report && !report.matrix && <p className="dr-hint">Chat (Matrix) is not set up: only KyMessages and its database are checked.</p>}
       {report && (
         <section className="dr-facts" aria-label="Components">
           {report.components.map((c) => (

@@ -1,10 +1,8 @@
 import React, { useEffect, useState } from 'react';
-import { Activity, Archive, ArrowRight, MessageSquare, RefreshCw } from 'lucide-react';
-import { isMatrixDisabled } from '../api';
+import { Activity, Archive, ArrowRight, Users } from 'lucide-react';
+import { arr, obj } from '../dto';
 import { parseHealth } from './Health';
-import { parseUsersPage } from './Users';
 import { backupAttempt } from './Backup';
-import { parseSyncStatus, syncCard } from '../components/SyncPanel';
 
 interface DashboardProps {
   settings: { app_name?: string } | null;
@@ -18,10 +16,8 @@ const TONE: Record<Card['tone'], string> = { success: 'dr-ok', warning: 'dr-warn
 
 export const Dashboard: React.FC<DashboardProps> = ({ settings, user, onNavigate }) => {
   const [health, setHealth] = useState<Card>(checking);
-  const [users, setUsers] = useState<Card>(checking);
+  const [directory, setDirectory] = useState<Card>(checking);
   const [backup, setBackup] = useState<Card>(checking);
-  // null until known, and stays null without Matrix: no sync, no card.
-  const [sync, setSync] = useState<Card | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -32,18 +28,18 @@ export const Dashboard: React.FC<DashboardProps> = ({ settings, user, onNavigate
       });
     void settle(setHealth, get('/api/admin/health').then(async (res): Promise<Card> => {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const { matrix, components } = parseHealth(await res.json());
+      const { components } = parseHealth(await res.json());
       const down = components.filter((c) => c.status === 'down').length;
       const off = components.filter((c) => c.mismatch).length;
       const text = `${components.length - down} of ${components.length} components up` +
-        (off ? `, ${off} off their pinned version` : '') + (matrix ? '' : ' (chat not set up)');
+        (off ? `, ${off} off their pinned version` : '');
       return { text, tone: down || off ? 'danger' : 'success' };
     }));
-    void settle(setUsers, get('/api/admin/matrix/users?limit=1').then(async (res): Promise<Card> => {
-      if (await isMatrixDisabled(res)) return { text: 'Chat (Matrix) is not set up', tone: 'muted' };
+    void settle(setDirectory, get('/api/v1/users').then(async (res): Promise<Card> => {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const { total } = parseUsersPage(await res.json());
-      return { text: `${total} Matrix user${total === 1 ? '' : 's'}`, tone: 'muted' };
+      const body = obj(await res.json());
+      const total = arr(body.users).length;
+      return { text: `${total} active member${total === 1 ? '' : 's'}`, tone: 'muted' };
     }));
     void settle(setBackup, get('/api/backup/status').then(async (res): Promise<Card> => {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -55,31 +51,21 @@ export const Dashboard: React.FC<DashboardProps> = ({ settings, user, onNavigate
         tone: last.outcome === 'success' ? 'success' : last.outcome === 'unknown' ? 'muted' : 'danger',
       };
     }));
-    get('/api/admin/matrix/sync-status')
-      .then(async (res) => {
-        if (await isMatrixDisabled(res)) return;
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        setSync(syncCard(parseSyncStatus(await res.json())));
-      })
-      .catch((err: unknown) => {
-        if (!controller.signal.aborted) setSync({ text: `Unavailable: ${err instanceof Error ? err.message : 'request failed'}`, tone: 'danger' });
-      });
     return () => controller.abort();
   }, []);
 
   const cards = [
-    { title: 'Chat health', card: health, Icon: Activity, tab: 'health', action: 'Open Health' },
-    { title: 'Matrix users', card: users, Icon: MessageSquare, tab: 'users', action: 'Open Users' },
+    { title: 'Service health', card: health, Icon: Activity, tab: 'health', action: 'Open Health' },
+    { title: 'Workspace directory', card: directory, Icon: Users, tab: 'scim', action: 'Open Directory & SCIM' },
     { title: 'Backups', card: backup, Icon: Archive, tab: 'backup', action: 'Open Backup & recovery' },
-    ...(sync ? [{ title: 'KyIdentity sync', card: sync, Icon: RefreshCw, tab: 'settings', action: 'Open Settings' }] : []),
   ];
   return (
     <div className="operator-overview">
       <header className="operator-heading">
         <h1>Overview</h1>
-        <p>{settings?.app_name || 'KyMessages'} operator console · {user?.display_name || user?.username || 'Administrator'}</p>
+        <p>{settings?.app_name || 'KyMessages'} administration · {user?.display_name || user?.username || 'Administrator'}</p>
       </header>
-      <p className="operator-boundary">Manage the chat service here. Use your everyday account to open chat and take part in conversations.</p>
+      <p className="operator-boundary">Monitor service health, directory provisioning, and backup snapshots for this workspace.</p>
       <div className="operator-summary">
         {cards.map(({ title, card, Icon, tab, action }) => (
           <section key={tab} className="operator-row" aria-label={title}>

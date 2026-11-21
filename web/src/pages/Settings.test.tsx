@@ -5,7 +5,12 @@ import { Settings } from './Settings';
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
 const renderWith = (db_driver?: string) => {
-  vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ error: 'x', code: 'matrix_disabled' }), { status: 404 })));
+  vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+    name: 'KyMessages',
+    stored_name: '',
+    default_name: 'KyMessages',
+    logo: { custom: false, sha256: '', size: 0 },
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } })));
   return render(<Settings settings={{ app_name: 'KyMessages', chat_url: '', db_driver }} onBrandingChanged={vi.fn()} />);
 };
 

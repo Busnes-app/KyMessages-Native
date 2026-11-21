@@ -1,12 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { BrandingPanel, elementNotice, parseBranding, staleServed } from './BrandingPanel';
+import { BrandingPanel, parseBranding } from './BrandingPanel';
 
 const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { 'Content-Type': 'application/json' } });
 const SHA = 'a'.repeat(64);
 const STATE = {
-  name: 'KyMessages', stored_name: '', default_name: 'KyMessages',
-  logo: { custom: false, sha256: '', size: 0 }, element: { brand: 'KyMessages', served: 'KyMessages' },
+  name: 'KyMessages',
+  stored_name: '',
+  default_name: 'KyMessages',
+  logo: { custom: false, sha256: '', size: 0 },
 };
 
 function serve(route: (url: string, init?: RequestInit) => Response | undefined) {
@@ -22,43 +24,10 @@ function serve(route: (url: string, init?: RequestInit) => Response | undefined)
 }
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
-describe('parseBranding and elementNotice', () => {
-  it('reads Element only when present and refuses a malformed body', () => {
-    expect(parseBranding({ ...STATE, element: undefined }).element).toBeNull();
-    expect(parseBranding({ ...STATE, element: { error: 'open: no such file' } }).element).toEqual({ brand: null, error: 'open: no such file', served: null, served_error: '', restart_hint: '' });
-    expect(() => parseBranding({ ...STATE, element: { restart_hint: 7 } })).toThrow();
+describe('parseBranding', () => {
+  it('parses branding payload and refuses a malformed logo field', () => {
+    expect(parseBranding(STATE)).toEqual(STATE);
     expect(() => parseBranding({ ...STATE, logo: { custom: 'yes', sha256: '', size: 0 } })).toThrow();
-    expect(() => parseBranding({ ...STATE, element: { brand: 7 } })).toThrow();
-  });
-  it('clips an over-long brand from a hand-edited Element file instead of refusing the body', () => {
-    const e = parseBranding({ ...STATE, element: { brand: 'x'.repeat(5000), served: 'y'.repeat(5000), error: 'e'.repeat(5000) } }).element;
-    expect(e?.brand).toBe(`${'x'.repeat(256)}\u2026`);
-    expect(e?.served).toBe(`${'y'.repeat(256)}\u2026`);
-    expect(e?.error).toHaveLength(1025);
-  });
-  it('names what Element shows and why, and is quiet when it matches', () => {
-    expect(elementNotice(parseBranding({ ...STATE, name: 'Acme', element: { brand: 'KyMessages', error: 'permission denied' } }), true))
-      .toBe('Saved, but Element shows "KyMessages": permission denied. It is retried every minute.');
-    expect(elementNotice(parseBranding({ ...STATE, name: 'Acme', element: { error: 'open: no such file' } }), true))
-      .toBe("Saved, but Element's config could not be read: open: no such file");
-    expect(elementNotice(parseBranding({ ...STATE, name: 'Acme', element: { brand: 'KyMessages' } }), true))
-      .toBe('Saved, but Element shows "KyMessages". It is retried every minute.');
-    expect(elementNotice(parseBranding(STATE), true)).toBeNull();
-    expect(elementNotice(parseBranding({ ...STATE, element: undefined }), true)).toBeNull();
-  });
-  it('claims no save on a plain load', () => {
-    expect(elementNotice(parseBranding({ ...STATE, name: 'Acme', element: { brand: 'KyMessages', error: 'permission denied' } }), false))
-      .toBe('Element shows "KyMessages": permission denied. It is retried every minute.');
-    expect(elementNotice(parseBranding({ ...STATE, name: 'Acme', element: { error: 'open: no such file' } }), false))
-      .toBe("Element's config could not be read: open: no such file");
-  });
-  it('names the brand a running Element serves until it restarts', () => {
-    expect(staleServed(parseBranding({ ...STATE, name: 'Acme', element: { brand: 'Acme', served: 'KyMessages' } }))).toBe('KyMessages');
-    // The file write failed: elementNotice speaks, not the restart hint.
-    expect(staleServed(parseBranding({ ...STATE, name: 'Acme', element: { brand: 'KyMessages', served: 'KyMessages', error: 'permission denied' } }))).toBeNull();
-    expect(staleServed(parseBranding({ ...STATE, name: 'Acme', element: { brand: 'Acme', served: 'Acme' } }))).toBeNull();
-    expect(staleServed(parseBranding({ ...STATE, name: 'Acme', element: { brand: 'Acme', served_error: 'connection refused' } }))).toBeNull();
-    expect(staleServed(parseBranding({ ...STATE, element: undefined }))).toBeNull();
   });
 });
 
@@ -67,56 +36,21 @@ describe('BrandingPanel', () => {
     const onChanged = vi.fn();
     const calls = serve((url, init) => {
       if (url === '/api/admin/branding') return json(STATE);
-      if (url === '/api/admin/branding/name' && init?.method === 'PUT') return json({ ...STATE, name: 'Acme', stored_name: 'Acme', element: { brand: 'Acme', served: 'KyMessages', restart_hint: 'kubectl -n ky-stack rollout restart deployment/element' } });
+      if (url === '/api/admin/branding/name' && init?.method === 'PUT') return json({ ...STATE, name: 'Acme', stored_name: 'Acme' });
       return undefined;
     });
     render(<BrandingPanel onChanged={onChanged} />);
-    expect(screen.queryByText(/until it restarts/)).toBeNull();
     fireEvent.change(await screen.findByLabelText('Product name'), { target: { value: 'Acme' } });
     fireEvent.click(screen.getByRole('button', { name: 'Save name' }));
     expect(await screen.findByText(/^Name saved/)).toBeTruthy();
     expect(onChanged).toHaveBeenCalledTimes(1);
     expect(calls.find((c) => c.init?.method === 'PUT')?.init?.body).toBe(JSON.stringify({ name: 'Acme' }));
     expect(screen.getByRole('button', { name: 'Use default (KyMessages)' })).toBeTruthy();
-    const hint = screen.getByText(/until it restarts/);
-    expect(hint.textContent).toBe('Element shows \u201cKyMessages\u201d until it restarts: kubectl -n ky-stack rollout restart deployment/element');
-    expect(hint.querySelector('code')?.textContent).toBe('kubectl -n ky-stack rollout restart deployment/element');
-  });
-
-  it('says what Element still shows when its config could not be written', async () => {
-    serve((url, init) => {
-      if (url === '/api/admin/branding') return json(STATE);
-      if (init?.method === 'PUT') return json({ ...STATE, name: 'Acme', stored_name: 'Acme', element: { brand: 'KyMessages', error: 'open /matrix/element/config.json: permission denied' } });
-      return undefined;
-    });
-    render(<BrandingPanel onChanged={() => {}} />);
-    fireEvent.change(await screen.findByLabelText('Product name'), { target: { value: 'Acme' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Save name' }));
-    expect(await screen.findByText('Saved, but Element shows "KyMessages": open /matrix/element/config.json: permission denied. It is retried every minute.')).toBeTruthy();
-    expect(screen.queryByText(/until it restarts/)).toBeNull();
-  });
-
-  it('on load, says what Element shows without claiming a save', async () => {
-    serve((url) => (url === '/api/admin/branding' ? json({ ...STATE, name: 'Acme', stored_name: 'Acme', element: { brand: 'KyMessages' } }) : undefined));
-    render(<BrandingPanel onChanged={() => {}} />);
-    expect((await screen.findByRole('alert')).textContent).toBe('Element shows "KyMessages". It is retried every minute.');
-  });
-
-  it('keeps the panel when Element\'s file holds an over-long hand-edited brand', async () => {
-    const long = `<b>${'x'.repeat(5000)}`;
-    serve((url) => (url === '/api/admin/branding' ? json({ ...STATE, element: { brand: long, served: long } }) : undefined));
-    render(<BrandingPanel onChanged={() => {}} />);
-    expect(await screen.findByLabelText('Product name')).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Save name' })).toBeTruthy();
-    const alert = screen.getByRole('alert');
-    expect(alert.textContent).toBe(`Element shows "${long.slice(0, 256)}\u2026". It is retried every minute.`);
-    expect(alert.querySelector('b')).toBeNull();
-    expect(screen.queryByText(/Invalid response/)).toBeNull();
   });
 
   it('resets the name to the default', async () => {
     const calls = serve((url, init) => {
-      if (url === '/api/admin/branding') return json({ ...STATE, name: 'Acme', stored_name: 'Acme', element: { brand: 'Acme' } });
+      if (url === '/api/admin/branding') return json({ ...STATE, name: 'Acme', stored_name: 'Acme' });
       if (init?.method === 'PUT') return json(STATE);
       return undefined;
     });
