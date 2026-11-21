@@ -225,6 +225,7 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 		chatHub.SetSessionCheck(func(ctx context.Context, userID, sessionHash string) (bool, error) {
 			return chatSessionValid(ctx, st, userID, sessionHash)
 		})
+		chatHub.SetRoomSource(st.Chat().ListUserRoomIDs)
 	}
 	var chatStore store.ChatStore
 	if st != nil {
