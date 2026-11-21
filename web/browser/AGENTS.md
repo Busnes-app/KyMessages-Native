@@ -12,14 +12,14 @@ This directory owns test setup, disposable server launch and UI assertions. The 
 
 - Never reuse a development or production server. Launch the compiled `.browser/server` with a minimal environment and an owned temporary data directory; remove that directory on exit. `server.mjs [port] [captcha]` serves 5391 with captcha `none` for the main projects and 5392 with `pow` for the `captcha-pow` project (`captcha.spec.mjs`, Chromium), which `globalSetup` never touches.
 - `captcha.spec.mjs` signs in through the real proof-of-work: one challenge fetch while idle, exactly one more after a wrong password, then the bootstrap password reaches "Change your password".
-- Find sign-in fields by label (`getByLabel('Username')`, `getByLabel('Password')`), not placeholder. The pairing dialog must poll with a POST that has no query string and gets 200.
+- Find sign-in fields by label (`getByLabel('Username')`, `getByLabel('Password')`), not placeholder. Sign-in lands in chat; `openSettings` waits for the Conversation region, opens the room list when a narrow screen hides the rail, then uses the rail's Settings gear. A reload returns to chat.
 - Use loopback only, with `KY_APP_URL` matching the test origin. Bootstrap credentials are disposable test values, not deployment defaults.
 - Test light/dark at 390px and 1280px on Chromium, plus Firefox at light/1280 and dark/390, using real authentication and API state. Do not disable service workers, relax CSP/CSRF, or substitute mocked responses.
 - The backup flow pins the repository's synthetic public-key fixture and makes
   local sealed copies through the real API; no private recovery key or shares are
   present. Check the persisted result and layout at both widths/themes.
 - Login allows 10 failed attempts per account and client per 15 minutes (successes do not count); only `dark-390` and `firefox-light-1280` try a wrong password. Do not relax the limiter; budget failures before adding projects.
-- The suite also covers Users, Agents and Rooms (Matrix off; Agents then Rooms by keyboard from Users), Health, the Audit kind filter with keyboard navigation and the Overview, at every project.
+- The suite also covers the Create channel modal (focus on its name field, fits, closes), Health, the Audit kind filter, Directory & SCIM reached from Audit by keyboard, and the Overview, at every project.
 - Settings Branding at every project: reset to defaults first (a failed project must not break the next on the shared server), a 64-character name typed by keyboard (the header wraps it), a PNG upload previewed by digest with `/app-icon.png` served `no-cache`, then both resets. With Matrix off there is no KyIdentity sync panel.
 - Screenshots and failure traces live in ignored `test-results/` and CI artifacts, not production assets.
 
