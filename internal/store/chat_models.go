@@ -211,11 +211,11 @@ type UpsertMeetingParams struct {
 
 // UpsertMeetingResult reports what changed during meeting reconciliation.
 type UpsertMeetingResult struct {
-	Meeting           *Meeting
-	Room              *Room
-	Created           bool
-	AddedMemberIDs    []string
-	RemovedMemberIDs  []string
-	IssuedGuestKeys   []string // guest keys newly created or re-issued
-	RevokedGuestKeys  []string
+	Meeting          *Meeting
+	Room             *Room
+	Created          bool
+	AddedMemberIDs   []string
+	RemovedMemberIDs []string
+	IssuedGuestKeys  []string // guest keys newly created or re-issued
+	RevokedGuestKeys []string
 }
