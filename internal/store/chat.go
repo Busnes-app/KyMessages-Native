@@ -254,7 +254,9 @@ func (c *chatStore) ListUserRooms(ctx context.Context, tenantID, userID string) 
 		INNER JOIN room_members rm ON rm.room_id = r.id AND rm.tenant_id = r.tenant_id
 		WHERE rm.tenant_id = ? AND rm.user_id = ?
 		ORDER BY r.created_at DESC, r.id ASC`)
-	rows, err := c.store.read().QueryContext(ctx, q, tenantID, userID)
+	// The primary: the list decides which rooms a user sees, so replica lag must not keep
+	// a removed member's room in it.
+	rows, err := c.store.db.QueryContext(ctx, q, tenantID, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -588,6 +590,20 @@ func (c *chatStore) CreateMessage(ctx context.Context, p CreateMessageParams) (*
 		}
 	}
 
+	if p.ReplyToID != "" {
+		var one int
+		err := tx.QueryRowContext(ctx,
+			c.store.rebind(`SELECT 1 FROM messages WHERE tenant_id = ? AND room_id = ? AND id = ?`),
+			tenantID, p.RoomID, p.ReplyToID,
+		).Scan(&one)
+		if errorsIs(err, sql.ErrNoRows) {
+			return nil, false, ErrReplyNotFound
+		}
+		if err != nil {
+			return nil, false, err
+		}
+	}
+
 	var seq int64
 	if err := tx.QueryRowContext(ctx,
 		c.store.rebind(`UPDATE rooms SET last_seq = last_seq + 1 WHERE tenant_id = ? AND id = ? RETURNING last_seq`),
@@ -822,21 +838,33 @@ func (c *chatStore) SearchMessages(ctx context.Context, tenantID, userID, roomID
 		limit = 50
 	}
 
-	var sqlText string
-	var args []any
+	// Membership comes from the primary; only the text search runs on the replica, so
+	// replica lag never extends a removed member's access.
+	rooms, err := c.ListUserRoomIDs(ctx, tenantID, userID)
+	if err != nil {
+		return nil, err
+	}
+	if roomID != "" {
+		if !slices.Contains(rooms, roomID) {
+			return []*Message{}, nil
+		}
+		rooms = []string{roomID}
+	}
+	if len(rooms) == 0 {
+		return []*Message{}, nil
+	}
 
+	var sqlText string
+	args := []any{tenantID, MessageEncodingPlainV1}
+	for _, id := range rooms {
+		args = append(args, id)
+	}
 	baseSelect := `
 		SELECT m.id, m.tenant_id, m.room_id, m.seq, m.sender_id, m.sender_name,
 		       m.reply_to_id, m.encoding, m.body, m.edited_at, m.deleted_at, m.idempotency_key, m.created_at
 		FROM messages m
-		INNER JOIN room_members rm ON rm.room_id = m.room_id AND rm.tenant_id = m.tenant_id
-		WHERE rm.tenant_id = ? AND rm.user_id = ? AND m.encoding = ? AND m.deleted_at IS NULL`
-	args = append(args, tenantID, userID, MessageEncodingPlainV1)
-
-	if roomID != "" {
-		baseSelect += ` AND m.room_id = ?`
-		args = append(args, roomID)
-	}
+		WHERE m.tenant_id = ? AND m.encoding = ? AND m.deleted_at IS NULL
+		  AND m.room_id IN (?` + strings.Repeat(", ?", len(rooms)-1) + `)`
 
 	if c.store.driver == "postgres" {
 		sqlText = baseSelect + ` AND to_tsvector('simple', m.body) @@ plainto_tsquery('simple', ?) ORDER BY m.created_at DESC LIMIT ?`

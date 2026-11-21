@@ -15,6 +15,7 @@ var (
 	ErrSessionExpired = errors.New("session expired")
 	ErrPairingExpired = errors.New("pairing session expired")
 	ErrRoomClosed     = errors.New("room is closed")
+	ErrReplyNotFound  = errors.New("reply target is not a message in this room")
 	ErrForbidden      = errors.New("forbidden")
 )
 

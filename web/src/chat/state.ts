@@ -145,3 +145,8 @@ export function initialsFor(name: string): string {
   if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
   return `${parts[0][0]}${parts[parts.length - 1][0]}`.toUpperCase();
 }
+
+/** Webhook posts choose their own sender_name, so they must never pass for a member. */
+export function isWebhookSender(senderId: string): boolean {
+  return senderId.startsWith('webhook:');
+}

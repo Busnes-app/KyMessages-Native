@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,8 @@ const (
 	maxMessageBodyLen = 16 << 10 // 16 KiB
 	maxEmojiLen       = 32
 	maxSearchQueryLen = 200
+	// The column is VARCHAR(128) on Postgres.
+	maxIdempotencyKeyLen = 128
 )
 
 func (s *Server) currentUser(r *http.Request) (*store.User, *store.Session, bool) {
@@ -35,6 +38,38 @@ func displayNameFor(u *store.User) string {
 		return u.DisplayName
 	}
 	return u.Username
+}
+
+// Per-user chat limits per minute. Rooms covers what reaches other users' room
+// lists: creating rooms and DMs, adding members, renaming, creating webhooks.
+var (
+	chatLimitRooms  = chatLimit{"chat-rooms:", 30}
+	chatLimitWrites = chatLimit{"chat-writes:", 240}
+)
+
+type chatLimit struct {
+	scope     string
+	perMinute int
+}
+
+// allowChatAction counts one action against the user's limit, writing 429 when it is spent.
+func (s *Server) allowChatAction(w http.ResponseWriter, userID string, l chatLimit) bool {
+	if s.allowAccountAttempt(l.scope+userID, l.perMinute, time.Minute) {
+		return true
+	}
+	w.Header().Set("Retry-After", "60")
+	s.writeError(w, http.StatusTooManyRequests, "Too many chat actions; try again shortly")
+	return false
+}
+
+// activeChatUser loads a user who can be put in a room. A suspended or deleted account
+// reads as not found, like an unknown ID.
+func (s *Server) activeChatUser(ctx context.Context, id string) (*store.User, error) {
+	u, err := s.store.Users().GetUserByID(ctx, id)
+	if err == nil && u.Status != "active" {
+		return nil, store.ErrNotFound
+	}
+	return u, err
 }
 
 func isRoomModerator(member *store.RoomMember, user *store.User) bool {
@@ -186,6 +221,9 @@ func (s *Server) handleChatCreateRoom(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	if !s.allowChatAction(w, user.ID, chatLimitRooms) {
+		return
+	}
 	var req createRoomRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeError(w, http.StatusBadRequest, "Invalid request body")
@@ -205,7 +243,7 @@ func (s *Server) handleChatCreateRoom(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, "dm_user_id is required for DM rooms")
 			return
 		}
-		if _, err := s.store.Users().GetUserByID(r.Context(), targetID); err != nil {
+		if _, err := s.activeChatUser(r.Context(), targetID); err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				s.writeError(w, http.StatusNotFound, "Target user not found")
 				return
@@ -250,7 +288,7 @@ func (s *Server) handleChatCreateRoom(w http.ResponseWriter, r *http.Request) {
 			if uid == "" || uid == user.ID {
 				continue
 			}
-			if _, err := s.store.Users().GetUserByID(r.Context(), uid); err != nil {
+			if _, err := s.activeChatUser(r.Context(), uid); err != nil {
 				if errors.Is(err, store.ErrNotFound) {
 					s.writeError(w, http.StatusBadRequest, "Unknown member user_id")
 					return
@@ -339,6 +377,9 @@ func (s *Server) handleChatUpdateRoom(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	if !s.allowChatAction(w, user.ID, chatLimitRooms) {
+		return
+	}
 	roomID := r.PathValue("id")
 	tenantID := store.DefaultTenantID
 
@@ -391,6 +432,9 @@ func (s *Server) handleChatAddMember(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	if !s.allowChatAction(w, user.ID, chatLimitRooms) {
+		return
+	}
 	roomID := r.PathValue("id")
 	tenantID := store.DefaultTenantID
 
@@ -430,7 +474,7 @@ func (s *Server) handleChatAddMember(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "role must be member or admin")
 		return
 	}
-	if _, err := s.store.Users().GetUserByID(r.Context(), targetID); err != nil {
+	if _, err := s.activeChatUser(r.Context(), targetID); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			s.writeError(w, http.StatusNotFound, "Target user not found")
 			return
@@ -589,6 +633,9 @@ func (s *Server) handleChatSendMessage(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	if !s.allowChatAction(w, user.ID, chatLimitWrites) {
+		return
+	}
 	roomID := r.PathValue("id")
 	tenantID := store.DefaultTenantID
 
@@ -614,7 +661,7 @@ func (s *Server) handleChatSendMessage(w http.ResponseWriter, r *http.Request) {
 	if idemKey == "" {
 		idemKey = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	}
-	if len(idemKey) > 128 {
+	if len(idemKey) > maxIdempotencyKeyLen {
 		s.writeError(w, http.StatusBadRequest, "idempotency_key too long")
 		return
 	}
@@ -635,6 +682,10 @@ func (s *Server) handleChatSendMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	if errors.Is(err, store.ErrRoomClosed) {
 		s.writeError(w, http.StatusConflict, "Room is closed")
+		return
+	}
+	if errors.Is(err, store.ErrReplyNotFound) {
+		s.writeError(w, http.StatusBadRequest, "reply_to_id is not a message in this room")
 		return
 	}
 	if err != nil {
@@ -666,6 +717,9 @@ func (s *Server) handleChatEditMessage(w http.ResponseWriter, r *http.Request) {
 	user, _, ok := s.currentUser(r)
 	if !ok {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+	if !s.allowChatAction(w, user.ID, chatLimitWrites) {
 		return
 	}
 	roomID := r.PathValue("id")
@@ -714,6 +768,9 @@ func (s *Server) handleChatDeleteMessage(w http.ResponseWriter, r *http.Request)
 	user, _, ok := s.currentUser(r)
 	if !ok {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+	if !s.allowChatAction(w, user.ID, chatLimitWrites) {
 		return
 	}
 	roomID := r.PathValue("id")
@@ -765,6 +822,9 @@ func (s *Server) handleChatReaction(w http.ResponseWriter, r *http.Request, add 
 	user, _, ok := s.currentUser(r)
 	if !ok {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+	if !s.allowChatAction(w, user.ID, chatLimitWrites) {
 		return
 	}
 	roomID := r.PathValue("id")
@@ -891,6 +951,9 @@ func (s *Server) handleChatCreateWebhook(w http.ResponseWriter, r *http.Request)
 	user, _, ok := s.currentUser(r)
 	if !ok {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+	if !s.allowChatAction(w, user.ID, chatLimitRooms) {
 		return
 	}
 	roomID := r.PathValue("id")
@@ -1065,6 +1128,10 @@ func (s *Server) handleChatIncomingWebhook(w http.ResponseWriter, r *http.Reques
 	idemKey := strings.TrimSpace(req.IdempotencyKey)
 	if idemKey == "" {
 		idemKey = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	}
+	if len(idemKey) > maxIdempotencyKeyLen {
+		s.writeError(w, http.StatusBadRequest, "idempotency_key too long")
+		return
 	}
 
 	msg, created, err := s.store.Chat().CreateMessage(r.Context(), store.CreateMessageParams{
