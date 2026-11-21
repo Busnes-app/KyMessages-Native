@@ -100,6 +100,7 @@ export interface ChatRoomWebhook {
 export type CallMode = 'p2p_mesh' | 'sfu_livekit';
 
 export interface CallPeer {
+  peer_id?: string;
   user_id: string;
   display_name: string;
   is_guest: boolean;
@@ -113,7 +114,9 @@ export interface CallPeer {
 export interface CallState {
   call_id: string;
   room_id: string;
+  active?: boolean;
   mode: CallMode;
+  epoch?: number;
   sfu_sticky: boolean;
   livekit_room?: string;
   ended?: boolean;
@@ -123,7 +126,9 @@ export interface CallState {
 export interface CallJoinResponse {
   call_id: string;
   room_id: string;
+  peer_id?: string;
   mode: CallMode;
+  epoch?: number;
   sfu_sticky: boolean;
   ice_servers: RTCIceServer[];
   livekit_url?: string;
@@ -135,6 +140,7 @@ export interface CallJoinResponse {
 export interface CallMigratePayload {
   call_id: string;
   room_id: string;
+  epoch?: number;
   target_mode: CallMode;
   reason?: string;
   livekit_url?: string;
@@ -147,6 +153,8 @@ export interface CallSignalData {
   call_id: string;
   from: string;
   to: string;
+  from_peer_id?: string;
+  to_peer_id?: string;
   kind: 'offer' | 'answer' | 'ice';
   payload: unknown;
 }
@@ -392,6 +400,7 @@ export function parseICEServers(v: unknown): RTCIceServer[] {
 export function parseCallPeer(v: unknown): CallPeer {
   const o = obj(v);
   return {
+    peer_id: opt(o.peer_id, (s) => str(s, 128)),
     user_id: str(o.user_id, 128),
     display_name: opt(o.display_name, (s) => str(s, 255)) ?? '',
     is_guest: opt(o.is_guest, bool) ?? false,
@@ -405,13 +414,17 @@ export function parseCallPeer(v: unknown): CallPeer {
 
 export function parseCallState(v: unknown): CallState {
   const o = obj(v);
+  const active = opt(o.active, bool);
+  const ended = opt(o.ended, bool) ?? (active === false ? true : undefined);
   return {
     call_id: str(o.call_id, 128),
     room_id: str(o.room_id, 128),
+    active,
     mode: opt(o.mode, (m) => oneOf(m, CALL_MODES)) ?? 'p2p_mesh',
+    epoch: opt(o.epoch, num),
     sfu_sticky: opt(o.sfu_sticky, bool) ?? false,
     livekit_room: opt(o.livekit_room, (s) => str(s, 256)),
-    ended: opt(o.ended, bool),
+    ended,
     peers: opt(o.peers, (list) => arr(list).map(parseCallPeer)) ?? [],
   };
 }
@@ -421,7 +434,9 @@ export function parseCallJoinResponse(v: unknown): CallJoinResponse {
   return {
     call_id: str(o.call_id, 128),
     room_id: str(o.room_id, 128),
+    peer_id: opt(o.peer_id, (s) => str(s, 128)),
     mode: oneOf(o.mode, CALL_MODES),
+    epoch: opt(o.epoch, num),
     sfu_sticky: opt(o.sfu_sticky, bool) ?? false,
     ice_servers: parseICEServers(o.ice_servers),
     livekit_url: opt(o.livekit_url, (s) => str(s, 512)),
@@ -436,6 +451,7 @@ export function parseCallMigrate(v: unknown): CallMigratePayload {
   return {
     call_id: str(o.call_id, 128),
     room_id: str(o.room_id, 128),
+    epoch: opt(o.epoch, num),
     target_mode: oneOf(o.target_mode, CALL_MODES),
     reason: opt(o.reason, (s) => str(s, 128)),
     livekit_url: opt(o.livekit_url, (s) => str(s, 512)),
@@ -652,15 +668,19 @@ export function parseWsEvent(raw: unknown): WsServerEvent | null {
         if (data === undefined || data === null) return null;
         const d = obj(data);
         const sigKind = oneOf(d.kind, ['offer', 'answer', 'ice'] as const);
+        const fromPeer = str(d.from_peer_id ?? d.from, 128);
+        const toPeer = str(d.to_peer_id ?? d.to, 128);
         return {
           kind: 'call.signal',
-          roomId,
+          roomId: roomId || (opt(d.room_id, (s) => str(s, 128)) ?? ''),
           signal: {
             call_id: str(d.call_id, 128),
-            from: str(d.from, 128),
-            to: str(d.to, 128),
+            from: fromPeer,
+            to: toPeer,
+            from_peer_id: fromPeer,
+            to_peer_id: toPeer,
             kind: sigKind,
-            payload: d.payload,
+            payload: d.data !== undefined ? d.data : d.payload,
           },
         };
       }

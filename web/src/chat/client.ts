@@ -562,12 +562,18 @@ export class ChatSocket {
     };
   }
 
-  private sendRaw(frame: Record<string, unknown>): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+  isOpen(): boolean {
+    return !!this.ws && this.ws.readyState === WebSocket.OPEN;
+  }
+
+  private sendRaw(frame: Record<string, unknown>): boolean {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
     try {
       this.ws.send(JSON.stringify(frame));
+      return true;
     } catch {
       // Ignore transient write errors while closing.
+      return false;
     }
   }
 
@@ -587,19 +593,26 @@ export class ChatSocket {
   sendCallSignal(
     roomId: string,
     callId: string,
-    to: string,
+    toPeerId: string,
     kind: 'offer' | 'answer' | 'ice',
-    payload: unknown,
+    data: unknown,
   ): void {
-    this.sendRaw({ t: 'call.signal', room: roomId, call_id: callId, to, kind, payload });
+    this.sendRaw({
+      t: 'call.signal',
+      room: roomId,
+      call_id: callId,
+      to_peer_id: toPeerId,
+      kind,
+      data,
+    });
   }
 
   sendCallMedia(
     roomId: string,
     callId: string,
     media: { audio: boolean; video: boolean; screenShare: boolean; protectIp: boolean },
-  ): void {
-    this.sendRaw({
+  ): boolean {
+    return this.sendRaw({
       t: 'call.media',
       room: roomId,
       call_id: callId,
@@ -610,8 +623,8 @@ export class ChatSocket {
     });
   }
 
-  sendCallMigrated(roomId: string, callId: string): void {
-    this.sendRaw({ t: 'call.migrated', room: roomId, call_id: callId });
+  sendCallMigrated(roomId: string, callId: string, epoch?: number): void {
+    this.sendRaw({ t: 'call.migrated', room: roomId, call_id: callId, ...(epoch !== undefined ? { epoch } : {}) });
   }
 
   sendCallICEFailed(roomId: string, callId: string): void {

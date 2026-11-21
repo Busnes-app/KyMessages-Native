@@ -100,7 +100,7 @@ export const Settings: React.FC<SettingsProps> = ({ settings, onBrandingChanged 
             <h3 style={{ fontSize: '16px' }}>Appearance</h3>
           </div>
           <p style={{ color: 'var(--ink)', fontSize: '13px', marginBottom: '16px' }}>
-            Color tokens: Patina Ky (`#0d0f14`/`#4deeea`), Cyber, Nord, Paper, OLED with Space Grotesk and IBM Plex Mono fonts.
+            Choose Busnes Light or Busnes Dark (default), or switch to Patina, Cyber, Nord, Paper, or OLED.
           </p>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
@@ -191,7 +191,7 @@ export const Settings: React.FC<SettingsProps> = ({ settings, onBrandingChanged 
             </label>
 
             {mediaError && <div className="dr-alert dr-alert-error" role="alert">{mediaError}</div>}
-            {mediaNotice && <div className="dr-alert dr-alert-info" role="status">{mediaNotice}</div>}
+            {mediaNotice && <div className="dr-alert dr-alert-success" role="status">{mediaNotice}</div>}
 
             <div>
               <button type="submit" disabled={savingMedia}>

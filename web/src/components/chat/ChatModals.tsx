@@ -1,8 +1,77 @@
-import React, { useEffect, useState } from 'react';
-import { Hash, Search, X } from 'lucide-react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Hash, Lock, MessageSquare, Search, Video, X } from 'lucide-react';
 import type { ChatDirectoryUser, ChatMessage, ChatRoomSummary } from '../../chat/types';
 import { searchMessages } from '../../chat/client';
 import { formatTime, isWebhookSender } from '../../chat/state';
+
+const FOCUSABLE_SELECTOR =
+  'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+function useModalFocus(dialogRef: React.RefObject<HTMLElement | null>, onClose: () => void) {
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  useEffect(() => {
+    const previous = document.activeElement as HTMLElement | null;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        onCloseRef.current();
+        return;
+      }
+      if (e.key !== 'Tab') return;
+      const root = dialogRef.current;
+      if (!root) return;
+      const focusables = Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+        (el) => el.offsetParent !== null || el === document.activeElement,
+      );
+      if (focusables.length === 0) return;
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      if (e.shiftKey) {
+        if (document.activeElement === first || !root.contains(document.activeElement)) {
+          e.preventDefault();
+          last.focus();
+        }
+      } else if (document.activeElement === last || !root.contains(document.activeElement)) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown, true);
+      if (previous && typeof previous.focus === 'function' && previous.isConnected) {
+        previous.focus();
+      }
+    };
+  }, [dialogRef]);
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function highlightQuery(text: string, query: string): React.ReactNode {
+  const terms = query
+    .trim()
+    .split(/\s+/)
+    .filter((t) => t.length >= 2);
+  if (terms.length === 0) return text;
+  const re = new RegExp(`(${terms.map(escapeRegExp).join('|')})`, 'gi');
+  const parts = text.split(re);
+  if (parts.length === 1) return text;
+  const lowerTerms = new Set(terms.map((t) => t.toLowerCase()));
+  return parts.map((part, idx) =>
+    lowerTerms.has(part.toLowerCase()) ? (
+      <mark key={idx} className="chat-search-mark">
+        {part}
+      </mark>
+    ) : (
+      part
+    ),
+  );
+}
 
 interface CreateChannelModalProps {
   directory: ChatDirectoryUser[];
@@ -17,6 +86,9 @@ export const CreateChannelModal: React.FC<CreateChannelModalProps> = ({
   onClose,
   onCreate,
 }) => {
+  const dialogRef = useRef<HTMLFormElement | null>(null);
+  useModalFocus(dialogRef, onClose);
+
   const [name, setName] = useState('');
   const [topic, setTopic] = useState('');
   const [isPrivate, setIsPrivate] = useState(false);
@@ -47,8 +119,16 @@ export const CreateChannelModal: React.FC<CreateChannelModalProps> = ({
   };
 
   return (
-    <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="new-channel-title">
-      <form className="chat-modal-card" onSubmit={handleSubmit}>
+    <div
+      className="modal-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="new-channel-title"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget && !busy) onClose();
+      }}
+    >
+      <form ref={dialogRef} className="chat-modal-card" onSubmit={handleSubmit}>
         <div className="chat-modal-head">
           <h3 id="new-channel-title">Create channel</h3>
           <button type="button" className="chat-icon-btn" onClick={onClose} aria-label="Close">
@@ -135,16 +215,28 @@ export const StartDMModal: React.FC<StartDMModalProps> = ({
   onClose,
   onSelectUser,
 }) => {
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  useModalFocus(dialogRef, onClose);
+
   const [filter, setFilter] = useState('');
+  const [activeIdx, setActiveIdx] = useState(0);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [err, setErr] = useState('');
 
   const q = filter.trim().toLowerCase();
-  const candidates = directory.filter((u) => {
-    if (u.id === currentUserId) return false;
-    if (!q) return true;
-    return u.display_name.toLowerCase().includes(q) || u.username.toLowerCase().includes(q);
-  });
+  const candidates = useMemo(
+    () =>
+      directory.filter((u) => {
+        if (u.id === currentUserId) return false;
+        if (!q) return true;
+        return u.display_name.toLowerCase().includes(q) || u.username.toLowerCase().includes(q);
+      }),
+    [directory, currentUserId, q],
+  );
+
+  useEffect(() => {
+    setActiveIdx(0);
+  }, [q]);
 
   const handlePick = async (userId: string) => {
     setBusyId(userId);
@@ -160,8 +252,16 @@ export const StartDMModal: React.FC<StartDMModalProps> = ({
   };
 
   return (
-    <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="new-dm-title">
-      <div className="chat-modal-card">
+    <div
+      className="modal-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="new-dm-title"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget && busyId === null) onClose();
+      }}
+    >
+      <div ref={dialogRef} className="chat-modal-card">
         <div className="chat-modal-head">
           <h3 id="new-dm-title">New direct message</h3>
           <button type="button" className="chat-icon-btn" onClick={onClose} aria-label="Close">
@@ -179,20 +279,37 @@ export const StartDMModal: React.FC<StartDMModalProps> = ({
             placeholder="Search by name or username…"
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
+            onKeyDown={(e) => {
+              if (candidates.length === 0 || busyId !== null) return;
+              if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                setActiveIdx((i) => (i + 1) % candidates.length);
+              } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                setActiveIdx((i) => (i - 1 + candidates.length) % candidates.length);
+              } else if (e.key === 'Enter') {
+                e.preventDefault();
+                const target = candidates[activeIdx] ?? candidates[0];
+                if (target) void handlePick(target.id);
+              }
+            }}
             autoFocus
           />
-          <div className="chat-picker-list chat-scroll">
+          <div className="chat-picker-list chat-scroll" role="listbox" aria-label="Teammates">
             {candidates.length === 0 ? (
               <p style={{ fontSize: '0.82rem', color: 'var(--ink)', padding: '0.6rem' }}>
                 {directory.length <= 1 ? 'No other active accounts yet.' : 'No matching teammates.'}
               </p>
             ) : (
-              candidates.map((u) => (
+              candidates.map((u, idx) => (
                 <button
                   key={u.id}
                   type="button"
-                  className="chat-picker-item"
+                  role="option"
+                  aria-selected={idx === activeIdx}
+                  className={`chat-picker-item${idx === activeIdx ? ' is-active' : ''}`}
                   disabled={busyId !== null}
+                  onMouseEnter={() => setActiveIdx(idx)}
                   onClick={() => void handlePick(u.id)}
                 >
                   <span>{u.display_name}</span>
@@ -213,32 +330,42 @@ interface SearchModalProps {
   rooms: ChatRoomSummary[];
   activeRoomId: string | null;
   onClose: () => void;
-  onSelectHit: (roomId: string) => void;
+  onSelectHit: (roomId: string, seq?: number) => void;
 }
 
 export const SearchModal: React.FC<SearchModalProps> = ({ rooms, activeRoomId, onClose, onSelectHit }) => {
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  useModalFocus(dialogRef, onClose);
+
   const [query, setQuery] = useState('');
   const [scopeCurrent, setScopeCurrent] = useState(false);
   const [hits, setHits] = useState<ChatMessage[]>([]);
+  const [activeIdx, setActiveIdx] = useState(0);
   const [searching, setSearching] = useState(false);
   const [err, setErr] = useState('');
 
-  const roomById = new Map(rooms.map((r) => [r.id, r]));
+  const roomById = useMemo(() => new Map(rooms.map((r) => [r.id, r])), [rooms]);
 
   useEffect(() => {
     const trimmed = query.trim();
     if (!trimmed) {
       setHits([]);
       setErr('');
+      setSearching(false);
       return;
     }
     let cancelled = false;
+    setSearching(true);
+    setHits([]);
+    setActiveIdx(0);
+    setErr('');
     const timer = setTimeout(() => {
-      setSearching(true);
-      setErr('');
       void searchMessages(trimmed, scopeCurrent && activeRoomId ? activeRoomId : undefined)
         .then((res) => {
-          if (!cancelled) setHits(res);
+          if (!cancelled) {
+            setHits(res);
+            setActiveIdx(0);
+          }
         })
         .catch((e) => {
           if (!cancelled) setErr(e instanceof Error ? e.message : 'Search failed');
@@ -254,12 +381,25 @@ export const SearchModal: React.FC<SearchModalProps> = ({ rooms, activeRoomId, o
     };
   }, [query, scopeCurrent, activeRoomId]);
 
+  const selectHit = (hit: ChatMessage) => {
+    onSelectHit(hit.room_id, hit.seq);
+    onClose();
+  };
+
   return (
-    <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="chat-search-title">
-      <div className="chat-modal-card">
+    <div
+      className="modal-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="chat-search-title"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div ref={dialogRef} className="chat-modal-card">
         <div className="chat-modal-head">
           <h3 id="chat-search-title" style={{ display: 'inline-flex', alignItems: 'center', gap: '0.45rem' }}>
-            <Search size={16} />
+            <Search size={16} aria-hidden="true" />
             Search messages
           </h3>
           <button type="button" className="chat-icon-btn" onClick={onClose} aria-label="Close search">
@@ -272,6 +412,20 @@ export const SearchModal: React.FC<SearchModalProps> = ({ rooms, activeRoomId, o
             placeholder="Search across your joined rooms…"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (hits.length === 0) return;
+              if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                setActiveIdx((i) => (i + 1) % hits.length);
+              } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                setActiveIdx((i) => (i - 1 + hits.length) % hits.length);
+              } else if (e.key === 'Enter') {
+                e.preventDefault();
+                const target = hits[activeIdx] ?? hits[0];
+                if (target) selectHit(target);
+              }
+            }}
             autoFocus
           />
 
@@ -297,22 +451,30 @@ export const SearchModal: React.FC<SearchModalProps> = ({ rooms, activeRoomId, o
           ) : query.trim() && hits.length === 0 ? (
             <p style={{ fontSize: '0.82rem', color: 'var(--ink)' }}>No matching messages found.</p>
           ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem' }}>
-              {hits.map((hit) => {
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem' }} role="listbox" aria-label="Search results">
+              {hits.map((hit, idx) => {
                 const room = roomById.get(hit.room_id);
                 return (
                   <button
                     key={hit.id}
                     type="button"
-                    className="chat-search-hit"
-                    onClick={() => {
-                      onSelectHit(hit.room_id);
-                      onClose();
-                    }}
+                    role="option"
+                    aria-selected={idx === activeIdx}
+                    className={`chat-search-hit${idx === activeIdx ? ' is-active' : ''}`}
+                    onMouseEnter={() => setActiveIdx(idx)}
+                    onClick={() => selectHit(hit)}
                   >
                     <div className="chat-search-hit-meta">
                       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3, fontWeight: 600 }}>
-                        <Hash size={11} />
+                        {room?.kind === 'meeting' ? (
+                          <Video size={11} aria-hidden="true" />
+                        ) : room?.kind === 'dm' ? (
+                          <MessageSquare size={11} aria-hidden="true" />
+                        ) : room?.is_private ? (
+                          <Lock size={11} aria-hidden="true" />
+                        ) : (
+                          <Hash size={11} aria-hidden="true" />
+                        )}
                         {room?.name || 'Room'}
                       </span>
                       <span>·</span>
@@ -321,7 +483,7 @@ export const SearchModal: React.FC<SearchModalProps> = ({ rooms, activeRoomId, o
                       <span>·</span>
                       <span>{formatTime(hit.created_at)}</span>
                     </div>
-                    <div className="chat-search-hit-body">{hit.body}</div>
+                    <div className="chat-search-hit-body">{highlightQuery(hit.body, query)}</div>
                   </button>
                 );
               })}

@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { Loader2, Mic, MicOff } from 'lucide-react';
 import { AppHeader } from './components/AppHeader';
 import { Dashboard } from './pages/Dashboard';
 import { Login } from './pages/Login';
@@ -11,7 +12,7 @@ import { Audit } from './pages/Audit';
 import { ConfirmItsYou } from './components/ConfirmItsYou';
 import { TwoFactorSetup } from './components/TwoFactorSetup';
 import { ThemeSwitcher } from './components/ThemeSwitcher';
-import { Chat } from './pages/Chat';
+import { Chat, type ActiveCallSummary } from './pages/Chat';
 import { GuestMeeting } from './pages/GuestMeeting';
 import './styles/theme.css';
 import './ky-ui/tokens.css';
@@ -34,9 +35,18 @@ export const App: React.FC = () => {
   const [loading, setLoading] = useState<boolean>(!meetToken);
   const [activeTab, setActiveTab] = useState<string>('chat');
   const [settings, setSettings] = useState<SiteSettings | null>(null);
+  const [activeCallSummary, setActiveCallSummary] = useState<ActiveCallSummary | null>(null);
 
   useEffect(() => {
-    if (meetToken) return;
+    if (meetToken) {
+      void fetch('/api/settings')
+        .then((r) => (r.ok ? r.json() : null))
+        .then((data) => {
+          if (data) setSettings(parseSettings(data));
+        })
+        .catch(() => undefined);
+      return;
+    }
     const checkAuth = async () => {
       try {
         const [authResp, setResp] = useResponses(
@@ -78,6 +88,7 @@ export const App: React.FC = () => {
     try {
       const res = await secureFetch('/api/auth/logout', { method: 'POST' });
       if (!res.ok) throw new Error(await errorMessage(res, 'Sign-out failed'));
+      setActiveCallSummary(null);
       setUser(null);
     } catch (err) {
       setError(`You are still signed in: ${err instanceof Error ? err.message : 'sign-out failed'}`);
@@ -91,8 +102,24 @@ export const App: React.FC = () => {
 
   if (loading) {
     return (
-      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg)', color: 'var(--ink)' }}>
-        Loading {settings?.app_name || 'KyMessages'}...
+      <div
+        role="status"
+        style={{
+          minHeight: '100dvh',
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          gap: '12px',
+          background: 'var(--bg)',
+          color: 'var(--ink)',
+        }}
+      >
+        <img src="/app-icon.png" width={40} height={40} alt="" />
+        <div style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', fontSize: '14px' }}>
+          <Loader2 size={16} className="animate-spin" aria-hidden="true" />
+          <span>Loading {settings?.app_name || 'KyMessages'}…</span>
+        </div>
       </div>
     );
   }
@@ -125,12 +152,17 @@ export const App: React.FC = () => {
   const isAdmin = user.role === 'admin';
   const currentTab = isAdmin ? activeTab : activeTab === 'settings' ? 'settings' : 'chat';
   const appName = settings?.app_name || 'KyMessages';
+  const isChatView = currentTab === 'chat';
 
-  if (currentTab === 'chat') {
-    return (
-      <div className="app-shell app-shell-chat">
-        {isAdmin && <ConfirmItsYou />}
-        {error && (
+  return (
+    <>
+      <div
+        className="app-shell app-shell-chat"
+        hidden={!isChatView}
+        style={isChatView ? undefined : { display: 'none' }}
+      >
+        {isAdmin && isChatView && <ConfirmItsYou />}
+        {isChatView && error && (
           <div className="dr-alert dr-alert-error app-floating-alert" role="alert">
             <span>{error}</span>
           </div>
@@ -140,9 +172,12 @@ export const App: React.FC = () => {
             <Chat
               appName={appName}
               user={user}
+              isActive={isChatView}
               onOpenSettings={() => setActiveTab('settings')}
               onLogout={handleLogout}
+              onActiveCallChange={setActiveCallSummary}
               onAuthRevoked={() => {
+                setActiveCallSummary(null);
                 setUser(null);
                 setNotice('Your session ended. Sign in again to continue.');
               }}
@@ -150,54 +185,98 @@ export const App: React.FC = () => {
           </ErrorBoundary>
         </main>
       </div>
-    );
-  }
 
-  return (
-    <div className="app-shell">
-      <AppHeader
-        appName={appName}
-        activeTab={currentTab}
-        onTabChange={(t) => setActiveTab(t)}
-        user={user}
-        onLogout={handleLogout}
-      />
+      {!isChatView && (
+        <div className="app-shell">
+          <AppHeader
+            appName={appName}
+            activeTab={currentTab}
+            onTabChange={(t) => setActiveTab(t)}
+            user={user}
+            onLogout={handleLogout}
+          />
 
-      {isAdmin && <ConfirmItsYou />}
-
-      <main className="app-main">
-        {errorAlert}
-        <ErrorBoundary key={currentTab}>
-          {!isAdmin && currentTab === 'settings' && (
-            <div style={{ maxWidth: '720px', margin: '0 auto', padding: '32px 20px' }}>
-              <h1 style={{ fontSize: '22px', fontWeight: 700, marginBottom: '6px' }}>Preferences</h1>
-              <p style={{ color: 'var(--ink)', fontSize: '14px', marginBottom: '20px' }}>
-                Appearance and account details for {user.display_name || user.username}.
-              </p>
-              <div className="panel" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-                <div>
-                  <h3 style={{ fontSize: '15px', marginBottom: '6px' }}>Color theme</h3>
-                  <p style={{ color: 'var(--ink)', fontSize: '13px', marginBottom: '10px' }}>
-                    Choose a palette for this browser.
-                  </p>
-                  <ThemeSwitcher />
-                </div>
-                <div style={{ borderTop: '1px solid var(--line)', paddingTop: '14px', fontSize: '13px', color: 'var(--ink)' }}>
-                  Signed in as <strong style={{ color: 'var(--ink-strong)' }}>{user.display_name || user.username}</strong> (@{user.username})
+          <div className="app-content-col">
+            {activeCallSummary && (
+              <div className="ky-call-mini-bar" role="region" aria-label="Active call controls">
+                <span>
+                  In call in <strong>{activeCallSummary.roomName}</strong> ({activeCallSummary.participantCount})
+                </span>
+                <div className="ky-call-mini-actions">
+                  <button
+                    type="button"
+                    className={`ky-lobby-btn ${activeCallSummary.audio ? 'is-neutral' : 'is-deny'}`}
+                    aria-pressed={activeCallSummary.audio}
+                    aria-label="Microphone"
+                    title={activeCallSummary.audio ? 'Mute microphone' : 'Unmute microphone'}
+                    onClick={activeCallSummary.onToggleAudio}
+                  >
+                    {activeCallSummary.audio ? (
+                      <Mic size={12} aria-hidden="true" />
+                    ) : (
+                      <MicOff size={12} aria-hidden="true" />
+                    )}
+                    <span>{activeCallSummary.audio ? 'Mic' : 'Muted'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="ky-lobby-btn is-admit"
+                    onClick={() => {
+                      setActiveTab('chat');
+                      activeCallSummary.onReturn();
+                    }}
+                  >
+                    Return to call
+                  </button>
+                  <button
+                    type="button"
+                    className="ky-lobby-btn is-deny"
+                    onClick={activeCallSummary.onLeave}
+                  >
+                    Leave
+                  </button>
                 </div>
               </div>
-            </div>
-          )}
-          {isAdmin && activeTab === 'dashboard' && <Dashboard settings={settings} user={user} onNavigate={(t) => setActiveTab(t)} />}
-          {isAdmin && activeTab === 'health' && <Health />}
-          {isAdmin && activeTab === 'audit' && <Audit />}
-          {isAdmin && activeTab === 'scim' && <SCIMAdmin />}
-          {isAdmin && activeTab === 'backup' && <Backup />}
-          {isAdmin && activeTab === 'settings' && <Settings settings={settings} onBrandingChanged={() => void loadSettings()} />}
-          {isAdmin && activeTab === 'settings' && <TwoFactorSetup />}
-        </ErrorBoundary>
-      </main>
-    </div>
+            )}
+
+            {isAdmin && <ConfirmItsYou />}
+
+            <main className="app-main">
+              {errorAlert}
+              <ErrorBoundary key={currentTab}>
+                {!isAdmin && currentTab === 'settings' && (
+                  <div style={{ maxWidth: '720px', margin: '0 auto', padding: '32px 20px' }}>
+                    <h1 style={{ fontSize: '22px', fontWeight: 700, marginBottom: '6px' }}>Preferences</h1>
+                    <p style={{ color: 'var(--ink)', fontSize: '14px', marginBottom: '20px' }}>
+                      Appearance and account details for {user.display_name || user.username}.
+                    </p>
+                    <div className="panel" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                      <div>
+                        <h2 style={{ fontSize: '15px', marginBottom: '6px' }}>Color theme</h2>
+                        <p style={{ color: 'var(--ink)', fontSize: '13px', marginBottom: '10px' }}>
+                          Choose a palette for this browser.
+                        </p>
+                        <ThemeSwitcher />
+                      </div>
+                      <div style={{ borderTop: '1px solid var(--line)', paddingTop: '14px', fontSize: '13px', color: 'var(--ink)' }}>
+                        Signed in as <strong style={{ color: 'var(--ink-strong)' }}>{user.display_name || user.username}</strong> (@{user.username})
+                      </div>
+                    </div>
+                  </div>
+                )}
+                {isAdmin && activeTab === 'dashboard' && <Dashboard settings={settings} user={user} onNavigate={(t) => setActiveTab(t)} />}
+                {isAdmin && activeTab === 'health' && <Health />}
+                {isAdmin && activeTab === 'audit' && <Audit />}
+                {isAdmin && activeTab === 'scim' && <SCIMAdmin />}
+                {isAdmin && activeTab === 'backup' && <Backup />}
+                {isAdmin && activeTab === 'settings' && <Settings settings={settings} onBrandingChanged={() => void loadSettings()} />}
+                {isAdmin && activeTab === 'settings' && <TwoFactorSetup />}
+              </ErrorBoundary>
+            </main>
+          </div>
+        </div>
+      )}
+    </>
   );
 };
 

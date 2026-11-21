@@ -4,9 +4,12 @@ import {
   ChevronDown,
   Copy,
   Hash,
+  Loader2,
   Lock,
   Menu,
   MessageSquarePlus,
+  Mic,
+  MicOff,
   PanelRightClose,
   PanelRightOpen,
   Phone,
@@ -61,17 +64,29 @@ import type {
 } from '../chat/types';
 import { ChatSidebar } from '../components/chat/ChatSidebar';
 import { MessageRow } from '../components/chat/MessageRow';
-import { RoomDetailsDrawer } from '../components/chat/RoomDetailsDrawer';
+import { RoomDetailsDrawer, type DrawerTab } from '../components/chat/RoomDetailsDrawer';
 import { CreateChannelModal, SearchModal, StartDMModal } from '../components/chat/ChatModals';
-import { CallStage } from '../components/chat/CallStage';
+import { CallAudioLayer, CallStage } from '../components/chat/CallStage';
 import { HybridCallController, type HybridCallSnapshot } from '../rtc/hybridCall';
+
+export interface ActiveCallSummary {
+  roomId: string;
+  roomName: string;
+  participantCount: number;
+  audio: boolean;
+  onToggleAudio: () => void;
+  onReturn: () => void;
+  onLeave: () => void;
+}
 
 interface ChatProps {
   appName?: string;
   user?: SessionUser | null;
+  isActive?: boolean;
   onOpenSettings?: () => void;
   onLogout?: () => void;
   onAuthRevoked?: () => void;
+  onActiveCallChange?: (summary: ActiveCallSummary | null) => void;
 }
 
 type ActiveModal = 'none' | 'new-channel' | 'new-dm' | 'search';
@@ -80,14 +95,21 @@ interface RoomMessageBucket {
   messages: ChatMessage[];
   hasMore: boolean;
   loaded: boolean;
+  hasGapAfter?: boolean;
 }
+
+const isMac =
+  typeof navigator !== 'undefined' && /mac|iphone|ipad|ipod/i.test(navigator.platform || navigator.userAgent);
+const SEARCH_HINT = isMac ? '⌘K' : 'Ctrl+K';
 
 export const Chat: React.FC<ChatProps> = ({
   appName,
   user,
+  isActive = true,
   onOpenSettings,
   onLogout,
   onAuthRevoked,
+  onActiveCallChange,
 }) => {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
@@ -101,15 +123,24 @@ export const Chat: React.FC<ChatProps> = ({
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [wsStatus, setWsStatus] = useState<WsStatus>('connecting');
-  const [draft, setDraft] = useState('');
-  const [replyTo, setReplyTo] = useState<ChatMessage | null>(null);
+  const [draftsByRoom, setDraftsByRoom] = useState<Record<string, string>>({});
+  const [replyByRoom, setReplyByRoom] = useState<Record<string, ChatMessage | null>>({});
   const [modal, setModal] = useState<ActiveModal>('none');
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [requestedDrawerTab, setRequestedDrawerTab] = useState<{ tab: DrawerTab; seq: number } | null>(null);
   const [roomDetail, setRoomDetail] = useState<ChatRoomDetail | null>(null);
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [mobileRailOpen, setMobileRailOpen] = useState(false);
   const [showJumpLatest, setShowJumpLatest] = useState(false);
+  const [missedCount, setMissedCount] = useState(0);
+  const [unreadDividerSeq, setUnreadDividerSeq] = useState<number | null>(null);
+  const [highlightedSeq, setHighlightedSeq] = useState<number | null>(null);
+  const [pendingJump, setPendingJump] = useState<{ roomId: string; seq: number } | null>(null);
+  const [editTrigger, setEditTrigger] = useState<{ messageId: string; seq: number } | null>(null);
+  const [srAnnouncement, setSrAnnouncement] = useState('');
   const [creatingGeneral, setCreatingGeneral] = useState(false);
+  const [creatingMeeting, setCreatingMeeting] = useState(false);
+  const [lobbyBusy, setLobbyBusy] = useState(false);
   // Map of roomId -> Map<userId, expiryTimestampMs>
   const [typingByRoom, setTypingByRoom] = useState<Record<string, Record<string, number>>>({});
   // Phase 3: hybrid calls, SFU availability, waiting room lobby, guest invite banner
@@ -117,23 +148,38 @@ export const Chat: React.FC<ChatProps> = ({
   const [sfuAvailable, setSfuAvailable] = useState(false);
   const [lobbyByRoom, setLobbyByRoom] = useState<Record<string, LobbyGuest[]>>({});
   const [callSnap, setCallSnap] = useState<HybridCallSnapshot | null>(null);
+  const [callExpanded, setCallExpanded] = useState(false);
   const [joiningCall, setJoiningCall] = useState(false);
   const [guestLinkBanner, setGuestLinkBanner] = useState<{ roomId: string; url: string; copied: boolean } | null>(null);
 
   const socketRef = useRef<ChatSocket | null>(null);
   const callCtrlRef = useRef<HybridCallController | null>(null);
+  const callStageRef = useRef<HTMLElement | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const nearBottomRef = useRef(true);
   const activeRoomIdRef = useRef<string | null>(null);
   const currentUserRef = useRef<ChatCurrentUser | null>(null);
   const bucketsRef = useRef<Record<string, RoomMessageBucket>>({});
+  const roomsRef = useRef<ChatRoomSummary[]>([]);
   const drawerOpenRef = useRef(false);
+  const highlightTimerRef = useRef<number | null>(null);
+  const isActiveRef = useRef(isActive);
+  const onAuthRevokedRef = useRef(onAuthRevoked);
+  const onActiveCallChangeRef = useRef(onActiveCallChange);
+  const pendingJumpRef = useRef(pendingJump);
+  const callRoomIdRef = useRef<string | null>(null);
 
   activeRoomIdRef.current = activeRoomId;
   currentUserRef.current = currentUser;
   bucketsRef.current = buckets;
+  roomsRef.current = rooms;
   drawerOpenRef.current = drawerOpen;
+  isActiveRef.current = isActive;
+  onAuthRevokedRef.current = onAuthRevoked;
+  onActiveCallChangeRef.current = onActiveCallChange;
+  pendingJumpRef.current = pendingJump;
+  callRoomIdRef.current = callSnap?.roomId ?? null;
 
   const activeRoom = useMemo(
     () => rooms.find((r) => r.id === activeRoomId) ?? null,
@@ -142,19 +188,25 @@ export const Chat: React.FC<ChatProps> = ({
 
   const activeBucket = activeRoomId ? buckets[activeRoomId] : undefined;
   const activeMessages = activeBucket?.messages ?? [];
+  const draft = activeRoomId ? draftsByRoom[activeRoomId] ?? '' : '';
+  const replyTo = activeRoomId ? replyByRoom[activeRoomId] ?? null : null;
+
+  const setActiveDraft = useCallback((value: string) => {
+    const rid = activeRoomIdRef.current;
+    if (!rid) return;
+    setDraftsByRoom((prev) => ({ ...prev, [rid]: value }));
+  }, []);
+
+  const setActiveReplyTo = useCallback((target: ChatMessage | null) => {
+    const rid = activeRoomIdRef.current;
+    if (!rid) return;
+    setReplyByRoom((prev) => ({ ...prev, [rid]: target }));
+  }, []);
 
   const directoryById = useMemo(
     () => new Map(directory.map((u) => [u.id, u])),
     [directory],
   );
-
-  const scrollToBottom = useCallback(() => {
-    const el = timelineRef.current;
-    if (!el) return;
-    el.scrollTop = el.scrollHeight;
-    nearBottomRef.current = true;
-    setShowJumpLatest(false);
-  }, []);
 
   const syncReadCursor = useCallback(async (roomId: string, seq: number) => {
     if (seq <= 0) return;
@@ -175,6 +227,88 @@ export const Chat: React.FC<ChatProps> = ({
       // Non-fatal; will catch up on next interaction.
     }
   }, []);
+
+  const scrollToBottom = useCallback(() => {
+    const el = timelineRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+    }
+    nearBottomRef.current = true;
+    setShowJumpLatest(false);
+    setMissedCount(0);
+    const rid = activeRoomIdRef.current;
+    if (rid) {
+      const msgs = bucketsRef.current[rid]?.messages ?? [];
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i].delivery.kind === 'synced') {
+          void syncReadCursor(rid, msgs[i].seq);
+          break;
+        }
+      }
+    }
+  }, [syncReadCursor]);
+
+  const highlightAndScrollSeq = useCallback((seq: number): boolean => {
+    const root = timelineRef.current;
+    if (!root) return false;
+    const target = root.querySelector<HTMLElement>(`[data-seq="${seq}"]`);
+    if (!target) return false;
+    const reduceMotion =
+      typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    target.scrollIntoView({ behavior: reduceMotion ? 'auto' : 'smooth', block: 'center' });
+    setHighlightedSeq(seq);
+    if (highlightTimerRef.current) window.clearTimeout(highlightTimerRef.current);
+    highlightTimerRef.current = window.setTimeout(() => setHighlightedSeq(null), 1900);
+    return true;
+  }, []);
+
+  const jumpToMessageSeq = useCallback(
+    async (roomId: string, seq: number) => {
+      if (highlightAndScrollSeq(seq)) return;
+      try {
+        const page = await fetchMessages(roomId, { before: seq + 25, limit: 50 });
+        if (activeRoomIdRef.current !== roomId) return;
+        let hasGap = false;
+        setBuckets((prev) => {
+          const existing = prev[roomId]?.messages ?? [];
+          const syncedExisting = existing.filter((m) => m.delivery.kind === 'synced');
+          const minExistingSeq = syncedExisting.length > 0 ? syncedExisting[0].seq : 0;
+          const maxPageSeq = page.messages.length > 0 ? page.messages[page.messages.length - 1].seq : 0;
+          const isContiguous = syncedExisting.length === 0 || maxPageSeq >= minExistingSeq - 1;
+          hasGap = !isContiguous && syncedExisting.length > 0;
+          return {
+            ...prev,
+            [roomId]: isContiguous
+              ? {
+                  messages: mergeMessageBatch(existing, page.messages),
+                  hasMore: prev[roomId]?.hasMore || page.has_more,
+                  loaded: true,
+                  hasGapAfter: prev[roomId]?.hasGapAfter ?? false,
+                }
+              : {
+                  messages: page.messages,
+                  hasMore: page.has_more,
+                  loaded: true,
+                  hasGapAfter: true,
+                },
+          };
+        });
+        if (hasGap) {
+          setShowJumpLatest(true);
+        }
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            if (!highlightAndScrollSeq(seq)) {
+              setBannerError('Referenced message is no longer available.');
+            }
+          });
+        });
+      } catch {
+        setBannerError('Could not load referenced message.');
+      }
+    },
+    [highlightAndScrollSeq],
+  );
 
   const refreshRoomsList = useCallback(async () => {
     try {
@@ -200,59 +334,95 @@ export const Chat: React.FC<ChatProps> = ({
   }, []);
 
   const loadRoomHistory = useCallback(
-    async (roomId: string) => {
+    async (roomId: string, hasUnreadDivider = false) => {
       setLoadingMessages(true);
       setBannerError('');
       try {
         const page = await fetchMessages(roomId, { limit: 50 });
-        setBuckets((prev) => ({
-          ...prev,
-          [roomId]: {
-            messages: mergeMessageBatch(prev[roomId]?.messages ?? [], page.messages),
-            hasMore: page.has_more,
-            loaded: true,
-          },
-        }));
+        setBuckets((prev) => {
+          const prevBucket = prev[roomId];
+          const messages = prevBucket?.hasGapAfter
+            ? page.messages
+            : mergeMessageBatch(prevBucket?.messages ?? [], page.messages);
+          return {
+            ...prev,
+            [roomId]: {
+              messages,
+              hasMore: page.has_more,
+              loaded: true,
+              hasGapAfter: false,
+            },
+          };
+        });
+        if (activeRoomIdRef.current !== roomId) return;
         const latestSeq = page.messages.length > 0 ? page.messages[page.messages.length - 1].seq : 0;
-        if (latestSeq > 0) {
-          void syncReadCursor(roomId, latestSeq);
-        }
-        requestAnimationFrame(scrollToBottom);
+        if (pendingJumpRef.current?.roomId === roomId) return;
+        requestAnimationFrame(() => {
+          const el = timelineRef.current;
+          if (!el) return;
+          if (hasUnreadDivider) {
+            const divider = el.querySelector<HTMLElement>('.chat-unread-divider');
+            if (divider) {
+              divider.scrollIntoView({ behavior: 'auto', block: 'center' });
+              const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+              nearBottomRef.current = nearBottom;
+              if (!nearBottom) {
+                setShowJumpLatest(true);
+                return;
+              }
+            }
+          }
+          el.scrollTop = el.scrollHeight;
+          nearBottomRef.current = true;
+          setShowJumpLatest(false);
+          if (latestSeq > 0 && isActiveRef.current) {
+            void syncReadCursor(roomId, latestSeq);
+          }
+        });
       } catch (e) {
-        setBannerError(e instanceof Error ? e.message : 'Could not load messages');
+        if (activeRoomIdRef.current === roomId) {
+          setBannerError(e instanceof Error ? e.message : 'Could not load messages');
+        }
       } finally {
         setLoadingMessages(false);
       }
     },
-    [scrollToBottom, syncReadCursor],
+    [syncReadCursor],
   );
 
-  const catchUpRoom = useCallback(async (roomId: string) => {
-    const bucket = bucketsRef.current[roomId];
-    const maxSeq = (bucket?.messages ?? []).reduce((acc, m) => (m.delivery.kind === 'synced' && m.seq > acc ? m.seq : acc), 0);
-    try {
-      const page =
-        maxSeq > 0
-          ? await fetchMessages(roomId, { after: maxSeq, limit: 100 })
-          : await fetchMessages(roomId, { limit: 50 });
-      if (page.messages.length === 0) return;
-      setBuckets((prev) => ({
-        ...prev,
-        [roomId]: {
-          messages: mergeMessageBatch(prev[roomId]?.messages ?? [], page.messages),
-          hasMore: prev[roomId]?.hasMore ?? page.has_more,
-          loaded: true,
-        },
-      }));
-      if (activeRoomIdRef.current === roomId && nearBottomRef.current) {
-        const latest = page.messages[page.messages.length - 1].seq;
-        void syncReadCursor(roomId, latest);
-        requestAnimationFrame(scrollToBottom);
+  const catchUpRoom = useCallback(
+    async (roomId: string) => {
+      const bucket = bucketsRef.current[roomId];
+      const maxSeq = (bucket?.messages ?? []).reduce(
+        (acc, m) => (m.delivery.kind === 'synced' && m.seq > acc ? m.seq : acc),
+        0,
+      );
+      try {
+        const page =
+          maxSeq > 0
+            ? await fetchMessages(roomId, { after: maxSeq, limit: 100 })
+            : await fetchMessages(roomId, { limit: 50 });
+        if (page.messages.length === 0) return;
+        setBuckets((prev) => ({
+          ...prev,
+          [roomId]: {
+            messages: mergeMessageBatch(prev[roomId]?.messages ?? [], page.messages),
+            hasMore: prev[roomId]?.hasMore ?? page.has_more,
+            loaded: true,
+          },
+        }));
+        const visible = isActiveRef.current && (typeof document === 'undefined' || document.visibilityState === 'visible');
+        if (visible && activeRoomIdRef.current === roomId && nearBottomRef.current) {
+          const latest = page.messages[page.messages.length - 1].seq;
+          void syncReadCursor(roomId, latest);
+          requestAnimationFrame(scrollToBottom);
+        }
+      } catch {
+        // Transient catch-up failure; next event or room switch will retry.
       }
-    } catch {
-      // Transient catch-up failure; next event or room switch will retry.
-    }
-  }, [scrollToBottom, syncReadCursor]);
+    },
+    [scrollToBottom, syncReadCursor],
+  );
 
   const handleWsEvent = useCallback(
     (event: WsServerEvent) => {
@@ -262,7 +432,7 @@ export const Chat: React.FC<ChatProps> = ({
           return;
         case 'auth.revoked':
           setBannerError('Your session has been revoked. Please sign in again.');
-          onAuthRevoked?.();
+          onAuthRevokedRef.current?.();
           return;
         case 'message.new': {
           if (event.refetch || !event.message) {
@@ -279,11 +449,17 @@ export const Chat: React.FC<ChatProps> = ({
             if (!current?.loaded && activeRoomIdRef.current !== event.roomId) {
               return prev;
             }
+            // If the user is viewing a non-contiguous historical jump slice, keep it
+            // untouched until they click "Jump to latest" so we never create a silent gap.
+            if (current?.hasGapAfter) {
+              return prev;
+            }
             return {
               ...prev,
               [event.roomId]: {
                 messages: upsertMessage(current?.messages ?? [], incoming),
                 hasMore: current?.hasMore ?? false,
+                hasGapAfter: false,
                 loaded: true,
               },
             };
@@ -297,13 +473,18 @@ export const Chat: React.FC<ChatProps> = ({
             return { ...prev, [event.roomId]: copy };
           });
 
-          const isViewing = activeRoomIdRef.current === event.roomId;
+          const isViewing =
+            isActiveRef.current &&
+            (typeof document === 'undefined' || document.visibilityState === 'visible') &&
+            activeRoomIdRef.current === event.roomId;
           const isSelf = incoming.sender_id === currentUserRef.current?.id;
+          const markAsReadNow = isSelf || (isViewing && nearBottomRef.current);
+
           setRooms((prev) =>
             prev.map((r) => {
               if (r.id !== event.roomId) return r;
               const nextLastSeq = Math.max(r.last_seq, incoming.seq);
-              const nextReadSeq = isViewing || isSelf ? Math.max(r.last_read_seq, incoming.seq) : r.last_read_seq;
+              const nextReadSeq = markAsReadNow ? Math.max(r.last_read_seq, incoming.seq) : r.last_read_seq;
               return {
                 ...r,
                 last_seq: nextLastSeq,
@@ -312,13 +493,19 @@ export const Chat: React.FC<ChatProps> = ({
               };
             }),
           );
+
           if (isViewing && !isSelf) {
+            setSrAnnouncement(`${incoming.sender_name || 'Member'}: ${incoming.body}`);
+          }
+
+          if (markAsReadNow && !isSelf) {
             void syncReadCursor(event.roomId, incoming.seq);
           }
           if (isViewing && nearBottomRef.current) {
             requestAnimationFrame(scrollToBottom);
           } else if (isViewing && !isSelf) {
             setShowJumpLatest(true);
+            setMissedCount((c) => c + 1);
           }
           return;
         }
@@ -350,7 +537,9 @@ export const Chat: React.FC<ChatProps> = ({
               [event.roomId]: {
                 ...current,
                 messages: current.messages.map((m) =>
-                  m.id === event.messageId ? { ...m, body: '', deleted_at: event.deletedAt } : m,
+                  m.id === event.messageId
+                    ? { ...m, body: '', deleted_at: event.deletedAt ?? Date.now() }
+                    : m,
                 ),
               },
             };
@@ -411,6 +600,9 @@ export const Chat: React.FC<ChatProps> = ({
           setRooms((prev) =>
             prev.map((r) => (r.id === event.roomId ? { ...r, closed_at: r.closed_at ?? Date.now() } : r)),
           );
+          if (activeRoomIdRef.current === event.roomId && drawerOpenRef.current) {
+            void refreshRoomDetail(event.roomId);
+          }
           return;
         }
         case 'typing': {
@@ -442,8 +634,9 @@ export const Chat: React.FC<ChatProps> = ({
         }
         case 'call.state': {
           const st = event.state;
+          const isEnded = Boolean(st.ended || st.active === false);
           setActiveCalls((prev) => {
-            if (st.ended || st.peers.length === 0) {
+            if (isEnded || st.peers.length === 0) {
               if (!(st.room_id in prev)) return prev;
               const next = { ...prev };
               delete next[st.room_id];
@@ -452,8 +645,11 @@ export const Chat: React.FC<ChatProps> = ({
             return { ...prev, [st.room_id]: st };
           });
           callCtrlRef.current?.handleCallState(st);
-          if (st.ended) {
-            setCallSnap((cur) => (cur && cur.roomId === st.room_id ? null : cur));
+          if (isEnded && callRoomIdRef.current === st.room_id) {
+            callCtrlRef.current?.dispose();
+            callCtrlRef.current = null;
+            setCallSnap(null);
+            setCallExpanded(false);
           }
           return;
         }
@@ -470,6 +666,9 @@ export const Chat: React.FC<ChatProps> = ({
           setLobbyByRoom((prev) => {
             const list = prev[event.roomId] ?? [];
             const filtered = list.filter((x) => x.guest_id !== g.guest_id);
+            if (g.status !== 'waiting') {
+              return { ...prev, [event.roomId]: filtered };
+            }
             return { ...prev, [event.roomId]: [...filtered, g] };
           });
           return;
@@ -490,7 +689,7 @@ export const Chat: React.FC<ChatProps> = ({
         }
       }
     },
-    [catchUpRoom, onAuthRevoked, refreshRoomDetail, refreshRoomsList, scrollToBottom, syncReadCursor],
+    [catchUpRoom, refreshRoomDetail, refreshRoomsList, scrollToBottom, syncReadCursor],
   );
 
   // Initial bootstrap + WebSocket connection.
@@ -510,7 +709,7 @@ export const Chat: React.FC<ChatProps> = ({
         setSfuAvailable(boot.rtc.sfu_available);
         const callMap: Record<string, CallState> = {};
         for (const [rid, c] of Object.entries(boot.active_calls)) {
-          if (!c.ended && c.peers.length > 0) callMap[rid] = c;
+          if (!c.ended && c.active !== false && c.peers.length > 0) callMap[rid] = c;
         }
         setActiveCalls(callMap);
         if (boot.rooms.length > 0) {
@@ -537,7 +736,33 @@ export const Chat: React.FC<ChatProps> = ({
       },
       onReconnect: () => {
         if (cancelled) return;
-        void refreshRoomsList();
+        void (async () => {
+          try {
+            const boot = await fetchBootstrap();
+            if (cancelled) return;
+            setRooms(boot.rooms);
+            const callMap: Record<string, CallState> = {};
+            for (const [rid, c] of Object.entries(boot.active_calls)) {
+              if (!c.ended && c.active !== false && c.peers.length > 0) callMap[rid] = c;
+            }
+            setActiveCalls(callMap);
+            const activeCallRoom = callRoomIdRef.current;
+            const myUid = currentUserRef.current?.id;
+            if (activeCallRoom && myUid) {
+              const serverCall = callMap[activeCallRoom];
+              const stillJoined = Boolean(serverCall?.peers.some((p) => p.user_id === myUid));
+              if (!stillJoined) {
+                callCtrlRef.current?.dispose();
+                callCtrlRef.current = null;
+                setCallSnap(null);
+                setCallExpanded(false);
+                setBannerError('Call connection was interrupted while offline — click Join to rejoin.');
+              }
+            }
+          } catch {
+            void refreshRoomsList();
+          }
+        })();
         const active = activeRoomIdRef.current;
         if (active) {
           void catchUpRoom(active);
@@ -549,6 +774,7 @@ export const Chat: React.FC<ChatProps> = ({
 
     return () => {
       cancelled = true;
+      if (highlightTimerRef.current) window.clearTimeout(highlightTimerRef.current);
       callCtrlRef.current?.dispose();
       callCtrlRef.current = null;
       sock.close();
@@ -577,33 +803,90 @@ export const Chat: React.FC<ChatProps> = ({
     return () => clearInterval(timer);
   }, []);
 
-  // Global keyboard shortcuts (Cmd/Ctrl+K for Search, Esc to dismiss).
+  // Close chat modals when navigating to Settings/Admin, and preserve unread divider when returning.
   useEffect(() => {
+    if (!isActive) {
+      setModal('none');
+      return;
+    }
+    const rid = activeRoomIdRef.current;
+    if (!rid) return;
+    const room = roomsRef.current.find((r) => r.id === rid);
+    if (room && room.unread_count > 0) {
+      setUnreadDividerSeq((prev) => (prev === null ? room.last_read_seq : prev));
+      setShowJumpLatest(true);
+      return;
+    }
+    if (nearBottomRef.current) {
+      const msgs = bucketsRef.current[rid]?.messages ?? [];
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i].delivery.kind === 'synced') {
+          void syncReadCursor(rid, msgs[i].seq);
+          break;
+        }
+      }
+    }
+  }, [isActive, syncReadCursor]);
+
+  // Global keyboard shortcuts (Cmd/Ctrl+K for Search, Esc to dismiss drawers/reply).
+  useEffect(() => {
+    if (!isActive) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault();
         setModal((m) => (m === 'search' ? 'none' : 'search'));
-      } else if (e.key === 'Escape') {
-        if (modal !== 'none') setModal('none');
-        else if (replyTo) setReplyTo(null);
+      } else if (e.key === 'Escape' && modal === 'none') {
+        if (mobileRailOpen) setMobileRailOpen(false);
+        else if (drawerOpen) setDrawerOpen(false);
+        else if (replyTo) setActiveReplyTo(null);
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [modal, replyTo]);
+  }, [isActive, modal, mobileRailOpen, drawerOpen, replyTo, setActiveReplyTo]);
 
   // Load room history when switching active room.
   useEffect(() => {
     if (!activeRoomId) return;
-    setReplyTo(null);
     setShowJumpLatest(false);
+    setMissedCount(0);
+
+    const entering = roomsRef.current.find((r) => r.id === activeRoomId);
+    const hasUnreadDivider = Boolean(entering && entering.unread_count > 0 && entering.last_read_seq > 0);
+    if (hasUnreadDivider && entering) {
+      setUnreadDividerSeq(entering.last_read_seq);
+    } else {
+      setUnreadDividerSeq(null);
+    }
+
+    // Re-fit composer height for the newly selected room's draft.
+    if (composerRef.current) {
+      composerRef.current.style.height = 'auto';
+      composerRef.current.style.height = `${Math.min(composerRef.current.scrollHeight, 144)}px`;
+    }
+
     const existing = bucketsRef.current[activeRoomId];
     if (!existing?.loaded) {
-      void loadRoomHistory(activeRoomId);
+      void loadRoomHistory(activeRoomId, hasUnreadDivider);
     } else {
       const latest = existing.messages[existing.messages.length - 1]?.seq ?? 0;
-      if (latest > 0) void syncReadCursor(activeRoomId, latest);
-      requestAnimationFrame(scrollToBottom);
+      if (latest > 0 && isActiveRef.current) void syncReadCursor(activeRoomId, latest);
+      if (pendingJumpRef.current?.roomId !== activeRoomId) {
+        requestAnimationFrame(() => {
+          const el = timelineRef.current;
+          if (!el) return;
+          if (hasUnreadDivider) {
+            const divider = el.querySelector<HTMLElement>('.chat-unread-divider');
+            if (divider) {
+              divider.scrollIntoView({ behavior: 'auto', block: 'center' });
+              nearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+              return;
+            }
+          }
+          el.scrollTop = el.scrollHeight;
+          nearBottomRef.current = true;
+        });
+      }
     }
     if (drawerOpenRef.current) {
       void refreshRoomDetail(activeRoomId);
@@ -615,7 +898,18 @@ export const Chat: React.FC<ChatProps> = ({
       .catch(() => {
         // Non-meeting rooms or transient failures simply show empty lobby.
       });
-  }, [activeRoomId, loadRoomHistory, refreshRoomDetail, scrollToBottom, syncReadCursor]);
+  }, [activeRoomId, loadRoomHistory, refreshRoomDetail, syncReadCursor]);
+
+  // Fulfill pending search-result message jump once target room messages render.
+  useEffect(() => {
+    if (!pendingJump || pendingJump.roomId !== activeRoomId) return;
+    if (!activeBucket?.loaded) return;
+    const { roomId, seq } = pendingJump;
+    setPendingJump(null);
+    requestAnimationFrame(() => {
+      void jumpToMessageSeq(roomId, seq);
+    });
+  }, [pendingJump, activeRoomId, activeBucket?.loaded, activeMessages.length, jumpToMessageSeq]);
 
   const handleLoadOlder = async () => {
     if (!activeRoomId || loadingOlder || !activeBucket?.hasMore) return;
@@ -623,6 +917,7 @@ export const Chat: React.FC<ChatProps> = ({
     if (!oldest) return;
     const timeline = timelineRef.current;
     const prevScrollHeight = timeline?.scrollHeight ?? 0;
+    const prevScrollTop = timeline?.scrollTop ?? 0;
     setLoadingOlder(true);
     try {
       const page = await fetchMessages(activeRoomId, { before: oldest.seq, limit: 50 });
@@ -636,7 +931,7 @@ export const Chat: React.FC<ChatProps> = ({
       }));
       requestAnimationFrame(() => {
         if (timeline) {
-          timeline.scrollTop = timeline.scrollHeight - prevScrollHeight;
+          timeline.scrollTop = prevScrollTop + (timeline.scrollHeight - prevScrollHeight);
         }
       });
     } catch (e) {
@@ -734,8 +1029,9 @@ export const Chat: React.FC<ChatProps> = ({
     if (!trimmed) return;
     const clientKey = newIdempotencyKey();
     const targetReply = replyTo?.id;
-    setDraft('');
-    setReplyTo(null);
+    setActiveDraft('');
+    setActiveReplyTo(null);
+    setUnreadDividerSeq(null);
     socketRef.current?.sendTyping(activeRoomId, false);
     if (composerRef.current) {
       composerRef.current.style.height = 'auto';
@@ -746,7 +1042,6 @@ export const Chat: React.FC<ChatProps> = ({
   const handleToggleReaction = (messageId: string, emoji: string, currentlyReacted: boolean) => {
     if (!activeRoomId || !currentUser) return;
     const add = !currentlyReacted;
-    // Optimistically toggle reaction pill.
     setBuckets((prev) => {
       const current = prev[activeRoomId];
       if (!current) return prev;
@@ -759,7 +1054,6 @@ export const Chat: React.FC<ChatProps> = ({
       };
     });
     void setReaction(activeRoomId, messageId, emoji, add).catch((e) => {
-      // Roll back on error.
       setBuckets((prev) => {
         const current = prev[activeRoomId];
         if (!current) return prev;
@@ -846,14 +1140,66 @@ export const Chat: React.FC<ChatProps> = ({
   };
 
   const handleLeaveCall = useCallback(async () => {
-    const leavingRoomId = callSnap?.roomId;
+    const leavingRoomId = callRoomIdRef.current;
     callCtrlRef.current?.dispose();
     callCtrlRef.current = null;
     setCallSnap(null);
+    setCallExpanded(false);
     if (leavingRoomId) {
       await leaveRoomCall(leavingRoomId).catch(() => undefined);
     }
-  }, [callSnap?.roomId]);
+  }, []);
+
+  // Keep in-call keyboard shortcuts (Cmd/Ctrl+Shift+M/O/E/H) working across room switches & Settings.
+  useEffect(() => {
+    if (!callSnap) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.repeat || !e.shiftKey || !(e.metaKey || e.ctrlKey) || e.altKey) return;
+      const key = e.key.toLowerCase();
+      if (key === 'm') {
+        e.preventDefault();
+        void callCtrlRef.current?.toggleAudio();
+      } else if (key === 'o') {
+        e.preventDefault();
+        void callCtrlRef.current?.toggleVideo();
+      } else if (key === 'e') {
+        e.preventDefault();
+        void callCtrlRef.current?.toggleScreenShare();
+      } else if (key === 'h') {
+        e.preventDefault();
+        void handleLeaveCall();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [Boolean(callSnap), handleLeaveCall]);
+
+  // Publish active call summary so App.tsx can display a persistent return-to-call bar in Settings/Admin.
+  useEffect(() => {
+    const notify = onActiveCallChangeRef.current;
+    if (!notify) return;
+    if (!callSnap) {
+      notify(null);
+      return;
+    }
+    const callRoomName = roomsRef.current.find((r) => r.id === callSnap.roomId)?.name || 'call';
+    notify({
+      roomId: callSnap.roomId,
+      roomName: callRoomName,
+      participantCount: callSnap.tiles.length,
+      audio: callSnap.audio,
+      onToggleAudio: () => {
+        void callCtrlRef.current?.toggleAudio();
+      },
+      onReturn: () => {
+        setActiveRoomId(callSnap.roomId);
+        requestAnimationFrame(() => callStageRef.current?.focus());
+      },
+      onLeave: () => {
+        void handleLeaveCall();
+      },
+    });
+  }, [callSnap, handleLeaveCall]);
 
   const handleJoinCall = async (roomId: string, withVideo: boolean) => {
     const me = currentUserRef.current;
@@ -861,7 +1207,6 @@ export const Chat: React.FC<ChatProps> = ({
     setJoiningCall(true);
     setBannerError('');
     try {
-      // Leave any existing call in another room first.
       if (callSnap && callSnap.roomId !== roomId) {
         await handleLeaveCall();
       }
@@ -895,6 +1240,7 @@ export const Chat: React.FC<ChatProps> = ({
   };
 
   const handleDecideLobby = async (roomId: string, guestId: string, admit: boolean) => {
+    setLobbyBusy(true);
     try {
       await decideRoomLobby(roomId, guestId, admit);
       setLobbyByRoom((prev) => ({
@@ -903,10 +1249,28 @@ export const Chat: React.FC<ChatProps> = ({
       }));
     } catch (e) {
       setBannerError(e instanceof Error ? e.message : 'Could not update waiting room');
+    } finally {
+      setLobbyBusy(false);
+    }
+  };
+
+  const handleAdmitAllLobby = async (roomId: string) => {
+    const guests = lobbyByRoom[roomId] ?? [];
+    if (guests.length === 0) return;
+    setLobbyBusy(true);
+    try {
+      await Promise.all(guests.map((g) => decideRoomLobby(roomId, g.guest_id, true)));
+      setLobbyByRoom((prev) => ({ ...prev, [roomId]: [] }));
+    } catch (e) {
+      setBannerError(e instanceof Error ? e.message : 'Could not admit waiting guests');
+    } finally {
+      setLobbyBusy(false);
     }
   };
 
   const handleStartInstantMeeting = async () => {
+    if (creatingMeeting) return;
+    setCreatingMeeting(true);
     setBannerError('');
     try {
       const stamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -917,6 +1281,8 @@ export const Chat: React.FC<ChatProps> = ({
       setGuestLinkBanner({ roomId: created.room.id, url: fullUrl, copied: false });
     } catch (e) {
       setBannerError(e instanceof Error ? e.message : 'Could not create meeting');
+    } finally {
+      setCreatingMeeting(false);
     }
   };
 
@@ -935,6 +1301,15 @@ export const Chat: React.FC<ChatProps> = ({
     nearBottomRef.current = near;
     if (near) {
       setShowJumpLatest(false);
+      setMissedCount(0);
+      if (activeRoomId) {
+        for (let i = activeMessages.length - 1; i >= 0; i--) {
+          if (activeMessages[i].delivery.kind === 'synced') {
+            void syncReadCursor(activeRoomId, activeMessages[i].seq);
+            break;
+          }
+        }
+      }
     }
   };
 
@@ -953,27 +1328,39 @@ export const Chat: React.FC<ChatProps> = ({
     [activeMessages],
   );
 
+  const firstUnreadMsgId = useMemo(() => {
+    if (!unreadDividerSeq) return null;
+    const found = activeMessages.find((m) => m.delivery.kind === 'synced' && m.seq > unreadDividerSeq);
+    return found ? found.id : null;
+  }, [activeMessages, unreadDividerSeq]);
+
   const canModerateActiveRoom =
     currentUser?.role === 'admin' || activeRoom?.role === 'owner' || activeRoom?.role === 'admin';
   const activeRoomCall = activeRoomId ? activeCalls[activeRoomId] : undefined;
+  const livePeerCount = activeRoomCall && !activeRoomCall.ended ? activeRoomCall.peers.length : 0;
   const inActiveRoomCall = Boolean(callSnap && activeRoomId && callSnap.roomId === activeRoomId);
   const inOtherRoomCall = Boolean(callSnap && activeRoomId && callSnap.roomId !== activeRoomId);
   const otherCallRoomName = callSnap
     ? rooms.find((r) => r.id === callSnap.roomId)?.name || 'call'
     : '';
   const activeRoomLobby = activeRoomId ? lobbyByRoom[activeRoomId] ?? [] : [];
+  const otherLobbyCount = activeRoomLobby.length - 1;
 
   if (loading) {
     return (
-      <div className="chat-empty-stage" style={{ height: '100vh' }}>
-        <p>Connecting to {tenantName}…</p>
+      <div className="chat-empty-stage" style={{ height: '100dvh' }} role="status">
+        <img src="/app-icon.png" width={36} height={36} alt="" />
+        <p style={{ display: 'inline-flex', alignItems: 'center', gap: '0.45rem' }}>
+          <Loader2 size={15} className="ky-spin" aria-hidden="true" />
+          <span>Connecting to {tenantName}…</span>
+        </p>
       </div>
     );
   }
 
   if (loadError) {
     return (
-      <div className="chat-empty-stage" style={{ height: '100vh' }}>
+      <div className="chat-empty-stage" style={{ height: '100dvh' }}>
         <h2>Could not load chat</h2>
         <p role="alert">{loadError}</p>
         <button type="button" onClick={() => window.location.reload()}>
@@ -985,15 +1372,37 @@ export const Chat: React.FC<ChatProps> = ({
 
   return (
     <div className={drawerOpen && activeRoom ? 'chat-workspace has-drawer' : 'chat-workspace'}>
+      {/* Persistent remote audio layer so calls stay audible across room switches and Settings */}
+      {callSnap && <CallAudioLayer tiles={callSnap.tiles} />}
+
+      {/* Single polite live region for incoming active-room messages */}
+      <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+        {srAnnouncement}
+      </div>
+
+      {/* Dismissible scrim for narrow-viewport rail and room drawer overlays */}
+      {(mobileRailOpen || (drawerOpen && activeRoom)) && (
+        <div
+          className={`chat-scrim${mobileRailOpen ? ' is-rail' : ''}${drawerOpen ? ' is-drawer' : ''}`}
+          aria-hidden="true"
+          onClick={() => {
+            setMobileRailOpen(false);
+            setDrawerOpen(false);
+          }}
+        />
+      )}
+
       <ChatSidebar
         appName={appName}
         tenantName={tenantName}
         rooms={rooms}
         activeRoomId={activeRoomId}
         activeCalls={activeCalls}
+        lobbyByRoom={lobbyByRoom}
         wsStatus={wsStatus}
         mobileOpen={mobileRailOpen}
         user={user}
+        creatingMeeting={creatingMeeting}
         onCloseMobile={() => setMobileRailOpen(false)}
         onSelectRoom={(id) => setActiveRoomId(id)}
         onOpenNewChannel={() => setModal('new-channel')}
@@ -1037,25 +1446,34 @@ export const Chat: React.FC<ChatProps> = ({
                   <>
                     <button
                       type="button"
-                      className="ky-header-call-btn"
-                      title="Start or join audio call (P2P-first)"
-                      aria-label="Audio call"
+                      className={`ky-header-call-btn${livePeerCount > 0 ? ' is-joining' : ''}`}
+                      title={
+                        livePeerCount > 0
+                          ? `Join active call with audio (${livePeerCount} in call)`
+                          : 'Start audio call'
+                      }
+                      aria-label={livePeerCount > 0 ? `Join audio call (${livePeerCount} in call)` : 'Audio call'}
                       disabled={joiningCall}
                       onClick={() => void handleJoinCall(activeRoom.id, false)}
                     >
-                      <Phone size={15} />
-                      <span>Call</span>
+                      <Phone size={15} aria-hidden="true" />
+                      <span className="ky-header-btn-label">{livePeerCount > 0 ? 'Join' : 'Call'}</span>
                     </button>
                     <button
                       type="button"
-                      className="ky-header-call-btn is-primary"
-                      title="Start or join video call (P2P-first)"
-                      aria-label="Video call"
+                      className={`ky-header-call-btn is-primary${livePeerCount > 0 ? ' is-live-call' : ''}`}
+                      title={
+                        livePeerCount > 0
+                          ? `Join active video call (${livePeerCount} in call)`
+                          : 'Start video call'
+                      }
+                      aria-label={livePeerCount > 0 ? `Join video call (${livePeerCount} in call)` : 'Video call'}
                       disabled={joiningCall}
                       onClick={() => void handleJoinCall(activeRoom.id, true)}
                     >
-                      <Video size={15} />
-                      <span>Video</span>
+                      {livePeerCount > 0 && <span className="ky-live-dot" aria-hidden="true" />}
+                      <Video size={15} aria-hidden="true" />
+                      <span className="ky-header-btn-label">{livePeerCount > 0 ? `Join (${livePeerCount})` : 'Video'}</span>
                     </button>
                   </>
                 )}
@@ -1064,16 +1482,17 @@ export const Chat: React.FC<ChatProps> = ({
                     type="button"
                     className="ky-header-call-btn is-danger"
                     title="Leave active call"
+                    aria-label="Leave active call"
                     onClick={() => void handleLeaveCall()}
                   >
-                    <PhoneOff size={15} />
-                    <span>Leave</span>
+                    <PhoneOff size={15} aria-hidden="true" />
+                    <span className="ky-header-btn-label">Leave</span>
                   </button>
                 )}
                 <button
                   type="button"
                   className="chat-icon-btn"
-                  title="Search messages (Cmd/Ctrl+K)"
+                  title={`Search messages (${SEARCH_HINT})`}
                   aria-label="Search messages"
                   onClick={() => setModal('search')}
                 >
@@ -1091,11 +1510,15 @@ export const Chat: React.FC<ChatProps> = ({
                     if (next) void refreshRoomDetail(activeRoom.id);
                   }}
                 >
-                  {drawerOpen ? <PanelRightClose size={16} aria-hidden="true" /> : <PanelRightOpen size={16} aria-hidden="true" />}
-                  <span>
-                    {drawerOpen ? 'Hide' : 'Details'}
-                    {activeRoomLobby.length > 0 ? ` (${activeRoomLobby.length})` : ''}
-                  </span>
+                  {drawerOpen ? (
+                    <PanelRightClose size={16} aria-hidden="true" />
+                  ) : (
+                    <PanelRightOpen size={16} aria-hidden="true" />
+                  )}
+                  <span className="chat-header-panel-label">{drawerOpen ? 'Hide' : 'Details'}</span>
+                  {activeRoomLobby.length > 0 && (
+                    <span className="chat-lobby-pill">{activeRoomLobby.length}</span>
+                  )}
                 </button>
               </div>
             </header>
@@ -1115,15 +1538,29 @@ export const Chat: React.FC<ChatProps> = ({
             )}
 
             {inOtherRoomCall && callSnap && (
-              <div className="ky-call-mini-bar" role="status">
+              <div className="ky-call-mini-bar" role="region" aria-label="Active call controls">
                 <span>
-                  In {callSnap.mode === 'p2p_mesh' ? 'P2P' : 'SFU'} call in <strong>{otherCallRoomName}</strong> ({callSnap.tiles.length})
+                  In call in <strong>{otherCallRoomName}</strong> ({callSnap.tiles.length})
                 </span>
                 <div className="ky-call-mini-actions">
                   <button
                     type="button"
+                    className={`ky-lobby-btn ${callSnap.audio ? 'is-neutral' : 'is-deny'}`}
+                    aria-pressed={callSnap.audio}
+                    aria-label="Microphone"
+                    title={callSnap.audio ? 'Mute microphone' : 'Unmute microphone'}
+                    onClick={() => void callCtrlRef.current?.toggleAudio()}
+                  >
+                    {callSnap.audio ? <Mic size={12} aria-hidden="true" /> : <MicOff size={12} aria-hidden="true" />}
+                    <span>{callSnap.audio ? 'Mic' : 'Muted'}</span>
+                  </button>
+                  <button
+                    type="button"
                     className="ky-lobby-btn is-admit"
-                    onClick={() => setActiveRoomId(callSnap.roomId)}
+                    onClick={() => {
+                      setActiveRoomId(callSnap.roomId);
+                      requestAnimationFrame(() => callStageRef.current?.focus());
+                    }}
                   >
                     Return to call
                   </button>
@@ -1140,7 +1577,7 @@ export const Chat: React.FC<ChatProps> = ({
 
             {guestLinkBanner && guestLinkBanner.roomId === activeRoom.id && (
               <div className="ky-guest-banner" role="status">
-                <span>
+                <span className="ky-guest-banner-copy">
                   Guest waiting-room link ready: <code>{guestLinkBanner.url}</code>
                 </span>
                 <div className="ky-call-mini-actions">
@@ -1148,9 +1585,12 @@ export const Chat: React.FC<ChatProps> = ({
                     type="button"
                     className="ky-lobby-btn is-admit"
                     onClick={() => {
-                      void navigator.clipboard.writeText(guestLinkBanner.url).then(() => {
-                        setGuestLinkBanner((b) => (b ? { ...b, copied: true } : b));
-                      }).catch(() => undefined);
+                      void navigator.clipboard
+                        .writeText(guestLinkBanner.url)
+                        .then(() => {
+                          setGuestLinkBanner((b) => (b ? { ...b, copied: true } : b));
+                        })
+                        .catch(() => undefined);
                     }}
                   >
                     {guestLinkBanner.copied ? <Check size={12} /> : <Copy size={12} />}
@@ -1172,12 +1612,16 @@ export const Chat: React.FC<ChatProps> = ({
               <div className="ky-lobby-banner" role="status">
                 <span>
                   <strong>{activeRoomLobby[0].display_name}</strong>
-                  {activeRoomLobby.length > 1 ? ` and ${activeRoomLobby.length - 1} other` : ''} waiting to join
+                  {otherLobbyCount > 0
+                    ? ` and ${otherLobbyCount} ${otherLobbyCount === 1 ? 'other' : 'others'}`
+                    : ''}{' '}
+                  waiting to join
                 </span>
                 <div className="ky-call-mini-actions">
                   <button
                     type="button"
                     className="ky-lobby-btn is-admit"
+                    disabled={lobbyBusy}
                     onClick={() => void handleDecideLobby(activeRoom.id, activeRoomLobby[0].guest_id, true)}
                   >
                     Admit
@@ -1185,46 +1629,47 @@ export const Chat: React.FC<ChatProps> = ({
                   <button
                     type="button"
                     className="ky-lobby-btn is-deny"
+                    disabled={lobbyBusy}
                     onClick={() => void handleDecideLobby(activeRoom.id, activeRoomLobby[0].guest_id, false)}
                   >
                     Deny
                   </button>
-                </div>
-              </div>
-            )}
-
-            {!inActiveRoomCall && activeRoomCall && !activeRoomCall.ended && activeRoomCall.peers.length > 0 && (
-              <div className="ky-active-call-banner" role="status">
-                <span>
-                  <strong>Call in progress</strong> · {activeRoomCall.peers.length}{' '}
-                  {activeRoomCall.peers.length === 1 ? 'person' : 'people'} ·{' '}
-                  {activeRoomCall.mode === 'p2p_mesh' ? 'P2P Direct' : 'LiveKit SFU'}
-                </span>
-                <div className="ky-call-mini-actions">
-                  <button
-                    type="button"
-                    className="ky-lobby-btn is-admit"
-                    disabled={joiningCall}
-                    onClick={() => void handleJoinCall(activeRoom.id, false)}
-                  >
-                    Join Audio
-                  </button>
-                  <button
-                    type="button"
-                    className="ky-lobby-btn is-admit"
-                    disabled={joiningCall}
-                    onClick={() => void handleJoinCall(activeRoom.id, true)}
-                  >
-                    Join Video
-                  </button>
+                  {activeRoomLobby.length > 1 && (
+                    <>
+                      <button
+                        type="button"
+                        className="ky-lobby-btn is-admit"
+                        disabled={lobbyBusy}
+                        onClick={() => void handleAdmitAllLobby(activeRoom.id)}
+                      >
+                        Admit all
+                      </button>
+                      <button
+                        type="button"
+                        className="ky-lobby-btn is-neutral"
+                        onClick={() => {
+                          setDrawerOpen(true);
+                          setRequestedDrawerTab({ tab: 'about', seq: Date.now() });
+                          void refreshRoomDetail(activeRoom.id);
+                        }}
+                      >
+                        Review
+                      </button>
+                    </>
+                  )}
                 </div>
               </div>
             )}
 
             {inActiveRoomCall && callSnap && (
               <CallStage
+                stageRef={callStageRef}
                 snapshot={callSnap}
                 sfuAvailable={sfuAvailable}
+                externalAudio
+                expanded={callExpanded}
+                onExpandedChange={setCallExpanded}
+                bindShortcuts={false}
                 onToggleAudio={() => void callCtrlRef.current?.toggleAudio()}
                 onToggleVideo={() => void callCtrlRef.current?.toggleVideo()}
                 onToggleScreenShare={() => void callCtrlRef.current?.toggleScreenShare()}
@@ -1244,9 +1689,6 @@ export const Chat: React.FC<ChatProps> = ({
                 ref={timelineRef}
                 className="chat-timeline chat-scroll"
                 onScroll={handleTimelineScroll}
-                role="log"
-                aria-live="polite"
-                aria-relevant="additions"
               >
                 {activeBucket?.hasMore && (
                   <button
@@ -1268,7 +1710,9 @@ export const Chat: React.FC<ChatProps> = ({
                     <h2>
                       {activeRoom.kind === 'dm'
                         ? `Start a conversation with ${activeRoom.name || 'your teammate'}`
-                        : `Welcome to #${activeRoom.name}`}
+                        : activeRoom.kind === 'meeting'
+                          ? activeRoom.name || 'Meeting room'
+                          : `Welcome to #${activeRoom.name}`}
                     </h2>
                     <p>
                       {activeRoom.topic ||
@@ -1279,12 +1723,18 @@ export const Chat: React.FC<ChatProps> = ({
                   activeMessages.map((msg, idx) => {
                     const prev = idx > 0 ? activeMessages[idx - 1] : undefined;
                     const showDivider = !prev || !sameCalendarDay(prev.created_at, msg.created_at);
-                    const grouped = !showDivider && isGroupedWithPrevious(prev, msg);
+                    const showUnreadDivider = firstUnreadMsgId === msg.id;
+                    const grouped = !showDivider && !showUnreadDivider && isGroupedWithPrevious(prev, msg);
                     return (
                       <React.Fragment key={msg.id}>
                         {showDivider && (
                           <div className="chat-day-divider">
                             <span>{formatDayDivider(msg.created_at)}</span>
+                          </div>
+                        )}
+                        {showUnreadDivider && (
+                          <div className="chat-unread-divider" role="separator" aria-label="New messages">
+                            <span>New messages</span>
                           </div>
                         )}
                         <MessageRow
@@ -1293,9 +1743,16 @@ export const Chat: React.FC<ChatProps> = ({
                           currentUserId={currentUser?.id ?? ''}
                           canModerate={Boolean(canModerateActiveRoom)}
                           replyTarget={msg.reply_to_id ? messageById.get(msg.reply_to_id) : undefined}
+                          highlighted={highlightedSeq === msg.seq}
+                          editTrigger={editTrigger?.messageId === msg.id ? editTrigger.seq : 0}
+                          onEditTriggerConsumed={() => setEditTrigger(null)}
+                          onEditEnd={() => composerRef.current?.focus()}
                           onReply={(target) => {
-                            setReplyTo(target);
+                            setActiveReplyTo(target);
                             composerRef.current?.focus();
+                          }}
+                          onJumpToMessage={(seq) => {
+                            void jumpToMessageSeq(activeRoom.id, seq);
                           }}
                           onToggleReaction={handleToggleReaction}
                           onEdit={handleEditMessage}
@@ -1332,10 +1789,23 @@ export const Chat: React.FC<ChatProps> = ({
                 )}
               </div>
 
-              {showJumpLatest && (
-                <button type="button" className="chat-jump-btn" onClick={scrollToBottom}>
-                  <ChevronDown size={14} />
-                  Jump to latest
+              {(showJumpLatest || activeBucket?.hasGapAfter) && (
+                <button
+                  type="button"
+                  className="chat-jump-btn"
+                  onClick={() => {
+                    setUnreadDividerSeq(null);
+                    if (activeBucket?.hasGapAfter) {
+                      void loadRoomHistory(activeRoom.id, false);
+                    } else {
+                      scrollToBottom();
+                    }
+                  }}
+                >
+                  <ChevronDown size={14} aria-hidden="true" />
+                  <span>
+                    {missedCount > 0 ? `Jump to latest (${missedCount} new)` : 'Jump to latest'}
+                  </span>
                 </button>
               )}
             </div>
@@ -1355,7 +1825,7 @@ export const Chat: React.FC<ChatProps> = ({
                   <button
                     type="button"
                     className="chat-icon-btn"
-                    onClick={() => setReplyTo(null)}
+                    onClick={() => setActiveReplyTo(null)}
                     aria-label="Cancel reply"
                   >
                     <X size={14} />
@@ -1376,12 +1846,14 @@ export const Chat: React.FC<ChatProps> = ({
                       ? 'Room is closed'
                       : activeRoom.kind === 'dm'
                         ? `Message ${activeRoom.name || 'teammate'}`
-                        : `Message #${activeRoom.name}`
+                        : activeRoom.kind === 'meeting'
+                          ? `Message ${activeRoom.name || 'meeting'}`
+                          : `Message #${activeRoom.name}`
                   }
                   aria-label="Message input"
                   value={draft}
                   onChange={(e) => {
-                    setDraft(e.target.value);
+                    setActiveDraft(e.target.value);
                     e.target.style.height = 'auto';
                     e.target.style.height = `${Math.min(e.target.scrollHeight, 144)}px`;
                     if (activeRoomId && e.target.value.trim()) {
@@ -1389,9 +1861,19 @@ export const Chat: React.FC<ChatProps> = ({
                     }
                   }}
                   onKeyDown={(e) => {
+                    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
                     if (e.key === 'Enter' && !e.shiftKey) {
                       e.preventDefault();
                       handleComposerSubmit(e);
+                    } else if (e.key === 'ArrowUp' && !draft && currentUser) {
+                      for (let i = activeMessages.length - 1; i >= 0; i--) {
+                        const m = activeMessages[i];
+                        if (m.delivery.kind === 'synced' && !m.deleted_at && m.sender_id === currentUser.id) {
+                          e.preventDefault();
+                          setEditTrigger({ messageId: m.id, seq: Date.now() });
+                          break;
+                        }
+                      }
                     }
                   }}
                 />
@@ -1401,8 +1883,8 @@ export const Chat: React.FC<ChatProps> = ({
                   disabled={Boolean(activeRoom.closed_at) || !draft.trim()}
                   aria-label="Send message"
                 >
-                  <Send size={15} />
-                  Send
+                  <Send size={15} aria-hidden="true" />
+                  <span>Send</span>
                 </button>
               </form>
 
@@ -1439,10 +1921,7 @@ export const Chat: React.FC<ChatProps> = ({
             <div className="chat-empty-stage">
               <MessageSquarePlus size={36} style={{ color: 'var(--accent)' }} aria-hidden="true" />
               <h2>Start your workspace chat</h2>
-              <p>
-                Create your first channel or start a direct message. Messages stream live over a single
-                WebSocket backed directly by your database.
-              </p>
+              <p>Create a channel for your team or start a direct message to get talking.</p>
               <div className="chat-empty-actions">
                 <button type="button" disabled={creatingGeneral} onClick={() => void handleQuickGeneral()}>
                   <Hash size={15} />
@@ -1469,11 +1948,13 @@ export const Chat: React.FC<ChatProps> = ({
           directory={directory}
           messages={activeMessages}
           lobbyGuests={activeRoomLobby}
+          requestedTab={requestedDrawerTab}
           onClose={() => setDrawerOpen(false)}
           onRefresh={async () => {
             await Promise.all([refreshRoomDetail(activeRoom.id), refreshRoomsList()]);
           }}
           onDecideLobby={(guestId, admit) => handleDecideLobby(activeRoom.id, guestId, admit)}
+          onAdmitAllLobby={() => handleAdmitAllLobby(activeRoom.id)}
           onCreateGuestLink={() => handleCreateGuestLink(activeRoom.id)}
           onLeftRoom={(leftId) => {
             setDrawerOpen(false);
@@ -1512,7 +1993,14 @@ export const Chat: React.FC<ChatProps> = ({
           rooms={rooms}
           activeRoomId={activeRoomId}
           onClose={() => setModal('none')}
-          onSelectHit={(roomId) => setActiveRoomId(roomId)}
+          onSelectHit={(roomId, seq) => {
+            if (roomId === activeRoomId && seq) {
+              void jumpToMessageSeq(roomId, seq);
+            } else {
+              setActiveRoomId(roomId);
+              if (seq) setPendingJump({ roomId, seq });
+            }
+          }}
         />
       )}
     </div>

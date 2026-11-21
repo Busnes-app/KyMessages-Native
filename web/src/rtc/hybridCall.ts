@@ -31,6 +31,8 @@ export interface HybridCallSnapshot {
   video: boolean;
   screenShare: boolean;
   protectIp: boolean;
+  protectIpPending?: boolean;
+  startedAt?: number;
   notice: string;
   tiles: CallParticipantTile[];
 }
@@ -41,6 +43,11 @@ type LiveKitRemoteParticipant = import('livekit-client').RemoteParticipant;
 interface PeerConnEntry {
   pc: RTCPeerConnection;
   remoteStream: MediaStream;
+  remoteScreenStream: MediaStream;
+  cameraStreamId: string | null;
+  cameraSender: RTCRtpSender | null;
+  audioSender: RTCRtpSender | null;
+  screenSender: RTCRtpSender | null;
   pendingCandidates: RTCIceCandidateInit[];
   disconnectTimer: ReturnType<typeof setTimeout> | null;
 }
@@ -53,6 +60,12 @@ export interface HybridCallControllerOptions {
   onChange: (snapshot: HybridCallSnapshot) => void;
 }
 
+const PROTECT_IP_TIMEOUT_MS = 10_000;
+
+function peerKey(peer: CallPeer): string {
+  return peer.peer_id || peer.user_id;
+}
+
 /**
  * Manages a single room's hybrid P2P-first WebRTC call with seamless mid-call
  * make-before-break escalation to LiveKit SFU (lazy-loaded on demand) and
@@ -61,16 +74,20 @@ export interface HybridCallControllerOptions {
 export class HybridCallController {
   private callId = '';
   private roomId = '';
+  private myPeerId = '';
   private mode: CallMode = 'p2p_mesh';
   private sfuSticky = false;
   private migrating = false;
   private migrationReason = '';
   private notice = '';
+  private startedAt = Date.now();
 
   private audioEnabled = true;
   private videoEnabled = false;
   private screenShareEnabled = false;
   private protectIp = false;
+  private protectIpPending = false;
+  private protectIpTimer: ReturnType<typeof setTimeout> | null = null;
 
   private iceServers: RTCIceServer[] = [];
   private peersMeta = new Map<string, CallPeer>();
@@ -80,11 +97,24 @@ export class HybridCallController {
   private screenStream: MediaStream | null = null;
 
   private livekitRoom: LiveKitRoom | null = null;
-  private livekitStreams = new Map<string, { cam: MediaStream | null; screen: MediaStream | null }>();
+  private livekitStreams = new Map<string, { cam: MediaStream; screen: MediaStream }>();
 
   private disposed = false;
 
-  constructor(private readonly opts: HybridCallControllerOptions) {}
+  constructor(private readonly opts: HybridCallControllerOptions) {
+    this.myPeerId = opts.localUserId;
+  }
+
+  private isSelfPeer(peer: CallPeer): boolean {
+    return peerKey(peer) === this.myPeerId || peer.user_id === this.opts.localUserId;
+  }
+
+  private clearProtectIpTimer(): void {
+    if (this.protectIpTimer) {
+      clearTimeout(this.protectIpTimer);
+      this.protectIpTimer = null;
+    }
+  }
 
   async start(
     joinResp: CallJoinResponse,
@@ -92,15 +122,19 @@ export class HybridCallController {
   ): Promise<void> {
     this.callId = joinResp.call_id;
     this.roomId = joinResp.room_id;
+    this.myPeerId = joinResp.peer_id || this.opts.localUserId;
     this.mode = joinResp.mode;
     this.sfuSticky = joinResp.sfu_sticky;
     this.iceServers = joinResp.ice_servers;
     this.audioEnabled = initialMedia.audio;
     this.videoEnabled = initialMedia.video;
-    this.protectIp = initialMedia.protectIp;
+    this.protectIp = initialMedia.protectIp && joinResp.mode === 'sfu_livekit';
+    this.protectIpPending = initialMedia.protectIp && joinResp.mode !== 'sfu_livekit';
+    this.startedAt = Date.now();
 
     this.syncPeersMeta(joinResp.peers);
     await this.acquireLocalMedia(initialMedia.audio, initialMedia.video);
+    if (this.disposed) return;
     this.emit();
 
     if (joinResp.mode === 'sfu_livekit' && joinResp.livekit_url && joinResp.livekit_token) {
@@ -108,13 +142,14 @@ export class HybridCallController {
     } else {
       this.reconcileP2PPeers();
     }
+    if (this.disposed) return;
     this.emit();
   }
 
   /** Called whenever the server broadcasts a `call.state` event for this room. */
   handleCallState(state: CallState): void {
     if (this.disposed || state.room_id !== this.roomId) return;
-    if (state.ended) {
+    if (state.ended || state.active === false) {
       this.dispose();
       return;
     }
@@ -131,7 +166,8 @@ export class HybridCallController {
   /** Called when the server relays a P2P WebRTC offer/answer/ICE candidate. */
   async handleSignal(sig: CallSignalData): Promise<void> {
     if (this.disposed || this.mode !== 'p2p_mesh') return;
-    if (sig.call_id !== this.callId || sig.from === this.opts.localUserId) return;
+    if (sig.call_id !== this.callId) return;
+    if (sig.from === this.myPeerId || sig.from === this.opts.localUserId) return;
 
     const entry = this.ensurePeerConnection(sig.from);
     const { pc } = entry;
@@ -177,17 +213,30 @@ export class HybridCallController {
 
     if (mig.target_mode === 'sfu_livekit' && mig.livekit_url && mig.livekit_token) {
       if (this.mode === 'sfu_livekit' && this.livekitRoom) return;
+      this.clearProtectIpTimer();
       this.migrating = true;
       this.migrationReason = mig.reason ?? 'escalating';
       this.emit();
       try {
         // Make-before-break: connect SFU first, then close P2P connections.
         await this.connectLiveKit(mig.livekit_url, mig.livekit_token);
+        if (this.disposed) return;
         this.mode = 'sfu_livekit';
         this.closeAllPeerConnections();
-        this.opts.socket()?.sendCallMigrated(this.roomId, this.callId);
+        if (this.protectIpPending) {
+          this.protectIp = true;
+          this.protectIpPending = false;
+        }
+        this.notice = '';
+        this.opts.socket()?.sendCallMigrated(this.roomId, this.callId, mig.epoch);
       } catch (err) {
-        this.notice = err instanceof Error ? `SFU handoff failed: ${err.message}` : 'SFU handoff failed';
+        await this.disconnectLiveKit();
+        if (this.protectIpPending) {
+          this.protectIp = false;
+          this.protectIpPending = false;
+          this.sendMediaUpdate();
+        }
+        this.notice = err instanceof Error ? `Relay handoff failed: ${err.message}` : 'Relay handoff failed';
       } finally {
         this.migrating = false;
         this.migrationReason = '';
@@ -198,14 +247,21 @@ export class HybridCallController {
 
     if (mig.target_mode === 'p2p_mesh') {
       if (this.mode === 'p2p_mesh') return;
+      this.clearProtectIpTimer();
+      const wasProtectingIp = this.protectIp || this.protectIpPending;
       this.migrating = true;
       this.migrationReason = 'stepping_down_to_p2p';
       this.emit();
       try {
         this.mode = 'p2p_mesh';
+        this.protectIp = false;
+        this.protectIpPending = false;
+        if (wasProtectingIp) {
+          this.notice = 'Switched to direct connection — IP protection is off';
+        }
         this.reconcileP2PPeers();
         await this.disconnectLiveKit();
-        this.opts.socket()?.sendCallMigrated(this.roomId, this.callId);
+        this.opts.socket()?.sendCallMigrated(this.roomId, this.callId, mig.epoch);
       } finally {
         this.migrating = false;
         this.migrationReason = '';
@@ -217,17 +273,30 @@ export class HybridCallController {
   async toggleAudio(): Promise<void> {
     if (this.disposed) return;
     const next = !this.audioEnabled;
-    this.audioEnabled = next;
-    if (next && (!this.localStream || this.localStream.getAudioTracks().length === 0)) {
-      await this.acquireLocalMedia(true, this.videoEnabled);
-      await this.republishLocalTracks();
-    } else if (this.localStream) {
-      for (const track of this.localStream.getAudioTracks()) {
-        track.enabled = next;
+    if (next) {
+      const liveAudio = (this.localStream?.getAudioTracks() ?? []).filter((t) => t.readyState === 'live');
+      if (liveAudio.length === 0) {
+        const track = await this.enableAudioTrack();
+        if (this.disposed) return;
+        if (!track) {
+          this.emit();
+          return;
+        }
+        this.audioEnabled = true;
+        await this.publishLocalAudioTrack(track);
+      } else {
+        this.audioEnabled = true;
+        for (const track of liveAudio) {
+          track.enabled = true;
+        }
       }
-    }
-    if (this.livekitRoom) {
-      await this.livekitRoom.localParticipant.setMicrophoneEnabled(next).catch(() => undefined);
+    } else {
+      this.audioEnabled = false;
+      if (this.localStream) {
+        for (const track of this.localStream.getAudioTracks()) {
+          track.enabled = false;
+        }
+      }
     }
     this.sendMediaUpdate();
     this.emit();
@@ -237,25 +306,30 @@ export class HybridCallController {
     if (this.disposed) return;
     const next = !this.videoEnabled;
     if (next) {
-      const addedTrack = await this.enableCameraTrack();
-      if (!addedTrack) {
+      const track = await this.enableCameraTrack();
+      if (this.disposed) return;
+      if (!track) {
         this.emit();
         return;
       }
       this.videoEnabled = true;
-      await this.republishLocalTracks();
+      await this.publishLocalCameraTrack(track);
     } else {
       this.videoEnabled = false;
-      if (this.localStream) {
-        for (const track of this.localStream.getVideoTracks()) {
-          track.enabled = false;
-          track.stop();
-          this.localStream.removeTrack(track);
+      const oldTracks = this.localStream?.getVideoTracks() ?? [];
+      for (const track of oldTracks) {
+        if (this.livekitRoom) {
+          await this.livekitRoom.localParticipant.unpublishTrack(track).catch(() => undefined);
         }
+        for (const entry of this.peerConns.values()) {
+          if (entry.cameraSender && entry.cameraSender.track === track) {
+            await entry.cameraSender.replaceTrack(null).catch(() => undefined);
+          }
+        }
+        track.enabled = false;
+        track.stop();
+        this.localStream?.removeTrack(track);
       }
-    }
-    if (this.livekitRoom) {
-      await this.livekitRoom.localParticipant.setCameraEnabled(this.videoEnabled).catch(() => undefined);
     }
     this.sendMediaUpdate();
     this.emit();
@@ -274,21 +348,41 @@ export class HybridCallController {
     }
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+      if (this.disposed) {
+        for (const t of stream.getTracks()) t.stop();
+        return;
+      }
       const track = stream.getVideoTracks()[0];
       if (!track) return;
-      this.screenStream = stream;
-      this.screenShareEnabled = true;
-      track.onended = () => {
-        this.stopScreenShare();
-      };
       if (this.livekitRoom) {
-        await this.livekitRoom.localParticipant.publishTrack(track).catch(() => undefined);
+        const { Track } = await import('livekit-client');
+        if (this.disposed) {
+          for (const t of stream.getTracks()) t.stop();
+          return;
+        }
+        try {
+          await this.livekitRoom.localParticipant.publishTrack(track, {
+            source: Track.Source.ScreenShare,
+          });
+        } catch (err) {
+          for (const t of stream.getTracks()) t.stop();
+          this.notice =
+            err instanceof Error ? `Could not share screen: ${err.message}` : 'Could not share screen';
+          this.emit();
+          return;
+        }
       } else {
         for (const [peerId, entry] of this.peerConns) {
-          entry.pc.addTrack(track, stream);
+          entry.screenSender = entry.pc.addTrack(track, stream);
           void this.renegotiatePeer(peerId, entry);
         }
       }
+      this.screenStream = stream;
+      this.screenShareEnabled = true;
+      this.notice = '';
+      track.onended = () => {
+        this.stopScreenShare();
+      };
       this.sendMediaUpdate();
       this.emit();
     } catch {
@@ -303,35 +397,103 @@ export class HybridCallController {
       if (this.livekitRoom) {
         void this.livekitRoom.localParticipant.unpublishTrack(track).catch(() => undefined);
       }
-      for (const entry of this.peerConns.values()) {
-        for (const sender of entry.pc.getSenders()) {
-          if (sender.track === track) {
-            try {
-              entry.pc.removeTrack(sender);
-            } catch {
-              // Ignore.
+      for (const [peerId, entry] of this.peerConns) {
+        let removed = false;
+        if (entry.screenSender && entry.screenSender.track === track) {
+          try {
+            entry.pc.removeTrack(entry.screenSender);
+            removed = true;
+          } catch {
+            // Ignore.
+          }
+          entry.screenSender = null;
+        } else {
+          for (const sender of entry.pc.getSenders()) {
+            if (sender.track === track) {
+              try {
+                entry.pc.removeTrack(sender);
+                removed = true;
+              } catch {
+                // Ignore.
+              }
             }
           }
+        }
+        if (removed && !this.disposed) {
+          void this.renegotiatePeer(peerId, entry);
         }
       }
       track.stop();
     }
     this.screenStream = null;
     this.screenShareEnabled = false;
-    this.sendMediaUpdate();
-    this.emit();
+    if (!this.disposed) {
+      this.sendMediaUpdate();
+      this.emit();
+    }
   }
 
   setProtectIp(protect: boolean): void {
-    if (this.disposed || this.protectIp === protect) return;
-    this.protectIp = protect;
-    this.sendMediaUpdate();
+    if (this.disposed) return;
+    if (protect && (this.protectIp || this.protectIpPending)) return;
+    if (!protect && !this.protectIp && !this.protectIpPending) return;
+
+    const sock = this.opts.socket();
+    if (!sock || !sock.isOpen()) {
+      this.notice = 'Reconnect to change relay privacy mode';
+      this.emit();
+      return;
+    }
+
+    this.clearProtectIpTimer();
+
+    if (protect) {
+      const alreadySfu = this.mode === 'sfu_livekit';
+      if (alreadySfu) {
+        this.protectIp = true;
+        this.protectIpPending = false;
+      } else {
+        // Stay pending until the SFU relay actually connects and P2P connections close.
+        this.protectIpPending = true;
+      }
+      const sent = sock.sendCallMedia(this.roomId, this.callId, {
+        audio: this.audioEnabled,
+        video: this.videoEnabled,
+        screenShare: this.screenShareEnabled,
+        protectIp: true,
+      });
+      if (!sent) {
+        this.protectIp = false;
+        this.protectIpPending = false;
+        this.notice = 'Could not request relay switch while offline';
+      } else if (!alreadySfu) {
+        this.protectIpTimer = setTimeout(() => {
+          this.protectIpTimer = null;
+          if (this.disposed || !this.protectIpPending) return;
+          this.protectIpPending = false;
+          this.protectIp = false;
+          this.notice = 'Relay switch timed out — still using direct connection';
+          this.sendMediaUpdate();
+          this.emit();
+        }, PROTECT_IP_TIMEOUT_MS);
+      }
+    } else {
+      this.protectIp = false;
+      this.protectIpPending = false;
+      sock.sendCallMedia(this.roomId, this.callId, {
+        audio: this.audioEnabled,
+        video: this.videoEnabled,
+        screenShare: this.screenShareEnabled,
+        protectIp: false,
+      });
+    }
     this.emit();
   }
 
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.clearProtectIpTimer();
     this.stopScreenShare();
     this.closeAllPeerConnections();
     void this.disconnectLiveKit();
@@ -344,7 +506,7 @@ export class HybridCallController {
   }
 
   // -------------------------------------------------------------------
-  // Media acquisition
+  // Media acquisition & track publication
   // -------------------------------------------------------------------
 
   private async acquireLocalMedia(wantAudio: boolean, wantVideo: boolean): Promise<void> {
@@ -360,13 +522,22 @@ export class HybridCallController {
         audio: wantAudio,
         video: wantVideo ? { width: { ideal: 1280 }, height: { ideal: 720 } } : false,
       });
+      if (this.disposed) {
+        for (const t of stream.getTracks()) t.stop();
+        return;
+      }
       this.localStream = stream;
       this.notice = '';
     } catch {
-      // Fallback: if video+audio failed, try audio-only; otherwise listen-only.
+      if (this.disposed) return;
       if (wantVideo && wantAudio) {
         try {
-          this.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+          const audioStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+          if (this.disposed) {
+            for (const t of audioStream.getTracks()) t.stop();
+            return;
+          }
+          this.localStream = audioStream;
           this.videoEnabled = false;
           this.notice = 'Camera unavailable — joined with audio only';
           return;
@@ -380,43 +551,95 @@ export class HybridCallController {
     }
   }
 
-  private async enableCameraTrack(): Promise<boolean> {
+  private async enableAudioTrack(): Promise<MediaStreamTrack | null> {
+    if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
+      this.notice = 'Microphone is not available in this browser';
+      return null;
+    }
+    try {
+      const micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      if (this.disposed) {
+        for (const t of micStream.getTracks()) t.stop();
+        return null;
+      }
+      const track = micStream.getAudioTracks()[0];
+      if (!track) return null;
+      if (!this.localStream) {
+        this.localStream = new MediaStream();
+      }
+      this.localStream.addTrack(track);
+      this.notice = '';
+      return track;
+    } catch {
+      this.notice = 'Could not access microphone';
+      return null;
+    }
+  }
+
+  private async enableCameraTrack(): Promise<MediaStreamTrack | null> {
     if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
       this.notice = 'Camera is not available in this browser';
-      return false;
+      return null;
     }
     try {
       const camStream = await navigator.mediaDevices.getUserMedia({
         video: { width: { ideal: 1280 }, height: { ideal: 720 } },
         audio: false,
       });
+      if (this.disposed) {
+        for (const t of camStream.getTracks()) t.stop();
+        return null;
+      }
       const track = camStream.getVideoTracks()[0];
-      if (!track) return false;
+      if (!track) return null;
       if (!this.localStream) {
         this.localStream = new MediaStream();
       }
       this.localStream.addTrack(track);
       this.notice = '';
-      return true;
+      return track;
     } catch {
       this.notice = 'Could not access camera';
-      return false;
+      return null;
     }
   }
 
-  private async republishLocalTracks(): Promise<void> {
-    if (!this.localStream) return;
-    if (this.mode === 'p2p_mesh') {
+  private async publishLocalAudioTrack(track: MediaStreamTrack): Promise<void> {
+    if (this.livekitRoom) {
+      const { Track } = await import('livekit-client');
+      if (this.disposed || !this.livekitRoom) return;
+      await this.livekitRoom.localParticipant
+        .publishTrack(track, { source: Track.Source.Microphone })
+        .catch(() => undefined);
+      return;
+    }
+    if (this.mode === 'p2p_mesh' && this.localStream) {
       for (const [peerId, entry] of this.peerConns) {
-        const existingTracks = new Set(entry.pc.getSenders().map((s) => s.track));
-        let changed = false;
-        for (const track of this.localStream.getTracks()) {
-          if (!existingTracks.has(track)) {
-            entry.pc.addTrack(track, this.localStream);
-            changed = true;
-          }
+        if (entry.audioSender) {
+          await entry.audioSender.replaceTrack(track).catch(() => undefined);
+        } else {
+          entry.audioSender = entry.pc.addTrack(track, this.localStream);
+          await this.renegotiatePeer(peerId, entry);
         }
-        if (changed) {
+      }
+    }
+  }
+
+  private async publishLocalCameraTrack(track: MediaStreamTrack): Promise<void> {
+    if (this.livekitRoom) {
+      const { Track } = await import('livekit-client');
+      if (this.disposed || !this.livekitRoom) return;
+      await this.livekitRoom.localParticipant
+        .publishTrack(track, { source: Track.Source.Camera })
+        .catch(() => undefined);
+      return;
+    }
+    if (this.mode === 'p2p_mesh' && this.localStream) {
+      for (const [peerId, entry] of this.peerConns) {
+        if (entry.cameraSender) {
+          await entry.cameraSender.replaceTrack(track).catch(() => undefined);
+        } else {
+          entry.cameraSender = entry.pc.addTrack(track, this.localStream);
           await this.renegotiatePeer(peerId, entry);
         }
       }
@@ -430,18 +653,19 @@ export class HybridCallController {
   private reconcileP2PPeers(): void {
     const activeIds = new Set<string>();
     for (const peer of this.peersMeta.values()) {
-      if (peer.user_id === this.opts.localUserId) continue;
-      activeIds.add(peer.user_id);
-      const existed = this.peerConns.has(peer.user_id);
-      const entry = this.ensurePeerConnection(peer.user_id);
+      if (this.isSelfPeer(peer)) continue;
+      const pid = peerKey(peer);
+      activeIds.add(pid);
+      const existed = this.peerConns.has(pid);
+      const entry = this.ensurePeerConnection(pid);
       // Deterministic impolite peer initiates the WebRTC offer to avoid glare.
-      if (!existed && this.opts.localUserId < peer.user_id) {
-        void this.renegotiatePeer(peer.user_id, entry);
+      if (!existed && this.myPeerId < pid) {
+        void this.renegotiatePeer(pid, entry);
       }
     }
-    for (const [peerId, entry] of this.peerConns) {
-      if (!activeIds.has(peerId)) {
-        this.closePeerEntry(peerId, entry);
+    for (const [pid, entry] of this.peerConns) {
+      if (!activeIds.has(pid)) {
+        this.closePeerEntry(pid, entry);
       }
     }
   }
@@ -454,9 +678,15 @@ export class HybridCallController {
       iceServers: this.iceServers.length > 0 ? this.iceServers : [{ urls: 'stun:stun.l.google.com:19302' }],
     });
     const remoteStream = new MediaStream();
+    const remoteScreenStream = new MediaStream();
     const entry: PeerConnEntry = {
       pc,
       remoteStream,
+      remoteScreenStream,
+      cameraStreamId: null,
+      cameraSender: null,
+      audioSender: null,
+      screenSender: null,
       pendingCandidates: [],
       disconnectTimer: null,
     };
@@ -464,24 +694,65 @@ export class HybridCallController {
 
     if (this.localStream) {
       for (const track of this.localStream.getTracks()) {
-        pc.addTrack(track, this.localStream);
+        const sender = pc.addTrack(track, this.localStream);
+        if (track.kind === 'audio') entry.audioSender = sender;
+        else if (track.kind === 'video') entry.cameraSender = sender;
       }
     }
     if (this.screenStream) {
       for (const track of this.screenStream.getTracks()) {
-        pc.addTrack(track, this.screenStream);
+        entry.screenSender = pc.addTrack(track, this.screenStream);
       }
     }
 
     pc.ontrack = (ev) => {
-      if (ev.streams && ev.streams[0]) {
-        for (const t of ev.streams[0].getTracks()) {
-          if (!remoteStream.getTrackById(t.id)) {
-            remoteStream.addTrack(t);
+      const incomingStream = ev.streams && ev.streams[0] ? ev.streams[0] : null;
+      const track = ev.track;
+      if (!track) return;
+
+      const peerMeta = this.peersMeta.get(peerId);
+      const isSecondStream =
+        !!incomingStream &&
+        entry.cameraStreamId !== null &&
+        incomingStream.id !== entry.cameraStreamId;
+      const isScreenTrack =
+        track.kind === 'video' &&
+        (isSecondStream ||
+          remoteStream.getVideoTracks().some((t) => t.id !== track.id && t.readyState === 'live') ||
+          Boolean(peerMeta?.screen_share && !peerMeta?.video));
+
+      const targetStream = isScreenTrack ? remoteScreenStream : remoteStream;
+      if (!isScreenTrack && incomingStream && entry.cameraStreamId === null) {
+        entry.cameraStreamId = incomingStream.id;
+      }
+
+      // Drop stale ended video tracks on the target stream before attaching the new one.
+      if (track.kind === 'video') {
+        for (const existingTrack of targetStream.getVideoTracks()) {
+          if (existingTrack.id !== track.id && (isScreenTrack || existingTrack.readyState !== 'live')) {
+            targetStream.removeTrack(existingTrack);
           }
         }
-      } else if (ev.track && !remoteStream.getTrackById(ev.track.id)) {
-        remoteStream.addTrack(ev.track);
+      }
+      if (!targetStream.getTrackById(track.id)) {
+        targetStream.addTrack(track);
+      }
+
+      const removeTrack = () => {
+        if (targetStream.getTrackById(track.id)) {
+          targetStream.removeTrack(track);
+          this.emit();
+        }
+      };
+      track.onended = removeTrack;
+      if (incomingStream) {
+        incomingStream.addEventListener(
+          'removetrack',
+          (remEv) => {
+            if (remEv.track.id === track.id) removeTrack();
+          },
+          { once: true },
+        );
       }
       this.emit();
     };
@@ -560,40 +831,62 @@ export class HybridCallController {
 
   private async connectLiveKit(url: string, token: string): Promise<void> {
     await this.disconnectLiveKit();
-    // Dynamic import keeps livekit-client completely out of the cold chat bundle!
+    // Dynamic import keeps livekit-client completely out of the cold chat bundle.
     const { Room, RoomEvent, Track } = await import('livekit-client');
     if (this.disposed) return;
 
+    // adaptiveStream: false prevents LiveKit from pausing remote video tracks
+    // when rendered via MediaStream srcObject instead of RemoteTrack.attach().
+    // stopLocalTrackOnUnpublish: false ensures LiveKit never stops our shared
+    // localStream / screenStream tracks when stepping down from SFU to P2P.
     const room = new Room({
-      adaptiveStream: true,
+      adaptiveStream: false,
       dynacast: true,
+      stopLocalTrackOnUnpublish: false,
     });
     this.livekitRoom = room;
 
-    const rebuildParticipantStreams = (participant: LiveKitRemoteParticipant) => {
-      const camStream = new MediaStream();
-      const scrStream = new MediaStream();
+    const syncParticipantStreams = (participant: LiveKitRemoteParticipant) => {
+      let bucket = this.livekitStreams.get(participant.identity);
+      if (!bucket) {
+        bucket = { cam: new MediaStream(), screen: new MediaStream() };
+        this.livekitStreams.set(participant.identity, bucket);
+      }
+
+      const desiredCam = new Map<string, MediaStreamTrack>();
+      const desiredScreen = new Map<string, MediaStreamTrack>();
       for (const pub of participant.trackPublications.values()) {
         const track = pub.track?.mediaStreamTrack;
         if (!track) continue;
         if (pub.source === Track.Source.ScreenShare) {
-          scrStream.addTrack(track);
+          desiredScreen.set(track.id, track);
         } else {
-          camStream.addTrack(track);
+          desiredCam.set(track.id, track);
         }
       }
-      this.livekitStreams.set(participant.identity, {
-        cam: camStream.getTracks().length > 0 ? camStream : null,
-        screen: scrStream.getTracks().length > 0 ? scrStream : null,
-      });
+
+      // Mutate streams in place so <audio> playback does not reset when a peer toggles video.
+      for (const t of bucket.cam.getTracks()) {
+        if (!desiredCam.has(t.id)) bucket.cam.removeTrack(t);
+      }
+      for (const t of desiredCam.values()) {
+        if (!bucket.cam.getTrackById(t.id)) bucket.cam.addTrack(t);
+      }
+      for (const t of bucket.screen.getTracks()) {
+        if (!desiredScreen.has(t.id)) bucket.screen.removeTrack(t);
+      }
+      for (const t of desiredScreen.values()) {
+        if (!bucket.screen.getTrackById(t.id)) bucket.screen.addTrack(t);
+      }
+
       this.emit();
     };
 
     room.on(RoomEvent.TrackSubscribed, (_track, _pub, participant) => {
-      rebuildParticipantStreams(participant);
+      syncParticipantStreams(participant);
     });
     room.on(RoomEvent.TrackUnsubscribed, (_track, _pub, participant) => {
-      rebuildParticipantStreams(participant);
+      syncParticipantStreams(participant);
     });
     room.on(RoomEvent.ParticipantDisconnected, (participant) => {
       this.livekitStreams.delete(participant.identity);
@@ -602,25 +895,40 @@ export class HybridCallController {
 
     await room.connect(url, token);
     if (this.disposed) {
-      await room.disconnect();
+      await room.disconnect(false);
       return;
     }
 
     for (const participant of room.remoteParticipants.values()) {
-      rebuildParticipantStreams(participant);
+      syncParticipantStreams(participant);
     }
 
-    // Publish existing local tracks into LiveKit SFU.
-    if (this.audioEnabled) {
-      await room.localParticipant.setMicrophoneEnabled(true).catch(() => undefined);
-    }
-    if (this.videoEnabled) {
-      await room.localParticipant.setCameraEnabled(true).catch(() => undefined);
+    // Publish already-captured local tracks directly so we never open duplicate hardware captures.
+    // Let failures propagate so handleMigrate rolls back cleanly instead of leaving silent tracks.
+    if (this.localStream) {
+      for (const audioTrack of this.localStream.getAudioTracks()) {
+        if (audioTrack.readyState !== 'live') continue;
+        audioTrack.enabled = this.audioEnabled;
+        await room.localParticipant.publishTrack(audioTrack, {
+          source: Track.Source.Microphone,
+          stopMicTrackOnMute: false,
+        });
+      }
+      if (this.videoEnabled) {
+        for (const videoTrack of this.localStream.getVideoTracks()) {
+          if (videoTrack.readyState !== 'live') continue;
+          await room.localParticipant.publishTrack(videoTrack, {
+            source: Track.Source.Camera,
+          });
+        }
+      }
     }
     if (this.screenStream) {
       const scrTrack = this.screenStream.getVideoTracks()[0];
-      if (scrTrack) {
-        await room.localParticipant.publishTrack(scrTrack).catch(() => undefined);
+      if (scrTrack && scrTrack.readyState === 'live') {
+        await room.localParticipant.publishTrack(scrTrack, {
+          source: Track.Source.ScreenShare,
+        });
       }
     }
   }
@@ -631,7 +939,8 @@ export class HybridCallController {
     this.livekitRoom = null;
     this.livekitStreams.clear();
     try {
-      await room.disconnect();
+      // Pass stopTracks = false so shared localStream / screenStream tracks survive SFU -> P2P step-down.
+      await room.disconnect(false);
     } catch {
       // Ignore.
     }
@@ -644,7 +953,7 @@ export class HybridCallController {
   private syncPeersMeta(peers: CallPeer[]): void {
     this.peersMeta.clear();
     for (const p of peers) {
-      this.peersMeta.set(p.user_id, p);
+      this.peersMeta.set(peerKey(p), p);
     }
   }
 
@@ -653,7 +962,7 @@ export class HybridCallController {
       audio: this.audioEnabled,
       video: this.videoEnabled,
       screenShare: this.screenShareEnabled,
-      protectIp: this.protectIp,
+      protectIp: this.protectIp || this.protectIpPending,
     });
   }
 
@@ -663,7 +972,7 @@ export class HybridCallController {
 
     // Always place local participant first.
     tiles.push({
-      id: this.opts.localUserId,
+      id: this.myPeerId,
       displayName: this.opts.localDisplayName || 'You',
       isLocal: true,
       isGuest: this.opts.isGuest,
@@ -675,18 +984,24 @@ export class HybridCallController {
     });
 
     for (const peer of this.peersMeta.values()) {
-      if (peer.user_id === this.opts.localUserId) continue;
+      if (this.isSelfPeer(peer)) continue;
+      const pid = peerKey(peer);
       let stream: MediaStream | null = null;
       let screenStream: MediaStream | null = null;
       if (this.mode === 'sfu_livekit') {
-        const lk = this.livekitStreams.get(peer.user_id);
-        stream = lk?.cam ?? null;
-        screenStream = lk?.screen ?? null;
+        const lk = this.livekitStreams.get(pid) ?? this.livekitStreams.get(peer.user_id);
+        stream = lk && lk.cam.getTracks().length > 0 ? lk.cam : null;
+        screenStream = lk && lk.screen.getTracks().length > 0 ? lk.screen : null;
       } else {
-        stream = this.peerConns.get(peer.user_id)?.remoteStream ?? null;
+        const conn = this.peerConns.get(pid) ?? this.peerConns.get(peer.user_id);
+        stream = conn?.remoteStream ?? null;
+        screenStream =
+          conn && conn.remoteScreenStream.getVideoTracks().some((t) => t.readyState === 'live')
+            ? conn.remoteScreenStream
+            : null;
       }
       tiles.push({
-        id: peer.user_id,
+        id: pid,
         displayName: peer.display_name || peer.user_id,
         isLocal: false,
         isGuest: peer.is_guest,
@@ -709,6 +1024,8 @@ export class HybridCallController {
       video: this.videoEnabled,
       screenShare: this.screenShareEnabled,
       protectIp: this.protectIp,
+      protectIpPending: this.protectIpPending,
+      startedAt: this.startedAt,
       notice: this.notice,
       tiles,
     });

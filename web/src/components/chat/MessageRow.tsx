@@ -1,9 +1,63 @@
-import React, { useState } from 'react';
-import { CornerUpLeft, Pencil, RefreshCw, Trash2, X } from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
+import { CornerUpLeft, MoreHorizontal, Pencil, RefreshCw, Trash2, X } from 'lucide-react';
 import type { ChatMessage } from '../../chat/types';
 import { formatTime, initialsFor, isWebhookSender } from '../../chat/state';
 
 const QUICK_REACTIONS = ['👍', '❤️', '🎉', '👀'] as const;
+
+const INLINE_TOKEN_RE = /(`[^`\n]+`|https?:\/\/[^\s<>()]+(?:\([^\s<>()]*\)[^\s<>()]*)*)/g;
+
+function trimTrailingUrlPunct(raw: string): { url: string; trailing: string } {
+  let url = raw;
+  let trailing = '';
+  while (/[.,!?;:]$/.test(url)) {
+    trailing = url.slice(-1) + trailing;
+    url = url.slice(0, -1);
+  }
+  return { url, trailing };
+}
+
+function renderFormattedBody(text: string): React.ReactNode {
+  if (!text) return null;
+  const nodes: React.ReactNode[] = [];
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  INLINE_TOKEN_RE.lastIndex = 0;
+  while ((match = INLINE_TOKEN_RE.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      nodes.push(text.slice(lastIndex, match.index));
+    }
+    const token = match[0];
+    if (token.startsWith('`') && token.endsWith('`') && token.length > 2) {
+      nodes.push(
+        <code key={`code-${match.index}`} className="chat-inline-code">
+          {token.slice(1, -1)}
+        </code>,
+      );
+    } else if (/^https?:\/\//i.test(token)) {
+      const { url, trailing } = trimTrailingUrlPunct(token);
+      nodes.push(
+        <a
+          key={`link-${match.index}`}
+          href={url}
+          className="chat-inline-link"
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          {url}
+        </a>,
+      );
+      if (trailing) nodes.push(trailing);
+    } else {
+      nodes.push(token);
+    }
+    lastIndex = match.index + token.length;
+  }
+  if (lastIndex < text.length) {
+    nodes.push(text.slice(lastIndex));
+  }
+  return nodes;
+}
 
 interface MessageRowProps {
   message: ChatMessage;
@@ -11,7 +65,12 @@ interface MessageRowProps {
   currentUserId: string;
   canModerate: boolean;
   replyTarget?: ChatMessage;
+  highlighted?: boolean;
+  editTrigger?: number;
+  onEditTriggerConsumed?: () => void;
+  onEditEnd?: () => void;
   onReply: (message: ChatMessage) => void;
+  onJumpToMessage?: (seq: number) => void;
   onToggleReaction: (messageId: string, emoji: string, currentlyReacted: boolean) => void;
   onEdit: (messageId: string, newBody: string) => Promise<void>;
   onDelete: (messageId: string) => Promise<void>;
@@ -25,7 +84,12 @@ export const MessageRow: React.FC<MessageRowProps> = ({
   currentUserId,
   canModerate,
   replyTarget,
+  highlighted = false,
+  editTrigger = 0,
+  onEditTriggerConsumed,
+  onEditEnd,
   onReply,
+  onJumpToMessage,
   onToggleReaction,
   onEdit,
   onDelete,
@@ -36,6 +100,11 @@ export const MessageRow: React.FC<MessageRowProps> = ({
   const [draft, setDraft] = useState(message.body);
   const [saving, setSaving] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [actionsPinned, setActionsPinned] = useState(false);
+  const [actionError, setActionError] = useState('');
+  const lastHandledTriggerRef = useRef(0);
+  const bodyRef = useRef(message.body);
+  bodyRef.current = message.body;
 
   const isDeleted = Boolean(message.deleted_at);
   const isSynced = message.delivery.kind === 'synced';
@@ -44,17 +113,33 @@ export const MessageRow: React.FC<MessageRowProps> = ({
   const canDelete = isSynced && !isDeleted && (isOwn || canModerate);
   const authorLabel = message.sender_name || 'Unknown';
 
+  useEffect(() => {
+    if (editTrigger > 0 && editTrigger !== lastHandledTriggerRef.current && canEdit) {
+      lastHandledTriggerRef.current = editTrigger;
+      setDraft(bodyRef.current);
+      setActionError('');
+      setEditing(true);
+      onEditTriggerConsumed?.();
+    }
+  }, [editTrigger, canEdit, onEditTriggerConsumed]);
+
   const handleSaveEdit = async (e: React.FormEvent) => {
     e.preventDefault();
     const trimmed = draft.trim();
     if (!trimmed || trimmed === message.body) {
+      setActionError('');
       setEditing(false);
+      onEditEnd?.();
       return;
     }
     setSaving(true);
+    setActionError('');
     try {
       await onEdit(message.id, trimmed);
       setEditing(false);
+      onEditEnd?.();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Could not save edit');
     } finally {
       setSaving(false);
     }
@@ -62,8 +147,16 @@ export const MessageRow: React.FC<MessageRowProps> = ({
 
   return (
     <article
-      className={`chat-msg${grouped ? ' grouped' : ''}${message.delivery.kind === 'sending' ? ' sending' : ''}`}
+      className={`chat-msg${grouped ? ' grouped' : ''}${message.delivery.kind === 'sending' ? ' sending' : ''}${highlighted ? ' is-highlighted' : ''}`}
       data-seq={message.seq}
+      data-msg-id={message.id}
+      onKeyDown={(e) => {
+        if (e.key === 'Escape' && (confirmDelete || actionsPinned)) {
+          e.stopPropagation();
+          setConfirmDelete(false);
+          setActionsPinned(false);
+        }
+      }}
     >
       <div>
         {grouped ? (
@@ -89,20 +182,36 @@ export const MessageRow: React.FC<MessageRowProps> = ({
         )}
 
         {message.reply_to_id && !isDeleted && (
-          <div className="chat-reply-quote">
-            <CornerUpLeft size={12} aria-hidden="true" style={{ flexShrink: 0 }} />
-            <strong>
-              {replyTarget ? replyTarget.sender_name || 'Message' : 'Reply'}
-              {replyTarget && isWebhookSender(replyTarget.sender_id) && ' (webhook)'}
-            </strong>
-            <span>
-              {replyTarget
-                ? replyTarget.deleted_at
-                  ? 'Original message deleted'
-                  : replyTarget.body
-                : 'Referenced message'}
-            </span>
-          </div>
+          replyTarget && onJumpToMessage ? (
+            <button
+              type="button"
+              className="chat-reply-quote is-clickable"
+              onClick={() => onJumpToMessage(replyTarget.seq)}
+              title="Jump to original message"
+            >
+              <CornerUpLeft size={12} aria-hidden="true" style={{ flexShrink: 0 }} />
+              <strong>
+                {replyTarget.sender_name || 'Message'}
+                {isWebhookSender(replyTarget.sender_id) && ' (webhook)'}
+              </strong>
+              <span>{replyTarget.deleted_at ? 'Original message deleted' : replyTarget.body}</span>
+            </button>
+          ) : (
+            <div className="chat-reply-quote">
+              <CornerUpLeft size={12} aria-hidden="true" style={{ flexShrink: 0 }} />
+              <strong>
+                {replyTarget ? replyTarget.sender_name || 'Message' : 'Reply'}
+                {replyTarget && isWebhookSender(replyTarget.sender_id) && ' (webhook)'}
+              </strong>
+              <span>
+                {replyTarget
+                  ? replyTarget.deleted_at
+                    ? 'Original message deleted'
+                    : replyTarget.body
+                  : 'Referenced earlier message'}
+              </span>
+            </div>
+          )
         )}
 
         {isDeleted ? (
@@ -114,9 +223,13 @@ export const MessageRow: React.FC<MessageRowProps> = ({
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={(e) => {
+                if (e.nativeEvent.isComposing || e.keyCode === 229) return;
                 if (e.key === 'Escape') {
+                  e.stopPropagation();
+                  setActionError('');
                   setEditing(false);
                   setDraft(message.body);
+                  onEditEnd?.();
                 } else if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault();
                   void handleSaveEdit(e);
@@ -134,8 +247,10 @@ export const MessageRow: React.FC<MessageRowProps> = ({
                 className="btn-secondary"
                 disabled={saving}
                 onClick={() => {
+                  setActionError('');
                   setEditing(false);
                   setDraft(message.body);
+                  onEditEnd?.();
                 }}
               >
                 Cancel
@@ -145,8 +260,14 @@ export const MessageRow: React.FC<MessageRowProps> = ({
           </form>
         ) : (
           <div className="chat-msg-body">
-            {message.body}
+            {renderFormattedBody(message.body)}
             {grouped && message.edited_at && <span className="chat-msg-edited"> (edited)</span>}
+          </div>
+        )}
+
+        {actionError && (
+          <div className="chat-msg-failed" role="alert">
+            <span>{actionError}</span>
           </div>
         )}
 
@@ -194,81 +315,112 @@ export const MessageRow: React.FC<MessageRowProps> = ({
       </div>
 
       {isSynced && !isDeleted && !editing && (
-        <div className="chat-msg-actions" role="toolbar" aria-label="Message actions">
-          {QUICK_REACTIONS.map((emoji) => {
-            const existing = message.reactions.find((r) => r.emoji === emoji);
-            const reacted = Boolean(existing?.user_ids.includes(currentUserId));
-            return (
-              <button
-                key={emoji}
-                type="button"
-                className="chat-action-btn"
-                title={`React ${emoji}`}
-                aria-label={`React with ${emoji}`}
-                onClick={() => onToggleReaction(message.id, emoji, reacted)}
-              >
-                {emoji}
-              </button>
-            );
-          })}
+        <>
           <button
             type="button"
-            className="chat-action-btn"
-            title="Reply"
-            aria-label="Reply"
-            onClick={() => onReply(message)}
+            className="chat-msg-more-btn"
+            aria-label="Message actions"
+            aria-expanded={actionsPinned}
+            onClick={() => setActionsPinned((v) => !v)}
           >
-            <CornerUpLeft size={14} />
+            <MoreHorizontal size={14} aria-hidden="true" />
           </button>
-          {canEdit && (
+
+          <div
+            className={`chat-msg-actions${confirmDelete || actionsPinned ? ' is-pinned' : ''}`}
+            role="toolbar"
+            aria-label="Message actions"
+          >
+            {QUICK_REACTIONS.map((emoji) => {
+              const existing = message.reactions.find((r) => r.emoji === emoji);
+              const reacted = Boolean(existing?.user_ids.includes(currentUserId));
+              return (
+                <button
+                  key={emoji}
+                  type="button"
+                  className={`chat-action-btn${reacted ? ' is-reacted' : ''}`}
+                  title={reacted ? `Remove ${emoji}` : `React ${emoji}`}
+                  aria-label={`React with ${emoji}`}
+                  aria-pressed={reacted}
+                  onClick={() => {
+                    onToggleReaction(message.id, emoji, reacted);
+                    setActionsPinned(false);
+                  }}
+                >
+                  {emoji}
+                </button>
+              );
+            })}
             <button
               type="button"
               className="chat-action-btn"
-              title="Edit"
-              aria-label="Edit message"
+              title="Reply"
+              aria-label="Reply"
               onClick={() => {
-                setDraft(message.body);
-                setEditing(true);
+                setActionsPinned(false);
+                onReply(message);
               }}
             >
-              <Pencil size={14} />
+              <CornerUpLeft size={14} aria-hidden="true" />
             </button>
-          )}
-          {canDelete && !confirmDelete && (
-            <button
-              type="button"
-              className="chat-action-btn danger"
-              title="Delete"
-              aria-label="Delete message"
-              onClick={() => setConfirmDelete(true)}
-            >
-              <Trash2 size={14} />
-            </button>
-          )}
-          {canDelete && confirmDelete && (
-            <>
-              <button
-                type="button"
-                className="chat-action-btn danger"
-                aria-label="Confirm delete message"
-                onClick={() => {
-                  setConfirmDelete(false);
-                  void onDelete(message.id);
-                }}
-              >
-                Delete?
-              </button>
+            {canEdit && (
               <button
                 type="button"
                 className="chat-action-btn"
-                aria-label="Cancel delete"
-                onClick={() => setConfirmDelete(false)}
+                title="Edit"
+                aria-label="Edit message"
+                onClick={() => {
+                  setActionsPinned(false);
+                  setDraft(message.body);
+                  setEditing(true);
+                }}
               >
-                <X size={13} />
+                <Pencil size={14} aria-hidden="true" />
               </button>
-            </>
-          )}
-        </div>
+            )}
+            {canDelete && !confirmDelete && (
+              <button
+                type="button"
+                className="chat-action-btn danger"
+                title="Delete"
+                aria-label="Delete message"
+                onClick={() => setConfirmDelete(true)}
+              >
+                <Trash2 size={14} aria-hidden="true" />
+              </button>
+            )}
+            {canDelete && confirmDelete && (
+              <>
+                <button
+                  type="button"
+                  className="chat-action-btn danger"
+                  aria-label="Confirm delete message"
+                  onClick={() => {
+                    setConfirmDelete(false);
+                    setActionsPinned(false);
+                    setActionError('');
+                    void onDelete(message.id).catch((err: unknown) => {
+                      setActionError(err instanceof Error ? err.message : 'Could not delete message');
+                    });
+                  }}
+                >
+                  Delete?
+                </button>
+                <button
+                  type="button"
+                  className="chat-action-btn"
+                  aria-label="Cancel delete"
+                  onClick={() => {
+                    setConfirmDelete(false);
+                    setActionsPinned(false);
+                  }}
+                >
+                  <X size={13} aria-hidden="true" />
+                </button>
+              </>
+            )}
+          </div>
+        </>
       )}
     </article>
   );

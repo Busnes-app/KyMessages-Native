@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Check,
   Copy,
@@ -15,7 +15,9 @@ import {
   UserMinus,
   UserPlus,
   Users,
+  Video,
   Webhook,
+  X,
 } from 'lucide-react';
 import type {
   ChatDirectoryUser,
@@ -34,7 +36,8 @@ import {
 } from '../../chat/client';
 import { formatTime, initialsFor } from '../../chat/state';
 
-type DrawerTab = 'about' | 'members' | 'shared';
+export type DrawerTab = 'about' | 'members' | 'shared';
+const DRAWER_TABS: DrawerTab[] = ['about', 'members', 'shared'];
 
 interface SharedLinkItem {
   url: string;
@@ -89,12 +92,14 @@ interface RoomDetailsDrawerProps {
   directory: ChatDirectoryUser[];
   messages: ChatMessage[];
   lobbyGuests?: LobbyGuest[];
+  requestedTab?: { tab: DrawerTab; seq: number } | null;
   onClose: () => void;
   onRefresh: () => Promise<void>;
   onLeftRoom: (roomId: string) => void;
   onOpenSearch: () => void;
   onStartDM: (userId: string) => Promise<void>;
   onDecideLobby?: (guestId: string, admit: boolean) => Promise<void>;
+  onAdmitAllLobby?: () => Promise<void>;
   onCreateGuestLink?: () => Promise<string>;
 }
 
@@ -106,12 +111,14 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
   directory,
   messages,
   lobbyGuests = [],
+  requestedTab = null,
   onClose,
   onRefresh,
   onLeftRoom,
   onOpenSearch,
   onStartDM,
   onDecideLobby,
+  onAdmitAllLobby,
   onCreateGuestLink,
 }) => {
   const [tab, setTab] = useState<DrawerTab>('about');
@@ -128,20 +135,47 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
   const [copiedLink, setCopiedLink] = useState(false);
   const [guestLink, setGuestLink] = useState('');
   const [copiedGuestLink, setCopiedGuestLink] = useState(false);
+  const [confirmLeave, setConfirmLeave] = useState(false);
+  const [confirmRemoveId, setConfirmRemoveId] = useState<string | null>(null);
+  const [confirmRevokeId, setConfirmRevokeId] = useState<string | null>(null);
+  const [decidingGuestIds, setDecidingGuestIds] = useState<Record<string, boolean>>({});
+  const [admittingAll, setAdmittingAll] = useState(false);
   const [err, setErr] = useState('');
+
+  const tabRefs = useRef<Record<DrawerTab, HTMLButtonElement | null>>({
+    about: null,
+    members: null,
+    shared: null,
+  });
 
   const room = detail?.room;
   const memberRole = detail?.member.role ?? 'member';
   const canModerate = isGlobalAdmin || memberRole === 'owner' || memberRole === 'admin';
   const isDM = room?.kind === 'dm';
+  const isMeeting = room?.kind === 'meeting';
+
+  useEffect(() => {
+    if (requestedTab) {
+      setTab(requestedTab.tab);
+    }
+  }, [requestedTab]);
+
+  useEffect(() => {
+    setGuestLink('');
+    setCopiedGuestLink(false);
+    setConfirmLeave(false);
+    setConfirmRemoveId(null);
+    setConfirmRevokeId(null);
+    setDecidingGuestIds({});
+    setCreatedToken(null);
+    setMemberFilter('');
+    setErr('');
+  }, [room?.id]);
 
   useEffect(() => {
     if (!room) return;
     setName(room.name);
     setTopic(room.topic);
-    setErr('');
-    setCreatedToken(null);
-    setMemberFilter('');
   }, [room?.id, room?.name, room?.topic]);
 
   useEffect(() => {
@@ -222,6 +256,8 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
     setErr('');
     try {
       await removeRoomMember(room.id, userId);
+      setConfirmLeave(false);
+      setConfirmRemoveId(null);
       if (userId === currentUserId) {
         onLeftRoom(room.id);
       } else {
@@ -269,11 +305,36 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
     setErr('');
     try {
       await revokeRoomWebhook(room.id, webhookId);
+      setConfirmRevokeId(null);
       setWebhooks((prev) => prev.map((w) => (w.id === webhookId ? { ...w, revoked_at: Date.now() } : w)));
     } catch (e) {
       setErr(e instanceof Error ? e.message : 'Could not revoke webhook');
     } finally {
       setBusyAction(false);
+    }
+  };
+
+  const handleLobbyDecision = async (guestId: string, admit: boolean) => {
+    if (!onDecideLobby || decidingGuestIds[guestId]) return;
+    setDecidingGuestIds((prev) => ({ ...prev, [guestId]: true }));
+    try {
+      await onDecideLobby(guestId, admit);
+    } finally {
+      setDecidingGuestIds((prev) => {
+        const copy = { ...prev };
+        delete copy[guestId];
+        return copy;
+      });
+    }
+  };
+
+  const handleAdmitAll = async () => {
+    if (!onAdmitAllLobby || admittingAll) return;
+    setAdmittingAll(true);
+    try {
+      await onAdmitAllLobby();
+    } finally {
+      setAdmittingAll(false);
     }
   };
 
@@ -301,12 +362,27 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
     }
   };
 
+  const handleTabKeyDown = (e: React.KeyboardEvent, current: DrawerTab) => {
+    const idx = DRAWER_TABS.indexOf(current);
+    let nextIdx = -1;
+    if (e.key === 'ArrowRight') nextIdx = (idx + 1) % DRAWER_TABS.length;
+    else if (e.key === 'ArrowLeft') nextIdx = (idx - 1 + DRAWER_TABS.length) % DRAWER_TABS.length;
+    else if (e.key === 'Home') nextIdx = 0;
+    else if (e.key === 'End') nextIdx = DRAWER_TABS.length - 1;
+    if (nextIdx >= 0) {
+      e.preventDefault();
+      const nextTab = DRAWER_TABS[nextIdx];
+      setTab(nextTab);
+      tabRefs.current[nextTab]?.focus();
+    }
+  };
+
   const sharedBadgeCount = sharedLinks.length + (canModerate && !isDM ? activeWebhookCount : 0);
 
   return (
     <aside className="chat-drawer" aria-label="Room panel">
       <div className="chat-drawer-head">
-        <h3>{isDM ? 'Conversation' : 'Room details'}</h3>
+        <h3>{isDM ? 'Conversation' : isMeeting ? 'Meeting details' : 'Room details'}</h3>
         <button
           type="button"
           className="chat-icon-btn"
@@ -320,32 +396,54 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
 
       <div className="chat-drawer-tabs" role="tablist" aria-label="Room sections">
         <button
+          ref={(el) => {
+            tabRefs.current.about = el;
+          }}
+          id="drawer-tab-about"
           type="button"
           role="tab"
           aria-selected={tab === 'about'}
+          aria-controls="drawer-panel-about"
+          tabIndex={tab === 'about' ? 0 : -1}
           className={tab === 'about' ? 'chat-drawer-tab active' : 'chat-drawer-tab'}
           onClick={() => setTab('about')}
+          onKeyDown={(e) => handleTabKeyDown(e, 'about')}
         >
           <Info size={14} aria-hidden="true" />
           <span>About</span>
+          {lobbyGuests.length > 0 && <span className="chat-tab-count">{lobbyGuests.length}</span>}
         </button>
         <button
+          ref={(el) => {
+            tabRefs.current.members = el;
+          }}
+          id="drawer-tab-members"
           type="button"
           role="tab"
           aria-selected={tab === 'members'}
+          aria-controls="drawer-panel-members"
+          tabIndex={tab === 'members' ? 0 : -1}
           className={tab === 'members' ? 'chat-drawer-tab active' : 'chat-drawer-tab'}
           onClick={() => setTab('members')}
+          onKeyDown={(e) => handleTabKeyDown(e, 'members')}
         >
           <Users size={14} aria-hidden="true" />
           <span>Members</span>
           {detail && <span className="chat-tab-count">{detail.members.length}</span>}
         </button>
         <button
+          ref={(el) => {
+            tabRefs.current.shared = el;
+          }}
+          id="drawer-tab-shared"
           type="button"
           role="tab"
           aria-selected={tab === 'shared'}
+          aria-controls="drawer-panel-shared"
+          tabIndex={tab === 'shared' ? 0 : -1}
           className={tab === 'shared' ? 'chat-drawer-tab active' : 'chat-drawer-tab'}
           onClick={() => setTab('shared')}
+          onKeyDown={(e) => handleTabKeyDown(e, 'shared')}
         >
           <Link2 size={14} aria-hidden="true" />
           <span>Shared</span>
@@ -365,12 +463,14 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
         ) : (
           <>
             {tab === 'about' && (
-              <>
+              <div id="drawer-panel-about" role="tabpanel" aria-labelledby="drawer-tab-about" className="chat-drawer-panel">
                 <div className="chat-room-summary">
                   <div className="chat-room-summary-head">
                     <span className="chat-room-summary-badge" aria-hidden="true">
                       {isDM ? (
                         initialsFor(room.name || 'DM')
+                      ) : isMeeting ? (
+                        <Video size={16} />
                       ) : room.is_private ? (
                         <Lock size={16} />
                       ) : (
@@ -380,7 +480,13 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
                     <div className="chat-room-summary-copy">
                       <div className="chat-room-summary-name">{room.name || 'Direct message'}</div>
                       <div className="chat-room-summary-kind">
-                        {isDM ? 'Direct message' : room.is_private ? 'Private channel' : 'Public channel'}
+                        {isDM
+                          ? 'Direct message'
+                          : isMeeting
+                            ? 'Meeting room'
+                            : room.is_private
+                              ? 'Private channel'
+                              : 'Public channel'}
                       </div>
                     </div>
                   </div>
@@ -437,12 +543,12 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
                       <span>{copiedGuestLink ? 'Copied!' : 'Guest link'}</span>
                     </button>
                   )}
-                  {!isDM && (
+                  {!isDM && !confirmLeave && (
                     <button
                       type="button"
                       className="chat-quick-btn danger"
                       disabled={busyAction}
-                      onClick={() => void handleRemoveMember(currentUserId)}
+                      onClick={() => setConfirmLeave(true)}
                     >
                       <LogOut size={14} aria-hidden="true" />
                       <span>Leave</span>
@@ -450,17 +556,48 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
                   )}
                 </div>
 
+                {!isDM && confirmLeave && (
+                  <div className="chat-confirm-bar" role="alert">
+                    <span>Leave {room.name || 'this room'}?</span>
+                    <div className="chat-confirm-bar-actions">
+                      <button
+                        type="button"
+                        className="ky-lobby-btn is-deny"
+                        disabled={busyAction}
+                        onClick={() => void handleRemoveMember(currentUserId)}
+                      >
+                        Leave room
+                      </button>
+                      <button
+                        type="button"
+                        className="btn-secondary"
+                        disabled={busyAction}
+                        onClick={() => setConfirmLeave(false)}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 {guestLink && (
                   <section className="chat-drawer-section">
                     <div className="chat-drawer-section-head">
                       <h4>External guest invite link</h4>
                     </div>
                     <div className="ky-guest-link-box">
-                      <input type="text" readOnly value={guestLink} onFocus={(e) => e.currentTarget.select()} />
+                      <input
+                        type="text"
+                        readOnly
+                        aria-label="External guest invite link"
+                        value={guestLink}
+                        onFocus={(e) => e.currentTarget.select()}
+                      />
                       <button
                         type="button"
                         className="chat-icon-btn"
                         title="Copy guest link"
+                        aria-label="Copy guest link"
                         onClick={() => {
                           void navigator.clipboard.writeText(guestLink).then(() => {
                             setCopiedGuestLink(true);
@@ -478,31 +615,44 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
                   <section className="chat-drawer-section">
                     <div className="chat-drawer-section-head">
                       <h4>Waiting room ({lobbyGuests.length})</h4>
+                      {lobbyGuests.length > 1 && onAdmitAllLobby && (
+                        <button
+                          type="button"
+                          className="chat-drawer-link-btn"
+                          disabled={admittingAll}
+                          onClick={() => void handleAdmitAll()}
+                        >
+                          {admittingAll ? 'Admitting…' : 'Admit all'}
+                        </button>
+                      )}
                     </div>
                     <div className="ky-lobby-list">
-                      {lobbyGuests.map((g) => (
-                        <div key={g.guest_id} className="ky-lobby-row">
-                          <span className="ky-lobby-name">{g.display_name}</span>
-                          <div className="ky-lobby-actions">
-                            <button
-                              type="button"
-                              className="ky-lobby-btn is-admit"
-                              disabled={busyAction}
-                              onClick={() => void onDecideLobby(g.guest_id, true)}
-                            >
-                              Admit
-                            </button>
-                            <button
-                              type="button"
-                              className="ky-lobby-btn is-deny"
-                              disabled={busyAction}
-                              onClick={() => void onDecideLobby(g.guest_id, false)}
-                            >
-                              Deny
-                            </button>
+                      {lobbyGuests.map((g) => {
+                        const deciding = Boolean(decidingGuestIds[g.guest_id]) || admittingAll;
+                        return (
+                          <div key={g.guest_id} className="ky-lobby-row">
+                            <span className="ky-lobby-name">{g.display_name}</span>
+                            <div className="ky-lobby-actions">
+                              <button
+                                type="button"
+                                className="ky-lobby-btn is-admit"
+                                disabled={deciding}
+                                onClick={() => void handleLobbyDecision(g.guest_id, true)}
+                              >
+                                Admit
+                              </button>
+                              <button
+                                type="button"
+                                className="ky-lobby-btn is-deny"
+                                disabled={deciding}
+                                onClick={() => void handleLobbyDecision(g.guest_id, false)}
+                              >
+                                Deny
+                              </button>
+                            </div>
                           </div>
-                        </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   </section>
                 )}
@@ -541,7 +691,7 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
 
                 {!isDM && canModerate && (
                   <form className="chat-drawer-section" onSubmit={handleSaveInfo}>
-                    <h4>Channel settings</h4>
+                    <h4>{isMeeting ? 'Meeting settings' : 'Channel settings'}</h4>
                     <div className="chat-field">
                       <label htmlFor="drawer-room-name">Name</label>
                       <input
@@ -558,7 +708,7 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
                         id="drawer-room-topic"
                         value={topic}
                         onChange={(e) => setTopic(e.target.value)}
-                        placeholder="What is this channel about?"
+                        placeholder="What is this room about?"
                         maxLength={500}
                       />
                     </div>
@@ -567,112 +717,135 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
                     </button>
                   </form>
                 )}
-              </>
+              </div>
             )}
 
             {tab === 'members' && (
-              <section className="chat-drawer-section">
-                {detail.members.length > 3 && (
-                  <input
-                    type="search"
-                    aria-label="Filter members"
-                    placeholder="Filter people…"
-                    value={memberFilter}
-                    onChange={(e) => setMemberFilter(e.target.value)}
-                    className="chat-drawer-filter"
-                  />
-                )}
-
-                {!isDM && canModerate && addableUsers.length > 0 && (
-                  <form onSubmit={handleAddMember} className="chat-drawer-inline-form">
-                    <select
-                      aria-label="Add member to channel"
-                      value={addUserId}
-                      onChange={(e) => setAddUserId(e.target.value)}
-                    >
-                      <option value="">Add teammate…</option>
-                      {addableUsers.map((u) => (
-                        <option key={u.id} value={u.id}>
-                          {u.display_name} (@{u.username})
-                        </option>
-                      ))}
-                    </select>
-                    <button
-                      type="submit"
-                      className="btn-secondary"
-                      disabled={busyAction || !addUserId}
-                      aria-label="Add selected member"
-                    >
-                      <UserPlus size={15} />
-                    </button>
-                  </form>
-                )}
-
-                <div>
-                  {visibleMembers.length === 0 ? (
-                    <p className="chat-drawer-muted">No matching members.</p>
-                  ) : (
-                    visibleMembers.map((m) => {
-                      const dirUser = userLookup.get(m.user_id);
-                      const label = dirUser?.display_name || dirUser?.username || m.user_id;
-                      const isSelf = m.user_id === currentUserId;
-                      const canRemove = !isDM && (isSelf || (canModerate && m.role !== 'owner'));
-                      return (
-                        <div key={m.user_id} className="chat-member-row">
-                          <span className="chat-member-avatar" aria-hidden="true">
-                            {initialsFor(label)}
-                          </span>
-                          <div className="chat-member-copy">
-                            <div className="chat-member-name">
-                              {label}
-                              {isSelf ? ' (you)' : ''}
-                            </div>
-                            <div className="chat-member-role">
-                              {dirUser?.username ? `@${dirUser.username} · ` : ''}
-                              {m.role}
-                            </div>
-                          </div>
-                          <div className="chat-member-actions">
-                            {!isSelf && (
-                              <button
-                                type="button"
-                                className="chat-icon-btn"
-                                disabled={busyAction}
-                                title={`Message ${label}`}
-                                aria-label={`Message ${label}`}
-                                onClick={() => void handleMessageMember(m.user_id)}
-                              >
-                                <MessageSquare size={14} />
-                              </button>
-                            )}
-                            {canRemove && (
-                              <button
-                                type="button"
-                                className="chat-icon-btn"
-                                disabled={busyAction}
-                                title={isSelf ? 'Leave channel' : `Remove ${label}`}
-                                aria-label={isSelf ? 'Leave channel' : `Remove ${label}`}
-                                onClick={() => void handleRemoveMember(m.user_id)}
-                              >
-                                <UserMinus size={14} />
-                              </button>
-                            )}
-                          </div>
-                        </div>
-                      );
-                    })
+              <div id="drawer-panel-members" role="tabpanel" aria-labelledby="drawer-tab-members" className="chat-drawer-panel">
+                <section className="chat-drawer-section">
+                  {detail.members.length > 3 && (
+                    <input
+                      type="search"
+                      aria-label="Filter members"
+                      placeholder="Filter people…"
+                      value={memberFilter}
+                      onChange={(e) => setMemberFilter(e.target.value)}
+                      className="chat-drawer-filter"
+                    />
                   )}
-                </div>
-              </section>
+
+                  {!isDM && canModerate && addableUsers.length > 0 && (
+                    <form onSubmit={handleAddMember} className="chat-drawer-inline-form">
+                      <select
+                        aria-label="Add member to channel"
+                        value={addUserId}
+                        onChange={(e) => setAddUserId(e.target.value)}
+                      >
+                        <option value="">Add teammate…</option>
+                        {addableUsers.map((u) => (
+                          <option key={u.id} value={u.id}>
+                            {u.display_name} (@{u.username})
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="submit"
+                        className="btn-secondary"
+                        disabled={busyAction || !addUserId}
+                        aria-label="Add selected member"
+                      >
+                        <UserPlus size={15} />
+                      </button>
+                    </form>
+                  )}
+
+                  <div>
+                    {visibleMembers.length === 0 ? (
+                      <p className="chat-drawer-muted">No matching members.</p>
+                    ) : (
+                      visibleMembers.map((m) => {
+                        const dirUser = userLookup.get(m.user_id);
+                        const label = dirUser?.display_name || dirUser?.username || m.user_id;
+                        const isSelf = m.user_id === currentUserId;
+                        const canRemove = !isDM && (isSelf || (canModerate && m.role !== 'owner'));
+                        const confirming = confirmRemoveId === m.user_id;
+                        return (
+                          <div key={m.user_id} className="chat-member-row">
+                            <span className="chat-member-avatar" aria-hidden="true">
+                              {initialsFor(label)}
+                            </span>
+                            <div className="chat-member-copy">
+                              <div className="chat-member-name">
+                                {label}
+                                {isSelf ? ' (you)' : ''}
+                              </div>
+                              <div className="chat-member-role">
+                                {dirUser?.username ? `@${dirUser.username} · ` : ''}
+                                {m.role}
+                              </div>
+                            </div>
+                            <div className="chat-member-actions">
+                              {!isSelf && !confirming && (
+                                <button
+                                  type="button"
+                                  className="chat-icon-btn"
+                                  disabled={busyAction}
+                                  title={`Message ${label}`}
+                                  aria-label={`Message ${label}`}
+                                  onClick={() => void handleMessageMember(m.user_id)}
+                                >
+                                  <MessageSquare size={14} />
+                                </button>
+                              )}
+                              {canRemove && !confirming && (
+                                <button
+                                  type="button"
+                                  className="chat-icon-btn"
+                                  disabled={busyAction}
+                                  title={isSelf ? 'Leave room' : `Remove ${label}`}
+                                  aria-label={isSelf ? 'Leave room' : `Remove ${label}`}
+                                  onClick={() => setConfirmRemoveId(m.user_id)}
+                                >
+                                  <UserMinus size={14} />
+                                </button>
+                              )}
+                              {canRemove && confirming && (
+                                <>
+                                  <button
+                                    type="button"
+                                    className="ky-lobby-btn is-deny"
+                                    disabled={busyAction}
+                                    onClick={() => void handleRemoveMember(m.user_id)}
+                                  >
+                                    {isSelf ? 'Leave?' : 'Remove?'}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="chat-icon-btn"
+                                    aria-label="Cancel"
+                                    onClick={() => setConfirmRemoveId(null)}
+                                  >
+                                    <X size={13} />
+                                  </button>
+                                </>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                </section>
+              </div>
             )}
 
             {tab === 'shared' && (
-              <>
+              <div id="drawer-panel-shared" role="tabpanel" aria-labelledby="drawer-tab-shared" className="chat-drawer-panel">
                 <section className="chat-drawer-section">
                   <h4>Shared links ({sharedLinks.length})</h4>
                   {sharedLinks.length === 0 ? (
                     <p className="chat-drawer-muted">
-                      Links posted in this {isDM ? 'conversation' : 'channel'} appear here automatically.
+                      Links posted in this {isDM ? 'conversation' : 'room'} appear here automatically.
                     </p>
                   ) : (
                     <div className="chat-shared-list">
@@ -743,33 +916,56 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
                       <p className="chat-drawer-muted">No incoming webhooks yet.</p>
                     ) : (
                       <div>
-                        {webhooks.map((wh) => (
-                          <div key={wh.id} className="chat-member-row">
-                            <div className="chat-member-copy">
-                              <div className="chat-member-name">{wh.name}</div>
-                              <div className="chat-member-role">
-                                {wh.revoked_at ? 'Revoked' : 'Active · Bearer auth'}
+                        {webhooks.map((wh) => {
+                          const confirming = confirmRevokeId === wh.id;
+                          return (
+                            <div key={wh.id} className="chat-member-row">
+                              <div className="chat-member-copy">
+                                <div className="chat-member-name">{wh.name}</div>
+                                <div className="chat-member-role">
+                                  {wh.revoked_at ? 'Revoked' : 'Active · Bearer auth'}
+                                </div>
                               </div>
+                              {!wh.revoked_at && !confirming && (
+                                <button
+                                  type="button"
+                                  className="chat-icon-btn"
+                                  disabled={busyAction}
+                                  title={`Revoke ${wh.name}`}
+                                  aria-label={`Revoke ${wh.name}`}
+                                  onClick={() => setConfirmRevokeId(wh.id)}
+                                >
+                                  <Trash2 size={14} />
+                                </button>
+                              )}
+                              {!wh.revoked_at && confirming && (
+                                <div className="chat-member-actions">
+                                  <button
+                                    type="button"
+                                    className="ky-lobby-btn is-deny"
+                                    disabled={busyAction}
+                                    onClick={() => void handleRevokeWebhook(wh.id)}
+                                  >
+                                    Revoke?
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="chat-icon-btn"
+                                    aria-label="Cancel"
+                                    onClick={() => setConfirmRevokeId(null)}
+                                  >
+                                    <X size={13} />
+                                  </button>
+                                </div>
+                              )}
                             </div>
-                            {!wh.revoked_at && (
-                              <button
-                                type="button"
-                                className="chat-icon-btn"
-                                disabled={busyAction}
-                                title={`Revoke ${wh.name}`}
-                                aria-label={`Revoke ${wh.name}`}
-                                onClick={() => void handleRevokeWebhook(wh.id)}
-                              >
-                                <Trash2 size={14} />
-                              </button>
-                            )}
-                          </div>
-                        ))}
+                          );
+                        })}
                       </div>
                     )}
                   </section>
                 )}
-              </>
+              </div>
             )}
           </>
         )}
