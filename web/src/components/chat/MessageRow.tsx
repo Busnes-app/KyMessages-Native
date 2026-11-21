@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { CornerUpLeft, Pencil, RefreshCw, Trash2, X } from 'lucide-react';
 import type { ChatMessage } from '../../chat/types';
-import { formatTime, initialsFor } from '../../chat/state';
+import { formatTime, initialsFor, isWebhookSender } from '../../chat/state';
 
 const QUICK_REACTIONS = ['👍', '❤️', '🎉', '👀'] as const;
 
@@ -79,6 +79,7 @@ export const MessageRow: React.FC<MessageRowProps> = ({
         {!grouped && (
           <div className="chat-msg-meta">
             <span className="chat-msg-author">{authorLabel}</span>
+            {isWebhookSender(message.sender_id) && <span className="chat-msg-badge">Webhook</span>}
             <time className="chat-msg-time" dateTime={new Date(message.created_at).toISOString()}>
               {formatTime(message.created_at)}
             </time>
@@ -90,7 +91,10 @@ export const MessageRow: React.FC<MessageRowProps> = ({
         {message.reply_to_id && !isDeleted && (
           <div className="chat-reply-quote">
             <CornerUpLeft size={12} aria-hidden="true" style={{ flexShrink: 0 }} />
-            <strong>{replyTarget ? replyTarget.sender_name || 'Message' : 'Reply'}</strong>
+            <strong>
+              {replyTarget ? replyTarget.sender_name || 'Message' : 'Reply'}
+              {replyTarget && isWebhookSender(replyTarget.sender_id) && ' (webhook)'}
+            </strong>
             <span>
               {replyTarget
                 ? replyTarget.deleted_at
