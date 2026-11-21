@@ -491,3 +491,38 @@ func TestHubResyncNeverRevivesAnUnregisteredClient(t *testing.T) {
 		t.Fatalf("rooms indexed = %d: resync re-added a closed client", rooms)
 	}
 }
+
+// A promotion ("role") is broadcast to the room and keeps the promoted member subscribed.
+func TestHubRoleDeltaKeepsTheMemberSubscribed(t *testing.T) {
+	hub := NewHub(NewMemoryBus())
+	defer hub.Close()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		uid := r.URL.Query().Get("u")
+		hub.ServeConn(r.Context(), conn, "default", uid, "sess_"+uid, []string{"r1"})
+	}))
+	defer srv.Close()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	alice, bob := dialTestWS(t, wsURL+"?u=alice"), dialTestWS(t, wsURL+"?u=bob")
+	for _, c := range []*websocket.Conn{alice, bob} {
+		if ev := readEvent(t, c); ev.Type != EventHello {
+			t.Fatalf("first frame = %+v, want hello", ev)
+		}
+	}
+	for _, ev := range []Event{
+		{Type: EventRoomMember, RoomID: "r1", Data: MustMarshalData(RoomMemberDelta{Action: "role", UserID: "bob", Role: "owner"})},
+		{Type: EventMessageNew, RoomID: "r1", Seq: 1},
+	} {
+		if err := hub.PublishRoom(context.Background(), "r1", ev); err != nil {
+			t.Fatal(err)
+		}
+		for name, c := range map[string]*websocket.Conn{"alice": alice, "bob": bob} {
+			if got := readEvent(t, c); got.Type != ev.Type || got.Seq != ev.Seq {
+				t.Fatalf("%s got %+v, want %s", name, got, ev.Type)
+			}
+		}
+	}
+}
