@@ -28,6 +28,7 @@ const LABEL: Record<string, string> = {
   kymessages: 'KyMessages',
   database: 'Database',
   postgres: 'PostgreSQL',
+  livekit: 'LiveKit SFU',
 };
 const VERSIONLESS = new Set(['database']);
 

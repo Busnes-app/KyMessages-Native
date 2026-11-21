@@ -150,3 +150,8 @@ export function initialsFor(name: string): string {
 export function isWebhookSender(senderId: string): boolean {
   return senderId.startsWith('webhook:');
 }
+
+/** Native bot accounts have bot_ user IDs; mark their posts and member rows distinctly. */
+export function isBotSender(senderId: string): boolean {
+  return senderId.startsWith('bot_');
+}

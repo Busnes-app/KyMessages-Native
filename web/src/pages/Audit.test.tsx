@@ -6,7 +6,7 @@ const json = (v: unknown) => new Response(JSON.stringify(v), { status: 200, head
 const rec = (id: number, action: string, extra: Record<string, unknown> = {}) =>
   ({ id, at: '2026-10-02T10:00:00Z', actor: 'root', action, target: '', outcome: '', details: '', ip: '192.0.2.9', ...extra });
 const PAGE = { records: [
-  rec(3, 'matrix.session_end', { target: '@alice:example.com', outcome: 'ended', details: 'session="S2" kind="oauth2" outcome="ended"' }),
+  rec(3, 'agent.create', { target: 'agent-triage', outcome: 'created', details: 'outcome="created"' }),
   rec(2, 'admin.backup_run', { outcome: 'failure' }),
   rec(1, 'auth.login'),
 ], total: 120, offset: 0, limit: 50 };
@@ -16,13 +16,15 @@ it('lists rows newest first and filters by kind', async () => {
   const calls: string[] = [];
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => { calls.push(String(input)); return json(PAGE); }));
   render(<Audit />);
-  const cells = await screen.findAllByRole('cell', { name: /^(matrix\.session_end|admin\.backup_run|auth\.login)$/ });
-  expect(cells.map((c) => c.textContent)).toEqual(['matrix.session_end', 'admin.backup_run', 'auth.login']);
+  const cells = await screen.findAllByRole('cell', { name: /^(agent\.create|admin\.backup_run|auth\.login)$/ });
+  expect(cells.map((c) => c.textContent)).toEqual(['agent.create', 'admin.backup_run', 'auth.login']);
   expect(screen.getByRole('cell', { name: 'failure' }).className).toContain('dr-danger');
   expect(calls[0]).toBe('/api/admin/audit?offset=0&limit=50');
   expect(calls[0]).not.toContain('kind');
   fireEvent.click(screen.getByRole('button', { name: 'Older' }));
   await waitFor(() => expect(calls).toContain('/api/admin/audit?offset=50&limit=50'));
+  fireEvent.change(screen.getByLabelText('Kind'), { target: { value: 'agents' } });
+  await waitFor(() => expect(calls).toContain('/api/admin/audit?kind=agents&offset=0&limit=50'));
   fireEvent.change(screen.getByLabelText('Kind'), { target: { value: 'backup' } });
   await waitFor(() => expect(calls).toContain('/api/admin/audit?kind=backup&offset=0&limit=50'));
   fireEvent.change(screen.getByLabelText('Kind'), { target: { value: 'branding' } });

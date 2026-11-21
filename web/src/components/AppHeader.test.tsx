@@ -13,6 +13,7 @@ it('admin sees only native settings and admin pages behind the settings gear', (
     'health',
     'audit',
     'scim',
+    'agents',
     'backup',
   ]);
 });

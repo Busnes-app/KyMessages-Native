@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Hash, Lock, MessageSquare, Search, Video, X } from 'lucide-react';
 import type { ChatDirectoryUser, ChatMessage, ChatRoomSummary } from '../../chat/types';
 import { searchMessages } from '../../chat/client';
-import { formatTime, isWebhookSender } from '../../chat/state';
+import { formatTime, isBotSender, isWebhookSender } from '../../chat/state';
 
 const FOCUSABLE_SELECTOR =
   'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
@@ -480,6 +480,7 @@ export const SearchModal: React.FC<SearchModalProps> = ({ rooms, activeRoomId, o
                       <span>·</span>
                       <span>{hit.sender_name || 'Member'}</span>
                       {isWebhookSender(hit.sender_id) && <span className="chat-msg-badge">Webhook</span>}
+                      {isBotSender(hit.sender_id) && <span className="chat-msg-badge">Bot</span>}
                       <span>·</span>
                       <span>{formatTime(hit.created_at)}</span>
                     </div>

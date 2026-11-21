@@ -55,26 +55,6 @@ interface CapsuleSize {
   warning: boolean;
 }
 
-interface MediaRun {
-  outcome: BackupAttempt['outcome'];
-  trigger: BackupAttempt['trigger'];
-  recorded_at: string;
-  archive: string;
-}
-
-export function mediaRun(value: unknown): MediaRun | undefined {
-  if (value === undefined) return undefined;
-  if (typeof value !== 'object' || value === null || !('archive' in value) || typeof value.archive !== 'string') {
-    throw new Error('Invalid media backup status');
-  }
-  try {
-    const { outcome, trigger, recorded_at } = backupAttempt({ ...value, capsule_id: '' })!;
-    return { outcome, trigger, recorded_at, archive: value.archive };
-  } catch {
-    throw new Error('Invalid media backup status');
-  }
-}
-
 function mib(n: number): string {
   return `${(n / 1048576).toFixed(1)} MiB`;
 }
@@ -93,8 +73,6 @@ export interface BackupStatus {
   last_run?: BackupAttempt;
   last_run_error?: string;
   capsule_size?: CapsuleSize;
-  media_last_run?: MediaRun;
-  media_last_run_error?: string;
   scheduler_error?: string;
   local_dir?: string;
   local_keep?: number;
@@ -193,8 +171,6 @@ export function parseBackupStatus(v: unknown): BackupStatus {
       const r = obj(c);
       return { bytes: count(r.bytes), limit: count(r.limit), percent: count(r.percent), warning: bool(r.warning) };
     }),
-    media_last_run: mediaRun(o.media_last_run),
-    media_last_run_error: optStr(o.media_last_run_error),
     scheduler_error: optStr(o.scheduler_error),
     local_dir: opt(o.local_dir, (d) => str(d, 4096)),
     local_keep: opt(o.local_keep, count),
@@ -552,15 +528,6 @@ export const Backup: React.FC = () => {
         <Alert kind={status.capsule_size.warning ? 'warn' : 'success'}>
           Last capsule: {mib(status.capsule_size.bytes)} of {mib(status.capsule_size.limit)} ({status.capsule_size.percent}%).
           {status.capsule_size.warning && ' Warning: at 75% or more of the limit; a larger capsule will fail to seal.'}
-        </Alert>
-      )}
-      {status?.media_last_run_error && <Alert kind="error">{status.media_last_run_error}</Alert>}
-      {status?.media_last_run && (
-        <Alert kind={status.media_last_run.outcome === 'success' ? 'success' : status.media_last_run.outcome === 'failure' ? 'error' : 'warn'}>
-          Last media backup: {{ success: 'Succeeded', warning: 'Needs attention', failure: 'Failed', unknown: 'Outcome unavailable' }[status.media_last_run.outcome] ?? 'Outcome unavailable'}
-          {' — '}{status.media_last_run.trigger}, {when(status.media_last_run.recorded_at)}.
-          {status.media_last_run.archive && <> Archive: <code>{status.media_last_run.archive}</code>.</>}
-          {status.media_last_run.outcome !== 'success' && ' Check the service logs for details.'}
         </Alert>
       )}
 

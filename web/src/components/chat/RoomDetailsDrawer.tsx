@@ -34,7 +34,7 @@ import {
   revokeRoomWebhook,
   updateRoomInfo,
 } from '../../chat/client';
-import { formatTime, initialsFor } from '../../chat/state';
+import { formatTime, initialsFor, isBotSender } from '../../chat/state';
 
 export type DrawerTab = 'about' | 'members' | 'shared';
 const DRAWER_TABS: DrawerTab[] = ['about', 'members', 'shared'];
@@ -744,7 +744,7 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
                         <option value="">Add teammate…</option>
                         {addableUsers.map((u) => (
                           <option key={u.id} value={u.id}>
-                            {u.display_name} (@{u.username})
+                            {u.display_name} (@{u.username}){u.role === 'bot' || isBotSender(u.id) ? ' · Bot' : ''}
                           </option>
                         ))}
                       </select>
@@ -767,6 +767,7 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
                         const dirUser = userLookup.get(m.user_id);
                         const label = dirUser?.display_name || dirUser?.username || m.user_id;
                         const isSelf = m.user_id === currentUserId;
+                        const isBot = m.role === 'bot' || dirUser?.role === 'bot' || isBotSender(m.user_id);
                         const canRemove = !isDM && (isSelf || (canModerate && m.role !== 'owner'));
                         const confirming = confirmRemoveId === m.user_id;
                         return (
@@ -778,6 +779,7 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
                               <div className="chat-member-name">
                                 {label}
                                 {isSelf ? ' (you)' : ''}
+                                {isBot && <span className="chat-msg-badge" style={{ marginLeft: '6px' }}>Bot</span>}
                               </div>
                               <div className="chat-member-role">
                                 {dirUser?.username ? `@${dirUser.username} · ` : ''}

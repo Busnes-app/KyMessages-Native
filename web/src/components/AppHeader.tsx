@@ -3,6 +3,7 @@ import {
   Activity,
   Archive,
   ArrowLeft,
+  Bot,
   LayoutDashboard,
   LogOut,
   ScrollText,
@@ -29,6 +30,7 @@ const adminSettingsItems = [
   { id: 'health', label: 'Health', icon: Activity },
   { id: 'audit', label: 'Audit', icon: ScrollText },
   { id: 'scim', label: 'Directory & SCIM', icon: Users },
+  { id: 'agents', label: 'Bots & Agents', icon: Bot },
   { id: 'backup', label: 'Backup & recovery', icon: Archive },
 ];
 

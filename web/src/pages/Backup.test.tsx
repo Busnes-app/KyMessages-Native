@@ -53,13 +53,6 @@ describe('Backup', () => {
     expect(screen.queryByText(/Last recorded backup attempt: Succeeded/)).toBeNull();
   });
 
-  it('rejects a malformed media run instead of showing it', async () => {
-    mockStatus({ ...PAIRED, media_last_run: { outcome: 'success', trigger: '<script>', recorded_at: '2026-10-01T12:00:00Z', archive: '' } });
-    render(<Backup />);
-    expect((await screen.findByRole('alert')).textContent).toContain('Invalid media backup status');
-    expect(screen.queryByText(/Last media backup/)).toBeNull();
-  });
-
   it('warns when a key is pinned but there is no destination', async () => {
     mockStatus({ key_pinned: true, paired: false, interval_sec: 0, recovery_key_id: 'k1', threshold: 2, total_shares: 3, database_driver: 'sqlite', members: [] });
     render(<Backup />);
@@ -133,17 +126,6 @@ describe('Backup', () => {
     render(<Backup />);
     const alert = await screen.findByText(/Last capsule: 1\.0 MiB/);
     expect(alert.textContent).not.toContain('Warning');
-  });
-
-  it('shows the last media run and its read error', async () => {
-    mockStatus({ ...PAIRED,
-      media_last_run: { outcome: 'failure', trigger: 'scheduled', recorded_at: '2026-10-01T12:00:00Z', archive: 'full-2026-10.tar' },
-      media_last_run_error: 'Could not read the latest media backup result',
-    });
-    render(<Backup />);
-    const run = await screen.findByText(/Last media backup: Failed/);
-    expect(run.textContent).toContain('full-2026-10.tar');
-    expect(screen.getByText('Could not read the latest media backup result')).toBeTruthy();
   });
 });
 

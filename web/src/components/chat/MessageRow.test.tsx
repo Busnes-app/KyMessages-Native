@@ -45,6 +45,24 @@ describe('MessageRow', () => {
     expect(screen.getByText('Webhook')).toBeTruthy();
   });
 
+  it('marks a native bot post with a Bot badge', () => {
+    render(
+      <MessageRow
+        message={{ ...baseMsg, sender_id: 'bot_123', sender_name: 'Triage Bot' }}
+        grouped={false}
+        currentUserId="u_bob"
+        canModerate={false}
+        onReply={vi.fn()}
+        onToggleReaction={vi.fn()}
+        onEdit={vi.fn().mockResolvedValue(undefined)}
+        onDelete={vi.fn().mockResolvedValue(undefined)}
+        onRetryFailed={vi.fn()}
+        onDismissFailed={vi.fn()}
+      />,
+    );
+    expect(screen.getByText('Bot')).toBeTruthy();
+  });
+
   it('shows no badge on a member post', () => {
     render(
       <MessageRow
@@ -61,6 +79,7 @@ describe('MessageRow', () => {
       />,
     );
     expect(screen.queryByText('Webhook')).toBeNull();
+    expect(screen.queryByText('Bot')).toBeNull();
   });
 
   it('renders formatted links with chat-inline-link and jumpable replies with is-clickable', () => {

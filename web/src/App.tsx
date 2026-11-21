@@ -6,6 +6,7 @@ import { Login } from './pages/Login';
 import { ChangePassword } from './pages/ChangePassword';
 import { Backup } from './pages/Backup';
 import { SCIMAdmin } from './pages/SCIMAdmin';
+import { Agents } from './pages/Agents';
 import { Settings } from './pages/Settings';
 import { Health } from './pages/Health';
 import { Audit } from './pages/Audit';
@@ -268,6 +269,7 @@ export const App: React.FC = () => {
                 {isAdmin && activeTab === 'health' && <Health />}
                 {isAdmin && activeTab === 'audit' && <Audit />}
                 {isAdmin && activeTab === 'scim' && <SCIMAdmin />}
+                {isAdmin && activeTab === 'agents' && <Agents />}
                 {isAdmin && activeTab === 'backup' && <Backup />}
                 {isAdmin && activeTab === 'settings' && <Settings settings={settings} onBrandingChanged={() => void loadSettings()} />}
                 {isAdmin && activeTab === 'settings' && <TwoFactorSetup />}

@@ -16,6 +16,7 @@ export interface ChatDirectoryUser {
   id: string;
   username: string;
   display_name: string;
+  role?: string;
 }
 
 export interface ChatTenant {
@@ -261,6 +262,7 @@ export function parseDirectoryUser(v: unknown): ChatDirectoryUser {
     id: str(o.id, 128),
     username: str(o.username, 255),
     display_name: opt(o.display_name, (s) => str(s, 255)) ?? str(o.username, 255),
+    role: opt(o.role, (s) => str(s, 32)),
   };
 }
 
