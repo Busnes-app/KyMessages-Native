@@ -3,8 +3,6 @@ package config_test
 import (
 	"bytes"
 	"encoding/json"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -237,167 +235,31 @@ func TestEmptyLegacyKySignOnEnvironmentIsIgnored(t *testing.T) {
 	}
 }
 
-// Matrix is optional, but a partial or malformed block must stop startup rather than serve a
-// .well-known that points members at the wrong homeserver.
-func TestMatrixConfigFromEnv(t *testing.T) {
-	secret := filepath.Join(t.TempDir(), "admin-secret")
-	if err := os.WriteFile(secret, []byte("s3cret\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	backupPW := filepath.Join(t.TempDir(), "kybackup")
-	if err := os.WriteFile(backupPW, []byte("kybpw\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	set := func(name, host, chat string) {
-		t.Setenv("KY_DATA_DIR", t.TempDir())
-		t.Setenv("KY_MATRIX_DIR", "/matrix")
-		t.Setenv("KY_MATRIX_MEDIA_DIR", "/matrix-media")
-		t.Setenv("KY_MATRIX_BACKUP_DB_PASSWORD_FILE", backupPW)
-		t.Setenv("KY_MATRIX_ADMIN_URL", "http://mas-admin:8081")
-		t.Setenv("KY_MATRIX_ADMIN_CLIENT_ID", "01J0000000000000000000ADMN")
-		t.Setenv("KY_MATRIX_ADMIN_SECRET_FILE", secret)
-		t.Setenv("KY_MATRIX_SERVER_NAME", name)
-		t.Setenv("KY_MATRIX_HOST", host)
-		t.Setenv("KY_MATRIX_CHAT_HOST", chat)
-		t.Setenv("KY_KYIDENTITY_HMAC_SECRET", "hmac")
-	}
-	set("", "", "")
-	for _, k := range []string{"KY_MATRIX_ADMIN_URL", "KY_MATRIX_ADMIN_CLIENT_ID", "KY_MATRIX_ADMIN_SECRET_FILE", "KY_MATRIX_DIR", "KY_MATRIX_MEDIA_DIR", "KY_MATRIX_BACKUP_DB_PASSWORD_FILE"} {
-		t.Setenv(k, "")
-	}
-	cfg, err := config.LoadFromEnv()
-	if err != nil || cfg.Matrix != (config.MatrixConfig{}) {
-		t.Fatalf("unset: %+v, %v", cfg, err)
-	}
-	set("example.com", "https://matrix.example.com/", "https://chat.example.com")
-	cfg, err = config.LoadFromEnv()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := (config.MatrixConfig{ServerName: "example.com", Host: "https://matrix.example.com", ChatHost: "https://chat.example.com", AdminURL: "http://mas-admin:8081", AdminClientID: "01J0000000000000000000ADMN", AdminSecret: "s3cret", Dir: "/matrix", MediaDir: "/matrix-media", DBHost: "postgres", BackupDBPassword: "kybpw", ElementRestartHint: config.DefaultElementRestartHint, SynapseRestartHint: config.DefaultSynapseRestartHint}); cfg.Matrix != want {
-		t.Fatalf("got %+v want %+v", cfg.Matrix, want)
-	}
-	t.Run("calling credentials", func(t *testing.T) {
-		t.Setenv("KY_MATRIX_RTC_HOST", "https://sfu.example.com/")
-		key := filepath.Join(t.TempDir(), "rtc-key")
-		value := strings.Repeat("k", 64)
-		if err := os.WriteFile(key, []byte(value), 0600); err != nil {
-			t.Fatal(err)
-		}
-		t.Setenv("KY_MATRIX_RTC_KEY_FILE", key)
-		t.Setenv("KY_MATRIX_RTC_SECRET_FILE", key)
-		cfg, err := config.LoadFromEnv()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if cfg.Matrix.RTCHost != "https://sfu.example.com" || cfg.Matrix.RTCSecret != value {
-			t.Fatal("calling config missing")
-		}
-		raw, err := json.Marshal(cfg.Matrix)
-		if err != nil || bytes.Contains(raw, []byte(value)) {
-			t.Fatal("credential serialized")
-		}
-		t.Setenv("KY_MATRIX_RTC_HOST", "http://sfu.example.com")
-		if _, err := config.LoadFromEnv(); err == nil {
-			t.Fatal("insecure signalling accepted")
-		}
-		t.Setenv("KY_MATRIX_RTC_HOST", "")
-		if _, err := config.LoadFromEnv(); err == nil {
-			t.Fatal("orphan credential accepted")
-		}
-		t.Setenv("KY_MATRIX_RTC_HOST", "https://sfu.example.com")
-		if err := os.WriteFile(key, []byte("short"), 0600); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := config.LoadFromEnv(); err == nil || strings.Contains(err.Error(), "short") {
-			t.Fatal("invalid credential handling", err)
-		}
-	})
-	// Without the webhook secret every directory delivery is refused, so a KyIdentity disable
-	// or delete never reaches MAS.
-	t.Setenv("KY_KYIDENTITY_HMAC_SECRET", "")
-	if _, err := config.LoadFromEnv(); err == nil || !strings.Contains(err.Error(), "KY_KYIDENTITY_HMAC_SECRET") {
-		t.Errorf("Matrix without HMAC secret: err = %v", err)
-	}
-	for _, tc := range []struct{ name, host, chat, wantVar string }{
-		{"example.com", "https://matrix.example.com", "", "KY_MATRIX_CHAT_HOST"},
-		{"", "https://matrix.example.com", "https://chat.example.com", "KY_MATRIX_SERVER_NAME"},
-		{"example.com", "http://matrix.example.com", "https://chat.example.com", "KY_MATRIX_HOST"},
-		{"example.com", "https://matrix.example.com/x", "https://chat.example.com", "KY_MATRIX_HOST"},
-		{"example.com", "https://matrix.example.com", "https://chat.example.com?a", "KY_MATRIX_CHAT_HOST"},
-		{"Example.com", "https://matrix.example.com", "https://chat.example.com", "KY_MATRIX_SERVER_NAME"},
-		{"localhost", "https://matrix.example.com", "https://chat.example.com", "KY_MATRIX_SERVER_NAME"},
-	} {
-		set(tc.name, tc.host, tc.chat)
-		if _, err := config.LoadFromEnv(); err == nil || !strings.Contains(err.Error(), tc.wantVar) {
-			t.Errorf("%+v: err = %v, want one naming %s", tc, err, tc.wantVar)
-		}
-	}
-}
-
-func TestMediaFullKeepFromEnv(t *testing.T) {
+func TestRTCConfigFromEnv(t *testing.T) {
 	t.Setenv("KY_DATA_DIR", t.TempDir())
-	cfg, err := config.LoadFromEnv()
-	if err != nil || cfg.Backup.MediaFullKeep != 3 {
-		t.Fatalf("default: %v %v", cfg, err)
-	}
-	t.Setenv("KY_BACKUP_MEDIA_FULL_KEEP", "0")
-	if _, err := config.LoadFromEnv(); err == nil || !strings.Contains(err.Error(), "KY_BACKUP_MEDIA_FULL_KEEP") {
-		t.Errorf("keep 0: %v", err)
-	}
-}
+	t.Setenv("KY_LIVEKIT_URL", "wss://sfu.example.com")
+	t.Setenv("KY_LIVEKIT_API_KEY", "devkey")
+	t.Setenv("KY_LIVEKIT_API_SECRET", "devsecret")
+	t.Setenv("KY_STUN_URLS", "stun:stun.example.com:3478,stuns:stun.example.com:5349")
 
-// Settings names the command that restarts Element on this deployment: Compose by default, the
-// cluster's kubectl when set. One line only; it is displayed, never run.
-func TestElementRestartHintFromEnv(t *testing.T) {
-	dir := t.TempDir()
-	for name, body := range map[string]string{"admin": "s3cret\n", "kybackup": "kybpw\n"} {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for k, v := range map[string]string{
-		"KY_DATA_DIR": t.TempDir(), "KY_MATRIX_SERVER_NAME": "example.com",
-		"KY_MATRIX_HOST": "https://matrix.example.com", "KY_MATRIX_CHAT_HOST": "https://chat.example.com",
-		"KY_MATRIX_ADMIN_URL": "http://mas-admin:8081", "KY_MATRIX_ADMIN_CLIENT_ID": "01J0000000000000000000ADMN",
-		"KY_MATRIX_ADMIN_SECRET_FILE": filepath.Join(dir, "admin"), "KY_MATRIX_DIR": "/matrix",
-		"KY_MATRIX_MEDIA_DIR": "/matrix-media", "KY_MATRIX_BACKUP_DB_PASSWORD_FILE": filepath.Join(dir, "kybackup"),
-		"KY_KYIDENTITY_HMAC_SECRET": "hmac", "KY_MATRIX_ELEMENT_RESTART_HINT": "",
-	} {
-		t.Setenv(k, v)
-	}
 	cfg, err := config.LoadFromEnv()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := cfg.Matrix.ElementRestartHint; got != "docker compose restart element" {
-		t.Fatalf("default hint %q", got)
+	if !cfg.RTC.LiveKitEnabled() || cfg.RTC.LiveKitURL != "https://sfu.example.com" {
+		t.Fatalf("unexpected RTC config: %+v", cfg.RTC)
 	}
-	const k8s = "kubectl -n ky-stack rollout restart deployment/element"
-	t.Setenv("KY_MATRIX_ELEMENT_RESTART_HINT", "  "+k8s+" ")
-	if cfg, err = config.LoadFromEnv(); err != nil {
-		t.Fatal(err)
+	raw, err := json.Marshal(cfg.RTC)
+	if err != nil || bytes.Contains(raw, []byte("devsecret")) {
+		t.Fatal("LiveKit secret serialized into JSON")
 	}
-	if got := cfg.Matrix.ElementRestartHint; got != k8s {
-		t.Fatalf("set hint %q", got)
+	if len(cfg.RTC.STUNURLs) != 2 {
+		t.Fatalf("unexpected STUN URLs: %v", cfg.RTC.STUNURLs)
 	}
-	for _, bad := range []string{"kubectl rollout\nrestart", strings.Repeat("x", 257)} {
-		t.Setenv("KY_MATRIX_ELEMENT_RESTART_HINT", bad)
-		if _, err := config.LoadFromEnv(); err == nil || !strings.Contains(err.Error(), "KY_MATRIX_ELEMENT_RESTART_HINT") {
-			t.Errorf("%q: err = %v, want one naming KY_MATRIX_ELEMENT_RESTART_HINT", bad, err)
-		}
-	}
-	t.Setenv("KY_MATRIX_ELEMENT_RESTART_HINT", "")
-	if cfg, err = config.LoadFromEnv(); err != nil || cfg.Matrix.SynapseRestartHint != "docker compose restart synapse" {
-		t.Fatalf("default Synapse hint %q, %v", cfg.Matrix.SynapseRestartHint, err)
-	}
-	t.Setenv("KY_MATRIX_SYNAPSE_RESTART_HINT", "kubectl -n ky-stack rollout restart deployment/synapse")
-	if cfg, err = config.LoadFromEnv(); err != nil || cfg.Matrix.SynapseRestartHint != "kubectl -n ky-stack rollout restart deployment/synapse" {
-		t.Fatalf("set Synapse hint %q, %v", cfg.Matrix.SynapseRestartHint, err)
-	}
-	t.Setenv("KY_MATRIX_SYNAPSE_RESTART_HINT", "a\nb")
-	if _, err := config.LoadFromEnv(); err == nil || !strings.Contains(err.Error(), "KY_MATRIX_SYNAPSE_RESTART_HINT") {
-		t.Errorf("multi-line Synapse hint: %v", err)
+
+	t.Setenv("KY_LIVEKIT_API_SECRET", "")
+	if _, err := config.LoadFromEnv(); err == nil {
+		t.Fatal("partial LiveKit config accepted")
 	}
 }
 

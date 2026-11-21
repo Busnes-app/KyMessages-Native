@@ -68,8 +68,11 @@ func (s *Server) handleInstallerDirectory(w http.ResponseWriter, r *http.Request
 		s.writeError(w, 422, "Directory revision or assigned identity refused")
 		return
 	}
-	if revoked != "" && s.chatHub != nil {
-		_ = s.chatHub.RevokeUser(r.Context(), revoked)
+	if revoked != "" {
+		if s.chatHub != nil {
+			_ = s.chatHub.RevokeUser(r.Context(), revoked)
+		}
+		s.revokeAgentsForOwner(r.Context(), revoked)
 	}
 	if s.directoryChanged != nil {
 		s.directoryChanged()

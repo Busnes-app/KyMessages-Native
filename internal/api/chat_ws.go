@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/Busnes-app/ky_server_base/internal/auth"
 	"github.com/Busnes-app/ky_server_base/internal/chat"
 	"github.com/Busnes-app/ky_server_base/internal/store"
 	"github.com/coder/websocket"
@@ -36,6 +37,43 @@ func (s *Server) CloseChat() {
 // still exists and is unexpired, and its user is active, allowed and not restricted.
 // A lookup failure is returned as an error, never as a revocation.
 func chatSessionValid(ctx context.Context, st store.Store, userID, sessionHash string) (bool, error) {
+	if rest, ok := strings.CutPrefix(sessionHash, auth.AgentSessionPrefix); ok {
+		agentID, tokenHash, splitOK := strings.Cut(rest, ":")
+		if !splitOK || agentID == "" || tokenHash == "" {
+			return false, nil
+		}
+		agent, err := st.Agents().GetAgentByTokenHash(ctx, tokenHash)
+		if errors.Is(err, store.ErrNotFound) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if agent.ID != agentID || agent.UserID != userID || agent.TokenState != store.AgentTokenActive {
+			return false, nil
+		}
+		botUser, err := st.Users().GetUserByID(ctx, userID)
+		if errors.Is(err, store.ErrNotFound) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if botUser.Status != "active" || botUser.Role != "bot" {
+			return false, nil
+		}
+		owner, err := st.Users().GetUserByID(ctx, agent.OwnerUserID)
+		if errors.Is(err, store.ErrNotFound) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if owner.Status != "active" {
+			return false, nil
+		}
+		return st.InstallerUserAllowed(ctx, owner)
+	}
 	sess, err := st.Sessions().GetSession(ctx, sessionHash)
 	if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrSessionExpired) {
 		return false, nil

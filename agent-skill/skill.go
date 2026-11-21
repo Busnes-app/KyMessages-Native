@@ -1,6 +1,6 @@
-// Package agentskill ships the KyMessages skill for chat agents (OpenClaw, Hermes Agent) and
-// fills each runtime's config block from the skill's own reference file, so the console and
-// the skill can never disagree.
+// Package agentskill ships the KyMessages skill for chat bots/agents (OpenClaw, Hermes Agent)
+// and fills each runtime's config block from the skill's own reference file, so the console
+// and the skill can never disagree.
 package agentskill
 
 import (
@@ -21,7 +21,7 @@ var Runtimes = []string{"openclaw", "hermes"}
 
 // Values fill a config block's placeholders.
 type Values struct {
-	Homeserver, AccessToken, Owner string
+	ServerURL, AccessToken, Owner string
 }
 
 // Config returns runtime's config block with v filled in.
@@ -30,13 +30,13 @@ func Config(runtime string, v Values) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	for _, s := range []string{v.Homeserver, v.AccessToken, v.Owner} {
+	for _, s := range []string{v.ServerURL, v.AccessToken, v.Owner} {
 		// Each value lands inside a quoted string or an env line.
 		if s == "" || strings.ContainsAny(s, "\"'\\\r\n\t #`$") {
 			return "", fmt.Errorf("unusable config value %q", s)
 		}
 	}
-	return strings.NewReplacer("<HOMESERVER>", v.Homeserver, "<ACCESS_TOKEN>", v.AccessToken, "<OWNER>", v.Owner).Replace(block), nil
+	return strings.NewReplacer("<SERVER_URL>", v.ServerURL, "<ACCESS_TOKEN>", v.AccessToken, "<OWNER>", v.Owner).Replace(block), nil
 }
 
 // configBlock is the first fenced block of the runtime's reference file.

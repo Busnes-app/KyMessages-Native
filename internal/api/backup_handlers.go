@@ -31,16 +31,12 @@ const errRecoveryKeyMismatch = "Recovery key file does not match the pinned key 
 // the pairing and the run refusals end with it.
 const privateRecoveryHint = " (set KY_BACKUP_ALLOW_PRIVATE_RECOVERY=true for a KyRecovery on your own network)"
 
-// Write budgets for the routes that seal: the listener's WriteTimeout is sized for JSON replies,
-// and with Matrix on each route first dumps both databases (backup.DumpTimeout).
+// Write budgets for the routes that seal: the listener's WriteTimeout is sized for JSON replies.
 const (
-	sealBudget = 2 * time.Minute // sealing, opening or extracting up to the capsule limits
-	// depositWriteBudget: dumps, sealing, then the lib's 15-minute upload ceiling.
-	depositWriteBudget = backup.DumpTimeout + sealBudget + 15*time.Minute
-	// drillWriteBudget: dumps, seal, open and extract, then each of the two dumps read in full.
-	drillWriteBudget = backup.DumpTimeout + 2*sealBudget + 2*backup.DumpCheckTimeout
-	// exportWriteBudget: dumps, sealing, then up to 384 MiB to the browser.
-	exportWriteBudget = backup.DumpTimeout + sealBudget + 10*time.Minute
+	sealBudget         = 2 * time.Minute // sealing, opening or extracting up to the capsule limits
+	depositWriteBudget = sealBudget + 15*time.Minute
+	drillWriteBudget   = 2 * sealBudget
+	exportWriteBudget  = sealBudget + 10*time.Minute
 )
 
 // writeTooLarge answers a payload past the capsule limits. A SizeError names the measured size
@@ -630,15 +626,6 @@ func (s *Server) scheduleStatus(ctx context.Context, out map[string]any) {
 	}
 	if size, ok, err := backup.LastSize(settings); err == nil && ok {
 		out["capsule_size"] = size
-	}
-	if s.config.Matrix.Enabled() {
-		// Media has its own result: its failure never fails the capsule run.
-		if last, err := s.store.Audit().LatestAuditRecord(ctx, "admin.backup_media"); err == nil {
-			out["media_last_run"] = map[string]any{"outcome": auditOutcome(last.Details), "trigger": auditTrigger(last.UserID),
-				"recorded_at": last.CreatedAt, "archive": last.Resource}
-		} else if !errors.Is(err, store.ErrNotFound) {
-			out["media_last_run_error"] = "Could not read the latest media backup result"
-		}
 	}
 }
 

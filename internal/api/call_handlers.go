@@ -38,6 +38,10 @@ func (s *Server) handleCallJoin(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	if user.Role == "bot" {
+		s.writeError(w, http.StatusForbidden, "Bot accounts cannot join calls")
+		return
+	}
 	roomID := r.PathValue("id")
 	if _, ok := s.requireRoomMember(w, r, store.DefaultTenantID, roomID, user.ID); !ok {
 		return

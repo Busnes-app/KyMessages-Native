@@ -95,7 +95,7 @@ func (s *SQLStore) ApplyInstallerDirectory(ctx context.Context, issuer, subject,
 		return "", err
 	}
 	if previousStatus == "deleted" && status == "active" {
-		return "", errors.New("deleted Matrix identity cannot be reactivated")
+		return "", errors.New("deleted directory identity cannot be reactivated")
 	}
 	now := time.Now().UTC()
 	result, err := tx.ExecContext(ctx, s.rebind("UPDATE users SET status=?,updated_at=? WHERE id=? AND sso_provider=? AND sso_subject=? AND role=?"), status, now, owned.UserID, "kyidentity", subject, owned.Role)

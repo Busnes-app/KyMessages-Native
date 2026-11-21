@@ -11,12 +11,10 @@ The console fills in the placeholders. Put the block under your OpenClaw config,
 ```json5
 {
   channels: {
-    matrix: {
+    kymessages: {
       enabled: true,
-      homeserver: "<HOMESERVER>",
+      serverUrl: "<SERVER_URL>",
       accessToken: "<ACCESS_TOKEN>",
-      encryption: true,
-      autoJoin: "always",
       dm: { policy: "allowlist", allowFrom: ["<OWNER>"] },
       groupPolicy: "allowlist",
       groupAllowFrom: ["<OWNER>"],
@@ -25,12 +23,7 @@ The console fills in the placeholders. Put the block under your OpenClaw config,
 }
 ```
 
-- `autoJoin: "always"` lets your owner invite you anywhere; `dm.allowFrom` and
-  `groupAllowFrom` make only your owner able to start a turn. To pin rooms instead, set
-  `autoJoin: "allowlist"` with `autoJoinAllowlist: ["!roomid:server"]`.
-- User IDs are case-sensitive: copy `<OWNER>` exactly.
-
-## Encryption
-
-Run `openclaw matrix encryption setup` once after the first start. Keep the recovery key it
-gives you outside the config; pass it later through `MATRIX_RECOVERY_KEY` for the CLI.
+- `dm.allowFrom` and `groupAllowFrom` make only your owner able to start a turn.
+- Keep your config file readable only by your user (`chmod 600`): it holds the `kybot_`
+  bearer token.
+- Usernames are case-sensitive: copy `<OWNER>` exactly.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"mime"
 	"net/http"
 	"net/netip"
@@ -19,13 +20,10 @@ import (
 	"github.com/Busnes-app/ky_server_base/internal/config"
 	"github.com/Busnes-app/ky_server_base/internal/devices"
 	"github.com/Busnes-app/ky_server_base/internal/health"
-	"github.com/Busnes-app/ky_server_base/internal/matrixrtc"
-	"github.com/Busnes-app/ky_server_base/internal/matrixsync"
 	"github.com/Busnes-app/ky_server_base/internal/rtc"
 	"github.com/Busnes-app/ky_server_base/internal/scim"
 	"github.com/Busnes-app/ky_server_base/internal/sso"
 	"github.com/Busnes-app/ky_server_base/internal/store"
-	"github.com/Busnes-app/ky_server_base/internal/synapseadmin"
 	"github.com/Busnes-app/ky_server_base/web"
 )
 
@@ -34,37 +32,6 @@ import (
 type recoveryClient interface {
 	ClaimPairing(ctx context.Context, serverURL, pairingCode, serviceName, appName string) (recoveryclient.PairingResult, error)
 	recoveryclient.Depositor
-}
-
-// MatrixAdmin is the MAS admin surface the console uses; *matrixsync.Client implements it.
-type MatrixAdmin interface {
-	Users(ctx context.Context) ([]matrixsync.User, error)
-	User(ctx context.Context, id string) (matrixsync.User, error)
-	Sessions(ctx context.Context, userID string) ([]matrixsync.Session, error)
-	Session(ctx context.Context, kind matrixsync.SessionKind, id string) (matrixsync.Session, error)
-	FinishSession(ctx context.Context, kind matrixsync.SessionKind, id string) (bool, error)
-	Version(ctx context.Context) (string, error)
-	// AsConsole runs fn with a 5-minute console session token for Synapse's admin API.
-	AsConsole(ctx context.Context, fn func(ctx context.Context, token string) error) error
-	Deactivate(ctx context.Context, id string) error
-
-	// Agent accounts (agent_handlers.go). Tokens are returned, never kept.
-	CreateAgentUser(ctx context.Context, username string) (string, error)
-	MintAgentToken(ctx context.Context, userID, deviceID string) (sessionID, token string, err error)
-	RotateAgentToken(ctx context.Context, userID, deviceID, sessionID string) (newSessionID, token string, err error)
-	RevokeAgentSession(ctx context.Context, sessionID string) error
-	AgentActivity(ctx context.Context, sessionID string) (matrixsync.Activity, error)
-}
-
-// RoomAdmin is the Synapse admin surface the console uses; *synapseadmin.Client implements it.
-type RoomAdmin interface {
-	Rooms(ctx context.Context, token string, q synapseadmin.RoomQuery) (synapseadmin.RoomPage, error)
-	Room(ctx context.Context, token, id string) (synapseadmin.Room, error)
-	Members(ctx context.Context, token, id string) ([]string, error)
-	Blocked(ctx context.Context, token, id string) (bool, error)
-	Close(ctx context.Context, token, id string) (string, error)
-	Delete(ctx context.Context, token, id string) (string, error)
-	DeleteJobs(ctx context.Context, token, id string) ([]synapseadmin.DeleteJob, error)
 }
 
 type Server struct {
@@ -79,14 +46,7 @@ type Server struct {
 	calls            *chat.CallManager
 	lobby            *chat.LobbyManager
 	recovery         recoveryClient
-	rtc              *matrixrtc.Client
-	mas              MatrixAdmin // nil when Matrix is off
-	rooms            RoomAdmin
-	roomBudget       time.Duration // a room change's steps before its final Close or Delete
-	matrixTargets    health.Targets
 	probeHTTP        *http.Client
-	fedHTTP          *http.Client // other homeservers: public addresses only
-	fedBaseForTest   func(name string) string
 	mux              *http.ServeMux
 	cspHeader        string
 	// clientAttempts throttles anonymous callers by address; accountAttempts throttles by
@@ -98,16 +58,6 @@ type Server struct {
 	// connection. http.Server.Shutdown does not know about them, so runServer waits on this
 	// before the store closes.
 	detached detachedCounter
-	// brandMu serialises Element brand writes: the name handler and the maintenance tick both
-	// patch one file. brandFailing and brandErr describe the current failure streak.
-	brandMu      sync.Mutex
-	brandFailing bool
-	brandErr     string
-	// fedMu serialises federation settings changes and Synapse federation file writes;
-	// fedFailing and fedErr describe the current write failure streak.
-	fedMu      sync.Mutex
-	fedFailing bool
-	fedErr     string
 }
 
 // detachedCounter is a WaitGroup that tolerates a registration arriving while the wait is
@@ -205,10 +155,6 @@ const attemptsCap = 10000
 // fn must not block: the webhook's sender is waiting.
 func (s *Server) OnDirectoryChange(fn func()) { s.directoryChanged = fn }
 
-// SetMatrixAdmin enables the Matrix console routes with the client the offboarding sweep
-// also uses, so they share one token and one path guard.
-func (s *Server) SetMatrixAdmin(m MatrixAdmin) { s.mas = m }
-
 func NewServer(cfg *config.Config, st store.Store) *Server {
 	sessions := auth.NewSessionManager(st, cfg.Security)
 	pairing := devices.NewPairingService(st, cfg.Server.AppName, cfg.Server.AppURL)
@@ -244,13 +190,6 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 		}
 	})
 
-	revokeUser := func(ctx context.Context, userID string) {
-		callMgr.HandleDisconnect(userID, 0)
-		_ = chatHub.RevokeUser(ctx, userID)
-	}
-	kyidentity.OnUserRevoked(revokeUser)
-	scimSrv.OnUserRevoked(revokeUser)
-
 	s := &Server{
 		config:          cfg,
 		store:           st,
@@ -262,20 +201,21 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 		calls:           callMgr,
 		lobby:           lobbyMgr,
 		recovery:        recovery,
-		matrixTargets:   health.ComposeTargets,
 		probeHTTP:       health.NewHTTPClient(),
-		fedHTTP:         newFederationHTTP(),
 		mux:             http.NewServeMux(),
 		cspHeader:       buildCSP(cfg),
 		clientAttempts:  attemptLimiter{m: make(map[string]attemptWindow), cap: attemptsCap},
 		accountAttempts: attemptLimiter{m: make(map[string]attemptWindow)},
 	}
-	s.rooms = synapseadmin.New(s.matrixTargets.Synapse) // the origin the Health probes use
-	s.roomBudget = roomChangeTimeout
 
-	if cfg.Matrix.RTCHost != "" {
-		s.rtc = matrixrtc.New("http://livekit:7880", cfg.Matrix.RTCKey, cfg.Matrix.RTCSecret)
+	revokeUser := func(ctx context.Context, userID string) {
+		callMgr.HandleDisconnect(userID, 0)
+		_ = chatHub.RevokeUser(ctx, userID)
+		s.revokeAgentsForOwner(ctx, userID)
 	}
+	kyidentity.OnUserRevoked(revokeUser)
+	scimSrv.OnUserRevoked(revokeUser)
+
 	s.routes()
 	return s
 }
@@ -418,29 +358,18 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/admin/network-check", s.requireAdmin(s.handleNetworkCheck))
 	s.mux.HandleFunc("GET /api/admin/scim/users", s.requireAdmin(s.handleSCIMUsers))
 
-	// Console. Reads are any admin; ending a session needs a recent sign-in and is audited.
-	s.mux.HandleFunc("GET /api/admin/matrix/users", s.requireAdmin(s.handleMatrixUsers))
-	s.mux.HandleFunc("GET /api/admin/matrix/users/{id}/sessions", s.requireAdmin(s.handleMatrixUserSessions))
-	s.mux.HandleFunc("POST /api/admin/matrix/sessions/{kind}/{id}/finish", s.tracked(s.requireFreshAdmin(s.handleMatrixSessionFinish)))
+	// Console.
 	s.mux.HandleFunc("GET /api/admin/health", s.requireAdmin(s.handleHealth))
 	s.mux.HandleFunc("GET /api/admin/audit", s.requireAdmin(s.handleAudit))
-	s.mux.HandleFunc("GET /api/admin/matrix/sync-status", s.requireAdmin(s.handleSyncStatus))
 
-	// Rooms act through a 5-minute console session on Synapse's admin API. Close and delete
-	// need a recent sign-in, run detached and are audited. Close is final: there is no reopen.
-	// Chat agent accounts: docs/superpowers/plans/2026-10-14-agent-accounts.md.
+	// Native Bot & Agent accounts.
 	s.mux.HandleFunc("GET /api/admin/agents", s.requireAdmin(s.handleAgents))
 	s.mux.HandleFunc("GET /api/admin/agents/skill", s.requireAdmin(s.handleAgentSkill))
 	s.mux.HandleFunc("POST /api/admin/agents", s.tracked(s.requireFreshAdmin(s.handleAgentCreate)))
 	s.mux.HandleFunc("POST /api/admin/agents/{id}/rotate", s.tracked(s.requireFreshAdmin(s.handleAgentRotate)))
-	// Revoke cuts access, so it is one click, like narrowing federation.
+	// Revoke cuts access immediately in one click.
 	s.mux.HandleFunc("POST /api/admin/agents/{id}/revoke", s.tracked(s.requireAdmin(s.handleAgentRevoke)))
 	s.mux.HandleFunc("DELETE /api/admin/agents/{id}", s.tracked(s.requireFreshAdmin(s.handleAgentDelete)))
-	s.mux.HandleFunc("GET /api/admin/matrix/rooms", s.requireAdmin(s.handleRooms))
-	s.mux.HandleFunc("GET /api/admin/matrix/rooms/{id}", s.requireAdmin(s.handleRoom))
-	s.mux.HandleFunc("GET /api/admin/matrix/rooms/{id}/delete-status", s.requireAdmin(s.handleRoomJobs))
-	s.mux.HandleFunc("POST /api/admin/matrix/rooms/{id}/close", s.tracked(s.requireFreshAdmin(s.handleRoomClose)))
-	s.mux.HandleFunc("POST /api/admin/matrix/rooms/{id}/delete", s.tracked(s.requireFreshAdmin(s.handleRoomDelete)))
 
 	// Settings & Theme. The read endpoint tiers its own payload by role.
 	s.mux.HandleFunc("/api/settings", s.handleGetSettings)
@@ -451,15 +380,6 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("PUT /api/admin/branding/name", s.tracked(s.requireFreshAdmin(s.handleBrandName)))
 	s.mux.HandleFunc("PUT /api/admin/branding/logo", s.tracked(s.requireFreshAdmin(s.handleBrandLogo)))
 	s.mux.HandleFunc("DELETE /api/admin/branding/logo", s.tracked(s.requireFreshAdmin(s.handleBrandLogoReset)))
-
-	// Federation. Any admin reads it and may narrow it; widening needs a recent sign-in, checked
-	// in fedChange because one route can do either. Changes run detached and are audited.
-	s.mux.HandleFunc("GET /api/admin/federation", s.requireAdmin(s.handleFederation))
-	s.mux.HandleFunc("GET /api/admin/federation/status", s.requireAdmin(s.handleFederationStatus))
-	s.mux.HandleFunc("PUT /api/admin/federation/level", s.tracked(s.requireAdmin(s.handleFederationLevel)))
-	s.mux.HandleFunc("POST /api/admin/federation/servers", s.tracked(s.requireAdmin(s.handleFederationAddServer)))
-	s.mux.HandleFunc("DELETE /api/admin/federation/servers/{name}", s.tracked(s.requireAdmin(s.handleFederationRemoveServer)))
-	s.mux.HandleFunc("PUT /api/admin/federation/presets/{name}", s.tracked(s.requireAdmin(s.handleFederationPreset)))
 
 	// Native KyMessages v1 Chat & Real-Time API
 	s.mux.HandleFunc("GET /api/v1/bootstrap", s.requireAuthenticated(s.handleChatBootstrap))
@@ -518,12 +438,6 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusNotFound, "Unknown API endpoint")
 	})
-
-	s.mux.HandleFunc("POST "+rtcPrefix+"/sfu/get", s.tracked(s.handleRTCToken))
-	s.mux.HandleFunc("POST "+rtcPrefix+"/get_token", s.tracked(s.handleRTCToken))
-	// Matrix client discovery lives outside /api/, so it must precede the SPA catch-all.
-	s.mux.HandleFunc("GET "+wellKnownMatrixClient, s.handleMatrixClientWellKnown)
-	s.mux.HandleFunc("GET "+wellKnownMatrixServer, s.handleMatrixServerWellKnown)
 
 	// Embedded React PWA Frontend. /app-icon.png is the admin's logo when one is set; public.
 	static := web.Handler()
@@ -596,26 +510,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 	w.Header().Set("Content-Security-Policy", s.cspHeader)
-	// Only on the app host: the Matrix server name is often the apex, and includeSubDomains
-	// there would break every plain-http service under it.
 	if app, err := url.Parse(s.config.Server.AppURL); s.config.Security.CookieSecure && err == nil && hostMatches(r.Host, app) {
 		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 	}
 
-	// Call grants use explicit Matrix OpenID tokens, never browser cookies.
-	if rtcPath(r.URL.Path) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Del("Access-Control-Allow-Credentials")
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
-		s.mux.ServeHTTP(w, r)
-		return
-	}
 	origin := r.Header.Get("Origin")
 	if origin != "" && sameOrigin(origin, s.config.Server.AppURL) {
 		w.Header().Set("Access-Control-Allow-Origin", origin)
@@ -625,11 +523,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-CSRF-Token, X-Guest-Session, Idempotency-Key, "+syncauth.HeaderSignature)
 
-	// Matrix discovery is public: any client origin may preflight it.
-	if r.Method == http.MethodOptions && (r.URL.Path == wellKnownMatrixClient || r.URL.Path == wellKnownMatrixServer) {
-		publicDiscovery(w, r)
-		return
-	}
 	if r.Method == http.MethodOptions {
 		if origin != "" && !sameOrigin(origin, s.config.Server.AppURL) {
 			http.Error(w, "Origin not allowed", http.StatusForbidden)
@@ -661,6 +554,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mux.ServeHTTP(w, r)
+}
+
+func decodeStrict(w http.ResponseWriter, r *http.Request, v any) bool {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10))
+	dec.DisallowUnknownFields()
+	return dec.Decode(v) == nil && dec.Decode(&struct{}{}) == io.EOF
 }
 
 func isUnsafeMethod(method string) bool {

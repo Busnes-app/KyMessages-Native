@@ -17,7 +17,6 @@ import (
 
 	"github.com/Busnes-app/ky-primitives/applysetup"
 	"github.com/Busnes-app/ky-primitives/keyfile"
-	"github.com/Busnes-app/ky_server_base/internal/matrixinit"
 )
 
 // Config encapsulates all runtime configuration for KyMessages.
@@ -31,7 +30,6 @@ type Config struct {
 	Backup       BackupConfig    `json:"backup"`
 	Captcha      CaptchaConfig   `json:"captcha"`
 	RTC          RTCConfig       `json:"rtc"`
-	Matrix       MatrixConfig    `json:"matrix"`
 }
 
 // RTCConfig holds native hybrid P2P + LiveKit SFU calling and KyCalendar meeting settings.
@@ -48,35 +46,6 @@ type RTCConfig struct {
 func (r RTCConfig) LiveKitEnabled() bool {
 	return r.LiveKitURL != "" && r.LiveKitAPIKey != "" && r.LiveKitAPISecret != ""
 }
-
-// MatrixConfig locates the optional Matrix stack: all set, or none. Hosts are https origins
-// with no trailing slash. AdminURL reaches MAS's admin API on the internal network.
-type MatrixConfig struct {
-	ServerName    string `json:"server_name"`
-	Host          string `json:"host"`
-	ChatHost      string `json:"chat_host"`
-	AdminURL      string `json:"admin_url"`
-	AdminClientID string `json:"admin_client_id"`
-	AdminSecret   string `json:"-"`
-	RTCHost       string `json:"rtc_host"`
-	RTCKey        string `json:"-"`
-	RTCSecret     string `json:"-"`
-	// Backups: matrix-init's output and Synapse's media store, both mounted read-only, the
-	// Postgres host on matrix-db, and the read-only kybackup role's password.
-	Dir              string `json:"dir"`
-	MediaDir         string `json:"media_dir"`
-	DBHost           string `json:"db_host"`
-	BackupDBPassword string `json:"-"`
-	// ElementRestartHint is the command Settings shows for restarting Element, whose image
-	// serves a copy of its config made at start. Displayed only, never run.
-	ElementRestartHint string `json:"element_restart_hint"`
-	// SynapseRestartHint is the command Settings shows after a federation change: Synapse
-	// reads its config only at start. Displayed only, never run.
-	SynapseRestartHint string `json:"synapse_restart_hint"`
-}
-
-// Enabled reports whether the Matrix stack is configured.
-func (m MatrixConfig) Enabled() bool { return m.ServerName != "" }
 
 // ServerConfig defines HTTP and network settings.
 type ServerConfig struct {
@@ -150,8 +119,6 @@ type BackupConfig struct {
 	// AllowPrivateRecovery admits private and CGNAT KyRecovery destinations (HTTPS still
 	// required). Off by default: KyRecovery destinations must be public.
 	AllowPrivateRecovery bool `json:"allow_private_recovery"`
-	// MediaFullKeep is how many monthly media archives to keep (Matrix only).
-	MediaFullKeep int `json:"media_full_keep"`
 }
 
 // CaptchaConfig holds anti-abuse settings for password login.
@@ -167,12 +134,6 @@ const MinDepositInterval = 15 * time.Minute
 // DefaultAppName is the service name an unconfigured instance runs under. Capsules are sealed
 // under it, so the restore CLI has to agree with it without loading a whole Config.
 const DefaultAppName = "KyMessages"
-
-// DefaultElementRestartHint is the Compose command; a cluster sets KY_MATRIX_ELEMENT_RESTART_HINT.
-const DefaultElementRestartHint = "docker compose restart element"
-
-// DefaultSynapseRestartHint is the Compose command; a cluster sets KY_MATRIX_SYNAPSE_RESTART_HINT.
-const DefaultSynapseRestartHint = "docker compose restart synapse"
 
 // AppVersion is shared by the CLI and every capsule-producing path.
 const AppVersion = "0.4.2"
@@ -231,11 +192,6 @@ func LoadFromEnv() (*Config, error) {
 		return nil, fmt.Errorf("KY_BACKUP_KEEP: must be at least 1, got %d", backupKeep)
 	}
 
-	mediaKeep := getEnvInt("KY_BACKUP_MEDIA_FULL_KEEP", 3)
-	if mediaKeep < 1 {
-		return nil, fmt.Errorf("KY_BACKUP_MEDIA_FULL_KEEP: must be at least 1, got %d", mediaKeep)
-	}
-
 	// An https app URL means browsers reach it over TLS, so cookies are Secure (and HSTS sent)
 	// whatever KY_ENV says. Production over plain HTTP must be an explicit choice.
 	https := strings.HasPrefix(strings.ToLower(appURL), "https://")
@@ -249,13 +205,8 @@ func LoadFromEnv() (*Config, error) {
 		return nil, fmt.Errorf("KY_TRUSTED_PROXIES: %w", err)
 	}
 
-	matrix, err := matrixFromEnv()
-	if err != nil {
-		return nil, err
-	}
-
 	kyIdentityHMAC := getEnv("KY_KYIDENTITY_HMAC_SECRET", "")
-	rtcCfg, err := rtcFromEnv(matrix, kyIdentityHMAC)
+	rtcCfg, err := rtcFromEnv(kyIdentityHMAC)
 	if err != nil {
 		return nil, err
 	}
@@ -311,19 +262,12 @@ func LoadFromEnv() (*Config, error) {
 			Keep:                 backupKeep,
 			DepositInterval:      depositInterval,
 			AllowPrivateRecovery: getEnvBool("KY_BACKUP_ALLOW_PRIVATE_RECOVERY", false),
-			MediaFullKeep:        mediaKeep,
 		},
 		Captcha: CaptchaConfig{
 			Provider:      getEnv("KY_CAPTCHA_PROVIDER", "pow"),
 			DifficultyPoW: getEnvInt("KY_CAPTCHA_POW_DIFFICULTY", 50000),
 		},
-		RTC:    rtcCfg,
-		Matrix: matrix,
-	}
-	// Unsigned directory webhooks are refused, so without the secret a KyIdentity disable or
-	// delete would never reach MAS.
-	if cfg.Matrix.Enabled() && cfg.SSO.KyIdentityHMACSecret == "" {
-		return nil, errors.New("KY_KYIDENTITY_HMAC_SECRET is required with the Matrix stack (KyIdentity's suite_webhook secret)")
+		RTC: rtcCfg,
 	}
 	// Login verifies only proof-of-work. Accepting another name would silently disable it.
 	if p := cfg.Captcha.Provider; p != "pow" && p != "none" {
@@ -333,9 +277,8 @@ func LoadFromEnv() (*Config, error) {
 	return cfg, nil
 }
 
-// rtcFromEnv parses native hybrid P2P + LiveKit SFU settings. If native KY_LIVEKIT_* vars
-// are unset, it reuses any Matrix RTC credentials configured for the same deployment.
-func rtcFromEnv(matrix MatrixConfig, fallbackSyncSecret string) (RTCConfig, error) {
+// rtcFromEnv parses native hybrid P2P + LiveKit SFU settings.
+func rtcFromEnv(fallbackSyncSecret string) (RTCConfig, error) {
 	rawURL := strings.TrimSpace(getEnv("KY_LIVEKIT_URL", ""))
 	apiKey := strings.TrimSpace(getEnv("KY_LIVEKIT_API_KEY", ""))
 	apiSecret := strings.TrimSpace(getEnv("KY_LIVEKIT_API_SECRET", ""))
@@ -353,12 +296,6 @@ func rtcFromEnv(matrix MatrixConfig, fallbackSyncSecret string) (RTCConfig, erro
 			return RTCConfig{}, fmt.Errorf("KY_LIVEKIT_API_SECRET_FILE: %w", err)
 		}
 		apiSecret = strings.TrimSpace(string(b))
-	}
-
-	if rawURL == "" && apiKey == "" && apiSecret == "" && matrix.RTCHost != "" {
-		rawURL = matrix.RTCHost
-		apiKey = matrix.RTCKey
-		apiSecret = matrix.RTCSecret
 	}
 
 	var lkURL string
@@ -408,103 +345,6 @@ func rtcFromEnv(matrix MatrixConfig, fallbackSyncSecret string) (RTCConfig, erro
 		MeetingSyncSecret: syncSecret,
 	}, nil
 }
-
-// matrixFromEnv validates like matrix-init. A partial block fails: serving half of it would
-// send members to a homeserver nobody configured.
-func matrixFromEnv() (MatrixConfig, error) {
-	m := MatrixConfig{
-		ServerName: getEnv("KY_MATRIX_SERVER_NAME", ""),
-		Host:       getEnv("KY_MATRIX_HOST", ""),
-		ChatHost:   getEnv("KY_MATRIX_CHAT_HOST", ""),
-		RTCHost:    getEnv("KY_MATRIX_RTC_HOST", ""),
-
-		AdminURL:      getEnv("KY_MATRIX_ADMIN_URL", ""),
-		AdminClientID: getEnv("KY_MATRIX_ADMIN_CLIENT_ID", ""),
-
-		Dir:      getEnv("KY_MATRIX_DIR", ""),
-		MediaDir: getEnv("KY_MATRIX_MEDIA_DIR", ""),
-		DBHost:   getEnv("KY_MATRIX_DB_HOST", ""),
-	}
-	secretFile := getEnv("KY_MATRIX_ADMIN_SECRET_FILE", "")
-	backupPWFile := getEnv("KY_MATRIX_BACKUP_DB_PASSWORD_FILE", "")
-	if m == (MatrixConfig{}) && secretFile == "" && backupPWFile == "" && getEnv("KY_MATRIX_RTC_KEY_FILE", "") == "" && getEnv("KY_MATRIX_RTC_SECRET_FILE", "") == "" {
-		return m, nil
-	}
-	if err := matrixinit.ValidServerName(m.ServerName); err != nil {
-		return MatrixConfig{}, fmt.Errorf("KY_MATRIX_SERVER_NAME: %w", err)
-	}
-	for _, h := range []struct {
-		env string
-		v   *string
-	}{{"KY_MATRIX_HOST", &m.Host}, {"KY_MATRIX_CHAT_HOST", &m.ChatHost}} {
-		o, err := matrixinit.Origin(*h.v)
-		if err != nil {
-			return MatrixConfig{}, fmt.Errorf("%s: %w", h.env, err)
-		}
-		*h.v = o
-	}
-	u, err := url.Parse(m.AdminURL)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil ||
-		(u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
-		// The value is not echoed: it may carry credentials.
-		return MatrixConfig{}, errors.New("KY_MATRIX_ADMIN_URL must be an http(s) origin with no userinfo, path, query or fragment")
-	}
-	m.AdminURL = u.Scheme + "://" + u.Host
-	if m.AdminClientID == "" {
-		return MatrixConfig{}, errors.New("KY_MATRIX_ADMIN_CLIENT_ID is required with the Matrix stack (printed by matrix-init)")
-	}
-	b, err := os.ReadFile(secretFile)
-	m.AdminSecret = strings.TrimSpace(string(b))
-	if err != nil || m.AdminSecret == "" {
-		return MatrixConfig{}, fmt.Errorf("KY_MATRIX_ADMIN_SECRET_FILE %q must name a readable, non-empty file: %v", secretFile, err)
-	}
-	for _, d := range []struct{ env, v string }{{"KY_MATRIX_DIR", m.Dir}, {"KY_MATRIX_MEDIA_DIR", m.MediaDir}} {
-		if !filepath.IsAbs(d.v) {
-			return MatrixConfig{}, fmt.Errorf("%s must be an absolute path (the Matrix overlay sets it)", d.env)
-		}
-	}
-	if m.DBHost == "" {
-		m.DBHost = "postgres"
-	}
-	if !dbHostRE.MatchString(m.DBHost) {
-		return MatrixConfig{}, errors.New("KY_MATRIX_DB_HOST must be a host name")
-	}
-	pw, err := os.ReadFile(backupPWFile)
-	m.BackupDBPassword = strings.TrimSpace(string(pw))
-	if err != nil || m.BackupDBPassword == "" {
-		return MatrixConfig{}, fmt.Errorf("KY_MATRIX_BACKUP_DB_PASSWORD_FILE %q must name a readable, non-empty file: %v", backupPWFile, err)
-	}
-	if m.RTCHost != "" {
-		origin, err := matrixinit.Origin(m.RTCHost)
-		if err != nil {
-			return MatrixConfig{}, fmt.Errorf("KY_MATRIX_RTC_HOST: %w", err)
-		}
-		m.RTCHost = origin
-		for _, f := range []struct {
-			env string
-			dst *string
-		}{{"KY_MATRIX_RTC_KEY_FILE", &m.RTCKey}, {"KY_MATRIX_RTC_SECRET_FILE", &m.RTCSecret}} {
-			b, err := os.ReadFile(getEnv(f.env, ""))
-			if err != nil || len(b) < 32 || len(b) > 256 || strings.ContainsFunc(string(b), unicode.IsControl) {
-				return MatrixConfig{}, fmt.Errorf("%s must name a readable secret of 32-256 bytes without control characters", f.env)
-			}
-			*f.dst = string(b)
-		}
-	} else if getEnv("KY_MATRIX_RTC_KEY_FILE", "") != "" || getEnv("KY_MATRIX_RTC_SECRET_FILE", "") != "" {
-		return MatrixConfig{}, errors.New("KY_MATRIX_RTC_HOST is required with call secrets")
-	}
-	m.ElementRestartHint = getEnv("KY_MATRIX_ELEMENT_RESTART_HINT", DefaultElementRestartHint)
-	m.SynapseRestartHint = getEnv("KY_MATRIX_SYNAPSE_RESTART_HINT", DefaultSynapseRestartHint)
-	for k, v := range map[string]string{"KY_MATRIX_ELEMENT_RESTART_HINT": m.ElementRestartHint, "KY_MATRIX_SYNAPSE_RESTART_HINT": m.SynapseRestartHint} {
-		if len(v) > 256 || strings.ContainsFunc(v, unicode.IsControl) {
-			return MatrixConfig{}, errors.New(k + " must be one line of at most 256 bytes")
-		}
-	}
-	return m, nil
-}
-
-// dbHostRE keeps KY_MATRIX_DB_HOST a plain host name: it is passed to pg_dump as --host=.
-var dbHostRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9.-]*$`)
 
 // rejectLegacyEnvironment refuses the pre-rename KY_KYSIGNON_* names: ignoring a set one
 // would silently leave suite sign-in unconfigured.

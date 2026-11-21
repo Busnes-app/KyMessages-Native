@@ -19,7 +19,6 @@ import (
 	"github.com/Busnes-app/ky_server_base/internal/backup"
 	"github.com/Busnes-app/ky_server_base/internal/chat"
 	"github.com/Busnes-app/ky_server_base/internal/config"
-	"github.com/Busnes-app/ky_server_base/internal/matrixsync"
 	"github.com/coder/websocket"
 	"log"
 	"strings"
@@ -190,10 +189,6 @@ func TestInstallerOIDCRejectsUnassignedAndKeepsAdminOutOfChat(t *testing.T) {
 	if err != nil || statuses["owner"] != "inactive" || statuses["daily"] != "active" {
 		t.Fatal(statuses, err)
 	}
-	actions := matrixsync.Plan([]matrixsync.User{{ID: "owner-mas", Username: "owner", Subject: "owner"}, {ID: "daily-mas", Username: "daily", Subject: "daily"}}, statuses, nil)
-	if len(actions) != 1 || actions[0].Kind != matrixsync.Lock || actions[0].User.ID != "owner-mas" {
-		t.Fatal("dedicated owner chat not locked", actions)
-	}
 	for _, sub := range []string{"owner", "daily", "unassigned"} {
 		response := idp.signIn(srv, map[string]any{"sub": sub, "preferred_username": "owner-admin", "email": "owner@example.test", "role": "admin", "auth_time": time.Now().Unix()})
 		if sub == "unassigned" {
@@ -216,7 +211,7 @@ func TestInstallerOIDCRejectsUnassignedAndKeepsAdminOutOfChat(t *testing.T) {
 		if sub == "owner" {
 			w := do(t, srv, "GET", "/api/settings", cookie)
 			var settings map[string]any
-			if json.Unmarshal(w.Body.Bytes(), &settings) != nil || settings["chat_url"] != "" || strings.Contains(w.Body.String(), "installer.") {
+			if json.Unmarshal(w.Body.Bytes(), &settings) != nil || settings["chat_url"] != nil || strings.Contains(w.Body.String(), "installer.") {
 				t.Fatal("owner ordinary chat or ownership exposed", w.Body)
 			}
 		}

@@ -1,4 +1,4 @@
-# Local operator-console preview. No chat client is embedded.
+# KyMessages standalone server (native chat, calls, bots, and operator console).
 services:
   app:
     # The published, attested release image. `docker compose pull` moves to the newest release;
@@ -25,7 +25,6 @@ services:
     container_name: kymessages
     restart: unless-stopped
     # Never root: the owner of ./data and ./backups (create both as that user before `up`).
-    # The Matrix overlay replaces it with KY_MATRIX_UID:KY_MATRIX_GID, which must own them too.
     user: "${KY_UID:?Set KY_UID and KY_GID to the owner of ./data and ./backups (id -u, id -g)}:${KY_GID:?Set KY_GID (id -g)}"
     security_opt: ["no-new-privileges:true"]
     cap_drop: [ALL]

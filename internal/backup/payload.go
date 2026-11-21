@@ -13,7 +13,6 @@ import (
 
 	"github.com/Busnes-app/ky-primitives/applysetup"
 	"github.com/Busnes-app/ky-primitives/capsule"
-	"github.com/Busnes-app/ky-primitives/keyfile"
 	"github.com/Busnes-app/ky-primitives/recoveryclient"
 	"github.com/Busnes-app/ky_server_base/internal/config"
 	_ "modernc.org/sqlite"
@@ -32,11 +31,11 @@ const recoveryPubPath = "data/recovery.pub"
 var ErrNoDatabaseSnapshot = errors.New("backup: no consistent database snapshot for this driver")
 
 // Collect assembles the payload every sealing caller uses: the local application files
-// (SQLite database, configuration) plus the members that may only ever travel inside a
-// sealed capsule (the encryption key, the pinned recovery public key). Nothing that returns
-// from here may leave the process except through a Sealer. With Matrix enabled the payload also
-// carries matrix-init's files, the MAS then Synapse dumps and data/media.key; a payload past the
-// expanded limit returns *SizeError.
+// (SQLite database containing native chat rooms, messages, calls, webhooks, bots/agents,
+// users, settings, and audit log; plus server configuration) and the secrets that may only
+// ever travel inside a sealed capsule (the encryption key, the pinned recovery public key,
+// and managed installer credentials). Nothing returned from here may leave the process except
+// through a Sealer. A payload past the expanded limit returns *SizeError.
 func Collect(ctx context.Context, cfg *config.Config, appVersion string) (recoveryclient.Payload, error) {
 	if strings.ToLower(cfg.Database.Driver) != "sqlite" {
 		return recoveryclient.Payload{}, fmt.Errorf("%w: %s", ErrNoDatabaseSnapshot, cfg.Database.Driver)
@@ -84,31 +83,16 @@ func Collect(ctx context.Context, cfg *config.Config, appVersion string) (recove
 	for _, f := range files {
 		b.add(f.Path, int64(len(f.Data)))
 	}
+	if err := b.err(); err != nil {
+		return recoveryclient.Payload{}, err
+	}
 	recipe := map[string]any{
 		"check_sqlite_integrity": true,
 		"sqlite_paths":           sqlitePaths,
 		"expected_env":           []string{"KY_PORT", "KY_DB_DRIVER"},
 		"expected_ports":         []int{cfg.Server.Port},
+		"required_files":         requiredFiles(files),
 	}
-	if cfg.Matrix.Enabled() {
-		key, err := keyfile.LoadOrCreate(MediaKeyPath(cfg.Database.DataDir), 32)
-		if err != nil {
-			return recoveryclient.Payload{}, fmt.Errorf("backup: media key: %w", err)
-		}
-		mk := recoveryclient.File{Path: mediaKeyPath, Data: []byte(hex.EncodeToString(key) + "\n"), Mode: 0600}
-		clear(key)
-		b.add(mk.Path, int64(len(mk.Data)))
-		mx, err := collectMatrix(ctx, cfg.Matrix, &b)
-		if err != nil {
-			return recoveryclient.Payload{}, err
-		}
-		files = append(append(files, mk), mx...)
-		recipe["pg_dumps"] = dumpBases()
-	}
-	if err := b.err(); err != nil {
-		return recoveryclient.Payload{}, err
-	}
-	recipe["required_files"] = requiredFiles(files)
 	return recoveryclient.Payload{
 		ServiceName: cfg.Server.AppName,
 		AppVersion:  appVersion,
@@ -196,10 +180,6 @@ func Members(cfg *config.Config) []string {
 	}
 	if cfg.InstallerSSO != nil {
 		m = append(m, "installer/client.secret", "installer/directory.secret", "installer/credential-paths.json")
-	}
-	if cfg.Matrix.Enabled() {
-		m = append(m, mediaKeyPath, "matrix/secrets/", "matrix/synapse/", "matrix/federation/", "matrix/mas/", "matrix/element/", "matrix/postgres/",
-			"matrix/dumps/mas.dump.NNN", "matrix/dumps/synapse.dump.NNN")
 	}
 	return m
 }

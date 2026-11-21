@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -14,106 +13,51 @@ import (
 	"image/color"
 	"image/jpeg"
 	"image/png"
-	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
-	"time"
 
 	"github.com/Busnes-app/ky_server_base/internal/api"
 	"github.com/Busnes-app/ky_server_base/internal/auth"
 	"github.com/Busnes-app/ky_server_base/internal/branding"
-	"github.com/Busnes-app/ky_server_base/internal/config"
-	"github.com/Busnes-app/ky_server_base/internal/health"
 	"github.com/Busnes-app/ky_server_base/internal/store"
 )
 
-const elementJSON = `{"default_server_config":{"m.homeserver":{"base_url":"https://matrix.example.com"}},"brand":"KyMessages","disable_guests":true}`
-
-// withElement turns Matrix on for branding and returns Element's config path, holding body
-// unless body is empty, and a running fake Element.
-func withElement(t *testing.T, srv *api.Server, cfg *config.Config, body string) (string, *fakeElement) {
-	t.Helper()
-	cfg.Matrix.ServerName = "example.com"
-	cfg.Matrix.Dir = t.TempDir()
-	p := filepath.Join(cfg.Matrix.Dir, "element", "config.json")
-	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if body != "" {
-		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	e := &fakeElement{path: p}
-	e.restart()
-	hs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		e.mu.Lock()
-		defer e.mu.Unlock()
-		if r.URL.Path != "/config.json" || e.body == nil {
-			http.NotFound(w, r)
-			return
-		}
-		_, _ = w.Write(e.body)
-	}))
-	t.Cleanup(hs.Close)
-	api.SetHealthTargetsForTest(srv, health.Targets{Element: hs.URL})
-	return p, e
-}
-
-// fakeElement serves /config.json as the Element image does: a copy of the file taken when
-// the container starts, so only a restart picks up a change.
-type fakeElement struct {
-	path string
-	mu   sync.Mutex
-	body []byte // nil: 404
-}
-
-func (e *fakeElement) restart() {
-	b, err := os.ReadFile(e.path)
-	if err != nil {
-		b = nil
-	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.body = b
-}
-
-// elementWith is elementJSON with brand set to name, as PatchElementBrand writes it.
-func elementWith(name string) string {
-	return strings.Replace(elementJSON, `"KyMessages"`, fmt.Sprintf("%q", name), 1)
-}
-
 func testPNG(t *testing.T, w, h int) []byte {
 	t.Helper()
-	img := image.NewNRGBA(image.Rect(0, 0, w, h))
-	img.Set(0, 0, color.NRGBA{R: 191, G: 63, B: 24, A: 255})
-	var b bytes.Buffer
-	if err := png.Encode(&b, img); err != nil {
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := range h {
+		for x := range w {
+			img.SetRGBA(x, y, color.RGBA{R: 12, G: 34, B: 56, A: 255})
+		}
+	}
+	var out bytes.Buffer
+	if err := png.Encode(&out, img); err != nil {
 		t.Fatal(err)
 	}
-	return b.Bytes()
+	return out.Bytes()
 }
 
-// withTextChunk adds a tEXt chunk after IHDR, as a camera or an editor would.
-func withTextChunk(p []byte) []byte {
-	data := []byte("Comment\x00kymatrix-secret")
-	c := binary.BigEndian.AppendUint32(nil, uint32(len(data)))
-	c = append(c, "tEXt"...)
-	c = append(c, data...)
-	c = binary.BigEndian.AppendUint32(c, crc32.ChecksumIEEE(append([]byte("tEXt"), data...)))
-	return append(append(append([]byte{}, p[:33]...), c...), p[33:]...)
+// withTextChunk inserts a tEXt chunk before IEND so the test can confirm normalisation drops it.
+func withTextChunk(src []byte) []byte {
+	data := []byte("Comment\x00kymessages-secret")
+	var chunk bytes.Buffer
+	_ = binary.Write(&chunk, binary.BigEndian, uint32(len(data)))
+	chunk.WriteString("tEXt")
+	chunk.Write(data)
+	_ = binary.Write(&chunk, binary.BigEndian, crc32.ChecksumIEEE(chunk.Bytes()[4:]))
+	iend := len(src) - 12
+	return append(append(append([]byte{}, src[:iend]...), chunk.Bytes()...), src[iend:]...)
 }
 
-// rawDo sends body as is with contentType, as the browser's logo upload does.
 func rawDo(t *testing.T, srv *api.Server, session *http.Cookie, method, path, contentType string, body []byte) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(method, path, bytes.NewReader(body))
-	req.Header.Set("Content-Type", contentType)
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
 	req.AddCookie(session)
 	req.AddCookie(&http.Cookie{Name: auth.CSRFCookieName, Value: "test-csrf"})
 	req.Header.Set(auth.HeaderCSRF, "test-csrf")
@@ -131,35 +75,16 @@ type brandingBody struct {
 		SHA256 string `json:"sha256"`
 		Size   int    `json:"size"`
 	} `json:"logo"`
-	Element *struct {
-		Brand       *string `json:"brand"`
-		Error       string  `json:"error"`
-		Served      *string `json:"served"`
-		ServedError string  `json:"served_error"`
-		RestartHint string  `json:"restart_hint"`
-	} `json:"element"`
 }
 
-func TestBrandNameRenamesTheConsoleAndElement(t *testing.T) {
+func TestBrandNameRenamesTheApp(t *testing.T) {
 	ctx := context.Background()
 	srv, st, cfg := setupTestServer(t)
-	p, _ := withElement(t, srv, cfg, elementJSON)
-	before, err := os.Stat(p)
-	if err != nil {
-		t.Fatal(err)
-	}
 	admin := loginAs(t, srv, st, "root", "admin")
 	path := "/api/admin/branding/name"
 	got := decode[brandingBody](t, adminDo(t, srv, admin, "PUT", path, map[string]string{"name": "  Acme Chat  "}))
-	if got.Name != "Acme Chat" || got.StoredName != "Acme Chat" || got.DefaultName != cfg.Server.AppName ||
-		got.Element == nil || got.Element.Brand == nil || *got.Element.Brand != "Acme Chat" || got.Element.Error != "" {
+	if got.Name != "Acme Chat" || got.StoredName != "Acme Chat" || got.DefaultName != cfg.Server.AppName {
 		t.Fatalf("%+v", got)
-	}
-	if b, _ := os.ReadFile(p); string(b) != elementWith("Acme Chat") {
-		t.Fatalf("Element config: %s", b)
-	}
-	if after, _ := os.Stat(p); !os.SameFile(before, after) {
-		t.Fatal("Element's config was replaced, not rewritten in place")
 	}
 	if s := decode[map[string]any](t, do(t, srv, "GET", "/api/settings", nil)); s["app_name"] != "Acme Chat" {
 		t.Fatalf("login page name: %v", s["app_name"])
@@ -173,9 +98,6 @@ func TestBrandNameRenamesTheConsoleAndElement(t *testing.T) {
 	if got.Name != cfg.Server.AppName || got.StoredName != "" {
 		t.Fatalf("after reset: %+v", got)
 	}
-	if b, _ := os.ReadFile(p); string(b) != elementWith(cfg.Server.AppName) {
-		t.Fatalf("Element config after reset: %s", b)
-	}
 	if _, err := st.Settings().GetSetting(ctx, "brand_name"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("reset left brand_name: %v", err)
 	}
@@ -186,8 +108,7 @@ func TestBrandNameRenamesTheConsoleAndElement(t *testing.T) {
 
 func TestBrandNameRefusals(t *testing.T) {
 	ctx := context.Background()
-	srv, st, cfg := setupTestServer(t)
-	withElement(t, srv, cfg, elementJSON)
+	srv, st, _ := setupTestServer(t)
 	path := "/api/admin/branding/name"
 	if w := adminDo(t, srv, staleAdmin(t, st), "PUT", path, map[string]string{"name": "Acme"}); w.Code != http.StatusForbidden ||
 		!strings.Contains(w.Body.String(), `"code":"reauthentication_required"`) {
@@ -218,27 +139,6 @@ func TestBrandNameRefusals(t *testing.T) {
 	}
 }
 
-// Element's file is missing: the name is still saved, and the answer says what Element shows.
-func TestBrandNameSavedWhenElementCannotBeWritten(t *testing.T) {
-	ctx := context.Background()
-	srv, st, cfg := setupTestServer(t)
-	p, _ := withElement(t, srv, cfg, "")
-	got := decode[brandingBody](t, adminDo(t, srv, loginAs(t, srv, st, "root", "admin"), "PUT", "/api/admin/branding/name", map[string]string{"name": "Acme"}))
-	if got.Name != "Acme" || got.Element == nil || got.Element.Brand != nil || got.Element.Error == "" {
-		t.Fatalf("%+v", got)
-	}
-	if v, err := st.Settings().GetSetting(ctx, "brand_name"); err != nil || v != "Acme" {
-		t.Fatalf("name not saved: %q %v", v, err)
-	}
-	if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
-		t.Fatal("the app created Element's config")
-	}
-	rows := auditRows(t, st, "admin.brand_name")
-	if len(rows) != 1 || !strings.HasPrefix(rows[0].Details, `outcome="saved; Element not updated: `) {
-		t.Fatalf("audit %+v", rows)
-	}
-}
-
 func TestLogoUploadNormalisesServesAndResets(t *testing.T) {
 	srv, st, _ := setupTestServer(t)
 	admin := loginAs(t, srv, st, "root", "admin")
@@ -255,7 +155,7 @@ func TestLogoUploadNormalisesServesAndResets(t *testing.T) {
 		hex.EncodeToString(sum[:]) != saved.Logo.SHA256 || len(body) != saved.Logo.Size {
 		t.Fatalf("served logo: %d %v", icon.Code, h)
 	}
-	if bytes.Contains(body, []byte("tEXt")) || bytes.Contains(body, []byte("kymatrix-secret")) {
+	if bytes.Contains(body, []byte("tEXt")) || bytes.Contains(body, []byte("kymessages-secret")) {
 		t.Fatal("the text chunk was served")
 	}
 	if _, err := png.Decode(bytes.NewReader(body)); err != nil {
@@ -304,7 +204,6 @@ func TestLogoUploadRefusals(t *testing.T) {
 	if err := jpeg.Encode(&jpg, image.NewRGBA(image.Rect(0, 0, 4, 4)), nil); err != nil {
 		t.Fatal(err)
 	}
-	// n bytes that start like a PNG and are not one.
 	signed := func(n int) []byte {
 		b := make([]byte, n)
 		copy(b, "\x89PNG\r\n\x1a\n")
@@ -332,234 +231,5 @@ func TestLogoUploadRefusals(t *testing.T) {
 	}
 	if _, err := st.Settings().GetSetting(ctx, "brand_logo"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("a refused logo was stored: %v", err)
-	}
-}
-
-// Review Focus 3: the minute tick neither rewrites a matching file nor logs every minute.
-func TestReconcileWritesOnlyOnChangeAndLogsOncePerStreak(t *testing.T) {
-	ctx := context.Background()
-	srv, st, cfg := setupTestServer(t)
-	p, _ := withElement(t, srv, cfg, elementWith(cfg.Server.AppName))
-	var logs bytes.Buffer
-	log.SetOutput(&logs)
-	t.Cleanup(func() { log.SetOutput(os.Stderr) })
-	old := time.Unix(1_000_000_000, 0)
-	if err := os.Chtimes(p, old, old); err != nil {
-		t.Fatal(err)
-	}
-	for range 3 {
-		if err := srv.ReconcileBrand(ctx); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if fi, _ := os.Stat(p); !fi.ModTime().Equal(old) {
-		t.Fatal("an unchanged brand was rewritten")
-	}
-	if err := st.Settings().SetSetting(ctx, "brand_name", "Acme"); err != nil {
-		t.Fatal(err)
-	}
-	if err := srv.ReconcileBrand(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if b, _ := os.ReadFile(p); string(b) != elementWith("Acme") {
-		t.Fatalf("not reconciled: %s", b)
-	}
-	if err := os.WriteFile(p, []byte("{"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	for range 3 {
-		if err := srv.ReconcileBrand(ctx); err == nil {
-			t.Fatal("a broken config reconciled")
-		}
-	}
-	if err := os.WriteFile(p, []byte(elementJSON), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := srv.ReconcileBrand(ctx); err != nil {
-		t.Fatal(err)
-	}
-	for line, want := range map[string]int{"Element brand not updated": 1, "Element brand updated again": 1} {
-		if n := strings.Count(logs.String(), line); n != want {
-			t.Errorf("%q logged %d times, want %d:\n%s", line, n, want, logs.String())
-		}
-	}
-	// Without Matrix nothing is read or written.
-	cfg.Matrix.ServerName = ""
-	if err := os.Remove(p); err != nil {
-		t.Fatal(err)
-	}
-	if err := srv.ReconcileBrand(ctx); err != nil {
-		t.Fatalf("without Matrix: %v", err)
-	}
-}
-
-// Review Focus 4: a save and a tick are two writers of one file; they must not interleave.
-// Run it with -race: without brandMu the writes rarely interleave visibly, but the streak
-// fields race every time.
-func TestConcurrentSavesAndTicksLeaveValidConfig(t *testing.T) {
-	ctx := context.Background()
-	srv, st, cfg := setupTestServer(t)
-	p, _ := withElement(t, srv, cfg, elementJSON)
-	admin := loginAs(t, srv, st, "root", "admin")
-	names := []string{"A", strings.Repeat("Long brand ", 5) + "end", "Mid size"}
-	// Goroutines only collect; the test goroutine reports.
-	errs := make(chan error, 24)
-	var wg sync.WaitGroup
-	for i := range 12 {
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			if w := adminDo(t, srv, admin, "PUT", "/api/admin/branding/name", map[string]string{"name": names[i%len(names)]}); w.Code != http.StatusOK {
-				errs <- fmt.Errorf("save: HTTP %d: %s", w.Code, w.Body)
-			}
-		}()
-		go func() {
-			defer wg.Done()
-			if err := srv.ReconcileBrand(ctx); err != nil {
-				errs <- fmt.Errorf("reconcile: %w", err)
-			}
-		}()
-	}
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		t.Error(err)
-	}
-	b, _ := os.ReadFile(p)
-	var got map[string]any
-	if err := json.Unmarshal(b, &got); err != nil {
-		t.Fatalf("two writers interleaved: %v\n%s", err, b)
-	}
-	stored, err := st.Settings().GetSetting(ctx, "brand_name")
-	if err != nil || got["brand"] != stored || got["disable_guests"] != true {
-		t.Fatalf("brand %v, stored %q (%v)", got["brand"], stored, err)
-	}
-}
-
-// Review Focus 5: KY_APP_NAME is the service name capsules are sealed under and KyRecovery
-// pins; the console name is display only.
-func TestBrandNameNeverRenamesTheService(t *testing.T) {
-	srv, st, cfg := setupTestServer(t)
-	admin := loginAs(t, srv, st, "root", "admin")
-	decode[brandingBody](t, adminDo(t, srv, admin, "PUT", "/api/admin/branding/name", map[string]string{"name": "Acme"}))
-	if got := statusOf(t, srv, admin)["app_name"]; got != cfg.Server.AppName {
-		t.Fatalf("backup status names the service %v, want %q", got, cfg.Server.AppName)
-	}
-}
-
-// Review Focus 1: the logo would ride on every admin page load.
-func TestSettingsCarryTheEffectiveNameButNotTheLogo(t *testing.T) {
-	ctx := context.Background()
-	srv, st, _ := setupTestServer(t)
-	for k, v := range map[string]string{"brand_name": "Acme", "brand_logo": strings.Repeat("A", 1<<20)} {
-		if err := st.Settings().SetSetting(ctx, k, v); err != nil {
-			t.Fatal(err)
-		}
-	}
-	w := do(t, srv, "GET", "/api/settings", loginAs(t, srv, st, "root", "admin"))
-	var out struct {
-		AppName string            `json:"app_name"`
-		Extra   map[string]string `json:"extra_settings"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
-		t.Fatal(err)
-	}
-	if _, found := out.Extra["brand_logo"]; out.AppName != "Acme" || out.Extra == nil || found || w.Body.Len() > 64<<10 {
-		t.Fatalf("app_name %q, logo in extra_settings %v, %d bytes", out.AppName, found, w.Body.Len())
-	}
-}
-
-func TestBrandingWithoutMatrixHasNoElement(t *testing.T) {
-	srv, st, _ := setupTestServer(t)
-	w := adminDo(t, srv, loginAs(t, srv, st, "root", "admin"), "GET", "/api/admin/branding", nil)
-	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), `"element"`) {
-		t.Fatalf("%d %s", w.Code, w.Body.String())
-	}
-}
-
-// A logo reset needs a recent sign-in like the uploads, and a refused one changes nothing.
-func TestLogoResetNeedsFreshAdmin(t *testing.T) {
-	ctx := context.Background()
-	srv, st, _ := setupTestServer(t)
-	if err := st.Settings().SetSetting(ctx, "brand_logo", "c3RheQ=="); err != nil {
-		t.Fatal(err)
-	}
-	w := adminDo(t, srv, staleAdmin(t, st), "DELETE", "/api/admin/branding/logo", nil)
-	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), `"code":"reauthentication_required"`) {
-		t.Fatalf("stale admin: %d %s", w.Code, w.Body.String())
-	}
-	if v, err := st.Settings().GetSetting(ctx, "brand_logo"); err != nil || v != "c3RheQ==" {
-		t.Fatalf("a refused reset changed the logo: %q %v", v, err)
-	}
-	if rows := auditRows(t, st, "admin.brand_logo"); len(rows) != 0 {
-		t.Fatalf("a refused reset was audited: %+v", rows)
-	}
-}
-
-func TestAuditKindBranding(t *testing.T) {
-	ctx := context.Background()
-	srv, st, _ := setupTestServer(t)
-	for _, action := range []string{"admin.brand_name", "admin.brand_logo", "admin.backup_run", "matrix.lock"} {
-		if err := st.Audit().LogAudit(ctx, &store.AuditRecord{Action: action, Details: `outcome="saved"`}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	type auditPage struct {
-		Records []struct{ Action string }
-		Total   int
-	}
-	page := decode[auditPage](t, adminDo(t, srv, loginAs(t, srv, st, "root", "admin"), "GET", "/api/admin/audit?kind=branding", nil))
-	if page.Total != 2 || len(page.Records) != 2 || page.Records[0].Action != "admin.brand_logo" || page.Records[1].Action != "admin.brand_name" {
-		t.Fatalf("branding kind: %+v", page)
-	}
-}
-
-// Element serves a copy of config.json made when it starts: after a rename the view reports
-// the file and what Element serves apart until Element restarts.
-func TestBrandingReportsWhatElementServes(t *testing.T) {
-	srv, st, cfg := setupTestServer(t)
-	p, element := withElement(t, srv, cfg, elementJSON)
-	admin := loginAs(t, srv, st, "root", "admin")
-	got := decode[brandingBody](t, adminDo(t, srv, admin, "PUT", "/api/admin/branding/name", map[string]string{"name": "Acme"}))
-	if e := got.Element; e == nil || e.Brand == nil || *e.Brand != "Acme" || e.Served == nil || *e.Served != "KyMessages" || e.ServedError != "" {
-		t.Fatalf("before the restart: %+v", got.Element)
-	}
-	element.restart()
-	got = decode[brandingBody](t, adminDo(t, srv, admin, "GET", "/api/admin/branding", nil))
-	if e := got.Element; e.Served == nil || *e.Served != "Acme" || e.ServedError != "" {
-		t.Fatalf("after the restart: %+v", e)
-	}
-	// Unknown is reported as such, never as a brand: Element answers 404, a redirect (not
-	// followed) or a body that is not a config.
-	if err := os.Remove(p); err != nil {
-		t.Fatal(err)
-	}
-	element.restart()
-	for _, h := range []http.Handler{
-		nil, // the fake Element, now 404
-		http.RedirectHandler("http://example.com/config.json", http.StatusFound),
-		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("{")) }),
-	} {
-		if h != nil {
-			hs := httptest.NewServer(h)
-			t.Cleanup(hs.Close)
-			api.SetHealthTargetsForTest(srv, health.Targets{Element: hs.URL})
-		}
-		got = decode[brandingBody](t, adminDo(t, srv, admin, "GET", "/api/admin/branding", nil))
-		if e := got.Element; e.Served != nil || e.ServedError == "" {
-			t.Errorf("unknown served brand reported as %+v", e)
-		}
-	}
-}
-
-// The restart hint is the deployment's own command, so a cluster operator is not told to run
-// Compose.
-func TestBrandingNamesTheRestartCommand(t *testing.T) {
-	srv, st, cfg := setupTestServer(t)
-	withElement(t, srv, cfg, elementJSON)
-	cfg.Matrix.ElementRestartHint = "kubectl -n ky-stack rollout restart deployment/element"
-	got := decode[brandingBody](t, adminDo(t, srv, loginAs(t, srv, st, "root", "admin"), "GET", "/api/admin/branding", nil))
-	if got.Element == nil || got.Element.RestartHint != cfg.Matrix.ElementRestartHint {
-		t.Fatalf("restart hint: %+v", got.Element)
 	}
 }

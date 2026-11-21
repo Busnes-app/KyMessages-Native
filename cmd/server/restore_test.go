@@ -388,32 +388,112 @@ func TestRestoreRefusesATargetThatAppears(t *testing.T) {
 	}
 }
 
-// restore extracts matrix/ with the rest; Element's config gets back the 0644 its nginx needs,
-// everything else stays owner-only.
-func TestRestoreBringsBackMatrix(t *testing.T) {
+// restore preserves native chat rooms and messages while invalidating active bot tokens
+// and closing open call sessions alongside sessions, challenges, and pairings.
+func TestRestorePreservesNativeChatAndInvalidatesAgentsAndCalls(t *testing.T) {
+	ctx := context.Background()
 	key, shares := testKit(t)
 	dbPath := filepath.Join(t.TempDir(), "s.db")
-	st, err := store.Open(context.Background(), config.DatabaseConfig{Driver: "sqlite", DSN: dbPath})
+	st, err := store.Open(ctx, config.DatabaseConfig{Driver: "sqlite", DSN: dbPath})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = st.Close()
-	db, _ := os.ReadFile(dbPath)
+	now := time.Now().UTC()
+	nowMs := now.UnixMilli()
+	for _, u := range []store.User{
+		{ID: "usr_alice", Username: "alice", DisplayName: "Alice", Role: "user", Status: "active", SSOProvider: "local"},
+		{ID: "bot_triage", Username: "agent-triage", DisplayName: "Triage Bot", Role: "bot", Status: "active", SSOProvider: "bot"},
+	} {
+		if err := st.Users().CreateUser(ctx, &u); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.Agents().CreateAgent(ctx, &store.Agent{
+		ID:          "agent_1",
+		UserID:      "bot_triage",
+		Username:    "agent-triage",
+		DisplayName: "Triage Bot",
+		OwnerUserID: "usr_alice",
+		TokenHash:   strings.Repeat("ab", 32),
+		TokenState:  store.AgentTokenActive,
+		CreatedBy:   "usr_alice",
+		CreatedAt:   now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	room := &store.Room{
+		ID:        "room_1",
+		TenantID:  store.DefaultTenantID,
+		Kind:      store.RoomKindChannel,
+		Name:      "general",
+		CreatedBy: "usr_alice",
+		CreatedAt: nowMs,
+	}
+	if err := st.Chat().CreateRoom(ctx, room, []string{"usr_alice", "bot_triage"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.Chat().CreateMessage(ctx, store.CreateMessageParams{
+		ID:         "msg_1",
+		TenantID:   store.DefaultTenantID,
+		RoomID:     "room_1",
+		SenderID:   "usr_alice",
+		SenderName: "Alice",
+		Encoding:   store.MessageEncodingPlainV1,
+		Body:       "hello restored world",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Chat().CreateCallSession(ctx, &store.CallSession{
+		ID:        "call_1",
+		TenantID:  store.DefaultTenantID,
+		RoomID:    "room_1",
+		Mode:      store.CallModeP2PMesh,
+		StartedBy: "usr_alice",
+		StartedAt: nowMs,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	path := sealTo(t, key, recoveryclient.Payload{ServiceName: "busnes_app", AppVersion: "1.0.0", Files: []recoveryclient.File{
 		{Path: "data/ky_server.db", Data: db, Mode: 0600},
 		{Path: "data/encryption.key", Data: []byte(strings.Repeat("01", 32)), Mode: 0600},
-		{Path: "matrix/synapse/signing.key", Data: []byte("ed25519 a_abcd seed\n"), Mode: 0600},
-		{Path: "matrix/element/config.json", Data: []byte("{}"), Mode: 0600},
-		{Path: "matrix/dumps/mas.dump.000", Data: []byte("PGDMP"), Mode: 0600},
 	}})
 	target := filepath.Join(t.TempDir(), "restored")
 	if err := restore(path, target, "busnes_app", shares, io.Discard); err != nil {
 		t.Fatal(err)
 	}
-	for rel, mode := range map[string]os.FileMode{"matrix/element/config.json": 0o644, "matrix/synapse/signing.key": 0o600, "matrix/dumps/mas.dump.000": 0o600} {
-		fi, err := os.Stat(filepath.Join(target, rel))
-		if err != nil || fi.Mode().Perm() != mode {
-			t.Errorf("%s: %v %v, want %v", rel, fi, err, mode)
-		}
+
+	restoredDB := (&url.URL{Scheme: "file", Path: filepath.Join(target, "data", "ky_server.db"), RawQuery: "mode=ro"}).String()
+	rst, err := store.Open(ctx, config.DatabaseConfig{Driver: "sqlite", DSN: restoredDB})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rst.Close()
+
+	// Chat history preserved.
+	msgs, _, err := rst.Chat().ListMessages(ctx, store.MessagePageQuery{
+		TenantID: store.DefaultTenantID,
+		RoomID:   "room_1",
+		Limit:    10,
+	})
+	if err != nil || len(msgs) != 1 || msgs[0].Body != "hello restored world" {
+		t.Fatalf("restored messages: %+v err=%v", msgs, err)
+	}
+	// Active bot agent revoked with token hash cleared.
+	ag, err := rst.Agents().GetAgent(ctx, "agent_1")
+	if err != nil || ag.TokenState != store.AgentTokenRevoked || ag.TokenHash != "" {
+		t.Fatalf("restored agent should be revoked: %+v err=%v", ag, err)
+	}
+	// Open call ended.
+	call, err := rst.Chat().GetActiveCallSession(ctx, store.DefaultTenantID, "room_1")
+	if !errors.Is(err, store.ErrNotFound) || call != nil {
+		t.Fatalf("restored open call should be ended: call=%+v err=%v", call, err)
 	}
 }

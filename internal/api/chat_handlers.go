@@ -97,6 +97,7 @@ type chatDirectoryUser struct {
 	ID          string `json:"id"`
 	Username    string `json:"username"`
 	DisplayName string `json:"display_name"`
+	Role        string `json:"role,omitempty"`
 }
 
 func (s *Server) resolveDMRoomNames(r *http.Request, tenantID, selfID string, rooms []*store.RoomSummary) {
@@ -183,6 +184,7 @@ func (s *Server) handleChatListUsers(w http.ResponseWriter, r *http.Request) {
 			ID:          u.ID,
 			Username:    u.Username,
 			DisplayName: displayNameFor(u),
+			Role:        u.Role,
 		})
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{"users": dir})
@@ -198,7 +200,7 @@ func (s *Server) handleChatListRooms(w http.ResponseWriter, r *http.Request) {
 	}
 	rooms, err := s.store.Chat().ListUserRooms(r.Context(), store.DefaultTenantID, user.ID)
 	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "Failed to list rooms")
+		s.writeError(w, http.StatusInternalServerError, "Failed to load rooms")
 		return
 	}
 	s.resolveDMRoomNames(r, store.DefaultTenantID, user.ID, rooms)
@@ -219,6 +221,10 @@ func (s *Server) handleChatCreateRoom(w http.ResponseWriter, r *http.Request) {
 	user, _, ok := s.currentUser(r)
 	if !ok {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+	if user.Role == "bot" {
+		s.writeError(w, http.StatusForbidden, "Bot accounts cannot create rooms")
 		return
 	}
 	if !s.allowChatAction(w, user.ID, chatLimitRooms) {

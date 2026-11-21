@@ -102,14 +102,27 @@ func (sm *SessionManager) IssueDerivedSession(ctx context.Context, w http.Respon
 	return sess, rawToken, nil
 }
 
+// AgentTokenPrefix identifies native KyMessages bot bearer tokens.
+const AgentTokenPrefix = "kybot_"
+
+// AgentSessionPrefix tags synthetic Session.TokenHash values returned for authenticated bots.
+const AgentSessionPrefix = "agent:"
+
 // AuthenticateRequest extracts the session token from cookie or Authorization header and returns the user.
 func (sm *SessionManager) AuthenticateRequest(r *http.Request) (*store.User, *store.Session, error) {
 	var rawToken string
+	fromBearer := false
 
 	// 1. Check Bearer token header
 	authHeader := r.Header.Get("Authorization")
 	if strings.HasPrefix(authHeader, "Bearer ") {
-		rawToken = strings.TrimPrefix(authHeader, "Bearer ")
+		rawToken = strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+		fromBearer = rawToken != ""
+	}
+
+	// Native bot bearer tokens are accepted only via Authorization: Bearer (never cookies).
+	if fromBearer && strings.HasPrefix(rawToken, AgentTokenPrefix) {
+		return sm.authenticateAgent(r.Context(), rawToken)
 	}
 
 	// 2. Fallback to HttpOnly cookie
@@ -150,6 +163,35 @@ func (sm *SessionManager) AuthenticateRequest(r *http.Request) (*store.User, *st
 		return nil, nil, ErrPasswordChangeRequired
 	}
 	return user, sess, nil
+}
+
+func (sm *SessionManager) authenticateAgent(ctx context.Context, rawToken string) (*store.User, *store.Session, error) {
+	tokenHash := crypto.SHA256Hex([]byte(rawToken))
+	agent, err := sm.store.Agents().GetAgentByTokenHash(ctx, tokenHash)
+	if err != nil {
+		return nil, nil, store.ErrNotFound
+	}
+	botUser, err := sm.store.Users().GetUserByID(ctx, agent.UserID)
+	if err != nil || botUser.Status != "active" || botUser.Role != "bot" {
+		return nil, nil, store.ErrNotFound
+	}
+	owner, err := sm.store.Users().GetUserByID(ctx, agent.OwnerUserID)
+	if err != nil || owner.Status != "active" {
+		return nil, nil, store.ErrNotFound
+	}
+	allowed, ownershipErr := sm.store.InstallerUserAllowed(ctx, owner)
+	if ownershipErr != nil || !allowed {
+		return nil, nil, store.ErrNotFound
+	}
+	now := time.Now().UTC()
+	if agent.LastUsedAt == nil || now.Sub(*agent.LastUsedAt) >= 5*time.Minute {
+		_ = sm.store.Agents().TouchAgentLastUsed(ctx, agent.ID, now)
+	}
+	return botUser, &store.Session{
+		TokenHash: AgentSessionPrefix + agent.ID + ":" + tokenHash,
+		UserID:    botUser.ID,
+		CreatedAt: agent.CreatedAt,
+	}, nil
 }
 
 // HasSessionCookie reports whether the request carries a session cookie.

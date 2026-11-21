@@ -3,159 +3,19 @@ package api_test
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
 
 	"github.com/Busnes-app/ky_server_base/internal/api"
 	"github.com/Busnes-app/ky_server_base/internal/auth"
-	"github.com/Busnes-app/ky_server_base/internal/config"
 	"github.com/Busnes-app/ky_server_base/internal/crypto"
 	"github.com/Busnes-app/ky_server_base/internal/health"
-	"github.com/Busnes-app/ky_server_base/internal/matrixsync"
 	"github.com/Busnes-app/ky_server_base/internal/store"
 )
-
-// MAS IDs are ULIDs: 26 Crockford base32 characters.
-const (
-	uAlice  = "01J9ZK8V6N3W4X5Y6Z7A8B9C0A"
-	uBob    = "01J9ZK8V6N3W4X5Y6Z7A8B9C0B"
-	uCarol  = "01J9ZK8V6N3W4X5Y6Z7A8B9C0C"
-	uDave   = "01J9ZK8V6N3W4X5Y6Z7A8B9C0D"
-	sOAuth  = "01J9ZK8V6N3W4X5Y6Z7A8B9C1A"
-	sCompat = "01J9ZK8V6N3W4X5Y6Z7A8B9C1B"
-	sNoUser = "01J9ZK8V6N3W4X5Y6Z7A8B9C1C"
-)
-
-type fakeMAS struct {
-	mu        sync.Mutex
-	users     []matrixsync.User
-	usersErr  error
-	sessions  map[string][]matrixsync.Session // by user ID; "" holds sessions without a user
-	finished  map[string]bool
-	finishErr error
-	finishes  []string
-
-	consoleErr  error
-	consoleHang chan struct{}
-	consoleRuns int
-	// consoleLate hands fn an already ended context, as after a slow console setup.
-	consoleLate bool
-
-	ag agentMAS // agent accounts (agents_test.go)
-}
-
-// AsConsole stands in for the console session: fn gets a fixed token unless consoleErr is set.
-// consoleHang blocks it, ignoring ctx, as a stuck MAS would.
-func (f *fakeMAS) AsConsole(ctx context.Context, fn func(context.Context, string) error) error {
-	f.mu.Lock()
-	f.consoleRuns++
-	err, hang := f.consoleErr, f.consoleHang
-	f.mu.Unlock()
-	if hang != nil {
-		<-hang
-	}
-	if err != nil {
-		return err
-	}
-	if f.consoleLate {
-		late, cancel := context.WithCancel(ctx)
-		cancel()
-		ctx = late
-	}
-	return fn(ctx, "console-token")
-}
-
-func notFound(path string) error {
-	return &matrixsync.StatusError{Method: "GET", Path: path, Status: http.StatusNotFound}
-}
-
-func (f *fakeMAS) Users(context.Context) ([]matrixsync.User, error) { return f.users, f.usersErr }
-
-func (f *fakeMAS) User(_ context.Context, id string) (matrixsync.User, error) {
-	for _, u := range f.users {
-		if u.ID == id {
-			return u, nil
-		}
-	}
-	return matrixsync.User{}, notFound("/api/admin/v1/users/" + id)
-}
-
-func (f *fakeMAS) Sessions(_ context.Context, userID string) ([]matrixsync.Session, error) {
-	list, ok := f.sessions[userID]
-	if !ok {
-		return nil, notFound("/api/admin/v1/user-sessions")
-	}
-	return list, nil
-}
-
-func (f *fakeMAS) Session(_ context.Context, kind matrixsync.SessionKind, id string) (matrixsync.Session, error) {
-	for _, list := range f.sessions {
-		for _, s := range list {
-			if s.Kind == kind && s.ID == id {
-				return s, nil
-			}
-		}
-	}
-	return matrixsync.Session{}, notFound("/api/admin/v1/sessions/" + id)
-}
-
-func (f *fakeMAS) FinishSession(_ context.Context, kind matrixsync.SessionKind, id string) (bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.finishes = append(f.finishes, string(kind)+"/"+id)
-	if f.finishErr != nil {
-		return false, f.finishErr
-	}
-	already := f.finished[id]
-	f.finished[id] = true
-	return already, nil
-}
-
-func (f *fakeMAS) Version(context.Context) (string, error) { return health.Pins["mas"], nil }
-
-// setupMatrixServer: four MAS users (active, locked, deactivated, unlinked) and a KyIdentity
-// directory in which sub-a is active, sub-b disabled and sub-c unknown.
-func setupMatrixServer(t *testing.T) (*api.Server, store.Store, *config.Config, *fakeMAS) {
-	t.Helper()
-	srv, st, cfg := setupTestServer(t)
-	cfg.Matrix.ServerName = "example.com"
-	cfg.SSO.KyIdentityIssuer = "https://id.example.com"
-	f := &fakeMAS{
-		users: []matrixsync.User{
-			{ID: uAlice, Username: "alice", Subject: "sub-a"},
-			{ID: uBob, Username: "bob", Subject: "sub-b", Locked: true},
-			{ID: uCarol, Username: "carol", Subject: "sub-c", Deactivated: true},
-			{ID: uDave, Username: "dave"},
-		},
-		sessions: map[string][]matrixsync.Session{
-			uAlice: {
-				{Kind: matrixsync.OAuth2Session, ID: sOAuth, UserID: uAlice, Device: "DEVA", Client: "Element", IP: "192.0.2.7", CreatedAt: time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)},
-				{Kind: matrixsync.CompatSession, ID: sCompat, UserID: uAlice, Device: "DEVB", Client: "bot"},
-			},
-			uDave: {},
-			"":    {{Kind: matrixsync.OAuth2Session, ID: sNoUser}},
-		},
-		finished: map[string]bool{},
-	}
-	srv.SetMatrixAdmin(f)
-	api.SetRoomAdminForTest(srv, newFakeRooms())
-	for _, u := range []store.User{
-		{ID: "usr_dir_a", Username: "alice-ky", Role: "user", Status: "active", SSOProvider: "kyidentity", SSOSubject: "sub-a"},
-		{ID: "usr_dir_b", Username: "bob-ky", Role: "user", Status: "disabled", SSOProvider: "kyidentity", SSOSubject: "sub-b"},
-	} {
-		if err := st.Users().CreateUser(context.Background(), &u); err != nil {
-			t.Fatal(err)
-		}
-	}
-	return srv, st, cfg, f
-}
 
 func decode[T any](t *testing.T, w *httptest.ResponseRecorder) T {
 	t.Helper()
@@ -167,141 +27,6 @@ func decode[T any](t *testing.T, w *httptest.ResponseRecorder) T {
 		t.Fatal(err)
 	}
 	return out
-}
-
-type componentsBody struct {
-	Matrix     bool
-	Components []health.Component
-}
-
-func TestMatrixRoutesAre404WithoutMatrix(t *testing.T) {
-	srv, st, _ := setupTestServer(t)
-	admin := loginAs(t, srv, st, "root", "admin")
-	for _, rt := range []struct{ method, path string }{
-		{"GET", "/api/admin/matrix/users"},
-		{"GET", "/api/admin/matrix/users/" + uAlice + "/sessions"},
-		{"POST", "/api/admin/matrix/sessions/oauth2/" + sOAuth + "/finish"},
-		{"GET", "/api/admin/matrix/rooms"},
-		{"GET", "/api/admin/matrix/rooms/%21grp:example.com"},
-		{"GET", "/api/admin/matrix/rooms/%21grp:example.com/delete-status"},
-		{"POST", "/api/admin/matrix/rooms/%21grp:example.com/close"},
-		{"POST", "/api/admin/matrix/rooms/%21grp:example.com/delete"},
-		{"GET", "/api/admin/matrix/sync-status"},
-		{"GET", "/api/admin/agents"},
-		{"POST", "/api/admin/agents"},
-		{"POST", "/api/admin/agents/" + agentPathID + "/rotate"},
-		{"POST", "/api/admin/agents/" + agentPathID + "/revoke"},
-		{"DELETE", "/api/admin/agents/" + agentPathID},
-	} {
-		w := adminDo(t, srv, admin, rt.method, rt.path, nil)
-		if w.Code != http.StatusNotFound || !strings.Contains(w.Body.String(), `"code":"matrix_disabled"`) {
-			t.Errorf("%s %s: %d %s", rt.method, rt.path, w.Code, w.Body.String())
-		}
-	}
-	h := decode[componentsBody](t, adminDo(t, srv, admin, "GET", "/api/admin/health", nil))
-	if h.Matrix || len(h.Components) != 2 || h.Components[0].Name != "kymessages" || h.Components[1].Name != "database" ||
-		h.Components[0].Status != "up" || h.Components[1].Status != "up" {
-		t.Fatalf("health without Matrix: %+v", h)
-	}
-}
-
-func TestMatrixUsersStatusesSearchAndPaging(t *testing.T) {
-	srv, st, _, _ := setupMatrixServer(t)
-	admin := loginAs(t, srv, st, "root", "admin")
-	type page struct {
-		Users []struct {
-			ID, Username, MXID, Status, KyIdentity string
-		}
-		Total, Offset, Limit int
-		DirectoryURL         string `json:"directory_url"`
-	}
-	get := func(q string) page {
-		return decode[page](t, adminDo(t, srv, admin, "GET", "/api/admin/matrix/users"+q, nil))
-	}
-	all := get("")
-	var rows []string
-	for _, u := range all.Users {
-		rows = append(rows, fmt.Sprintf("%s %s %s %s", u.MXID, u.Username, u.Status, u.KyIdentity))
-	}
-	want := []string{
-		"@alice:example.com alice active active", "@bob:example.com bob locked disabled",
-		"@carol:example.com carol deactivated unknown", "@dave:example.com dave not_linked ",
-	}
-	if strings.Join(rows, "|") != strings.Join(want, "|") || all.Total != 4 || all.Limit != 50 || all.DirectoryURL != "https://id.example.com" {
-		t.Fatalf("all: %v total=%d limit=%d url=%q", rows, all.Total, all.Limit, all.DirectoryURL)
-	}
-	p := get("?search=A&limit=2&offset=1") // alice, carol, dave match "a"
-	if p.Total != 3 || len(p.Users) != 2 || p.Users[0].Username != "carol" || p.Users[1].Username != "dave" {
-		t.Fatalf("search page: %+v", p)
-	}
-	if body := adminDo(t, srv, admin, "GET", "/api/admin/matrix/users?search=zzz", nil).Body.String(); !strings.Contains(body, `"users":[]`) {
-		t.Errorf("empty page is not an empty array: %s", body)
-	}
-	for _, bad := range []string{"?limit=0", "?limit=101", "?offset=-1", "?limit=x"} {
-		if w := adminDo(t, srv, admin, "GET", "/api/admin/matrix/users"+bad, nil); w.Code != http.StatusBadRequest {
-			t.Errorf("%s: %d", bad, w.Code)
-		}
-	}
-}
-
-func TestMatrixUsersReportsMASFailure(t *testing.T) {
-	srv, st, _, f := setupMatrixServer(t)
-	f.usersErr = errors.New("MAS token: HTTP 401")
-	w := adminDo(t, srv, loginAs(t, srv, st, "root", "admin"), "GET", "/api/admin/matrix/users", nil)
-	if w.Code != http.StatusBadGateway || !strings.Contains(w.Body.String(), "MAS token: HTTP 401") {
-		t.Fatalf("%d %s", w.Code, w.Body.String())
-	}
-}
-
-func TestMatrixSessionsListed(t *testing.T) {
-	srv, st, _, _ := setupMatrixServer(t)
-	admin := loginAs(t, srv, st, "root", "admin")
-	type sessions struct {
-		Sessions []struct {
-			Kind, ID, Device, Client, IP string
-			LastActiveAt                 *string `json:"last_active_at"`
-		}
-	}
-	got := decode[sessions](t, adminDo(t, srv, admin, "GET", "/api/admin/matrix/users/"+uAlice+"/sessions", nil))
-	if len(got.Sessions) != 2 {
-		t.Fatalf("%+v", got)
-	}
-	s := got.Sessions[0]
-	if s.Kind != "oauth2" || s.ID != sOAuth || s.Device != "DEVA" || s.Client != "Element" || s.IP != "192.0.2.7" || s.LastActiveAt != nil {
-		t.Errorf("%+v", s)
-	}
-	if body := adminDo(t, srv, admin, "GET", "/api/admin/matrix/users/"+uDave+"/sessions", nil).Body.String(); !strings.Contains(body, `"sessions":[]`) {
-		t.Errorf("no sessions is not an empty array: %s", body)
-	}
-	if w := adminDo(t, srv, admin, "GET", "/api/admin/matrix/users/"+uBob+"/sessions", nil); w.Code != http.StatusNotFound {
-		t.Errorf("unknown to MAS: %d", w.Code)
-	}
-	for _, id := range []string{"not-a-ulid", "..%2F..%2Fusers", strings.ToLower(uAlice)} {
-		if w := adminDo(t, srv, admin, "GET", "/api/admin/matrix/users/"+id+"/sessions", nil); w.Code != http.StatusBadRequest {
-			t.Errorf("id %q: %d", id, w.Code)
-		}
-	}
-}
-
-func TestMatrixSessionsClipLongDeviceAndClient(t *testing.T) {
-	srv, st, _, f := setupMatrixServer(t)
-	admin := loginAs(t, srv, st, "root", "admin")
-	long := strings.Repeat("é", 300)
-	f.sessions[uAlice] = []matrixsync.Session{{Kind: matrixsync.OAuth2Session, ID: sOAuth, UserID: uAlice, Device: long, Client: long}}
-	var got struct {
-		Sessions []struct{ Device, Client string }
-	}
-	got = decode[struct {
-		Sessions []struct{ Device, Client string }
-	}](t, adminDo(t, srv, admin, "GET", "/api/admin/matrix/users/"+uAlice+"/sessions", nil))
-	if len(got.Sessions) != 1 {
-		t.Fatalf("%+v", got)
-	}
-	for _, v := range []string{got.Sessions[0].Device, got.Sessions[0].Client} {
-		if len(v) > 200 || !utf8.ValidString(v) || v == "" {
-			t.Errorf("not clipped to 200 valid bytes: %d bytes", len(v))
-		}
-	}
 }
 
 func staleAdmin(t *testing.T, st store.Store) *http.Cookie {
@@ -322,105 +47,68 @@ func staleAdmin(t *testing.T, st store.Store) *http.Cookie {
 	return &http.Cookie{Name: auth.SessionCookieName, Value: raw}
 }
 
-func TestSessionFinishNeedsFreshAdminAndIsAudited(t *testing.T) {
-	srv, st, _, f := setupMatrixServer(t)
-	path := "/api/admin/matrix/sessions/oauth2/" + sOAuth + "/finish"
-	w := adminDo(t, srv, staleAdmin(t, st), "POST", path, nil)
-	body := w.Body.String()
-	if w.Code != http.StatusForbidden || !strings.Contains(body, `"code":"reauthentication_required"`) ||
-		!strings.Contains(body, "Confirm it's you") || strings.Contains(body, "backup") || strings.Contains(body, "reauth_url") {
-		t.Fatalf("stale local admin: %d %s", w.Code, body)
-	}
-	if len(f.finishes) != 0 {
-		t.Fatalf("a stale session reached MAS: %v", f.finishes)
-	}
+type componentsBody struct {
+	Components []health.Component `json:"components"`
+}
+
+func TestHealthReportsNativeComponentsAndLiveKit(t *testing.T) {
+	srv, st, cfg := setupTestServer(t)
 	admin := loginAs(t, srv, st, "root", "admin")
-	for _, want := range []string{"ended", "already_ended"} {
-		w := adminDo(t, srv, admin, "POST", path, nil)
-		if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"outcome":"`+want+`"`) || !strings.Contains(w.Body.String(), `"mxid":"@alice:example.com"`) {
-			t.Fatalf("want %s: %d %s", want, w.Code, w.Body.String())
-		}
+
+	// Without LiveKit configured: kymessages + database.
+	h := decode[componentsBody](t, adminDo(t, srv, admin, "GET", "/api/admin/health", nil))
+	if len(h.Components) != 2 || h.Components[0].Name != "kymessages" || h.Components[1].Name != "database" ||
+		h.Components[0].Status != "up" || h.Components[1].Status != "up" {
+		t.Fatalf("health without LiveKit: %+v", h)
 	}
-	f.finishErr = errors.New("MAS POST /api/admin/v1/oauth2-sessions/x/finish: HTTP 500")
-	if w := adminDo(t, srv, admin, "POST", path, nil); w.Code != http.StatusBadGateway {
-		t.Fatalf("MAS failure: %d %s", w.Code, w.Body.String())
+
+	// With LiveKit configured and reachable.
+	lk := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	}))
+	defer lk.Close()
+	cfg.RTC.LiveKitURL = lk.URL
+	cfg.RTC.LiveKitAPIKey = "devkey"
+	cfg.RTC.LiveKitAPISecret = "devsecret"
+
+	h = decode[componentsBody](t, adminDo(t, srv, admin, "GET", "/api/admin/health", nil))
+	if len(h.Components) != 3 {
+		t.Fatalf("health with LiveKit: %+v", h)
 	}
-	rows := auditRows(t, st, "matrix.session_end") // newest first
-	if len(rows) != 3 {
-		t.Fatalf("%d session_end rows", len(rows))
+	by := map[string]health.Component{}
+	for _, c := range h.Components {
+		by[c.Name] = c
 	}
-	for i, outcome := range []string{`outcome="error: MAS POST`, `outcome="already_ended"`, `outcome="ended"`} {
-		r := rows[i]
-		if r.Resource != "@alice:example.com" || r.UserID != "usr_root" || r.IPAddress == "" ||
-			!strings.Contains(r.Details, `session="`+sOAuth+`"`) || !strings.Contains(r.Details, `kind="oauth2"`) || !strings.Contains(r.Details, outcome) {
-			t.Errorf("row %d: %+v", i, r)
-		}
+	if c := by["livekit"]; c.Status != "up" || c.Error != "" {
+		t.Errorf("livekit up: %+v", c)
 	}
-	// Refused before MAS: unknown kind, malformed ID.
-	for _, p := range []string{"/api/admin/matrix/sessions/device/" + sOAuth + "/finish", "/api/admin/matrix/sessions/oauth2/nope/finish"} {
-		if w := adminDo(t, srv, admin, "POST", p, nil); w.Code != http.StatusBadRequest {
-			t.Errorf("%s: %d", p, w.Code)
-		}
+
+	// With LiveKit unreachable: status=down, error non-empty, secret never leaked.
+	lk.Close()
+	w := adminDo(t, srv, admin, "GET", "/api/admin/health", nil)
+	if strings.Contains(w.Body.String(), "devsecret") {
+		t.Fatal("health response leaked LiveKit secret")
 	}
-	// MAS's own client sessions belong to no user: refused, audited, never finished.
-	if w := adminDo(t, srv, admin, "POST", "/api/admin/matrix/sessions/oauth2/"+sNoUser+"/finish", nil); w.Code != http.StatusBadRequest {
-		t.Errorf("no-user session: %d", w.Code)
-	}
-	rows = auditRows(t, st, "matrix.session_end")
-	if len(rows) != 4 || !strings.Contains(rows[0].Details, `outcome="refused: no user"`) || len(f.finishes) != 3 {
-		t.Errorf("rows %d newest %+v finishes %v", len(rows), rows[0], f.finishes)
+	h = decode[componentsBody](t, w)
+	if len(h.Components) != 3 || h.Components[2].Name != "livekit" || h.Components[2].Status != "down" || h.Components[2].Error == "" {
+		t.Fatalf("livekit down: %+v", h)
 	}
 }
 
-func TestHealthWithMatrixReportsEveryComponent(t *testing.T) {
-	srv, st, cfg, _ := setupMatrixServer(t)
-	mux := func(routes map[string]string) string {
-		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if b, ok := routes[r.URL.Path]; ok {
-				fmt.Fprint(w, b)
-				return
-			}
-			http.NotFound(w, r)
-		}))
-		t.Cleanup(s.Close)
-		return s.URL
-	}
-	api.SetHealthTargetsForTest(srv, health.Targets{
-		Synapse: mux(map[string]string{"/health": "OK", "/_synapse/admin/v1/server_version": `{"server_version":"` + health.Pins["synapse"] + `"}`}),
-		MAS:     mux(map[string]string{"/.well-known/openid-configuration": "{}"}),
-		Element: mux(map[string]string{"/version": "1.0.0"}),
-	})
-	cfg.Matrix.DBHost = "postgres.invalid"
-	cfg.Matrix.BackupDBPassword = "pw-hunter2"
-	cfg.Matrix.AdminSecret = "mas-secret-xyz"
-	w := adminDo(t, srv, loginAs(t, srv, st, "root", "admin"), "GET", "/api/admin/health", nil)
-	if w.Header().Get("Cache-Control") != "no-store" || strings.Contains(w.Body.String(), "pw-hunter2") || strings.Contains(w.Body.String(), "mas-secret-xyz") {
-		t.Fatalf("headers %v body %s", w.Header(), w.Body.String())
-	}
-	h := decode[componentsBody](t, w)
-	by := map[string]health.Component{}
-	var names []string
-	for _, c := range h.Components {
-		by[c.Name] = c
-		names = append(names, c.Name)
-	}
-	if !h.Matrix || strings.Join(names, ",") != "kymessages,database,synapse,mas,element,postgres,synapse-admin" {
-		t.Fatalf("components %v", names)
-	}
-	if c := by["synapse"]; c.Status != "up" || c.Version != health.Pins["synapse"] || c.Mismatch || c.Source == "" {
-		t.Errorf("synapse %+v", c)
-	}
-	if c := by["mas"]; c.Status != "up" || c.Version != health.Pins["mas"] || c.Mismatch {
-		t.Errorf("mas %+v", c)
-	}
-	if c := by["synapse-admin"]; c.Status != "up" || c.Version != "" || c.Pinned != "" || c.Error != "" {
-		t.Errorf("synapse-admin %+v", c)
-	}
-	if c := by["element"]; c.Status != "up" || !c.Mismatch || c.Pinned != health.Pins["element"] {
-		t.Errorf("element %+v", c)
-	}
-	if c := by["postgres"]; c.Status != "down" || c.Error == "" {
-		t.Errorf("postgres %+v", c)
+func TestRetiredMatrixRoutesReturn404(t *testing.T) {
+	srv, st, _ := setupTestServer(t)
+	admin := loginAs(t, srv, st, "root", "admin")
+	for _, rt := range []struct{ method, path string }{
+		{"GET", "/api/admin/matrix/users"},
+		{"GET", "/api/admin/matrix/rooms"},
+		{"GET", "/api/admin/matrix/sync-status"},
+		{"GET", "/api/admin/federation"},
+		{"POST", "/api/rtc/sfu/get"},
+	} {
+		if w := adminDo(t, srv, admin, rt.method, rt.path, nil); w.Code != http.StatusNotFound {
+			t.Errorf("%s %s: got %d, want 404", rt.method, rt.path, w.Code)
+		}
 	}
 }
 
@@ -430,7 +118,7 @@ func TestAuditListsNewestFirstByKind(t *testing.T) {
 	ctx := context.Background()
 	for _, r := range []store.AuditRecord{
 		{UserID: "usr_root", Action: "admin.backup_run", Resource: "cap-1", Details: `outcome="success" trigger="admin"`, IPAddress: "192.0.2.9"},
-		{Action: "matrix.lock", Resource: "@bob:example.com", Details: `subject="s" reason="r" outcome="ok"`},
+		{Action: "agent.expire", Resource: "agent-triage", Details: `outcome="expired" owner="alice"`},
 		{UserID: "usr_gone", Action: "scim.user.create", Resource: "erin"},
 	} {
 		if err := st.Audit().LogAudit(ctx, &r); err != nil {
@@ -444,20 +132,23 @@ func TestAuditListsNewestFirstByKind(t *testing.T) {
 	}
 	get := func(q string) page { return decode[page](t, adminDo(t, srv, admin, "GET", "/api/admin/audit"+q, nil)) }
 	all := get("")
-	if len(all.Records) < 4 || all.Records[0].Action != "scim.user.create" || all.Records[1].Action != "matrix.lock" || all.Records[2].Action != "admin.backup_run" {
+	if len(all.Records) < 4 || all.Records[0].Action != "scim.user.create" || all.Records[1].Action != "agent.expire" || all.Records[2].Action != "admin.backup_run" {
 		t.Fatalf("order: %+v", all.Records)
 	}
 	if r := all.Records[0]; r.Actor != "scim" || r.Target != "erin" || r.Outcome != "" {
 		t.Errorf("scim row: %+v", r)
 	}
-	if r := all.Records[1]; r.Actor != "system" || r.Outcome != "ok" {
-		t.Errorf("sweep row: %+v", r)
+	if r := all.Records[1]; r.Actor != "system" || r.Outcome != "expired" {
+		t.Errorf("agent row: %+v", r)
 	}
 	if r := all.Records[2]; r.Actor != "root" || r.Outcome != "success" || r.Target != "cap-1" || r.IP != "192.0.2.9" || !strings.Contains(r.Details, `trigger="admin"`) {
 		t.Errorf("backup row: %+v", r)
 	}
 	if b := get("?kind=backup"); b.Total != 1 || b.Records[0].Action != "admin.backup_run" {
 		t.Errorf("backup kind: %+v", b)
+	}
+	if a := get("?kind=agents"); a.Total != 1 || a.Records[0].Action != "agent.expire" {
+		t.Errorf("agents kind: %+v", a)
 	}
 	for _, r := range get("?kind=auth").Records {
 		if !strings.HasPrefix(r.Action, "auth.") && !strings.HasPrefix(r.Action, "device.") {
@@ -467,23 +158,10 @@ func TestAuditListsNewestFirstByKind(t *testing.T) {
 	if p := get("?limit=1&offset=1"); len(p.Records) != 1 || p.Records[0] != all.Records[1] || p.Total != all.Total {
 		t.Errorf("page: %+v", p)
 	}
-	for _, bad := range []string{"?kind=", "?kind=messaging", "?limit=500", "?offset=x"} {
+	for _, bad := range []string{"?kind=", "?kind=matrix", "?kind=messaging", "?limit=500", "?offset=x"} {
 		if w := adminDo(t, srv, admin, "GET", "/api/admin/audit"+bad, nil); w.Code != http.StatusBadRequest {
 			t.Errorf("%s: %d", bad, w.Code)
 		}
-	}
-}
-
-func TestSessionFinishClipsLongErrorsInAudit(t *testing.T) {
-	srv, st, _, f := setupMatrixServer(t)
-	f.finishErr = errors.New("MAS POST https://mas.invalid/" + strings.Repeat("x", 400))
-	adminDo(t, srv, loginAs(t, srv, st, "root", "admin"), "POST", "/api/admin/matrix/sessions/oauth2/"+sOAuth+"/finish", nil)
-	r := auditRows(t, st, "matrix.session_end")[0]
-	if !strings.HasPrefix(r.Details, `outcome="error: MAS POST`) || !strings.Contains(r.Details, `session="`+sOAuth+`"`) {
-		t.Fatalf("details %q", r.Details)
-	}
-	if got := api.DetailOutcomeForTest(r.Details); !strings.HasPrefix(got, "error: MAS POST") || strings.Contains(got, `"`) {
-		t.Errorf("outcome %q", got)
 	}
 }
 
@@ -505,23 +183,10 @@ func TestAuditOutcomeIgnoresSpoofs(t *testing.T) {
 	}
 }
 
-func TestSessionFinishMultibyteErrorKeepsQuotes(t *testing.T) {
-	srv, st, _, f := setupMatrixServer(t)
-	f.finishErr = errors.New(strings.Repeat("\U0001F4A5", 120))
-	adminDo(t, srv, loginAs(t, srv, st, "root", "admin"), "POST", "/api/admin/matrix/sessions/oauth2/"+sOAuth+"/finish", nil)
-	r := auditRows(t, st, "matrix.session_end")[0]
-	if !strings.HasSuffix(r.Details, `kind="oauth2"`) || !strings.HasPrefix(api.DetailOutcomeForTest(r.Details), "error: ") {
-		t.Fatalf("details %q", r.Details)
-	}
-}
-
-// One oversized username or resource must not break the page: the web rejects the whole page
-// when a field exceeds its bound (actor 255, target 1024).
 func TestAuditClipsLongActorAndTarget(t *testing.T) {
 	srv, st, _ := setupTestServer(t)
 	admin := loginAs(t, srv, st, "root", "admin")
 	ctx := context.Background()
-	// 100 characters (within Postgres's varchar(128) username) but 400 bytes, past the 200-byte clip.
 	long := strings.Repeat("\U0001F600", 100)
 	if err := st.Users().CreateUser(ctx, &store.User{ID: "usr_long", Username: long, Role: "user", Status: "active"}); err != nil {
 		t.Fatal(err)
@@ -552,15 +217,13 @@ func TestAuditClipsLongActorAndTarget(t *testing.T) {
 	}
 }
 
-// Details, outcome and IP are bounded too (web: details 4096, outcome 1024, ip 64).
 func TestAuditClipsLongDetailsOutcomeAndIP(t *testing.T) {
 	srv, st, _ := setupTestServer(t)
 	admin := loginAs(t, srv, st, "root", "admin")
-	// 64 characters fit Postgres's varchar(64) but are 256 bytes.
 	ip := strings.Repeat("\U0001F600", 64)
 	outcome := strings.Repeat("\U0001F600", 1500)
 	details := `outcome="` + outcome + `"`
-	if err := st.Audit().LogAudit(context.Background(), &store.AuditRecord{Action: "matrix.lock", Details: details, IPAddress: ip}); err != nil {
+	if err := st.Audit().LogAudit(context.Background(), &store.AuditRecord{Action: "agent.create", Details: details, IPAddress: ip}); err != nil {
 		t.Fatal(err)
 	}
 	type rec struct{ Details, Outcome, IP string }

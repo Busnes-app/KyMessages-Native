@@ -28,6 +28,10 @@ func (s *Server) handlePairInit(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	if user.Role == "bot" {
+		s.writeError(w, http.StatusForbidden, "Bot accounts cannot pair devices")
+		return
+	}
 	if !s.allowAccountAttempt("pair-init:"+user.ID, 10, time.Minute) {
 		s.writeError(w, http.StatusTooManyRequests, "Too many pairing requests")
 		return

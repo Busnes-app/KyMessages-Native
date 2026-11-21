@@ -88,24 +88,25 @@ type Setting struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// Agent token states: a current personal session, revoked by an admin, or expired unused.
+// Agent token states: an active bearer token, revoked by an admin, or expired unused.
 const (
 	AgentTokenActive  = "active"
 	AgentTokenRevoked = "revoked"
 	AgentTokenExpired = "expired"
 )
 
-// Agent is a chat agent account: a MAS user with no upstream link, owned by a directory
-// member (OwnerSubject, a KyIdentity subject). Its token lives only in MAS; SessionID names the
-// current personal session and is empty when TokenState is not active.
+// Agent is a native chat bot/agent account backed by a users row (Role="bot", SSOProvider="bot")
+// and owned by an active human user (OwnerUserID). Its bearer token (kybot_<hex>) is shown once
+// at creation/rotation; only its SHA-256 hex digest is persisted in TokenHash.
 type Agent struct {
-	ID           string    `json:"id"`
-	Username     string    `json:"username"`
-	MASUserID    string    `json:"mas_user_id"`
-	DeviceID     string    `json:"device_id"`
-	OwnerSubject string    `json:"owner_subject"`
-	SessionID    string    `json:"-"`
-	TokenState   string    `json:"token_state"`
-	CreatedBy    string    `json:"created_by"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID          string     `json:"id"`
+	UserID      string     `json:"user_id"`
+	Username    string     `json:"username"`
+	DisplayName string     `json:"display_name"`
+	OwnerUserID string     `json:"owner_user_id"`
+	TokenHash   string     `json:"-"`
+	TokenState  string     `json:"token_state"`
+	LastUsedAt  *time.Time `json:"last_used_at,omitempty"`
+	CreatedBy   string     `json:"created_by"`
+	CreatedAt   time.Time  `json:"created_at"`
 }

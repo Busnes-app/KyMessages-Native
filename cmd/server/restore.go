@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -71,13 +70,10 @@ func restore(capsulePath, targetDir, expectService string, shares []string, stdo
 	if err := prepareRestoredData(target); err != nil {
 		return errors.Join(fmt.Errorf("restore failed, restored files were removed: %w", err), removeExtracted(root, target, created))
 	}
-	if err := prepareRestoredMatrix(root); err != nil {
-		return errors.Join(fmt.Errorf("restore failed, restored files were removed: %w", err), removeExtracted(root, target, created))
-	}
 	if _, err := io.Copy(stdout, &manifest); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintln(stdout, "Restored sessions, challenges and pairings invalidated. Sign in freshly.")
+	_, err = fmt.Fprintln(stdout, "Restored sessions, challenges, pairings, active bot tokens and open calls invalidated. Sign in freshly.")
 	return err
 }
 
@@ -218,13 +214,4 @@ func prepareRestoredData(target string) error {
 		return err
 	}
 	return errors.Join(st.InvalidateRestoredGrants(ctx), st.Close())
-}
-
-// prepareRestoredMatrix gives Element's config back the 0644 matrix-init wrote: capsules clamp
-// every member to owner-only, and Element's nginx reads the file as another user.
-func prepareRestoredMatrix(root *os.Root) error {
-	if err := root.Chmod("matrix/element/config.json", 0o644); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
-	return nil
 }

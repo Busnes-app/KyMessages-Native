@@ -265,6 +265,10 @@ func (s *Server) handleCreateInstantMeeting(w http.ResponseWriter, r *http.Reque
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	if user.Role == "bot" {
+		s.writeError(w, http.StatusForbidden, "Bot accounts cannot create meetings")
+		return
+	}
 	var req struct {
 		Title     string   `json:"title"`
 		MemberIDs []string `json:"member_ids"`
@@ -335,6 +339,10 @@ func (s *Server) handleCreateRoomGuestLink(w http.ResponseWriter, r *http.Reques
 	user, _, ok := s.currentUser(r)
 	if !ok {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+	if user.Role == "bot" {
+		s.writeError(w, http.StatusForbidden, "Bot accounts cannot create meeting links")
 		return
 	}
 	roomID := r.PathValue("id")

@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/Busnes-app/ky_server_base/internal/matrixsync"
 	"github.com/Busnes-app/ky_server_base/internal/sso"
 )
 
@@ -14,8 +13,8 @@ type ThemeUpdateRequest struct {
 }
 
 // notExtra are settings extra_settings never carries: the logo is up to 1 MiB and is served at
-// /app-icon.png; the sync records have their own route.
-var notExtra = map[string]bool{brandLogoKey: true, sso.WebhookRecordKey: true, matrixsync.SweepRecordKey: true}
+// /app-icon.png; webhook records stay internal.
+var notExtra = map[string]bool{brandLogoKey: true, sso.WebhookRecordKey: true}
 
 func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	theme, _ := s.store.Settings().GetSetting(r.Context(), "site_theme")
@@ -35,7 +34,6 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		"theme":            theme,
 		"captcha_provider": s.config.Captcha.Provider,
 		"sso_enabled":      s.config.SSO.Enabled,
-		"chat_url":         s.config.Matrix.ChatHost,
 	}
 
 	user, _, err := s.sessions.AuthenticateRequest(r)
@@ -44,9 +42,6 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if user.Role == "admin" && s.config.InstallerSSO != nil {
-		out["chat_url"] = ""
-	}
 	out["scim_enabled"] = s.config.SCIM.Enabled
 	out["db_driver"] = s.config.Database.Driver
 

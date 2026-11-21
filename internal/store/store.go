@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
+
 	"github.com/Busnes-app/ky-primitives/applysetup"
 )
 
@@ -155,17 +157,23 @@ type SettingsStore interface {
 	GetAllSettings(ctx context.Context) (map[string]string, error)
 }
 
-// AgentStore is the registry of chat agent accounts.
+// AgentStore is the registry of native chat bot/agent accounts.
 type AgentStore interface {
-	// CreateAgent returns ErrAlreadyExists when the username, MAS user or device is taken.
+	// CreateAgent returns ErrAlreadyExists when the username or backing user_id is taken.
 	CreateAgent(ctx context.Context, a *Agent) error
 	GetAgent(ctx context.Context, id string) (*Agent, error)
+	// GetAgentByTokenHash returns the active agent matching the SHA-256 token hash, or ErrNotFound.
+	GetAgentByTokenHash(ctx context.Context, tokenHash string) (*Agent, error)
 	// ListAgents returns every agent, oldest first.
 	ListAgents(ctx context.Context) ([]*Agent, error)
-	// SetAgentToken records the agent's device and current session: a session ID with
-	// AgentTokenActive, or "" with AgentTokenRevoked or AgentTokenExpired. It is ErrNotFound
-	// unless the agent still holds fromSession, so a concurrent change is never overwritten.
-	SetAgentToken(ctx context.Context, id, fromSession, deviceID, sessionID, state string) error
+	// ListAgentsByOwner returns agents owned by ownerUserID.
+	ListAgentsByOwner(ctx context.Context, ownerUserID string) ([]*Agent, error)
+	// SetAgentToken records the agent's current token hash and state: a non-empty hash with
+	// AgentTokenActive, or "" with AgentTokenRevoked or AgentTokenExpired. It returns ErrNotFound
+	// unless the agent still holds fromTokenHash, so a concurrent change is never overwritten.
+	SetAgentToken(ctx context.Context, id, fromTokenHash, newTokenHash, state string) error
+	// TouchAgentLastUsed records the most recent authenticated API/WS use of the agent.
+	TouchAgentLastUsed(ctx context.Context, id string, at time.Time) error
 	DeleteAgent(ctx context.Context, id string) error
 }
 

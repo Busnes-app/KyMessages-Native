@@ -14,7 +14,6 @@ import (
 
 	"github.com/Busnes-app/ky-primitives/recoveryclient"
 	"github.com/Busnes-app/ky_server_base/internal/backup"
-	"github.com/Busnes-app/ky_server_base/internal/backup/media"
 	"github.com/Busnes-app/ky_server_base/internal/config"
 	"github.com/Busnes-app/ky_server_base/internal/store"
 )
@@ -189,20 +188,18 @@ func TestBackupTickInProgressLeavesItDue(t *testing.T) {
 	}
 }
 
-// A `kymessages deposit` from cron holds backup.lock: the scheduler neither runs nor mirrors
-// media, and leaves the run unstamped so the next tick retries it.
+// A `kymessages deposit` from cron holds backup.lock: the scheduler leaves the run unstamped
+// so the next tick retries it.
 func TestBackupTickWaitsOutAnotherProcessRun(t *testing.T) {
 	st, cfg := tickFixture(t, time.Hour)
-	cfg.Matrix.ServerName = "example.com"
 	ran := stubRun(t, func() error { return nil })
-	mirrored := stubMedia(t, func() error { return nil })
 	unlock, err := backup.Lock(cfg.Database.DataDir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	backupTick(context.Background(), cfg, st, recoveryclient.RunConfig{}, nil)
-	if *ran != 0 || *mirrored != 0 {
-		t.Fatalf("ran %d capsule and %d media runs while another process held the lock", *ran, *mirrored)
+	if *ran != 0 {
+		t.Fatalf("ran %d capsule runs while another process held the lock", *ran)
 	}
 	if next, on, err := recoveryclient.NextRun(time.Hour, backup.Settings(context.Background(), st.Settings())); err != nil || !on || next.After(time.Now()) {
 		t.Fatalf("not due: %v %v %v", next, on, err)
@@ -262,106 +259,5 @@ func TestWriteNewRefusesAnExistingPath(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
 		t.Fatalf("temporary left behind: %v", entries)
-	}
-}
-
-func stubMedia(t *testing.T, fn func() error) *int {
-	t.Helper()
-	var ran int
-	old := runMedia
-	t.Cleanup(func() { runMedia = old })
-	runMedia = func(context.Context, *config.Config) (media.Result, error) {
-		ran++
-		return media.Result{Copied: 1}, fn()
-	}
-	return &ran
-}
-
-func latest(t *testing.T, st store.Store, action string) *store.AuditRecord {
-	t.Helper()
-	rec, err := st.Audit().LatestAuditRecord(context.Background(), action)
-	if err != nil {
-		t.Fatalf("no %s row: %v", action, err)
-	}
-	return rec
-}
-
-// Media runs after a delivered capsule and is audited on its own row.
-func TestBackupTickRunsMediaAfterTheCapsule(t *testing.T) {
-	st, cfg := tickFixture(t, time.Hour)
-	cfg.Matrix.ServerName = "example.com"
-	stubRun(t, func() error { return nil })
-	ran := stubMedia(t, func() error { return nil })
-	backupTick(context.Background(), cfg, st, recoveryclient.RunConfig{}, nil)
-	if *ran != 1 {
-		t.Fatalf("media ran %d times", *ran)
-	}
-	if !strings.HasPrefix(latest(t, st, mediaRunAction).Details, `outcome="success"`) ||
-		!strings.HasPrefix(latest(t, st, backupRunAction).Details, `outcome="success"`) {
-		t.Fatal("capsule and media outcomes not recorded separately")
-	}
-}
-
-// A capsule that reached no destination never carried the media key anywhere: no mirror.
-func TestBackupTickSkipsMediaAfterAFailedCapsule(t *testing.T) {
-	st, cfg := tickFixture(t, time.Hour)
-	cfg.Matrix.ServerName = "example.com"
-	stubRun(t, func() error { return errors.New("capsule failed") })
-	ran := stubMedia(t, func() error { return nil })
-	backupTick(context.Background(), cfg, st, recoveryclient.RunConfig{}, nil)
-	if *ran != 0 {
-		t.Fatalf("media ran %d times after a failed capsule", *ran)
-	}
-}
-
-func TestBackupTickBusyMediaIsNotAFailureRow(t *testing.T) {
-	st, cfg := tickFixture(t, time.Hour)
-	cfg.Matrix.ServerName = "example.com"
-	stubRun(t, func() error { return nil })
-	stubMedia(t, func() error { return media.ErrBusy })
-	backupTick(context.Background(), cfg, st, recoveryclient.RunConfig{}, nil)
-	if _, err := st.Audit().LatestAuditRecord(context.Background(), mediaRunAction); err == nil {
-		t.Fatal("busy mirror audited")
-	}
-}
-
-func TestBackupTickSkipsMediaOnceShutdownBegan(t *testing.T) {
-	st, cfg := tickFixture(t, time.Hour)
-	cfg.Matrix.ServerName = "example.com"
-	ctx, cancel := context.WithCancel(context.Background())
-	stubRun(t, func() error { cancel(); return nil })
-	ran := stubMedia(t, func() error { return nil })
-	backupTick(ctx, cfg, st, recoveryclient.RunConfig{}, nil)
-	if *ran != 0 {
-		t.Fatal("media started after shutdown")
-	}
-}
-
-func TestBackupTickMediaFailureLeavesTheCapsuleSuccess(t *testing.T) {
-	st, cfg := tickFixture(t, time.Hour)
-	cfg.Matrix.ServerName = "example.com"
-	stubRun(t, func() error { return nil })
-	stubMedia(t, func() error { return errors.New("disk full") })
-	backupTick(context.Background(), cfg, st, recoveryclient.RunConfig{}, nil)
-	if d := latest(t, st, mediaRunAction).Details; !strings.HasPrefix(d, `outcome="failure"`) || !strings.Contains(d, "disk full") {
-		t.Errorf("media row %q", d)
-	}
-	if !strings.HasPrefix(latest(t, st, backupRunAction).Details, `outcome="success"`) {
-		t.Error("a media failure changed the capsule outcome")
-	}
-}
-
-func TestBackupTickSkipsMediaWithoutMatrixOrWhenBusy(t *testing.T) {
-	st, cfg := tickFixture(t, time.Hour)
-	stubRun(t, func() error { return nil })
-	ran := stubMedia(t, func() error { return nil })
-	backupTick(context.Background(), cfg, st, recoveryclient.RunConfig{}, nil)
-	cfg.Matrix.ServerName = "example.com"
-	for _, e := range []error{recoveryclient.ErrInProgress, recoveryclient.ErrNotPaired, recoveryclient.ErrNoDestination} {
-		stubRun(t, func() error { return e })
-		backupTick(context.Background(), cfg, st, recoveryclient.RunConfig{}, nil)
-	}
-	if *ran != 0 {
-		t.Fatalf("media ran %d times without Matrix or beside an unsealed capsule run", *ran)
 	}
 }

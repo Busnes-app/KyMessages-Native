@@ -29,13 +29,13 @@ func TestFrontmatterNamesTheFolder(t *testing.T) {
 }
 
 func TestConfigFillsEveryPlaceholder(t *testing.T) {
-	v := Values{Homeserver: "https://matrix.example.com", AccessToken: "mpt_abc123", Owner: "@alice:example.com"}
+	v := Values{ServerURL: "https://chat.example.com", AccessToken: "kybot_abc123", Owner: "alice"}
 	for _, rt := range Runtimes {
 		got, err := Config(rt, v)
 		if err != nil {
 			t.Fatal(rt, err)
 		}
-		for _, want := range []string{v.Homeserver, v.AccessToken, v.Owner} {
+		for _, want := range []string{v.ServerURL, v.AccessToken, v.Owner} {
 			if !strings.Contains(got, want) {
 				t.Errorf("%s: missing %q in\n%s", rt, want, got)
 			}
@@ -46,12 +46,12 @@ func TestConfigFillsEveryPlaceholder(t *testing.T) {
 	}
 }
 
-// The settings the plan requires, per runtime: encryption on and only the owner served.
-func TestConfigRequiresEncryptionAndOwnerOnly(t *testing.T) {
-	v := Values{Homeserver: "https://m.example", AccessToken: "t", Owner: "@o:example"}
+// Each runtime restricts replies to the owner only.
+func TestConfigRequiresOwnerOnly(t *testing.T) {
+	v := Values{ServerURL: "https://chat.example", AccessToken: "kybot_t", Owner: "alice"}
 	want := map[string][]string{
-		"openclaw": {"encryption: true", `allowFrom: ["@o:example"]`, `groupAllowFrom: ["@o:example"]`, `groupPolicy: "allowlist"`},
-		"hermes":   {"MATRIX_E2EE_MODE=required\n", "MATRIX_ALLOWED_USERS=@o:example\n"},
+		"openclaw": {`serverUrl: "https://chat.example"`, `allowFrom: ["alice"]`, `groupAllowFrom: ["alice"]`, `groupPolicy: "allowlist"`},
+		"hermes":   {"KYMESSAGES_SERVER_URL=https://chat.example\n", "KYMESSAGES_ACCESS_TOKEN=kybot_t\n", "KYMESSAGES_ALLOWED_USERS=alice\n"},
 	}
 	for rt, needles := range want {
 		got, err := Config(rt, v)
@@ -68,7 +68,7 @@ func TestConfigRequiresEncryptionAndOwnerOnly(t *testing.T) {
 
 func TestConfigRefusesInjection(t *testing.T) {
 	for _, bad := range []string{"", `x"y`, "x\ny", "x y", "x#y", "x\\y", "$(id)"} {
-		if _, err := Config("hermes", Values{Homeserver: "https://m.example", AccessToken: bad, Owner: "@o:example"}); err == nil {
+		if _, err := Config("hermes", Values{ServerURL: "https://chat.example", AccessToken: bad, Owner: "alice"}); err == nil {
 			t.Errorf("accepted %q", bad)
 		}
 	}

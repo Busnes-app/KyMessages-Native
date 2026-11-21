@@ -19,14 +19,12 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o kymessages ./cmd/serve
 
 # Stage 3: Minimal Production Container
 FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
-# postgresql17-client: pg_dump/pg_restore for Matrix backups; its major must equal the
-# postgres service's (scripts/check-compose-matrix.sh).
-RUN apk --no-cache add ca-certificates tzdata postgresql17-client
+RUN apk --no-cache add ca-certificates tzdata
 WORKDIR /app
 COPY --from=backend-builder /app/kymessages /app/kymessages
 # /app/backups is the optional mount for sealed local capsules; KY_BACKUP_DIR is set by the
 # operator (compose does), so an image run bare keeps no local copies.
-# Never root: Compose runs it as the owner of ./data (KY_UID, or KY_MATRIX_UID with Matrix);
+# Never root: Compose runs it as the owner of ./data (KY_UID);
 # a bare run uses 10001, which owns the image's own volumes.
 RUN mkdir -p /app/data /app/backups && chown 10001:10001 /app/data /app/backups
 USER 10001:10001

@@ -248,10 +248,32 @@ ALTER TABLE mfa_challenges ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';`,
 	// The suite identity provider was renamed from KySignOn to KyIdentity.
 	{Version: 20, Name: "kyidentity_provider", SQLite: kyIdentityProvider, Postgres: kyIdentityProvider},
 	{Version: 21, Name: "drop_messaging", SQLite: dropMessaging, Postgres: dropMessaging},
-	// Chat agent accounts. The token lives only in MAS; session_id names its personal session.
+	// Chat agent accounts (legacy MAS-backed table replaced in migration 24).
 	{Version: 22, Name: "agents", SQLite: agentsSchema("DATETIME"), Postgres: agentsSchema("TIMESTAMPTZ")},
 	// Native multi-tenant chat, calls, meetings, and webhooks schema.
 	{Version: 23, Name: "native_chat", SQLite: nativeChatSchemaSQLite, Postgres: nativeChatSchemaPostgres},
+	// Native chat bot/agent accounts backed directly by users and hashed bearer tokens.
+	{Version: 24, Name: "native_agents", SQLite: nativeAgentsSchema("DATETIME"), Postgres: nativeAgentsSchema("TIMESTAMPTZ")},
+}
+
+func nativeAgentsSchema(timestamp string) string {
+	return `
+DROP TABLE IF EXISTS agents;
+CREATE TABLE agents (
+    id VARCHAR(64) PRIMARY KEY,
+    user_id VARCHAR(64) NOT NULL UNIQUE,
+    username VARCHAR(64) NOT NULL UNIQUE,
+    display_name VARCHAR(255) NOT NULL DEFAULT '',
+    owner_user_id VARCHAR(64) NOT NULL,
+    token_hash VARCHAR(64) NOT NULL DEFAULT '',
+    token_state VARCHAR(16) NOT NULL,
+    last_used_at ` + timestamp + `,
+    created_by VARCHAR(255) NOT NULL,
+    created_at ` + timestamp + ` NOT NULL
+);
+CREATE INDEX idx_agents_token_hash ON agents(token_hash);
+CREATE INDEX idx_agents_owner_user_id ON agents(owner_user_id);
+`
 }
 
 func agentsSchema(timestamp string) string {

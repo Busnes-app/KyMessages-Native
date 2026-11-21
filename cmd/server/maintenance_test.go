@@ -42,38 +42,11 @@ func TestMaintenanceLoopClosesDoneOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	done := make(chan struct{})
-	go maintenanceLoop(ctx, nil, nil, done)
+	go maintenanceLoop(ctx, nil, done)
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("maintenanceLoop did not close done after its context was cancelled")
-	}
-}
-
-// The brand is reconciled when the loop starts, under a deadline, and a failure (which the
-// reconciler logs itself) does not stop the loop.
-func TestMaintenanceLoopReconcilesBrandAtStart(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	called := make(chan struct{}, 1)
-	done := make(chan struct{})
-	go maintenanceLoop(ctx, nil, func(ctx context.Context) error {
-		if _, ok := ctx.Deadline(); !ok {
-			t.Error("brand reconcile runs without a deadline")
-		}
-		called <- struct{}{}
-		return errors.New("logged by the reconciler")
-	}, done)
-	select {
-	case <-called:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the brand was not reconciled at start")
-	}
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("done not closed")
 	}
 }
 
@@ -87,7 +60,7 @@ func TestAgentExpiryLoopRunsAtStartAndStops(t *testing.T) {
 			t.Error("expiry runs without a deadline or a time")
 		}
 		called <- struct{}{}
-		return errors.New("MAS down")
+		return errors.New("store unavailable")
 	}, done)
 	select {
 	case <-called:

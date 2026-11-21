@@ -5,7 +5,6 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 
@@ -299,138 +298,28 @@ func TestChecksSQLiteFilenameIsNotADSN(t *testing.T) {
 	}
 }
 
-// fakePgRestore takes a dump that starts with PGDMP: --list prints the rest as its TOC, and
-// --file=/dev/null reads it whole, which a complete dump ends in a PGEND line.
-func fakePgRestore(t *testing.T) {
-	fakeTool(t, "pg_restore", `case $1 in --list|--file=/dev/null) ;; *) exit 3 ;; esac
-IFS= read -r first || [ -n "$first" ] || exit 1
-case $first in PGDMP*) ;; *) echo 'pg_restore: error: input file does not appear to be a valid archive' >&2; exit 1 ;; esac
-[ "$1" = --list ] && exec /bin/cat
-last=
-while IFS= read -r line; do last=$line; done
-[ "$last" = PGEND ] && exit 0
-echo 'pg_restore: error: could not read from input file: end of file' >&2
-exit 1
-`)
-}
-
-func matrixScratch(t *testing.T, p recoveryclient.Payload, skip string, corrupt string) string {
-	t.Helper()
-	dir := t.TempDir()
-	for _, f := range p.Files {
-		if f.Path == skip {
-			continue
-		}
-		data := f.Data
-		if f.Path == corrupt {
-			data = []byte("not a dump\n")
-		}
-		full := filepath.Join(dir, f.Path)
-		if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(full, data, 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	return dir
-}
-
-func TestDrillChecksDumps(t *testing.T) {
+func TestDrillVerifiesNativeChatSchema(t *testing.T) {
 	t.Setenv("KY_PORT", "8080")
 	t.Setenv("KY_DB_DRIVER", "sqlite")
-	backup.SetLimitsForTest(t, 1000, 1<<20)
-	fakePgRestore(t)
-	cfg, _ := matrixInstance(t, append(dumpOf(1500), []byte("\n; TABLE public users\nPGEND\n")...), append(dumpOf(10), []byte("\nPGEND\n")...))
-	p, err := backup.Collect(context.Background(), cfg, "1.0.0")
+	cfg, _ := payloadConfig(t)
+	payload, err := backup.Collect(context.Background(), cfg, "test")
 	if err != nil {
 		t.Fatal(err)
 	}
-	passed := func(checks []recoveryclient.Check) bool {
-		for _, c := range checks {
-			if !c.Passed {
-				return false
-			}
-		}
-		return len(checks) > 0
-	}
-	byName := func(checks []recoveryclient.Check, name string) *recoveryclient.Check {
-		for i := range checks {
-			if checks[i].Name == name {
-				return &checks[i]
-			}
-		}
-		return nil
-	}
-	ok := backup.Checks(matrixScratch(t, p, "", ""), manifestFor(p))
-	if !passed(ok) || byName(ok, "Postgres Dump: matrix/dumps/mas.dump") == nil || byName(ok, "Postgres Dump: matrix/dumps/synapse.dump") == nil {
-		t.Fatalf("complete dumps: %+v", ok)
-	}
-	if c := byName(backup.Checks(matrixScratch(t, p, "", "matrix/dumps/synapse.dump.000"), manifestFor(p)), "Postgres Dump: matrix/dumps/synapse.dump"); c == nil || c.Passed {
-		t.Errorf("corrupt dump passed: %+v", c)
-	}
-	// A truncated last part has a whole TOC; only the full read catches it.
-	cut := matrixScratch(t, p, "", "")
-	if err := os.Truncate(filepath.Join(cut, "matrix/dumps/mas.dump.001"), 100); err != nil {
-		t.Fatal(err)
-	}
-	if c := byName(backup.Checks(cut, manifestFor(p)), "Postgres Dump: matrix/dumps/mas.dump"); c == nil || c.Passed || !strings.Contains(c.Message, "in full") {
-		t.Errorf("truncated dump: %+v", c)
-	}
-	if passed(backup.Checks(matrixScratch(t, p, "matrix/dumps/mas.dump.001", ""), manifestFor(p))) {
-		t.Error("missing dump part passed")
-	}
-	// The recipe must account for every dump member.
-	bad := p
-	bad.VerificationRecipe = maps.Clone(p.VerificationRecipe)
-	delete(bad.VerificationRecipe, "pg_dumps")
-	if c := backup.Checks(matrixScratch(t, p, "", ""), manifestFor(bad)); len(c) != 1 || c[0].Name != "Verification Recipe" {
-		t.Errorf("recipe without pg_dumps: %+v", c)
-	}
-	// A Matrix capsule without the backup role's SQL cannot rebuild a stack that dumps.
-	const role = "matrix/postgres/kybackup-role.sql"
-	noRole := p
-	noRole.Files = slices.DeleteFunc(slices.Clone(p.Files), func(f recoveryclient.File) bool { return f.Path == role })
-	noRole.VerificationRecipe = maps.Clone(p.VerificationRecipe)
-	req, _ := p.VerificationRecipe["required_files"].([]string)
-	noRole.VerificationRecipe["required_files"] = slices.DeleteFunc(slices.Clone(req), func(s string) bool { return s == role })
-	if c := backup.Checks(matrixScratch(t, noRole, "", ""), manifestFor(noRole)); len(c) != 1 || c[0].Message != "required_files omits "+role {
-		t.Errorf("capsule without %s: %+v", role, c)
-	}
-}
-
-// The drill refuses what restore-matrix refuses: a dump with an extension its owner cannot
-// restore, and a capsule without an owner password restore-matrix restores as.
-func TestDrillRefusesWhatRestoreMatrixRefuses(t *testing.T) {
-	t.Setenv("KY_PORT", "8080")
-	t.Setenv("KY_DB_DRIVER", "sqlite")
-	fakePgRestore(t)
-	cfg, _ := matrixInstance(t, append(dumpOf(10), []byte("\n2; 3079 17063 EXTENSION - plpython3u \nPGEND\n")...), append(dumpOf(10), []byte("\nPGEND\n")...))
-	p, err := backup.Collect(context.Background(), cfg, "1.0.0")
+	result, err := backup.RunDrill(context.Background(), cfg, payload, backup.Checks)
 	if err != nil {
 		t.Fatal(err)
 	}
-	checks := backup.Checks(matrixScratch(t, p, "", ""), manifestFor(p))
-	for _, c := range checks {
-		if c.Name == "Postgres Dump: matrix/dumps/mas.dump" {
-			if c.Passed || !strings.Contains(c.Message, "cannot restore") {
-				t.Errorf("untrusted extension: %+v", c)
-			}
-		} else if !c.Passed {
-			t.Errorf("unrelated check failed: %+v", c)
+	if !result.Passed {
+		t.Fatalf("native drill failed: %+v", result)
+	}
+	found := false
+	for _, c := range result.Checks {
+		if c.Name == "Native Chat Schema" && c.Passed {
+			found = true
 		}
 	}
-	for _, secret := range []string{"matrix/secrets/mas_db_password", "matrix/secrets/synapse_db_password"} {
-		cfg, _ := matrixInstance(t, append(dumpOf(10), []byte("\nPGEND\n")...), append(dumpOf(10), []byte("\nPGEND\n")...))
-		if err := os.Remove(filepath.Join(cfg.Matrix.Dir, strings.TrimPrefix(secret, "matrix/"))); err != nil {
-			t.Fatal(err)
-		}
-		p, err := backup.Collect(context.Background(), cfg, "1.0.0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if c := backup.Checks(matrixScratch(t, p, "", ""), manifestFor(p)); len(c) != 1 || c[0].Message != "required_files omits "+secret {
-			t.Errorf("capsule without %s: %+v", secret, c)
-		}
+	if !found {
+		t.Fatalf("expected passing Native Chat Schema check, got %+v", result.Checks)
 	}
 }

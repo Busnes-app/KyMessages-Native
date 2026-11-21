@@ -9,11 +9,8 @@ import (
 	"image/color"
 	"image/jpeg"
 	"image/png"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestValidateName(t *testing.T) {
@@ -84,7 +81,7 @@ func withSize(p []byte, w, h uint32) []byte {
 }
 
 func TestNormalizePNGStripsAncillaryChunks(t *testing.T) {
-	in := afterIHDR(encode(t, 16, 16), chunk("tEXt", []byte("Comment\x00kymatrix-secret")))
+	in := afterIHDR(encode(t, 16, 16), chunk("tEXt", []byte("Comment\x00kymessages-secret")))
 	if _, err := png.Decode(bytes.NewReader(in)); err != nil {
 		t.Fatalf("fixture does not decode: %v", err)
 	}
@@ -92,7 +89,7 @@ func TestNormalizePNGStripsAncillaryChunks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(out, []byte("tEXt")) || bytes.Contains(out, []byte("kymatrix-secret")) {
+	if bytes.Contains(out, []byte("tEXt")) || bytes.Contains(out, []byte("kymessages-secret")) {
 		t.Fatal("the tEXt chunk survived")
 	}
 	img, err := png.Decode(bytes.NewReader(out))
@@ -129,126 +126,6 @@ func TestNormalizePNGRefuses(t *testing.T) {
 	} {
 		if _, err := NormalizePNG(tc.in); !errors.Is(err, tc.want) {
 			t.Errorf("%s: got %v, want %v", name, err, tc.want)
-		}
-	}
-}
-
-const elementConfig = `{
-  "default_server_config": {
-    "m.homeserver": { "base_url": "https://matrix.example.com" }
-  },
-  "brand": "KyMessages",
-  "branding": { "auth_header_logo_url": "https://admin.example.com/app-icon.png" },
-  "setting_defaults": { "UIFeature.voip": false }
-}
-`
-
-func writeConfig(t *testing.T, body string) string {
-	t.Helper()
-	p := filepath.Join(t.TempDir(), "config.json")
-	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	return p
-}
-
-func TestPatchElementBrandChangesOnlyTheBrandInPlace(t *testing.T) {
-	p := writeConfig(t, elementConfig)
-	if err := os.Chmod(p, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	before, _ := os.Stat(p)
-	name := `Acme "Chat" <ops>`
-	changed, err := PatchElementBrand(p, name)
-	if err != nil || !changed {
-		t.Fatalf("changed=%v err=%v", changed, err)
-	}
-	got, _ := os.ReadFile(p)
-	if want := strings.Replace(elementConfig, `"KyMessages"`, `"Acme \"Chat\" \u003cops\u003e"`, 1); string(got) != want {
-		t.Fatalf("other bytes changed:\n%s", got)
-	}
-	after, _ := os.Stat(p)
-	if !os.SameFile(before, after) {
-		t.Fatal("the file was replaced, not rewritten in place")
-	}
-	if after.Mode().Perm() != 0o600 {
-		t.Fatalf("mode changed to %04o", after.Mode().Perm())
-	}
-	if brand, err := ElementBrand(p); err != nil || brand != name {
-		t.Fatalf("read back %q, %v", brand, err)
-	}
-	// Idempotent: the same name again writes nothing.
-	old := time.Unix(1_000_000_000, 0)
-	if err := os.Chtimes(p, old, old); err != nil {
-		t.Fatal(err)
-	}
-	if changed, err := PatchElementBrand(p, name); err != nil || changed {
-		t.Fatalf("second patch: changed=%v err=%v", changed, err)
-	}
-	if fi, _ := os.Stat(p); !fi.ModTime().Equal(old) {
-		t.Fatal("an unchanged brand was rewritten")
-	}
-}
-
-func TestPatchElementBrandAddsAMissingKeyAndPatchesDuplicates(t *testing.T) {
-	for in, want := range map[string]string{
-		`{"a": 1}`: `{"brand":"Acme","a": 1}`,
-		`{ }`:      `{"brand":"Acme" }`,
-		`{"brand": "x", "b": {"brand": "nested"}, "brand": "y"}`: `{"brand": "Acme", "b": {"brand": "nested"}, "brand": "Acme"}`,
-	} {
-		p := writeConfig(t, in)
-		if _, err := PatchElementBrand(p, "Acme"); err != nil {
-			t.Fatalf("%s: %v", in, err)
-		}
-		if got, _ := os.ReadFile(p); string(got) != want {
-			t.Errorf("%s: got %s, want %s", in, got, want)
-		}
-	}
-	if brand, err := ElementBrand(writeConfig(t, `{"a": 1}`)); err != nil || brand != "" {
-		t.Errorf("absent brand: %q, %v", brand, err)
-	}
-	if _, err := ElementBrand(writeConfig(t, `{"brand": 5}`)); err == nil {
-		t.Error("a non-string brand was read")
-	}
-}
-
-func TestPatchElementBrandRefusesAndLeavesTheFileAlone(t *testing.T) {
-	missing := filepath.Join(t.TempDir(), "config.json")
-	if _, err := PatchElementBrand(missing, "Acme"); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("missing: %v", err)
-	}
-	if _, err := os.Stat(missing); !errors.Is(err, os.ErrNotExist) {
-		t.Error("a missing config was created")
-	}
-	if _, err := PatchElementBrand(t.TempDir(), "Acme"); err == nil {
-		t.Error("a directory was accepted")
-	}
-	for name, body := range map[string]string{
-		"unparseable": `{"brand": "KyMessages",`,
-		"array":       `["brand"]`,
-		"string":      `"brand"`,
-		"trailing":    `{"brand":"KyMessages"} {}`,
-		"empty":       ``,
-	} {
-		p := writeConfig(t, body)
-		if _, err := PatchElementBrand(p, "Acme"); err == nil {
-			t.Errorf("%s: accepted", name)
-		}
-		if got, _ := os.ReadFile(p); string(got) != body {
-			t.Errorf("%s: file changed to %q", name, got)
-		}
-	}
-}
-
-func TestParseBrandKeepsTheLastAndRefusesNonObjects(t *testing.T) {
-	for body, want := range map[string]string{`{"brand":"A","x":1,"brand":"B"}`: "B", `{"x":1}`: ""} {
-		if got, err := ParseBrand([]byte(body)); err != nil || got != want {
-			t.Errorf("%s: %q %v", body, got, err)
-		}
-	}
-	for _, body := range []string{"{", "[]", `{"brand":1}`} {
-		if _, err := ParseBrand([]byte(body)); err == nil {
-			t.Errorf("%s accepted", body)
 		}
 	}
 }

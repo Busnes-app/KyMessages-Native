@@ -1,12 +1,8 @@
 package api
 
 import (
-	"context"
-	"github.com/Busnes-app/ky_server_base/internal/matrixrtc"
-	"net/http"
 	"time"
 
-	"github.com/Busnes-app/ky_server_base/internal/health"
 	"github.com/Busnes-app/ky_server_base/internal/store"
 )
 
@@ -45,52 +41,5 @@ func RegisterDetachedForTest(s *Server) func() {
 	return s.detached.done
 }
 
-// SetHealthTargetsForTest points the Matrix probes at test servers. Test-only.
-func SetHealthTargetsForTest(s *Server, t health.Targets) { s.matrixTargets = t }
-
 // DetailOutcomeForTest exposes the audit view's outcome parser. Test-only.
 func DetailOutcomeForTest(details string) string { return detailOutcome(details) }
-
-// SetRoomAdminForTest replaces the Synapse admin client. Test-only.
-func SetRoomAdminForTest(s *Server, r RoomAdmin) { s.rooms = r }
-
-// SetRoomBudgetForTest shortens the time a room change has before its final Close or Delete. Test-only.
-func SetRoomBudgetForTest(s *Server, d time.Duration) { s.roomBudget = d }
-
-// RoomWriteDeadlineForTest returns the default room budget, the fixed steps after it and the
-// write deadline a room change sets. Test-only.
-func RoomWriteDeadlineForTest() (budget, steps, total time.Duration) {
-	return roomChangeTimeout, roomAfterBudget, roomWriteTimeout(roomChangeTimeout)
-}
-
-func SetRTCForTest(s *Server, c *matrixrtc.Client) { s.rtc = c }
-
-// SetFederationPresetsForTest replaces the compiled public-server list for one test.
-func SetFederationPresetsForTest(t interface{ Cleanup(func()) }, names ...string) {
-	old := federationPresets
-	federationPresets = nil
-	for _, n := range names {
-		federationPresets = append(federationPresets, federationPreset{Name: n, Operator: "Test", Source: "https://" + n + "/", Checked: "2026-10-11"})
-	}
-	t.Cleanup(func() { federationPresets = old })
-}
-
-// SetFederationPeerForTest sends every federation request to base with client.
-func SetFederationPeerForTest(s *Server, base string, client *http.Client) {
-	s.fedBaseForTest = func(string) string { return base }
-	s.fedHTTP = client
-}
-
-// FederationHTTPForTest is the app's client for other homeservers.
-func FederationHTTPForTest(s *Server) *http.Client { return s.fedHTTP }
-
-var PublicOnlyForTest = publicOnly
-
-// FederationBaseForTest resolves name with client, as the call authorizer does.
-func FederationBaseForTest(s *Server, client *http.Client, name string) (string, error) {
-	s.fedHTTP = client
-	return s.federationBase(context.Background(), name)
-}
-
-// FederationPresetsForTest is this release's compiled public-server list.
-func FederationPresetsForTest() []federationPreset { return federationPresets }

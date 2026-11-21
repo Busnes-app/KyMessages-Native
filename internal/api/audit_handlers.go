@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -9,12 +10,14 @@ import (
 	"time"
 )
 
+const auditDetailsMax = 200
+
 // auditKinds maps the console's filter to action prefixes.
 var auditKinds = map[string][]string{
 	"auth":     {"auth.", "device.", "sso."},
 	"backup":   {"backup.", "admin.backup_", "restore."},
 	"branding": {"admin.brand_"},
-	"matrix":   {"matrix.", "agent."},
+	"agents":   {"agent."},
 	"scim":     {"scim."},
 }
 
@@ -48,6 +51,51 @@ func detailOutcome(details string) string {
 		}
 	}
 	return ""
+}
+
+// pageParams reads offset (>=0) and limit (1..100) query params.
+func pageParams(r *http.Request) (offset, limit int, ok bool) {
+	offset, limit = 0, 50
+	q := r.URL.Query()
+	if v := q.Get("offset"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return 0, 0, false
+		}
+		offset = n
+	}
+	if v := q.Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 100 {
+			return 0, 0, false
+		}
+		limit = n
+	}
+	return offset, limit, true
+}
+
+// auditFields formats outcome="..." followed by quoted key/value pairs, shortening outcome by
+// whole runes until the result fits within auditDetailsMax bytes.
+func auditFields(outcome string, kv ...string) string {
+	r := []rune(outcome)
+	for {
+		var b strings.Builder
+		fmt.Fprintf(&b, "outcome=%q", string(r))
+		for i := 0; i+1 < len(kv); i += 2 {
+			fmt.Fprintf(&b, " %s=%q", kv[i], kv[i+1])
+		}
+		if b.Len() <= auditDetailsMax || len(r) == 0 {
+			return b.String()
+		}
+		r = r[:len(r)-1]
+	}
+}
+
+func clip200(v string) string {
+	if len(v) <= 200 {
+		return v
+	}
+	return strings.ToValidUTF8(v[:200], "")
 }
 
 // handleAudit pages the audit log newest first, optionally by kind. Read-only, any admin.

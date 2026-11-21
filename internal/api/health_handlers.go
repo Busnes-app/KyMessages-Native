@@ -7,7 +7,6 @@ import (
 
 	"github.com/Busnes-app/ky_server_base/internal/config"
 	"github.com/Busnes-app/ky_server_base/internal/health"
-	"github.com/Busnes-app/ky_server_base/internal/synapseadmin"
 )
 
 const (
@@ -15,8 +14,8 @@ const (
 	healthTimeout = 5 * time.Second
 )
 
-// handleHealth probes every component now, in parallel. Without Matrix: KyMessages and its
-// database only.
+// handleHealth probes every native component in parallel: KyMessages, its database, and
+// LiveKit SFU when configured.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), healthTimeout)
 	defer cancel()
@@ -24,32 +23,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		{Name: "kymessages", Run: func(context.Context) (string, error) { return config.AppVersion, nil }},
 		{Name: "database", Run: func(ctx context.Context) (string, error) { return "", s.store.Ping(ctx) }},
 	}
-	m := s.config.Matrix
-	if s.mas != nil {
-		t := s.matrixTargets
-		probes = append(probes,
-			health.Probe{Name: "synapse", Run: health.Synapse(s.probeHTTP, t.Synapse)},
-			health.Probe{Name: "mas", Run: health.MAS(s.probeHTTP, t.MAS, s.mas.Version)},
-			health.Probe{Name: "element", Run: health.Element(s.probeHTTP, t.Element)},
-			health.Probe{Name: "postgres", Run: health.Postgres(m.DBHost, m.BackupDBPassword)},
-			health.Probe{Name: "synapse-admin", Run: s.synapseAdminProbe},
-		)
-	}
-	if s.rtc != nil {
-		probes = append(probes, health.Probe{Name: "livekit", Run: func(ctx context.Context) (string, error) { _, err := s.rtc.Rooms(ctx); return "", err }})
+	if s.config.RTC.LiveKitEnabled() {
+		probes = append(probes, health.Probe{Name: "livekit", Run: health.LiveKit(s.probeHTTP, s.config.RTC.LiveKitURL)})
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	s.writeJSON(w, http.StatusOK, map[string]any{
-		"matrix":     s.mas != nil,
-		"components": health.Check(ctx, probeTimeout, probes, m.BackupDBPassword, m.AdminSecret, m.RTCKey, m.RTCSecret),
-	})
-}
-
-// synapseAdminProbe proves the console can use Synapse's admin API: a console session, one
-// admin read, revoked. It has no version.
-func (s *Server) synapseAdminProbe(ctx context.Context) (string, error) {
-	return "", s.mas.AsConsole(ctx, func(ctx context.Context, tok string) error {
-		_, err := s.rooms.Rooms(ctx, tok, synapseadmin.RoomQuery{Limit: 1})
-		return err
+		"components": health.Check(ctx, probeTimeout, probes, s.config.RTC.LiveKitAPIKey, s.config.RTC.LiveKitAPISecret),
 	})
 }
