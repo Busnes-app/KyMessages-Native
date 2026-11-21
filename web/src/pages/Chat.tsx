@@ -378,18 +378,17 @@ export const Chat: React.FC<ChatProps> = ({
           return;
         }
         case 'room.member': {
-          const selfId = currentUserRef.current?.id;
-          if (event.userId === selfId) {
-            if (event.action === 'removed') {
-              setRooms((prev) => prev.filter((r) => r.id !== event.roomId));
-              if (activeRoomIdRef.current === event.roomId) {
-                setActiveRoomId(null);
-                setDrawerOpen(false);
-              }
-            } else {
-              void refreshRoomsList();
+          const self = event.userId === currentUserRef.current?.id;
+          if (self && event.action === 'removed') {
+            setRooms((prev) => prev.filter((r) => r.id !== event.roomId));
+            if (activeRoomIdRef.current === event.roomId) {
+              setActiveRoomId(null);
+              setDrawerOpen(false);
             }
-          } else if (drawerOpenRef.current && activeRoomIdRef.current === event.roomId) {
+            return;
+          }
+          if (self) void refreshRoomsList();
+          if (drawerOpenRef.current && activeRoomIdRef.current === event.roomId) {
             void refreshRoomDetail(event.roomId);
           }
           return;

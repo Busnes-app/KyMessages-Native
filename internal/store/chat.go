@@ -352,11 +352,62 @@ func (c *chatStore) AddRoomMember(ctx context.Context, m *RoomMember) error {
 	return uniqueError(err)
 }
 
-func (c *chatStore) RemoveRoomMember(ctx context.Context, tenantID, roomID, userID string) error {
+func (c *chatStore) RemoveRoomMember(ctx context.Context, tenantID, roomID, userID string) (string, error) {
 	tenantID = normalizeTenant(tenantID)
-	q := c.store.rebind(`DELETE FROM room_members WHERE tenant_id = ? AND room_id = ? AND user_id = ?`)
-	res, err := c.store.db.ExecContext(ctx, q, tenantID, roomID, userID)
-	return oneRow(res, err)
+	tx, err := c.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Serializes concurrent removals, so two moderators leaving at once cannot both
+	// see the other one stay.
+	if c.store.driver == "postgres" {
+		var id string
+		err := tx.QueryRowContext(ctx, c.store.rebind(`SELECT id FROM rooms WHERE tenant_id = ? AND id = ? FOR UPDATE`), tenantID, roomID).Scan(&id)
+		if errorsIs(err, sql.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		if err != nil {
+			return "", err
+		}
+	}
+	res, err := tx.ExecContext(ctx, c.store.rebind(`DELETE FROM room_members WHERE tenant_id = ? AND room_id = ? AND user_id = ?`), tenantID, roomID, userID)
+	if err := oneRow(res, err); err != nil {
+		return "", err
+	}
+
+	var moderators int
+	if err := tx.QueryRowContext(ctx, c.store.rebind(`
+		SELECT COUNT(*) FROM room_members WHERE tenant_id = ? AND room_id = ? AND role IN (?, ?)`),
+		tenantID, roomID, RoomRoleOwner, RoomRoleAdmin,
+	).Scan(&moderators); err != nil {
+		return "", err
+	}
+	var promoted string
+	if moderators == 0 {
+		err := tx.QueryRowContext(ctx, c.store.rebind(`
+			SELECT m.user_id FROM room_members m JOIN users u ON u.id = m.user_id
+			WHERE m.tenant_id = ? AND m.room_id = ? AND u.status = 'active'
+			ORDER BY m.joined_at, m.user_id LIMIT 1`),
+			tenantID, roomID,
+		).Scan(&promoted)
+		if err != nil && !errorsIs(err, sql.ErrNoRows) {
+			return "", err
+		}
+		if promoted != "" {
+			if _, err := tx.ExecContext(ctx, c.store.rebind(`
+				UPDATE room_members SET role = ? WHERE tenant_id = ? AND room_id = ? AND user_id = ?`),
+				RoomRoleOwner, tenantID, roomID, promoted,
+			); err != nil {
+				return "", err
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return promoted, nil
 }
 
 func (c *chatStore) GetRoomMember(ctx context.Context, tenantID, roomID, userID string) (*RoomMember, error) {
