@@ -19,7 +19,7 @@ func TestChatRoomKeepsAModerator(t *testing.T) {
 	dave, _ := createChatTestUser(t, st, "usr_mod_1_dave", "mod_dave", "user")
 	bob, bobTok := createChatTestUser(t, st, "usr_mod_2_bob", "mod_bob", "user")
 	carol, carolTok := createChatTestUser(t, st, "usr_mod_3_carol", "mod_carol", "user")
-	erin, erinTok := createChatTestUser(t, st, "usr_mod_4_erin", "mod_erin", "user")
+	erin, _ := createChatTestUser(t, st, "usr_mod_4_erin", "mod_erin", "user")
 
 	rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", aliceTok, map[string]any{"name": "ops"}, nil)
 	var roomResp struct {
@@ -58,14 +58,20 @@ func TestChatRoomKeepsAModerator(t *testing.T) {
 		t.Fatalf("after owner left with an admin in the room: %v", r)
 	}
 
-	// The last moderator leaves: the earliest-joined active member becomes owner.
-	dave.Status = "suspended"
-	if err := st.Users().UpdateUser(ctx, dave); err != nil {
-		t.Fatal(err)
+	// The only admin left is suspended, so it does not count: when a member leaves, the
+	// earliest-joined active member becomes owner, skipping suspended dave.
+	for _, u := range []*store.User{dave, erin} {
+		u.Status = "suspended"
+		if err := st.Users().UpdateUser(ctx, u); err != nil {
+			t.Fatal(err)
+		}
 	}
-	leave(erin.ID, erinTok)
-	if r := roles(); r[bob.ID] != store.RoomRoleOwner || r[dave.ID] != store.RoomRoleMember || r[carol.ID] != store.RoomRoleMember {
-		t.Fatalf("after last moderator left: %v", r)
+	leave(carol.ID, carolTok)
+	if r := roles(); r[bob.ID] != store.RoomRoleOwner || r[dave.ID] != store.RoomRoleMember || r[erin.ID] != store.RoomRoleAdmin {
+		t.Fatalf("after a member left with only a suspended admin: %v", r)
+	}
+	if rec = doBearerJSON(t, srv, http.MethodPost, room+"/members", bobTok, map[string]any{"user_id": carol.ID}, nil); rec.Code != http.StatusCreated {
+		t.Fatalf("re-add carol = %d", rec.Code)
 	}
 
 	// Removing someone else leaves the remover moderating: no promotion.
@@ -84,9 +90,9 @@ func TestChatRoomKeepsAModerator(t *testing.T) {
 		t.Fatalf("after bob left: %v", r)
 	}
 
-	// Only a suspended member remains: nobody is promoted, and leaving still works.
+	// Only suspended members remain: nobody is promoted, and leaving still works.
 	leave(carol.ID, carolTok)
-	if r := roles(); len(r) != 1 || r[dave.ID] != store.RoomRoleMember {
-		t.Fatalf("with only a suspended member left: %v", r)
+	if r := roles(); len(r) != 2 || r[dave.ID] != store.RoomRoleMember || r[erin.ID] != store.RoomRoleAdmin {
+		t.Fatalf("with only suspended members left: %v", r)
 	}
 }

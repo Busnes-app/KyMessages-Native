@@ -377,9 +377,11 @@ func (c *chatStore) RemoveRoomMember(ctx context.Context, tenantID, roomID, user
 		return "", err
 	}
 
+	// Only active accounts count: a suspended admin cannot moderate.
 	var moderators int
 	if err := tx.QueryRowContext(ctx, c.store.rebind(`
-		SELECT COUNT(*) FROM room_members WHERE tenant_id = ? AND room_id = ? AND role IN (?, ?)`),
+		SELECT COUNT(*) FROM room_members m JOIN users u ON u.id = m.user_id
+		WHERE m.tenant_id = ? AND m.room_id = ? AND m.role IN (?, ?) AND u.status = 'active'`),
 		tenantID, roomID, RoomRoleOwner, RoomRoleAdmin,
 	).Scan(&moderators); err != nil {
 		return "", err
