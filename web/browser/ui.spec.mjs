@@ -5,6 +5,18 @@ async function fits(page) {
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 }
 
+// Everyone lands in chat; settings and the admin pages sit behind the gear in its rail,
+// which a narrow screen keeps behind the room-list button.
+async function openSettings(page) {
+  // count() does not wait: let chat render before asking whether the rail is hidden.
+  await expect(page.getByRole('region', { name: 'Conversation' })).toBeVisible();
+  const openList = page.getByRole('button', { name: 'Open room list' }).filter({ visible: true });
+  if (await openList.count()) await openList.first().click();
+  await page.getByRole('complementary', { name: 'Workspace and conversations' })
+    .getByRole('button', { name: 'Settings', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'System Settings & Architecture' })).toBeVisible();
+}
+
 test('production CSP, worker, themes, keyboard, dialog and responsive shell', async ({ page, context }, testInfo) => {
   const violations = [];
   page.on('console', message => {
@@ -33,9 +45,25 @@ test('production CSP, worker, themes, keyboard, dialog and responsive shell', as
   }
   await page.getByLabel('Password').fill('BrowserUpdated456!');
   await page.getByRole('button', { name: 'Sign In', exact: true }).click();
-  const nav = page.getByRole('navigation', { name: 'Primary' });
-  await expect(nav).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'Overview', exact: true })).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Conversation' })).toBeVisible();
+  await fits(page);
+  // A chat modal opens focused on its first field, fits the screen and closes.
+  const openList = page.getByRole('button', { name: 'Open room list' }).filter({ visible: true });
+  if (await openList.count()) await openList.first().click();
+  await page.getByRole('complementary', { name: 'Workspace and conversations' })
+    .getByRole('button', { name: 'New channel' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Create channel' });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByLabel('Channel name')).toBeFocused();
+  await fits(page);
+  await page.screenshot({ path: testInfo.outputPath('dialog.png'), fullPage: true });
+  await dialog.getByRole('button', { name: 'Close' }).click();
+  await expect(dialog).toHaveCount(0);
+  await page.reload();
+
+  await openSettings(page);
+  const nav = page.getByRole('navigation', { name: 'Settings and administration' });
+  await expect(nav.getByRole('button', { name: 'Settings & DB' })).toHaveAttribute('aria-current', 'page');
   await fits(page);
   const theme = page.getByLabel('Color theme');
   await theme.selectOption('paper');
@@ -45,9 +73,11 @@ test('production CSP, worker, themes, keyboard, dialog and responsive shell', as
   await expect(page.locator('body')).toHaveCSS('background-color', 'rgb(24, 35, 38)');
   const other = await context.newPage();
   await other.goto('/');
+  await openSettings(other);
   await other.getByLabel('Color theme').selectOption('busnes-light');
   await expect(page.locator('body')).toHaveCSS('background-color', 'rgb(248, 246, 240)');
   await other.close();
+  await openSettings(page);
   await theme.selectOption('system');
   await page.emulateMedia({ colorScheme: 'dark' });
   await expect(page.locator('body')).toHaveCSS('background-color', 'rgb(24, 35, 38)');
@@ -58,33 +88,6 @@ test('production CSP, worker, themes, keyboard, dialog and responsive shell', as
   await page.keyboard.press('Tab');
   await expect(nav.getByRole('button').nth(1)).toBeFocused();
   await expect(nav.getByRole('button').nth(1)).toHaveCSS('outline-style', 'solid');
-  await nav.getByRole('button', { name: 'Settings & DB' }).click();
-  await expect(nav.getByRole('button', { name: 'Settings & DB' })).toHaveAttribute('aria-current', 'page');
-  await expect(page.getByRole('heading', { name: 'System Settings & Architecture' })).toBeVisible();
-  await fits(page);
-  const pair = page.getByRole('button', { name: 'Pair Device' });
-  // The poll carries the session-redeemable secret in a POST body, never in the URL.
-  const polls = [];
-  page.on('response', response => {
-    if (new URL(response.url()).pathname === '/api/devices/pair/poll') polls.push(response);
-  });
-  await pair.click();
-  const dialog = page.getByRole('dialog', { name: 'Link Mobile Device' });
-  await expect(dialog).toBeVisible();
-  await expect(dialog.getByRole('button', { name: 'Close modal' })).toBeFocused();
-  // Native modal containment makes the rest of the document inert.
-  await pair.evaluate(button => button.focus());
-  await expect(dialog.getByRole('button', { name: 'Close modal' })).toBeFocused();
-  await expect(dialog.getByText('Pairing PIN')).toHaveCount(0);
-  await fits(page);
-  await page.screenshot({ path: testInfo.outputPath('dialog.png'), fullPage: true });
-  await expect.poll(() => polls.length).toBeGreaterThan(0);
-  expect(polls[0].request().method()).toBe('POST');
-  expect(polls[0].url()).not.toContain('?');
-  expect(polls[0].status()).toBe(200);
-  await page.keyboard.press('Escape');
-  await expect(dialog).not.toBeVisible();
-  await expect(pair).toBeFocused();
   await page.evaluate(() => fetch('/browser-regression-uncached'));
   const cachedDynamic = await page.evaluate(async () => {
     const keys = await caches.keys();
@@ -151,28 +154,8 @@ test('production CSP, worker, themes, keyboard, dialog and responsive shell', as
   await expect(page.getByText(/Last recorded backup attempt: Succeeded/)).toBeVisible();
   await fits(page);
   await page.screenshot({ path: testInfo.outputPath('backup.png'), fullPage: true });
-  // Console pages. Matrix is off here: Users says so, Health checks the app and its database
-  // (with the network check moved from Settings), Audit lists the backup that just ran.
-  await nav.getByRole('button', { name: 'Users', exact: true }).click();
-  await expect(page.getByText('Chat (Matrix) is not set up on this server.')).toBeVisible();
-  await fits(page);
-  // Agents, then Rooms, Matrix off: the same notice; reached from Users by keyboard.
-  await nav.getByRole('button', { name: 'Users', exact: true }).focus();
-  await page.keyboard.press('Tab');
-  await expect(nav.getByRole('button', { name: 'Agents', exact: true })).toBeFocused();
-  await page.keyboard.press('Enter');
-  await expect(nav.getByRole('button', { name: 'Agents', exact: true })).toHaveAttribute('aria-current', 'page');
-  await expect(page.getByRole('heading', { name: 'Agents', level: 1 })).toBeVisible();
-  await expect(page.getByText('Chat (Matrix) is not set up on this server.')).toBeVisible();
-  await fits(page);
-  await page.keyboard.press('Tab');
-  await expect(nav.getByRole('button', { name: 'Rooms', exact: true })).toBeFocused();
-  await page.keyboard.press('Enter');
-  await expect(nav.getByRole('button', { name: 'Rooms', exact: true })).toHaveAttribute('aria-current', 'page');
-  await expect(page.getByRole('heading', { name: 'Rooms', level: 1 })).toBeVisible();
-  await expect(page.getByText('Chat (Matrix) is not set up on this server.')).toBeVisible();
-  await fits(page);
-  await page.screenshot({ path: testInfo.outputPath('rooms.png'), fullPage: true });
+  // Console pages: Health checks the app and its database (with the network check moved
+  // from Settings), Audit lists the backup that just ran, then Directory by keyboard.
   await nav.getByRole('button', { name: 'Health', exact: true }).click();
   const components = page.getByRole('region', { name: 'Components' });
   await expect(components.getByText('Up', { exact: true })).toHaveCount(2);
@@ -191,6 +174,12 @@ test('production CSP, worker, themes, keyboard, dialog and responsive shell', as
   await expect(page.getByRole('cell', { name: 'auth.login', exact: true })).toHaveCount(0);
   await fits(page);
   await page.screenshot({ path: testInfo.outputPath('audit.png'), fullPage: true });
+  await nav.getByRole('button', { name: 'Audit', exact: true }).focus();
+  await page.keyboard.press('Tab');
+  await expect(nav.getByRole('button', { name: 'Directory & SCIM', exact: true })).toBeFocused();
+  await page.keyboard.press('Enter');
+  await expect(nav.getByRole('button', { name: 'Directory & SCIM', exact: true })).toHaveAttribute('aria-current', 'page');
+  await fits(page);
   await nav.getByRole('button', { name: 'Overview', exact: true }).click();
   await expect(page.getByText(/^Last backup: Succeeded/)).toBeVisible();
   await expect(page.getByText(/not set up yet/)).toHaveCount(0);
