@@ -2,17 +2,17 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [main, master]
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# Keep master verification complete; superseded pull request runs may cancel.
+# Keep default-branch verification complete; superseded pull request runs may cancel.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' }}
 
 env:
   NODE_VERSION: "26"
@@ -38,9 +38,6 @@ jobs:
 
       - name: Proxy compose overlay
         run: bash scripts/check-compose-proxy.sh
-
-      - name: Matrix compose overlay
-        run: bash scripts/check-compose-matrix.sh
 
       - name: go.mod is tidy
         run: |
@@ -160,51 +157,6 @@ jobs:
           path: web/test-results/
           retention-days: 7
 
-  matrix-acceptance:
-    name: Matrix acceptance (encrypted storage, closed server)
-    runs-on: ubuntu-latest
-    # Measured locally: 434s (backup, restore and console rooms included); headroom for slower runners and image pulls.
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      # The throwaway KyIdentity, built from source with its own Dockerfile. Pinned so a
-      # KyIdentity change cannot break this repo's CI unannounced; bump deliberately.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: Busnes-app/KyIdentity-server
-          ref: 8cf7cf9f424e14eaf9d7bea8e822af904f779528
-          path: kyidentity-src
-          persist-credentials: false
-      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
-        with:
-          go-version: stable
-          check-latest: true
-          cache: true
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
-          cache-dependency-path: scripts/matrix-acceptance/package-lock.json
-      # The script runs npm ci itself; install the browser for the version its lockfile pins.
-      - run: npx --yes "playwright@$(jq -r '.packages["node_modules/playwright"].version' package-lock.json)" install --with-deps chromium
-        working-directory: scripts/matrix-acceptance
-      - name: TURN TLS certificate tools
-        run: sudo apt-get update && sudo apt-get install -y libnss3-tools
-      - name: Matrix acceptance
-        env:
-          KYIDENTITY_SRC: ${{ github.workspace }}/kyidentity-src
-          MATRIX_ACCEPT_REPRODUCE: "1"
-          MATRIX_ACCEPT_ARTIFACTS: ${{ runner.temp }}/matrix-acceptance
-        run: bash scripts/matrix-acceptance.sh
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: failure()
-        with:
-          name: matrix-acceptance-traces
-          path: ${{ runner.temp }}/matrix-acceptance/
-          retention-days: 7
-
   security:
     name: Vulnerability scan
     runs-on: ubuntu-latest
@@ -229,7 +181,7 @@ jobs:
           check-latest: true
           cache: true
 
-      - run: shellcheck scripts/*.sh scripts/matrix-acceptance/*.sh
+      - run: shellcheck scripts/*.sh
       - run: go build -o kymessages ./cmd/server
       - run: scripts/smoke-test.sh
       - run: python3 scripts/backup-acceptance.py

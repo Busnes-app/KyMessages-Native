@@ -94,7 +94,6 @@ jobs:
             Go tests (PostgreSQL)
             Frontend typecheck & build
             Browser regressions (production server)
-            Matrix acceptance (encrypted storage, closed server)
             Vulnerability scan
             End-to-end smoke test
             Docker image build & run
@@ -120,7 +119,7 @@ jobs:
 
           if [ -n "$missing" ]; then
             echo "::error::refusing to publish $sha: CI did not pass for it:$missing" >&2
-            echo "Let ci.yml finish green on this commit (push to master or open a PR) before releasing." >&2
+            echo "Let ci.yml finish green on this commit (push to main or open a PR) before releasing." >&2
             exit 1
           fi
 

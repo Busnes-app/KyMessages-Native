@@ -45,7 +45,9 @@ jobs:
 
       - name: Point this repository at that checkout
         working-directory: consumer
-        run: go mod edit -replace github.com/Busnes-app/ky-primitives=../ky-primitives
+        run: |
+          go mod edit -replace github.com/Busnes-app/ky-primitives=../ky-primitives
+          go mod tidy
 
       - name: Build
         working-directory: consumer
