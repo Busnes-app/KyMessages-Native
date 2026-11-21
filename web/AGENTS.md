@@ -1,7 +1,7 @@
 # Web
 
 ## Purpose
-React 19 + TypeScript + Vite PWA frontend embedding KySecurity color tokens (Busnes light/dark defaults plus `Patina Ky`, `Cyber`, `Nord`, `Paper`, `OLED`), 90-second ephemeral QR device pairing modals, client-side WebCrypto PoW CAPTCHA, and administrative management panels.
+React 19 + TypeScript + Vite PWA frontend embedding KySecurity color tokens (Busnes light/dark defaults plus `Patina Ky`, `Cyber`, `Nord Dark` (`nord`), `Nord Light` (`paper`), `OLED`), 90-second ephemeral QR device pairing modals, client-side WebCrypto PoW CAPTCHA, and administrative management panels.
 
 ## Ownership
 Owns user interface components, service worker caching, PWA installation manifests, and frontend theme switching.
@@ -15,7 +15,7 @@ Owns user interface components, service worker caching, PWA installation manifes
 - A signed-in user with `must_change_password` sees only password replacement and sign-out. Replacement uses `secureFetch`, returns to login after session revocation, and never exposes the normal navigation before completion.
 - Strict TypeScript type safety without unused imports.
 - The authenticated shell uses a persistent sidebar; the selected page is marked by a quiet surface and slim accent rail, with a horizontal overflow navigation on small screens.
-- Dynamic theme selection applies `data-theme` attribute to the root HTML document and persists to `localStorage`.
+- Dynamic theme selection applies `data-theme` attribute to the root HTML document and persists to `localStorage`. Nord Dark/Light take ky-ui's suite palettes (`themes.js` `applyThemeVariables`, set inline on the root); the other named themes are local CSS in `styles/theme.css`.
 - Authenticated state-changing requests use `secureFetch` so the CSRF cookie (`__Host-ky_csrf` on secure deployments without `KY_COOKIE_DOMAIN`, else `ky_csrf`) is mirrored into `X-CSRF-Token`.
 - `TwoFactorSetup.tsx` ("Account security", mounted under the Settings page) reads `/api/auth/me` and renders nothing for non-local accounts. Off: set up shows the QR (`qrcode` `toDataURL`, a `data:` image the CSP allows) and the key, then confirms one code. The recovery codes from confirm are shown once, until "I have saved them". On: turning off takes a code or a recovery code. All calls use `adminFetch`; refused codes stay on the form (`TwoFactorSetup.test.tsx`).
 - Register the service worker from the production JS bundle; keep `script-src 'self'` intact. Pairing uses a native modal dialog for focus containment, Escape and focus restoration. It shows only the QR code (no typed PIN) and treats poll status `consumed` as linked. `QRPairingModal` polls with `secureFetch` `POST /api/devices/pair/poll` and the secret in the JSON body, never in a URL; it aborts on close (timers start only after init resolves and an abort check), and stops with a visible error at 90 seconds or on any non-OK init or poll answer (`QRPairingModal.test.tsx`).

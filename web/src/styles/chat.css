@@ -217,8 +217,7 @@
   font-size: 0.68rem;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
-  color: var(--ink);
-  opacity: 0.75;
+  color: var(--ink-muted, var(--ink));
 }
 
 .chat-icon-btn {
@@ -697,7 +696,7 @@
 .chat-reaction-pill.reacted {
   background: var(--accent-soft);
   border-color: var(--accent);
-  color: var(--accent);
+  color: var(--ink-strong);
 }
 
 /* Hover Action Bar */
@@ -1513,13 +1512,13 @@
 .ky-header-call-btn.is-primary {
   background: var(--accent);
   border-color: var(--accent);
-  color: #090b10;
+  color: var(--button-text, #090b10);
 }
 
 .ky-header-call-btn.is-danger {
   background: var(--danger, #dc2626);
   border-color: var(--danger, #dc2626);
-  color: #fff;
+  color: var(--button-text, #fff);
 }
 
 .ky-header-call-btn.is-active {
