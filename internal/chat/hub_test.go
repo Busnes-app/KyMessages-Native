@@ -343,3 +343,151 @@ func TestHubSessionCheckClosesRevokedSocket(t *testing.T) {
 		t.Fatalf("live clients = %d, want the valid and the unverifiable session", clients)
 	}
 }
+
+// podBus stands in for Postgres LISTEN/NOTIFY: every publish reaches every pod's hub.
+type podBus struct{ pods []*Hub }
+
+func (b *podBus) PublishRoom(_ context.Context, _ string, ev Event) error { return b.publish(ev) }
+func (b *podBus) PublishUser(_ context.Context, _ string, ev Event) error { return b.publish(ev) }
+func (b *podBus) Run(ctx context.Context, _ func(Event)) error            { <-ctx.Done(); return nil }
+func (b *podBus) publish(ev Event) error {
+	for _, h := range b.pods {
+		h.Dispatch(ev)
+	}
+	return nil
+}
+
+func TestHubRevokeSessionReachesOtherPods(t *testing.T) {
+	bus := &podBus{}
+	loggedOutOn, socketsOn := NewHub(bus), NewHub(bus)
+	bus.pods = []*Hub{loggedOutOn, socketsOn}
+	defer socketsOn.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		socketsOn.ServeConn(r.Context(), conn, "default", r.URL.Query().Get("u"), r.URL.Query().Get("s"), nil)
+	}))
+	defer srv.Close()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	gone, otherDevice, otherUser := dialTestWS(t, wsURL+"?u=alice&s=s1"), dialTestWS(t, wsURL+"?u=alice&s=s2"), dialTestWS(t, wsURL+"?u=bob&s=s1")
+	for _, c := range []*websocket.Conn{gone, otherDevice, otherUser} {
+		if ev := readEvent(t, c); ev.Type != EventHello {
+			t.Fatalf("first frame = %+v, want hello", ev)
+		}
+	}
+
+	if err := loggedOutOn.RevokeSession(context.Background(), "alice", "s1"); err != nil {
+		t.Fatal(err)
+	}
+	ev := readEvent(t, gone)
+	if ev.Type != EventAuthRevoked || len(ev.Data) != 0 {
+		t.Fatalf("logged-out socket got %+v, want a bare auth.revoked", ev)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, _, err := gone.Read(ctx); websocket.CloseStatus(err) != websocket.StatusPolicyViolation {
+		t.Fatalf("logged-out socket close = %v, want policy violation", err)
+	}
+	// Alice's other session stays signed in.
+	socketsOn.Dispatch(Event{Type: EventReadSync, UserID: "alice"})
+	if ev := readEvent(t, otherDevice); ev.Type != EventReadSync {
+		t.Fatalf("other session got %+v, want it still open", ev)
+	}
+	if clients, _, _ := socketsOn.Stats(); clients < 2 {
+		t.Fatalf("live clients = %d, want alice's other session and bob", clients)
+	}
+}
+
+func TestHubResyncCorrectsRoomsTheBusMissed(t *testing.T) {
+	hub := NewHub(NewMemoryBus())
+	defer hub.Close()
+	hub.pingInterval = 20 * time.Millisecond
+	var mu sync.Mutex
+	stored := []string{"r1"}
+	hub.SetRoomSource(func(context.Context, string, string) ([]string, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), stored...), nil
+	})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		// r2 was listed before a removal that reached no client.
+		hub.ServeConn(r.Context(), conn, "default", "alice", "s", []string{"r1", "r2"})
+	}))
+	defer srv.Close()
+	alice := dialTestWS(t, "ws"+strings.TrimPrefix(srv.URL, "http"))
+	if ev := readEvent(t, alice); ev.Type != EventHello {
+		t.Fatalf("first frame = %+v, want hello", ev)
+	}
+
+	send := func(room string) { hub.Dispatch(Event{Type: EventMessageNew, RoomID: room}) }
+	send("r2")
+	send("r1")
+	if ev := readEvent(t, alice); ev.RoomID != "r1" {
+		t.Fatalf("after connect got %+v, want only r1", ev)
+	}
+
+	// Changes the bus lost (listener down): the next ping applies them.
+	mu.Lock()
+	stored = []string{"r3"}
+	mu.Unlock()
+	time.Sleep(100 * time.Millisecond)
+	send("r1")
+	send("r3")
+	if ev := readEvent(t, alice); ev.RoomID != "r3" {
+		t.Fatalf("after resync got %+v, want only r3", ev)
+	}
+}
+
+func TestHubResyncDiscardsListRacedByEvent(t *testing.T) {
+	hub := NewHub(NewMemoryBus())
+	c := &Client{userID: "alice", tenantID: "default", rooms: map[string]struct{}{}}
+	hub.register(c, []string{"r1"})
+	calls := 0
+	hub.SetRoomSource(func(context.Context, string, string) ([]string, error) {
+		calls++
+		if calls == 1 {
+			// Removed while the list loads: the list still has r1.
+			hub.unsubscribeUserFromRoom("alice", "r1")
+			return []string{"r1"}, nil
+		}
+		return nil, nil
+	})
+	hub.resync(context.Background(), c)
+	if calls != 2 || c.hasRoom("r1") {
+		t.Fatalf("calls = %d, has r1 = %v: a stale list re-added a removed room", calls, c.hasRoom("r1"))
+	}
+}
+
+func TestHubResyncLeavesAdmittedGuestsAlone(t *testing.T) {
+	hub := NewHub(NewMemoryBus())
+	hub.SetRoomSource(func(context.Context, string, string) ([]string, error) { return nil, nil })
+	guest := &Client{userID: "guest_1", tenantID: "default", isGuest: true, rooms: map[string]struct{}{}}
+	hub.register(guest, nil)
+	hub.SubscribeUserToRoom("guest_1", "rm_meeting") // the lobby admits the guest
+	hub.resync(context.Background(), guest)
+	if !guest.hasRoom("rm_meeting") {
+		t.Fatal("resync removed an admitted guest from the meeting room")
+	}
+}
+
+func TestHubResyncNeverRevivesAnUnregisteredClient(t *testing.T) {
+	hub := NewHub(NewMemoryBus())
+	c := &Client{userID: "alice", tenantID: "default", rooms: map[string]struct{}{}}
+	hub.register(c, nil)
+	hub.SetRoomSource(func(context.Context, string, string) ([]string, error) {
+		hub.unregister(c) // the socket closes while the list loads
+		return []string{"r1"}, nil
+	})
+	hub.resync(context.Background(), c)
+	if _, _, rooms := hub.Stats(); rooms != 0 {
+		t.Fatalf("rooms indexed = %d: resync re-added a closed client", rooms)
+	}
+}

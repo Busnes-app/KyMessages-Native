@@ -67,7 +67,7 @@ test('production CSP, worker, themes, keyboard, dialog and responsive shell', as
   await fits(page);
   const theme = page.getByLabel('Color theme');
   await theme.selectOption('paper');
-  await expect(page.locator('body')).toHaveCSS('background-color', 'rgb(248, 250, 252)');
+  await expect(page.locator('body')).toHaveCSS('background-color', 'rgb(236, 239, 244)');
   await theme.selectOption('busnes-dark');
   await page.reload();
   await expect(page.locator('body')).toHaveCSS('background-color', 'rgb(24, 35, 38)');

@@ -38,6 +38,11 @@ type Hub struct {
 	callFrameHook  CallFrameHandler
 	disconnectHook DisconnectHandler
 	pingInterval   time.Duration
+
+	// roomSource, when set, rebuilds each socket's rooms from the store after it registers
+	// and on every ping, so a membership change the bus never delivered (one made during
+	// connect, or while the Postgres listener reconnected) lasts one ping at most.
+	roomSource func(ctx context.Context, tenantID, userID string) ([]string, error)
 }
 
 // Client represents one authenticated WebSocket connection (member or confined guest).
@@ -51,6 +56,9 @@ type Client struct {
 
 	roomsMu sync.RWMutex
 	rooms   map[string]struct{}
+	// memberEvents counts membership events applied to this client, under hub.mu, so a
+	// resync that raced one discards its now-stale list.
+	memberEvents uint64
 
 	send      chan []byte
 	stop      chan struct{}
@@ -98,6 +106,11 @@ func (h *Hub) SetDisconnectHandler(fn DisconnectHandler) {
 	h.disconnectHook = fn
 }
 
+// SetRoomSource registers the store lookup resync uses. Call it before serving connections.
+func (h *Hub) SetRoomSource(fn func(ctx context.Context, tenantID, userID string) ([]string, error)) {
+	h.roomSource = fn
+}
+
 // Run starts consuming events from the EventBus and dispatching them until ctx is canceled.
 func (h *Hub) Run(ctx context.Context) error {
 	return h.bus.Run(ctx, h.Dispatch)
@@ -139,25 +152,21 @@ func (h *Hub) RevokeUser(ctx context.Context, userID string) error {
 	})
 }
 
-// RevokeSession disconnects local WebSocket connections bound to a specific session hash.
-func (h *Hub) RevokeSession(sessionHash string) {
-	if sessionHash == "" {
-		return
+// RevokeSession disconnects the user's WebSockets bound to sessionHash across all pods.
+func (h *Hub) RevokeSession(ctx context.Context, userID, sessionHash string) error {
+	if userID == "" || sessionHash == "" {
+		return nil
 	}
-	h.mu.RLock()
-	var targets []*Client
-	for c := range h.clients {
-		if c.sessionHash == sessionHash {
-			targets = append(targets, c)
-		}
-	}
-	h.mu.RUnlock()
+	return h.bus.PublishUser(ctx, userID, Event{
+		Type:   EventAuthRevoked,
+		UserID: userID,
+		Data:   MustMarshalData(sessionRevoke{Session: sessionHash}),
+	})
+}
 
-	frame, _ := json.Marshal(Event{Type: EventAuthRevoked})
-	for _, c := range targets {
-		c.tryEnqueue(frame)
-		c.kick(websocket.StatusPolicyViolation, "session revoked")
-	}
+// sessionRevoke narrows an EventAuthRevoked to one session. It travels only on the bus.
+type sessionRevoke struct {
+	Session string `json:"session"`
 }
 
 // Close terminates all active WebSocket connections on shutdown.
@@ -193,10 +202,19 @@ func (h *Hub) Dispatch(ev Event) {
 		if ev.UserID == "" {
 			return
 		}
+		// Without a readable session it revokes every socket the user has.
+		var only sessionRevoke
+		if len(ev.Data) > 0 {
+			_ = json.Unmarshal(ev.Data, &only)
+			raw, _ = json.Marshal(Event{Type: EventAuthRevoked, UserID: ev.UserID})
+		}
 		h.mu.RLock()
 		targets := copyClients(h.byUser[ev.UserID])
 		h.mu.RUnlock()
 		for _, c := range targets {
+			if only.Session != "" && c.sessionHash != only.Session {
+				continue
+			}
 			c.tryEnqueue(raw)
 			c.kick(websocket.StatusPolicyViolation, "session revoked")
 		}
@@ -358,6 +376,7 @@ func (h *Hub) subscribeUserToRoom(userID, roomID string) {
 		h.byRoom[roomID] = make(map[*Client]struct{})
 	}
 	for c := range set {
+		c.memberEvents++
 		c.roomsMu.Lock()
 		c.rooms[roomID] = struct{}{}
 		c.roomsMu.Unlock()
@@ -372,6 +391,7 @@ func (h *Hub) unsubscribeUserFromRoom(userID, roomID string) {
 	set := h.byUser[userID]
 	roomSet := h.byRoom[roomID]
 	for c := range set {
+		c.memberEvents++
 		c.roomsMu.Lock()
 		delete(c.rooms, roomID)
 		c.roomsMu.Unlock()
@@ -381,6 +401,62 @@ func (h *Hub) unsubscribeUserFromRoom(userID, roomID string) {
 	}
 	if roomSet != nil && len(roomSet) == 0 {
 		delete(h.byRoom, roomID)
+	}
+}
+
+// resync replaces c's rooms with the store's list. A membership event that lands while
+// the list is loading makes it stale, so it retries; after three races the next ping does.
+// Guests have no store membership: the lobby admits them, so they are left alone.
+func (h *Hub) resync(ctx context.Context, c *Client) {
+	if h.roomSource == nil || c.isGuest {
+		return
+	}
+	for range 3 {
+		h.mu.RLock()
+		seen := c.memberEvents
+		h.mu.RUnlock()
+		ids, err := h.roomSource(ctx, c.tenantID, c.userID)
+		if err != nil {
+			return // keep the current rooms; the next ping retries
+		}
+		h.mu.Lock()
+		if _, live := h.clients[c]; !live {
+			h.mu.Unlock()
+			return // unregistered while the list loaded: never re-add it
+		}
+		if c.memberEvents != seen {
+			h.mu.Unlock()
+			continue
+		}
+		want := make(map[string]struct{}, len(ids))
+		for _, rid := range ids {
+			if rid != "" {
+				want[rid] = struct{}{}
+			}
+		}
+		c.roomsMu.Lock()
+		for rid := range c.rooms {
+			if _, ok := want[rid]; ok {
+				continue
+			}
+			delete(c.rooms, rid)
+			if set := h.byRoom[rid]; set != nil {
+				delete(set, c)
+				if len(set) == 0 {
+					delete(h.byRoom, rid)
+				}
+			}
+		}
+		for rid := range want {
+			c.rooms[rid] = struct{}{}
+			if h.byRoom[rid] == nil {
+				h.byRoom[rid] = make(map[*Client]struct{})
+			}
+			h.byRoom[rid][c] = struct{}{}
+		}
+		c.roomsMu.Unlock()
+		h.mu.Unlock()
+		return
 	}
 }
 
@@ -417,6 +493,10 @@ func (h *Hub) serveClient(ctx context.Context, conn *websocket.Conn, tenantID, u
 		c.kick(websocket.StatusNormalClosure, "")
 		h.unregister(c)
 	}()
+	// roomIDs was listed before register, so a change between the two reached no client.
+	rctx, rcancel := context.WithTimeout(ctx, clientWriteTimeout)
+	h.resync(rctx, c)
+	rcancel()
 
 	hello, _ := json.Marshal(Event{
 		Type: EventHello,
@@ -534,6 +614,9 @@ func (c *Client) writeLoop(ctx context.Context, cancel context.CancelFunc) {
 					continue // the stop case flushes the frame and closes
 				}
 			}
+			rctx, rcancel := context.WithTimeout(ctx, clientWriteTimeout)
+			c.hub.resync(rctx, c)
+			rcancel()
 			pctx, pcancel := context.WithTimeout(ctx, clientWriteTimeout)
 			err := c.conn.Ping(pctx)
 			pcancel()

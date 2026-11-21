@@ -59,34 +59,6 @@
   --success: #00ff66;
 }
 
-[data-theme="nord"] {
-  --bg: #2e3440;
-  --panel: #3b4252;
-  --panel-hover: #434c5e;
-  --ink: #d8dee9;
-  --ink-strong: #eceff4;
-  --accent: #88c0d0;
-  --accent-soft: rgba(136, 192, 208, 0.2);
-  --line: #4c566a;
-  --line-strong: #5e81ac;
-  --danger: #bf616a;
-  --success: #a3be8c;
-}
-
-[data-theme="paper"] {
-  --bg: #f8fafc;
-  --panel: #ffffff;
-  --panel-hover: #f1f5f9;
-  --ink: #64748b;
-  --ink-strong: #0f172a;
-  --accent: #0284c7;
-  --accent-soft: rgba(2, 132, 199, 0.12);
-  --line: #e2e8f0;
-  --line-strong: #cbd5e1;
-  --danger: #dc2626;
-  --success: #16a34a;
-}
-
 [data-theme="oled"] {
   --bg: #000000;
   --panel: #111111;
