@@ -42,7 +42,7 @@ func TestChatSearchAndRoomListIgnoreLaggingReplica(t *testing.T) {
 	}
 	defer st.Close()
 	seed(st)
-	if err := st.Chat().RemoveRoomMember(ctx, store.DefaultTenantID, "rm_lag", "u_bob"); err != nil {
+	if _, err := st.Chat().RemoveRoomMember(ctx, store.DefaultTenantID, "rm_lag", "u_bob"); err != nil {
 		t.Fatal(err)
 	}
 

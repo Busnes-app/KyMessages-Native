@@ -65,7 +65,7 @@ type ClientFrame struct {
 // RoomMemberDelta is the payload for EventRoomMember so every pod updates its live
 // room subscription index without requiring clients to reconnect.
 type RoomMemberDelta struct {
-	Action string `json:"action"` // "added" or "removed"
+	Action string `json:"action"` // "added", "removed" or "role"
 	UserID string `json:"user_id"`
 	Role   string `json:"role,omitempty"`
 }

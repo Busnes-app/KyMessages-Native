@@ -226,7 +226,7 @@ export type WsServerEvent =
   | { kind: 'message.edit'; roomId: string; seq: number; message?: ChatMessage; refetch: boolean }
   | { kind: 'message.delete'; roomId: string; seq: number; messageId: string; deletedAt: number }
   | { kind: 'reaction.set'; roomId: string; messageId: string; userId: string; emoji: string; added: boolean }
-  | { kind: 'room.member'; roomId: string; action: 'added' | 'removed'; userId: string; role?: RoomRole }
+  | { kind: 'room.member'; roomId: string; action: 'added' | 'removed' | 'role'; userId: string; role?: RoomRole }
   | { kind: 'room.updated'; roomId: string; room?: ChatRoom }
   | { kind: 'room.closed'; roomId: string }
   | { kind: 'typing'; roomId: string; userId: string; active: boolean }
@@ -606,7 +606,7 @@ export function parseWsEvent(raw: unknown): WsServerEvent | null {
       case 'room.member': {
         if (!roomId) return null;
         const d = obj(data);
-        const action = oneOf(d.action, ['added', 'removed'] as const);
+        const action = oneOf(d.action, ['added', 'removed', 'role'] as const);
         return {
           kind: 'room.member',
           roomId,

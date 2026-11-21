@@ -535,7 +535,8 @@ func (s *Server) handleChatRemoveMember(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if err := s.store.Chat().RemoveRoomMember(r.Context(), tenantID, roomID, targetID); err != nil {
+	promoted, err := s.store.Chat().RemoveRoomMember(r.Context(), tenantID, roomID, targetID)
+	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			s.writeError(w, http.StatusNotFound, "Member not found")
 			return
@@ -552,6 +553,13 @@ func (s *Server) handleChatRemoveMember(w http.ResponseWriter, r *http.Request) 
 		RoomID: roomID,
 		Data:   chat.MustMarshalData(chat.RoomMemberDelta{Action: "removed", UserID: targetID}),
 	})
+	if promoted != "" {
+		_ = s.chatHub.PublishRoom(r.Context(), roomID, chat.Event{
+			Type:   chat.EventRoomMember,
+			RoomID: roomID,
+			Data:   chat.MustMarshalData(chat.RoomMemberDelta{Action: "role", UserID: promoted, Role: store.RoomRoleOwner}),
+		})
+	}
 	s.writeJSON(w, http.StatusOK, map[string]bool{"removed": true})
 }
 

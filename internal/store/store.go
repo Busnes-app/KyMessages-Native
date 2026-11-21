@@ -186,7 +186,9 @@ type ChatStore interface {
 	CloseRoom(ctx context.Context, tenantID, roomID string) (*Room, error)
 
 	AddRoomMember(ctx context.Context, m *RoomMember) error
-	RemoveRoomMember(ctx context.Context, tenantID, roomID, userID string) error
+	// RemoveRoomMember returns the member it promoted to owner when the room would
+	// otherwise be left without a moderator; "" when none was needed or possible.
+	RemoveRoomMember(ctx context.Context, tenantID, roomID, userID string) (string, error)
 	GetRoomMember(ctx context.Context, tenantID, roomID, userID string) (*RoomMember, error)
 	ListRoomMembers(ctx context.Context, tenantID, roomID string) ([]*RoomMember, error)
 	UpdateReadCursor(ctx context.Context, tenantID, roomID, userID string, seq int64) (int64, error)
