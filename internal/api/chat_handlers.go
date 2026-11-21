@@ -107,10 +107,23 @@ func (s *Server) handleChatBootstrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.resolveDMRoomNames(r, tenantID, user.ID, rooms)
+	activeCalls := make(map[string]*chat.CallStatePayload)
+	if s.calls != nil {
+		for _, rm := range rooms {
+			if st := s.calls.GetState(rm.ID); st != nil {
+				activeCalls[rm.ID] = st
+			}
+		}
+	}
 	s.writeJSON(w, http.StatusOK, map[string]any{
-		"user":   user,
-		"tenant": tenant,
-		"rooms":  rooms,
+		"user":         user,
+		"tenant":       tenant,
+		"rooms":        rooms,
+		"active_calls": activeCalls,
+		"rtc": map[string]any{
+			"sfu_available": s.calls != nil && s.calls.SFUAvailable(),
+			"ice_servers":   s.calls.ICEServers(),
+		},
 	})
 }
 
@@ -487,6 +500,9 @@ func (s *Server) handleChatRemoveMember(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	if s.calls != nil {
+		s.calls.Leave(r.Context(), roomID, targetID)
+	}
 	_ = s.chatHub.PublishRoom(r.Context(), roomID, chat.Event{
 		Type:   chat.EventRoomMember,
 		RoomID: roomID,

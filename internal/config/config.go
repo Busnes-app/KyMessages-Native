@@ -30,7 +30,23 @@ type Config struct {
 	SCIM         SCIMConfig      `json:"scim"`
 	Backup       BackupConfig    `json:"backup"`
 	Captcha      CaptchaConfig   `json:"captcha"`
+	RTC          RTCConfig       `json:"rtc"`
 	Matrix       MatrixConfig    `json:"matrix"`
+}
+
+// RTCConfig holds native hybrid P2P + LiveKit SFU calling and KyCalendar meeting settings.
+// LiveKit is optional: when unset, P2P WebRTC calls still work directly over /api/v1/ws.
+type RTCConfig struct {
+	LiveKitURL        string   `json:"livekit_url"`
+	LiveKitAPIKey     string   `json:"-"`
+	LiveKitAPISecret  string   `json:"-"`
+	STUNURLs          []string `json:"stun_urls"`
+	MeetingSyncSecret string   `json:"-"`
+}
+
+// LiveKitEnabled reports whether LiveKit SFU credentials and endpoint are configured.
+func (r RTCConfig) LiveKitEnabled() bool {
+	return r.LiveKitURL != "" && r.LiveKitAPIKey != "" && r.LiveKitAPISecret != ""
 }
 
 // MatrixConfig locates the optional Matrix stack: all set, or none. Hosts are https origins
@@ -238,6 +254,12 @@ func LoadFromEnv() (*Config, error) {
 		return nil, err
 	}
 
+	kyIdentityHMAC := getEnv("KY_KYIDENTITY_HMAC_SECRET", "")
+	rtcCfg, err := rtcFromEnv(matrix, kyIdentityHMAC)
+	if err != nil {
+		return nil, err
+	}
+
 	adminUsername := getEnv("KY_ADMIN_USERNAME", "admin")
 	if !ValidUsername(adminUsername) {
 		return nil, errors.New("KY_ADMIN_USERNAME: must be 3-64 characters of letters, digits, '.', '_' or '-'")
@@ -276,7 +298,7 @@ func LoadFromEnv() (*Config, error) {
 			KyIdentityIssuer:     getEnv("KY_KYIDENTITY_ISSUER", ""),
 			KyIdentityClientID:   getEnv("KY_KYIDENTITY_CLIENT_ID", ""),
 			KyIdentitySecret:     getEnv("KY_KYIDENTITY_SECRET", ""),
-			KyIdentityHMACSecret: getEnv("KY_KYIDENTITY_HMAC_SECRET", ""),
+			KyIdentityHMACSecret: kyIdentityHMAC,
 			AutoProvision:        getEnvBool("KY_SSO_AUTO_PROVISION", true),
 		},
 		SCIM: SCIMConfig{
@@ -295,6 +317,7 @@ func LoadFromEnv() (*Config, error) {
 			Provider:      getEnv("KY_CAPTCHA_PROVIDER", "pow"),
 			DifficultyPoW: getEnvInt("KY_CAPTCHA_POW_DIFFICULTY", 50000),
 		},
+		RTC:    rtcCfg,
 		Matrix: matrix,
 	}
 	// Unsigned directory webhooks are refused, so without the secret a KyIdentity disable or
@@ -308,6 +331,82 @@ func LoadFromEnv() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// rtcFromEnv parses native hybrid P2P + LiveKit SFU settings. If native KY_LIVEKIT_* vars
+// are unset, it reuses any Matrix RTC credentials configured for the same deployment.
+func rtcFromEnv(matrix MatrixConfig, fallbackSyncSecret string) (RTCConfig, error) {
+	rawURL := strings.TrimSpace(getEnv("KY_LIVEKIT_URL", ""))
+	apiKey := strings.TrimSpace(getEnv("KY_LIVEKIT_API_KEY", ""))
+	apiSecret := strings.TrimSpace(getEnv("KY_LIVEKIT_API_SECRET", ""))
+
+	if keyFile := strings.TrimSpace(getEnv("KY_LIVEKIT_API_KEY_FILE", "")); keyFile != "" {
+		b, err := os.ReadFile(keyFile)
+		if err != nil {
+			return RTCConfig{}, fmt.Errorf("KY_LIVEKIT_API_KEY_FILE: %w", err)
+		}
+		apiKey = strings.TrimSpace(string(b))
+	}
+	if secretFile := strings.TrimSpace(getEnv("KY_LIVEKIT_API_SECRET_FILE", "")); secretFile != "" {
+		b, err := os.ReadFile(secretFile)
+		if err != nil {
+			return RTCConfig{}, fmt.Errorf("KY_LIVEKIT_API_SECRET_FILE: %w", err)
+		}
+		apiSecret = strings.TrimSpace(string(b))
+	}
+
+	if rawURL == "" && apiKey == "" && apiSecret == "" && matrix.RTCHost != "" {
+		rawURL = matrix.RTCHost
+		apiKey = matrix.RTCKey
+		apiSecret = matrix.RTCSecret
+	}
+
+	var lkURL string
+	if rawURL != "" || apiKey != "" || apiSecret != "" {
+		if rawURL == "" || apiKey == "" || apiSecret == "" {
+			return RTCConfig{}, errors.New("KY_LIVEKIT_URL, KY_LIVEKIT_API_KEY, and KY_LIVEKIT_API_SECRET must all be set together")
+		}
+		u, err := url.Parse(rawURL)
+		if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+			return RTCConfig{}, errors.New("KY_LIVEKIT_URL must be a valid http(s) or ws(s) origin")
+		}
+		switch strings.ToLower(u.Scheme) {
+		case "https", "wss":
+			lkURL = "https://" + u.Host
+		case "http", "ws":
+			lkURL = "http://" + u.Host
+		default:
+			return RTCConfig{}, errors.New("KY_LIVEKIT_URL scheme must be http, https, ws, or wss")
+		}
+		if strings.ContainsFunc(apiKey, unicode.IsControl) || strings.ContainsFunc(apiSecret, unicode.IsControl) {
+			return RTCConfig{}, errors.New("LiveKit API credentials must not contain control characters")
+		}
+	}
+
+	var stunURLs []string
+	rawStun := strings.TrimSpace(getEnv("KY_STUN_URLS", "stun:stun.l.google.com:19302"))
+	if rawStun != "" && strings.ToLower(rawStun) != "none" {
+		for _, part := range strings.Split(rawStun, ",") {
+			s := strings.TrimSpace(part)
+			if s == "" {
+				continue
+			}
+			lower := strings.ToLower(s)
+			if !strings.HasPrefix(lower, "stun:") && !strings.HasPrefix(lower, "stuns:") {
+				return RTCConfig{}, fmt.Errorf("KY_STUN_URLS: %q must start with stun: or stuns:", s)
+			}
+			stunURLs = append(stunURLs, s)
+		}
+	}
+
+	syncSecret := strings.TrimSpace(getEnv("KY_MEETING_SYNC_SECRET", fallbackSyncSecret))
+	return RTCConfig{
+		LiveKitURL:        lkURL,
+		LiveKitAPIKey:     apiKey,
+		LiveKitAPISecret:  apiSecret,
+		STUNURLs:          stunURLs,
+		MeetingSyncSecret: syncSecret,
+	}, nil
 }
 
 // matrixFromEnv validates like matrix-init. A partial block fails: serving half of it would

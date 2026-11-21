@@ -10,12 +10,18 @@ import (
 )
 
 const (
-	clientSendBuffer   = 64
-	clientMaxReadBytes = 8 << 10 // 8 KiB max inbound control frame
+	clientSendBuffer   = 128
+	clientMaxReadBytes = 64 << 10 // 64 KiB max inbound control frame (WebRTC SDP + ICE)
 	clientWriteTimeout = 10 * time.Second
 	clientPingInterval = 25 * time.Second
 	typingMinInterval  = 2 * time.Second
 )
+
+// CallFrameHandler handles inbound WebRTC signaling and call control frames from WS clients.
+type CallFrameHandler func(ctx context.Context, userID string, isGuest bool, frame ClientFrame)
+
+// DisconnectHandler is invoked whenever a client disconnects, with the user's remaining socket count.
+type DisconnectHandler func(userID string, isGuest bool, remainingConns int)
 
 // Hub manages live WebSocket connections on this pod and routes EventBus frames to them.
 type Hub struct {
@@ -28,17 +34,20 @@ type Hub struct {
 
 	// sessionValid, when set, is re-checked on every ping so a socket never outlives
 	// its session, whichever path revoked or expired it. An error skips that tick.
-	sessionValid func(ctx context.Context, userID, sessionHash string) (bool, error)
-	pingInterval time.Duration
+	sessionValid   func(ctx context.Context, userID, sessionHash string) (bool, error)
+	callFrameHook  CallFrameHandler
+	disconnectHook DisconnectHandler
+	pingInterval   time.Duration
 }
 
-// Client represents one authenticated WebSocket connection.
+// Client represents one authenticated WebSocket connection (member or confined guest).
 type Client struct {
 	hub         *Hub
 	conn        *websocket.Conn
 	userID      string
 	tenantID    string
 	sessionHash string
+	isGuest     bool
 
 	roomsMu sync.RWMutex
 	rooms   map[string]struct{}
@@ -77,6 +86,16 @@ func NewHub(bus EventBus) *Hub {
 // SetSessionCheck registers the per-ping session check. Call it before serving connections.
 func (h *Hub) SetSessionCheck(fn func(ctx context.Context, userID, sessionHash string) (bool, error)) {
 	h.sessionValid = fn
+}
+
+// SetCallFrameHandler registers the handler for inbound call.* WebSocket frames.
+func (h *Hub) SetCallFrameHandler(fn CallFrameHandler) {
+	h.callFrameHook = fn
+}
+
+// SetDisconnectHandler registers a callback invoked when a WebSocket client disconnects.
+func (h *Hub) SetDisconnectHandler(fn DisconnectHandler) {
+	h.disconnectHook = fn
 }
 
 // Run starts consuming events from the EventBus and dispatching them until ctx is canceled.
@@ -239,6 +258,39 @@ func copyClients(set map[*Client]struct{}) []*Client {
 	return out
 }
 
+// SendToUserLocal delivers ev directly to local WebSocket connections for userID without
+// passing through the PostgreSQL NOTIFY bus (preserving full >4 KiB WebRTC SDP frames).
+// Returns true if at least one local connection for userID was found.
+func (h *Hub) SendToUserLocal(userID string, ev Event) bool {
+	if userID == "" {
+		return false
+	}
+	raw, err := json.Marshal(ev)
+	if err != nil {
+		return false
+	}
+	h.mu.RLock()
+	targets := copyClients(h.byUser[userID])
+	h.mu.RUnlock()
+	if len(targets) == 0 {
+		return false
+	}
+	for _, c := range targets {
+		c.enqueue(raw)
+	}
+	return true
+}
+
+// SubscribeUserToRoom subscribes all local WebSocket connections for userID to roomID.
+func (h *Hub) SubscribeUserToRoom(userID, roomID string) {
+	h.subscribeUserToRoom(userID, roomID)
+}
+
+// UnsubscribeUserFromRoom unsubscribes all local WebSocket connections for userID from roomID.
+func (h *Hub) UnsubscribeUserFromRoom(userID, roomID string) {
+	h.unsubscribeUserFromRoom(userID, roomID)
+}
+
 func (h *Hub) register(c *Client, roomIDs []string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -265,12 +317,13 @@ func (h *Hub) register(c *Client, roomIDs []string) {
 
 func (h *Hub) unregister(c *Client) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 
 	delete(h.clients, c)
+	remaining := 0
 	if set := h.byUser[c.userID]; set != nil {
 		delete(set, c)
-		if len(set) == 0 {
+		remaining = len(set)
+		if remaining == 0 {
 			delete(h.byUser, c.userID)
 		}
 	}
@@ -285,6 +338,12 @@ func (h *Hub) unregister(c *Client) {
 		}
 	}
 	c.roomsMu.Unlock()
+	hook := h.disconnectHook
+	h.mu.Unlock()
+
+	if hook != nil {
+		hook(c.userID, c.isGuest, remaining)
+	}
 }
 
 func (h *Hub) subscribeUserToRoom(userID, roomID string) {
@@ -327,6 +386,16 @@ func (h *Hub) unsubscribeUserFromRoom(userID, roomID string) {
 
 // ServeConn registers conn, sends the hello frame, and runs its read/write pumps until closed.
 func (h *Hub) ServeConn(ctx context.Context, conn *websocket.Conn, tenantID, userID, sessionHash string, roomIDs []string) {
+	h.serveClient(ctx, conn, tenantID, userID, sessionHash, false, roomIDs)
+}
+
+// ServeGuestConn serves a strictly confined WebSocket for an external meeting guest.
+// Until admitted, roomIDs is empty and the guest only receives targeted lobby.decision events.
+func (h *Hub) ServeGuestConn(ctx context.Context, conn *websocket.Conn, tenantID, guestID string, roomIDs []string) {
+	h.serveClient(ctx, conn, tenantID, guestID, "", true, roomIDs)
+}
+
+func (h *Hub) serveClient(ctx context.Context, conn *websocket.Conn, tenantID, userID, sessionHash string, isGuest bool, roomIDs []string) {
 	conn.SetReadLimit(clientMaxReadBytes)
 
 	c := &Client{
@@ -335,6 +404,7 @@ func (h *Hub) ServeConn(ctx context.Context, conn *websocket.Conn, tenantID, use
 		userID:      userID,
 		tenantID:    tenantID,
 		sessionHash: sessionHash,
+		isGuest:     isGuest,
 		rooms:       make(map[string]struct{}, len(roomIDs)),
 		send:        make(chan []byte, clientSendBuffer),
 		stop:        make(chan struct{}),
@@ -352,6 +422,7 @@ func (h *Hub) ServeConn(ctx context.Context, conn *websocket.Conn, tenantID, use
 		Type: EventHello,
 		Data: MustMarshalData(map[string]any{
 			"user_id":     userID,
+			"is_guest":    isGuest,
 			"server_time": time.Now().UTC().UnixMilli(),
 		}),
 	})
@@ -451,7 +522,7 @@ func (c *Client) writeLoop(ctx context.Context, cancel context.CancelFunc) {
 				return
 			}
 		case <-ticker.C:
-			if c.hub.sessionValid != nil {
+			if !c.isGuest && c.hub.sessionValid != nil {
 				vctx, vcancel := context.WithTimeout(ctx, clientWriteTimeout)
 				valid, err := c.hub.sessionValid(vctx, c.userID, c.sessionHash)
 				vcancel()
@@ -510,6 +581,10 @@ func (c *Client) readLoop(ctx context.Context) {
 				RoomID: frame.RoomID,
 				Data:   MustMarshalData(TypingPayload{UserID: c.userID, Active: frame.Active}),
 			})
+		case ClientFrameCallSignal, ClientFrameCallMedia, ClientFrameCallMigrated, ClientFrameCallICEFailed:
+			if c.hub.callFrameHook != nil {
+				c.hub.callFrameHook(ctx, c.userID, c.isGuest, frame)
+			}
 		}
 	}
 }

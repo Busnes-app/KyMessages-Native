@@ -173,6 +173,7 @@ type ChatStore interface {
 	// Tenants
 	CreateTenant(ctx context.Context, t *Tenant) error
 	GetTenant(ctx context.Context, tenantID string) (*Tenant, error)
+	UpdateTenantMediaPolicy(ctx context.Context, tenantID, policy string, maxVideo, maxAudio int, guestForceSFU bool) (*Tenant, error)
 
 	// Rooms & Membership
 	CreateRoom(ctx context.Context, r *Room, initialMemberIDs []string) error
@@ -205,4 +206,18 @@ type ChatStore interface {
 	GetRoomWebhook(ctx context.Context, webhookID string) (*RoomWebhook, error)
 	ListRoomWebhooks(ctx context.Context, tenantID, roomID string) ([]*RoomWebhook, error)
 	RevokeRoomWebhook(ctx context.Context, tenantID, roomID, webhookID string) error
+
+	// Call Sessions
+	CreateCallSession(ctx context.Context, cs *CallSession) error
+	GetActiveCallSession(ctx context.Context, tenantID, roomID string) (*CallSession, error)
+	UpdateCallSession(ctx context.Context, cs *CallSession) error
+	EndCallSession(ctx context.Context, tenantID, callID string, endedAt int64) error
+
+	// Native Meetings & External Guest Links
+	UpsertMeeting(ctx context.Context, p UpsertMeetingParams) (*UpsertMeetingResult, error)
+	GetMeeting(ctx context.Context, tenantID, meetingID string) (*Meeting, []MeetingWindow, []MeetingGuest, error)
+	GetMeetingByRoomID(ctx context.Context, tenantID, roomID string) (*Meeting, []MeetingWindow, error)
+	CreateMeetingGuest(ctx context.Context, g *MeetingGuest) error
+	GetMeetingGuestByTokenHash(ctx context.Context, tokenHash string) (*MeetingGuest, *Meeting, []MeetingWindow, error)
+	CloseMeeting(ctx context.Context, tenantID, meetingID string) (*Meeting, error)
 }

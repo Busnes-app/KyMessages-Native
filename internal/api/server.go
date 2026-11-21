@@ -21,6 +21,7 @@ import (
 	"github.com/Busnes-app/ky_server_base/internal/health"
 	"github.com/Busnes-app/ky_server_base/internal/matrixrtc"
 	"github.com/Busnes-app/ky_server_base/internal/matrixsync"
+	"github.com/Busnes-app/ky_server_base/internal/rtc"
 	"github.com/Busnes-app/ky_server_base/internal/scim"
 	"github.com/Busnes-app/ky_server_base/internal/sso"
 	"github.com/Busnes-app/ky_server_base/internal/store"
@@ -75,6 +76,8 @@ type Server struct {
 	directoryChanged func()
 	scim             *scim.Server
 	chatHub          *chat.Hub
+	calls            *chat.CallManager
+	lobby            *chat.LobbyManager
 	recovery         recoveryClient
 	rtc              *matrixrtc.Client
 	mas              MatrixAdmin // nil when Matrix is off
@@ -85,6 +88,7 @@ type Server struct {
 	fedHTTP          *http.Client // other homeservers: public addresses only
 	fedBaseForTest   func(name string) string
 	mux              *http.ServeMux
+	cspHeader        string
 	// clientAttempts throttles anonymous callers by address; accountAttempts throttles by
 	// user ID. Separate maps, so anonymous traffic filling one cannot evict the other.
 	clientAttempts  attemptLimiter
@@ -222,7 +226,25 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 			return chatSessionValid(ctx, st, userID, sessionHash)
 		})
 	}
+	var chatStore store.ChatStore
+	if st != nil {
+		chatStore = st.Chat()
+	}
+	var nativeLK *rtc.Client
+	if cfg.RTC.LiveKitEnabled() {
+		nativeLK = rtc.NewClient(cfg.RTC.LiveKitURL, cfg.RTC.LiveKitAPIKey, cfg.RTC.LiveKitAPISecret)
+	}
+	callMgr := chat.NewCallManager(chatStore, chatHub, nativeLK, cfg.RTC.STUNURLs)
+	lobbyMgr := chat.NewLobbyManager(chatHub, callMgr)
+	chatHub.SetDisconnectHandler(func(userID string, isGuest bool, remainingConns int) {
+		callMgr.HandleDisconnect(userID, remainingConns)
+		if isGuest {
+			lobbyMgr.HandleDisconnect(userID, remainingConns)
+		}
+	})
+
 	revokeUser := func(ctx context.Context, userID string) {
+		callMgr.HandleDisconnect(userID, 0)
 		_ = chatHub.RevokeUser(ctx, userID)
 	}
 	kyidentity.OnUserRevoked(revokeUser)
@@ -236,11 +258,14 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 		kyidentity:      kyidentity,
 		scim:            scimSrv,
 		chatHub:         chatHub,
+		calls:           callMgr,
+		lobby:           lobbyMgr,
 		recovery:        recovery,
 		matrixTargets:   health.ComposeTargets,
 		probeHTTP:       health.NewHTTPClient(),
 		fedHTTP:         newFederationHTTP(),
 		mux:             http.NewServeMux(),
+		cspHeader:       buildCSP(cfg),
 		clientAttempts:  attemptLimiter{m: make(map[string]attemptWindow), cap: attemptsCap},
 		accountAttempts: attemptLimiter{m: make(map[string]attemptWindow)},
 	}
@@ -252,6 +277,20 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 	}
 	s.routes()
 	return s
+}
+
+func buildCSP(cfg *config.Config) string {
+	connectSrc := "'self'"
+	if cfg != nil && cfg.RTC.LiveKitEnabled() {
+		if u, err := url.Parse(cfg.RTC.LiveKitURL); err == nil && u.Host != "" {
+			if u.Scheme == "http" || u.Scheme == "ws" {
+				connectSrc += " http://" + u.Host + " ws://" + u.Host
+			} else {
+				connectSrc += " https://" + u.Host + " wss://" + u.Host
+			}
+		}
+	}
+	return "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self'; connect-src " + connectSrc + "; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
 }
 
 func (l *attemptLimiter) allow(key string, limit int, window time.Duration) bool {
@@ -444,6 +483,32 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/v1/webhooks/in/{id}", s.handleChatIncomingWebhook)
 	s.mux.HandleFunc("GET /api/v1/ws", s.handleChatWS)
 
+	// Hybrid P2P-first / LiveKit SFU Calling & Meeting Waiting Rooms
+	s.mux.HandleFunc("GET /api/v1/rooms/{id}/calls/state", s.requireAuthenticated(s.handleCallState))
+	s.mux.HandleFunc("POST /api/v1/rooms/{id}/calls/join", s.requireAuthenticated(s.handleCallJoin))
+	s.mux.HandleFunc("POST /api/v1/rooms/{id}/calls/leave", s.requireAuthenticated(s.handleCallLeave))
+	s.mux.HandleFunc("POST /api/v1/rooms/{id}/calls/escalate", s.requireAuthenticated(s.handleCallEscalate))
+	s.mux.HandleFunc("GET /api/v1/rooms/{id}/lobby", s.requireAuthenticated(s.handleRoomLobbyList))
+	s.mux.HandleFunc("POST /api/v1/rooms/{id}/lobby/{gid}/admit", s.requireAuthenticated(s.handleRoomLobbyAdmit))
+	s.mux.HandleFunc("POST /api/v1/rooms/{id}/lobby/{gid}/deny", s.requireAuthenticated(s.handleRoomLobbyDeny))
+	s.mux.HandleFunc("POST /api/v1/rooms/{id}/meeting/guest-link", s.requireAuthenticated(s.handleCreateRoomGuestLink))
+	s.mux.HandleFunc("POST /api/v1/meetings", s.requireAuthenticated(s.handleCreateInstantMeeting))
+	s.mux.HandleFunc("GET /api/admin/media-policy", s.requireAdmin(s.handleAdminGetMediaPolicy))
+	s.mux.HandleFunc("PUT /api/admin/media-policy", s.requireAdmin(s.handleAdminUpdateMediaPolicy))
+
+	// KyCalendar signed meeting sync
+	s.mux.HandleFunc("PUT /api/meetings/{id}", s.handleKyCalendarUpsertMeeting)
+	s.mux.HandleFunc("DELETE /api/meetings/{id}", s.handleKyCalendarCloseMeeting)
+
+	// Confined external guest waiting room & meeting endpoints
+	s.mux.HandleFunc("GET /api/meet/{token}", s.handleGuestMeetInfo)
+	s.mux.HandleFunc("POST /api/meet/{token}/knock", s.handleGuestMeetKnock)
+	s.mux.HandleFunc("GET /api/meet/{token}/ws", s.handleGuestMeetWS)
+	s.mux.HandleFunc("POST /api/meet/{token}/call/join", s.handleGuestCallJoin)
+	s.mux.HandleFunc("POST /api/meet/{token}/call/leave", s.handleGuestCallLeave)
+	s.mux.HandleFunc("GET /api/meet/{token}/messages", s.handleGuestListMessages)
+	s.mux.HandleFunc("POST /api/meet/{token}/messages", s.handleGuestSendMessage)
+
 	// SCIM 2.0 routes
 	s.scim.RegisterRoutes(s.mux)
 
@@ -529,7 +594,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
-	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+	w.Header().Set("Content-Security-Policy", s.cspHeader)
 	// Only on the app host: the Matrix server name is often the apex, and includeSubDomains
 	// there would break every plain-http service under it.
 	if app, err := url.Parse(s.config.Server.AppURL); s.config.Security.CookieSecure && err == nil && hostMatches(r.Host, app) {
@@ -557,7 +622,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Vary", "Origin")
 	}
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-CSRF-Token, Idempotency-Key, "+syncauth.HeaderSignature)
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-CSRF-Token, X-Guest-Session, Idempotency-Key, "+syncauth.HeaderSignature)
 
 	// Matrix discovery is public: any client origin may preflight it.
 	if r.Method == http.MethodOptions && (r.URL.Path == wellKnownMatrixClient || r.URL.Path == wellKnownMatrixServer) {
@@ -605,7 +670,9 @@ func csrfExempt(path string) bool {
 	return path == "/api/auth/login" ||
 		strings.HasPrefix(path, "/api/auth/mfa/") ||
 		path == "/api/sso/kyidentity/sync" ||
-		strings.HasPrefix(path, "/api/v1/webhooks/in/")
+		strings.HasPrefix(path, "/api/v1/webhooks/in/") ||
+		strings.HasPrefix(path, "/api/meetings/") ||
+		strings.HasPrefix(path, "/api/meet/")
 }
 
 func mintsSession(path string) bool {

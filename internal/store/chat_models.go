@@ -146,3 +146,76 @@ type RoomWebhook struct {
 	RevokedAt *int64 `json:"revoked_at,omitempty"`
 	CreatedAt int64  `json:"created_at"` // Unix milliseconds
 }
+
+// Call transport modes.
+const (
+	CallModeP2PMesh    = "p2p_mesh"
+	CallModeSFULiveKit = "sfu_livekit"
+)
+
+// CallSession tracks an active or completed voice/video call in a room.
+type CallSession struct {
+	ID          string `json:"id"`
+	TenantID    string `json:"tenant_id"`
+	RoomID      string `json:"room_id"`
+	Mode        string `json:"mode"`
+	Epoch       int    `json:"epoch"`
+	SFUSticky   bool   `json:"sfu_sticky"`
+	LiveKitRoom string `json:"livekit_room,omitempty"`
+	StartedBy   string `json:"started_by"`
+	StartedAt   int64  `json:"started_at"`
+	EndedAt     *int64 `json:"ended_at,omitempty"`
+}
+
+// Meeting represents a KyCalendar-backed or standalone native meeting room.
+type Meeting struct {
+	ID           string `json:"id"`
+	TenantID     string `json:"tenant_id"`
+	RoomID       string `json:"room_id"`
+	OrganizerSub string `json:"organizer_sub"`
+	Title        string `json:"title"`
+	ClosedAt     *int64 `json:"closed_at,omitempty"`
+	UpdatedAt    int64  `json:"updated_at"`
+}
+
+// MeetingWindow is one active time window [StartsAt, EndsAt] in Unix milliseconds.
+type MeetingWindow struct {
+	MeetingID string `json:"meeting_id"`
+	StartsAt  int64  `json:"starts_at"`
+	EndsAt    int64  `json:"ends_at"`
+}
+
+// MeetingGuest binds one hashed external guest invite token to a meeting.
+type MeetingGuest struct {
+	ID        string `json:"id"`
+	MeetingID string `json:"meeting_id"`
+	GuestKey  string `json:"guest_key"`
+	TokenHash string `json:"-"`
+	RevokedAt *int64 `json:"revoked_at,omitempty"`
+	CreatedAt int64  `json:"created_at"`
+}
+
+// UpsertMeetingParams defines the desired reconciled state of a meeting.
+type UpsertMeetingParams struct {
+	ID             string
+	TenantID       string
+	RoomID         string // Used only if creating a new meeting room
+	OrganizerID    string // Local user ID for room ownership
+	OrganizerSub   string
+	Title          string
+	MemberUserIDs  []string // Internal local user IDs that should be members
+	Windows        []MeetingWindow
+	NewGuestTokens map[string]MeetingGuest // key -> guest record to insert if key is not already active
+	KeepGuestKeys  map[string]struct{}     // active keys to retain; others are revoked
+}
+
+// UpsertMeetingResult reports what changed during meeting reconciliation.
+type UpsertMeetingResult struct {
+	Meeting           *Meeting
+	Room              *Room
+	Created           bool
+	AddedMemberIDs    []string
+	RemovedMemberIDs  []string
+	IssuedGuestKeys   []string // guest keys newly created or re-issued
+	RevokedGuestKeys  []string
+}
