@@ -5,12 +5,14 @@ import {
   Hash,
   Lock,
   LogOut,
+  Phone,
   Plus,
   Search,
   Settings as SettingsIcon,
+  Video,
   X,
 } from 'lucide-react';
-import type { ChatRoomSummary, WsStatus } from '../../chat/types';
+import type { CallState, ChatRoomSummary, WsStatus } from '../../chat/types';
 import { initialsFor, sortRooms } from '../../chat/state';
 import type { SessionUser } from '../../dto';
 
@@ -19,6 +21,7 @@ interface ChatSidebarProps {
   tenantName: string;
   rooms: ChatRoomSummary[];
   activeRoomId: string | null;
+  activeCalls?: Record<string, CallState>;
   wsStatus: WsStatus;
   mobileOpen: boolean;
   user?: SessionUser | null;
@@ -27,6 +30,7 @@ interface ChatSidebarProps {
   onOpenNewChannel: () => void;
   onOpenNewDM: () => void;
   onOpenSearch: () => void;
+  onStartInstantMeeting?: () => void;
   onOpenSettings?: () => void;
   onLogout?: () => void;
 }
@@ -51,6 +55,7 @@ export const ChatSidebar: React.FC<ChatSidebarProps> = ({
   tenantName,
   rooms,
   activeRoomId,
+  activeCalls,
   wsStatus,
   mobileOpen,
   user,
@@ -59,6 +64,7 @@ export const ChatSidebar: React.FC<ChatSidebarProps> = ({
   onOpenNewChannel,
   onOpenNewDM,
   onOpenSearch,
+  onStartInstantMeeting,
   onOpenSettings,
   onLogout,
 }) => {
@@ -103,13 +109,26 @@ export const ChatSidebar: React.FC<ChatSidebarProps> = ({
         </div>
       </div>
 
-      <button type="button" className="chat-search-trigger" onClick={onOpenSearch}>
-        <span className="chat-search-trigger-left">
-          <Search size={14} aria-hidden="true" />
-          <span>Search messages</span>
-        </span>
-        <kbd className="chat-kbd">⌘K</kbd>
-      </button>
+      <div className="chat-rail-actions">
+        <button type="button" className="chat-search-trigger" onClick={onOpenSearch}>
+          <span className="chat-search-trigger-left">
+            <Search size={14} aria-hidden="true" />
+            <span>Search</span>
+          </span>
+          <kbd className="chat-kbd">⌘K</kbd>
+        </button>
+        {onStartInstantMeeting && (
+          <button
+            type="button"
+            className="chat-meet-trigger"
+            onClick={onStartInstantMeeting}
+            title="Start an instant meeting with a shareable guest link"
+          >
+            <Video size={14} aria-hidden="true" />
+            <span>Meet</span>
+          </button>
+        )}
+      </div>
 
       <div className="chat-rail-list chat-scroll">
         <section aria-labelledby="chat-channels-heading">
@@ -148,6 +167,8 @@ export const ChatSidebar: React.FC<ChatSidebarProps> = ({
                 channels.map((room) => {
                   const active = room.id === activeRoomId;
                   const unread = !active && room.unread_count > 0;
+                  const call = activeCalls?.[room.id];
+                  const callCount = call && !call.ended ? call.peers.length : 0;
                   return (
                     <button
                       key={room.id}
@@ -160,14 +181,24 @@ export const ChatSidebar: React.FC<ChatSidebarProps> = ({
                       }}
                     >
                       <span className="chat-room-btn-left">
-                        {room.is_private ? (
+                        {room.kind === 'meeting' ? (
+                          <Video size={14} className="chat-room-icon" aria-hidden="true" />
+                        ) : room.is_private ? (
                           <Lock size={14} className="chat-room-icon" aria-hidden="true" />
                         ) : (
                           <Hash size={14} className="chat-room-icon" aria-hidden="true" />
                         )}
                         <span className="chat-room-btn-name">{room.name || 'Untitled'}</span>
                       </span>
-                      {unread && <span className="chat-unread-pill">{room.unread_count}</span>}
+                      <span className="chat-room-btn-right">
+                        {callCount > 0 && (
+                          <span className="chat-live-call-pill" title="Call in progress">
+                            <Phone size={10} />
+                            <span>{callCount}</span>
+                          </span>
+                        )}
+                        {unread && <span className="chat-unread-pill">{room.unread_count}</span>}
+                      </span>
                     </button>
                   );
                 })
@@ -213,6 +244,8 @@ export const ChatSidebar: React.FC<ChatSidebarProps> = ({
                   const active = room.id === activeRoomId;
                   const unread = !active && room.unread_count > 0;
                   const label = room.name || 'Direct message';
+                  const call = activeCalls?.[room.id];
+                  const callCount = call && !call.ended ? call.peers.length : 0;
                   return (
                     <button
                       key={room.id}
@@ -230,7 +263,15 @@ export const ChatSidebar: React.FC<ChatSidebarProps> = ({
                         </span>
                         <span className="chat-room-btn-name">{label}</span>
                       </span>
-                      {unread && <span className="chat-unread-pill">{room.unread_count}</span>}
+                      <span className="chat-room-btn-right">
+                        {callCount > 0 && (
+                          <span className="chat-live-call-pill" title="Call in progress">
+                            <Phone size={10} />
+                            <span>{callCount}</span>
+                          </span>
+                        )}
+                        {unread && <span className="chat-unread-pill">{room.unread_count}</span>}
+                      </span>
                     </button>
                   );
                 })

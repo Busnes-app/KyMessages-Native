@@ -12,6 +12,7 @@ import { ConfirmItsYou } from './components/ConfirmItsYou';
 import { TwoFactorSetup } from './components/TwoFactorSetup';
 import { ThemeSwitcher } from './components/ThemeSwitcher';
 import { Chat } from './pages/Chat';
+import { GuestMeeting } from './pages/GuestMeeting';
 import './styles/theme.css';
 import './ky-ui/tokens.css';
 import './ky-ui/navigation.css';
@@ -19,15 +20,23 @@ import { errorMessage, secureFetch } from './api';
 import { parseSettings, parseUser, type SessionUser, type SiteSettings } from './dto';
 import { ErrorBoundary } from './components/ErrorBoundary';
 
+function extractMeetToken(): string | null {
+  if (typeof window === 'undefined') return null;
+  const match = /^\/meet\/([A-Za-z0-9_-]{8,128})\/?$/.exec(window.location.pathname);
+  return match ? match[1] : null;
+}
+
 export const App: React.FC = () => {
+  const meetToken = extractMeetToken();
   const [user, setUser] = useState<SessionUser | null>(null);
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
-  const [loading, setLoading] = useState<boolean>(true);
+  const [loading, setLoading] = useState<boolean>(!meetToken);
   const [activeTab, setActiveTab] = useState<string>('chat');
   const [settings, setSettings] = useState<SiteSettings | null>(null);
 
   useEffect(() => {
+    if (meetToken) return;
     const checkAuth = async () => {
       try {
         const [authResp, setResp] = useResponses(
@@ -75,6 +84,10 @@ export const App: React.FC = () => {
     }
   };
   const errorAlert = error && <div className="dr-alert dr-alert-error" role="alert" style={{ margin: 16 }}><span>{error}</span></div>;
+
+  if (meetToken) {
+    return <GuestMeeting token={meetToken} appName={settings?.app_name || 'KyMessages'} />;
+  }
 
   if (loading) {
     return (

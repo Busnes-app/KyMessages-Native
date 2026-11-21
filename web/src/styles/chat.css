@@ -1424,3 +1424,682 @@
     transform: translateX(0);
   }
 }
+
+/* =====================================================================
+   Phase 3: Hybrid P2P / LiveKit Calling, Waiting Room, & Guest Meetings
+   ===================================================================== */
+
+.chat-rail-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0 0.75rem 0.65rem;
+}
+
+.chat-rail-actions .chat-search-trigger {
+  margin: 0;
+  flex: 1;
+  min-width: 0;
+}
+
+.chat-meet-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.32rem;
+  padding: 0.42rem 0.62rem;
+  border-radius: 7px;
+  border: 1px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--ink-strong);
+  font-size: 0.76rem;
+  font-weight: 600;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.chat-meet-trigger:hover {
+  background: color-mix(in srgb, var(--accent) 24%, transparent);
+}
+
+.chat-room-btn-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex-shrink: 0;
+}
+
+.chat-live-call-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.22rem;
+  padding: 0.1rem 0.38rem;
+  border-radius: 999px;
+  background: rgba(16, 185, 129, 0.16);
+  border: 1px solid rgba(16, 185, 129, 0.45);
+  color: #10b981;
+  font-size: 0.68rem;
+  font-weight: 700;
+}
+
+.ky-header-call-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.36rem 0.68rem;
+  border-radius: 7px;
+  border: 1px solid var(--line-strong);
+  background: var(--bg);
+  color: var(--ink-strong);
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.ky-header-call-btn:hover:not(:disabled) {
+  background: var(--panel-hover);
+}
+
+.ky-header-call-btn.is-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #090b10;
+}
+
+.ky-header-call-btn.is-danger {
+  background: var(--danger, #dc2626);
+  border-color: var(--danger, #dc2626);
+  color: #fff;
+}
+
+.ky-header-call-btn.is-active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* Inline Call / Lobby / Guest Link Banners */
+.ky-call-mini-bar,
+.ky-active-call-banner,
+.ky-lobby-banner,
+.ky-guest-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.5rem 1rem;
+  font-size: 0.82rem;
+  border-bottom: 1px solid var(--line);
+  flex-wrap: wrap;
+}
+
+.ky-active-call-banner {
+  background: rgba(16, 185, 129, 0.11);
+  color: var(--ink-strong);
+}
+
+.ky-call-mini-bar {
+  background: color-mix(in srgb, var(--accent) 12%, var(--panel));
+  color: var(--ink-strong);
+}
+
+.ky-lobby-banner {
+  background: rgba(245, 158, 11, 0.14);
+  color: var(--ink-strong);
+}
+
+.ky-guest-banner {
+  background: var(--panel);
+  color: var(--ink-strong);
+}
+
+.ky-guest-banner code {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  padding: 0.1rem 0.35rem;
+  border-radius: 4px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+}
+
+.ky-call-mini-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.ky-lobby-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.26rem 0.62rem;
+  border-radius: 6px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  border: 1px solid transparent;
+  cursor: pointer;
+}
+
+.ky-lobby-btn.is-admit {
+  background: #10b981;
+  color: #062118;
+}
+
+.ky-lobby-btn.is-deny {
+  background: transparent;
+  border-color: var(--line-strong);
+  color: var(--ink-strong);
+}
+
+.ky-lobby-btn.is-deny:hover {
+  border-color: var(--danger, #dc2626);
+  color: var(--danger, #dc2626);
+}
+
+/* Drawer Guest Link & Waiting Room */
+.ky-guest-link-box {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.ky-guest-link-box input {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  padding: 0.38rem 0.5rem;
+}
+
+.ky-lobby-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.ky-lobby-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.48rem 0.6rem;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+}
+
+.ky-lobby-name {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--ink-strong);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ky-lobby-actions {
+  display: inline-flex;
+  gap: 0.3rem;
+  flex-shrink: 0;
+}
+
+/* CallStage (Zoom / Teams style) */
+.ky-call-stage {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  padding: 0.75rem 1rem 0.85rem;
+  background: #0a0c10;
+  border-bottom: 1px solid var(--line-strong);
+  color: #f4f6fa;
+  flex-shrink: 0;
+}
+
+.ky-call-stage.is-expanded {
+  flex: 1;
+  min-height: 0;
+}
+
+.ky-call-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.ky-call-topbar-left {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  flex-wrap: wrap;
+}
+
+.ky-call-mode-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.32rem;
+  padding: 0.2rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.ky-call-mode-badge.is-p2p {
+  background: rgba(16, 185, 129, 0.18);
+  border: 1px solid rgba(16, 185, 129, 0.5);
+  color: #34d399;
+}
+
+.ky-call-mode-badge.is-sfu {
+  background: rgba(77, 238, 234, 0.16);
+  border: 1px solid rgba(77, 238, 234, 0.5);
+  color: #4deeea;
+}
+
+.ky-call-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.76rem;
+  color: #a6b0c3;
+}
+
+.ky-call-migrating {
+  font-size: 0.74rem;
+  color: #fbbf24;
+  font-weight: 600;
+}
+
+.ky-call-notice {
+  font-size: 0.74rem;
+  color: #cbd5e1;
+}
+
+.ky-call-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.06);
+  color: #f4f6fa;
+  cursor: pointer;
+}
+
+.ky-call-screens {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.6rem;
+}
+
+.ky-call-grid {
+  display: grid;
+  gap: 0.6rem;
+  min-height: 180px;
+}
+
+.ky-call-stage.is-expanded .ky-call-grid {
+  flex: 1;
+  min-height: 0;
+}
+
+.ky-call-grid.cols-1 {
+  grid-template-columns: minmax(0, 420px);
+  justify-content: center;
+}
+
+.ky-call-grid.cols-2,
+.ky-call-grid.cols-2-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.ky-call-grid.cols-3 {
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+}
+
+.ky-call-tile {
+  position: relative;
+  border-radius: 10px;
+  overflow: hidden;
+  background: #141821;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  aspect-ratio: 16 / 9;
+  min-height: 150px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ky-call-tile.is-screen {
+  max-height: 360px;
+}
+
+.ky-call-video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background: #000;
+}
+
+.ky-call-video.is-mirrored {
+  transform: scaleX(-1);
+}
+
+.ky-call-avatar-wrap {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ky-call-avatar {
+  width: 60px;
+  height: 60px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, rgba(77, 238, 234, 0.25), rgba(59, 130, 246, 0.35));
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  color: #f8fafc;
+  font-size: 1.25rem;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ky-call-tile-label {
+  position: absolute;
+  left: 0.55rem;
+  bottom: 0.5rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: 6px;
+  background: rgba(9, 11, 16, 0.72);
+  backdrop-filter: blur(6px);
+  font-size: 0.74rem;
+  color: #f8fafc;
+}
+
+.ky-call-guest-pill {
+  padding: 0.08rem 0.36rem;
+  border-radius: 4px;
+  background: rgba(245, 158, 11, 0.22);
+  color: #fbbf24;
+  font-size: 0.66rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.ky-call-mic-dot {
+  display: inline-flex;
+  align-items: center;
+}
+
+.ky-call-mic-dot.is-on {
+  color: #34d399;
+}
+
+.ky-call-mic-dot.is-off {
+  color: #f87171;
+}
+
+.ky-call-dock {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.ky-call-ctrl {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.48rem 0.85rem;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.08);
+  color: #f8fafc;
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.ky-call-ctrl:hover {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+.ky-call-ctrl.is-muted {
+  background: rgba(239, 68, 68, 0.22);
+  border-color: rgba(239, 68, 68, 0.55);
+  color: #fca5a5;
+}
+
+.ky-call-ctrl.is-active {
+  background: rgba(77, 238, 234, 0.18);
+  border-color: rgba(77, 238, 234, 0.6);
+  color: #4deeea;
+}
+
+.ky-call-ctrl.is-leave {
+  background: #dc2626;
+  border-color: #dc2626;
+  color: #fff;
+}
+
+/* Guest Meeting Waiting Room & Confined Shell (/meet/:token) */
+.ky-guest-center {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  padding: 1.5rem;
+  background: var(--bg);
+  color: var(--ink-strong);
+}
+
+.ky-guest-card {
+  width: min(26rem, 100%);
+  background: var(--panel);
+  border: 1px solid var(--line-strong);
+  border-radius: 14px;
+  padding: 1.75rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 0.9rem;
+}
+
+.ky-guest-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.ky-guest-card h2 {
+  font-size: 1.25rem;
+  font-weight: 700;
+  margin: 0;
+}
+
+.ky-guest-card p {
+  font-size: 0.88rem;
+  color: var(--ink);
+  margin: 0;
+}
+
+.ky-guest-notice {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  border-radius: 8px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  font-size: 0.84rem;
+  text-align: left;
+}
+
+.ky-guest-form {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  text-align: left;
+}
+
+.ky-guest-form label {
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.ky-guest-ws-pill {
+  font-size: 0.75rem;
+  color: var(--ink);
+  padding: 0.25rem 0.65rem;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+}
+
+.ky-guest-shell {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--ink-strong);
+}
+
+.ky-guest-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.7rem 1rem;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+  flex-wrap: wrap;
+}
+
+.ky-guest-header-title,
+.ky-guest-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  flex-wrap: wrap;
+}
+
+.ky-ws-pill {
+  font-size: 0.7rem;
+  padding: 0.12rem 0.45rem;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  text-transform: capitalize;
+}
+
+.ky-ws-pill.is-live {
+  border-color: rgba(16, 185, 129, 0.5);
+  color: #10b981;
+}
+
+.ky-guest-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.ky-guest-stage-col {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.ky-guest-ready {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.9rem;
+  padding: 2rem;
+  text-align: center;
+}
+
+.ky-guest-ready-actions {
+  display: flex;
+  gap: 0.65rem;
+}
+
+.ky-guest-chat {
+  width: min(20rem, 100%);
+  border-left: 1px solid var(--line);
+  background: var(--panel);
+  display: flex;
+  flex-direction: column;
+}
+
+.ky-guest-chat-head {
+  padding: 0.7rem 0.9rem;
+  border-bottom: 1px solid var(--line);
+  font-size: 0.84rem;
+  font-weight: 700;
+}
+
+.ky-guest-chat-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0.75rem 0.9rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.ky-guest-chat-empty {
+  font-size: 0.82rem;
+  color: var(--ink);
+  text-align: center;
+  margin-top: 2rem;
+}
+
+.ky-guest-msg-sender {
+  font-size: 0.74rem;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.ky-guest-msg-body {
+  font-size: 0.85rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.ky-guest-chat-form {
+  display: flex;
+  gap: 0.4rem;
+  padding: 0.65rem 0.75rem;
+  border-top: 1px solid var(--line);
+}
+
+.ky-guest-chat-form input {
+  flex: 1;
+  min-width: 0;
+}
+
+.ky-spin {
+  animation: kySpin 1s linear infinite;
+}
+
+@keyframes kySpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+

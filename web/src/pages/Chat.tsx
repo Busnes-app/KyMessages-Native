@@ -1,14 +1,19 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Check,
   ChevronDown,
+  Copy,
   Hash,
   Lock,
   Menu,
   MessageSquarePlus,
   PanelRightClose,
   PanelRightOpen,
+  Phone,
+  PhoneOff,
   Search,
   Send,
+  Video,
   X,
 } from 'lucide-react';
 import '../styles/chat.css';
@@ -16,13 +21,19 @@ import type { SessionUser } from '../dto';
 import {
   ChatSocket,
   createChannel,
+  createInstantMeeting,
+  createRoomGuestLink,
+  decideRoomLobby,
   deleteMessage,
   editMessage,
   fetchBootstrap,
   fetchDirectoryUsers,
   fetchMessages,
   fetchRoomDetail,
+  fetchRoomLobby,
   fetchRooms,
+  joinRoomCall,
+  leaveRoomCall,
   markRoomRead,
   newIdempotencyKey,
   openDirectMessage,
@@ -38,11 +49,13 @@ import {
   upsertMessage,
 } from '../chat/state';
 import type {
+  CallState,
   ChatCurrentUser,
   ChatDirectoryUser,
   ChatMessage,
   ChatRoomDetail,
   ChatRoomSummary,
+  LobbyGuest,
   WsServerEvent,
   WsStatus,
 } from '../chat/types';
@@ -50,6 +63,8 @@ import { ChatSidebar } from '../components/chat/ChatSidebar';
 import { MessageRow } from '../components/chat/MessageRow';
 import { RoomDetailsDrawer } from '../components/chat/RoomDetailsDrawer';
 import { CreateChannelModal, SearchModal, StartDMModal } from '../components/chat/ChatModals';
+import { CallStage } from '../components/chat/CallStage';
+import { HybridCallController, type HybridCallSnapshot } from '../rtc/hybridCall';
 
 interface ChatProps {
   appName?: string;
@@ -97,8 +112,16 @@ export const Chat: React.FC<ChatProps> = ({
   const [creatingGeneral, setCreatingGeneral] = useState(false);
   // Map of roomId -> Map<userId, expiryTimestampMs>
   const [typingByRoom, setTypingByRoom] = useState<Record<string, Record<string, number>>>({});
+  // Phase 3: hybrid calls, SFU availability, waiting room lobby, guest invite banner
+  const [activeCalls, setActiveCalls] = useState<Record<string, CallState>>({});
+  const [sfuAvailable, setSfuAvailable] = useState(false);
+  const [lobbyByRoom, setLobbyByRoom] = useState<Record<string, LobbyGuest[]>>({});
+  const [callSnap, setCallSnap] = useState<HybridCallSnapshot | null>(null);
+  const [joiningCall, setJoiningCall] = useState(false);
+  const [guestLinkBanner, setGuestLinkBanner] = useState<{ roomId: string; url: string; copied: boolean } | null>(null);
 
   const socketRef = useRef<ChatSocket | null>(null);
+  const callCtrlRef = useRef<HybridCallController | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const nearBottomRef = useRef(true);
@@ -418,6 +441,50 @@ export const Chat: React.FC<ChatProps> = ({
           );
           return;
         }
+        case 'call.state': {
+          const st = event.state;
+          setActiveCalls((prev) => {
+            if (st.ended || st.peers.length === 0) {
+              if (!(st.room_id in prev)) return prev;
+              const next = { ...prev };
+              delete next[st.room_id];
+              return next;
+            }
+            return { ...prev, [st.room_id]: st };
+          });
+          callCtrlRef.current?.handleCallState(st);
+          if (st.ended) {
+            setCallSnap((cur) => (cur && cur.roomId === st.room_id ? null : cur));
+          }
+          return;
+        }
+        case 'call.signal': {
+          void callCtrlRef.current?.handleSignal(event.signal);
+          return;
+        }
+        case 'call.migrate': {
+          void callCtrlRef.current?.handleMigrate(event.migrate);
+          return;
+        }
+        case 'lobby.knock': {
+          const g = event.guest;
+          setLobbyByRoom((prev) => {
+            const list = prev[event.roomId] ?? [];
+            const filtered = list.filter((x) => x.guest_id !== g.guest_id);
+            return { ...prev, [event.roomId]: [...filtered, g] };
+          });
+          return;
+        }
+        case 'lobby.decision': {
+          if (event.roomId && event.guestId) {
+            setLobbyByRoom((prev) => {
+              const list = prev[event.roomId!];
+              if (!list) return prev;
+              return { ...prev, [event.roomId!]: list.filter((x) => x.guest_id !== event.guestId) };
+            });
+          }
+          return;
+        }
         default: {
           const _exhaustive: never = event;
           void _exhaustive;
@@ -441,6 +508,12 @@ export const Chat: React.FC<ChatProps> = ({
         setTenantName(boot.tenant.display_name || 'KyMessages');
         setRooms(boot.rooms);
         setDirectory(users);
+        setSfuAvailable(boot.rtc.sfu_available);
+        const callMap: Record<string, CallState> = {};
+        for (const [rid, c] of Object.entries(boot.active_calls)) {
+          if (!c.ended && c.peers.length > 0) callMap[rid] = c;
+        }
+        setActiveCalls(callMap);
         if (boot.rooms.length > 0) {
           const requestedRoom = new URLSearchParams(window.location.search).get('room');
           const matched = requestedRoom ? boot.rooms.find((r) => r.id === requestedRoom) : undefined;
@@ -477,6 +550,8 @@ export const Chat: React.FC<ChatProps> = ({
 
     return () => {
       cancelled = true;
+      callCtrlRef.current?.dispose();
+      callCtrlRef.current = null;
       sock.close();
       socketRef.current = null;
     };
@@ -534,6 +609,13 @@ export const Chat: React.FC<ChatProps> = ({
     if (drawerOpenRef.current) {
       void refreshRoomDetail(activeRoomId);
     }
+    void fetchRoomLobby(activeRoomId)
+      .then((guests) => {
+        setLobbyByRoom((prev) => ({ ...prev, [activeRoomId]: guests }));
+      })
+      .catch(() => {
+        // Non-meeting rooms or transient failures simply show empty lobby.
+      });
   }, [activeRoomId, loadRoomHistory, refreshRoomDetail, scrollToBottom, syncReadCursor]);
 
   const handleLoadOlder = async () => {
@@ -764,6 +846,88 @@ export const Chat: React.FC<ChatProps> = ({
     setActiveRoomId(room.id);
   };
 
+  const handleLeaveCall = useCallback(async () => {
+    const leavingRoomId = callSnap?.roomId;
+    callCtrlRef.current?.dispose();
+    callCtrlRef.current = null;
+    setCallSnap(null);
+    if (leavingRoomId) {
+      await leaveRoomCall(leavingRoomId).catch(() => undefined);
+    }
+  }, [callSnap?.roomId]);
+
+  const handleJoinCall = async (roomId: string, withVideo: boolean) => {
+    const me = currentUserRef.current;
+    if (!me || joiningCall) return;
+    setJoiningCall(true);
+    setBannerError('');
+    try {
+      // Leave any existing call in another room first.
+      if (callSnap && callSnap.roomId !== roomId) {
+        await handleLeaveCall();
+      }
+      const joinResp = await joinRoomCall(roomId, { audio: true, video: withVideo });
+      callCtrlRef.current?.dispose();
+      const ctrl = new HybridCallController({
+        localUserId: me.id,
+        localDisplayName: me.display_name || me.username,
+        isGuest: false,
+        socket: () => socketRef.current,
+        onChange: setCallSnap,
+      });
+      callCtrlRef.current = ctrl;
+      await ctrl.start(joinResp, { audio: true, video: withVideo, protectIp: false });
+      setActiveCalls((prev) => ({
+        ...prev,
+        [roomId]: {
+          call_id: joinResp.call_id,
+          room_id: roomId,
+          mode: joinResp.mode,
+          sfu_sticky: joinResp.sfu_sticky,
+          peers: joinResp.peers,
+          ended: false,
+        },
+      }));
+    } catch (e) {
+      setBannerError(e instanceof Error ? e.message : 'Could not join call');
+    } finally {
+      setJoiningCall(false);
+    }
+  };
+
+  const handleDecideLobby = async (roomId: string, guestId: string, admit: boolean) => {
+    try {
+      await decideRoomLobby(roomId, guestId, admit);
+      setLobbyByRoom((prev) => ({
+        ...prev,
+        [roomId]: (prev[roomId] ?? []).filter((g) => g.guest_id !== guestId),
+      }));
+    } catch (e) {
+      setBannerError(e instanceof Error ? e.message : 'Could not update waiting room');
+    }
+  };
+
+  const handleStartInstantMeeting = async () => {
+    setBannerError('');
+    try {
+      const stamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      const created = await createInstantMeeting({ title: `Quick Meeting (${stamp})` });
+      await refreshRoomsList();
+      setActiveRoomId(created.room.id);
+      const fullUrl = created.guestUrl || `${window.location.origin}${created.guestPath}`;
+      setGuestLinkBanner({ roomId: created.room.id, url: fullUrl, copied: false });
+    } catch (e) {
+      setBannerError(e instanceof Error ? e.message : 'Could not create meeting');
+    }
+  };
+
+  const handleCreateGuestLink = async (roomId: string): Promise<string> => {
+    const res = await createRoomGuestLink(roomId);
+    const fullUrl = res.guestUrl || `${window.location.origin}${res.guestPath}`;
+    setGuestLinkBanner({ roomId, url: fullUrl, copied: false });
+    return fullUrl;
+  };
+
   const handleTimelineScroll = () => {
     const el = timelineRef.current;
     if (!el) return;
@@ -792,6 +956,13 @@ export const Chat: React.FC<ChatProps> = ({
 
   const canModerateActiveRoom =
     currentUser?.role === 'admin' || activeRoom?.role === 'owner' || activeRoom?.role === 'admin';
+  const activeRoomCall = activeRoomId ? activeCalls[activeRoomId] : undefined;
+  const inActiveRoomCall = Boolean(callSnap && activeRoomId && callSnap.roomId === activeRoomId);
+  const inOtherRoomCall = Boolean(callSnap && activeRoomId && callSnap.roomId !== activeRoomId);
+  const otherCallRoomName = callSnap
+    ? rooms.find((r) => r.id === callSnap.roomId)?.name || 'call'
+    : '';
+  const activeRoomLobby = activeRoomId ? lobbyByRoom[activeRoomId] ?? [] : [];
 
   if (loading) {
     return (
@@ -820,6 +991,7 @@ export const Chat: React.FC<ChatProps> = ({
         tenantName={tenantName}
         rooms={rooms}
         activeRoomId={activeRoomId}
+        activeCalls={activeCalls}
         wsStatus={wsStatus}
         mobileOpen={mobileRailOpen}
         user={user}
@@ -828,6 +1000,7 @@ export const Chat: React.FC<ChatProps> = ({
         onOpenNewChannel={() => setModal('new-channel')}
         onOpenNewDM={() => setModal('new-dm')}
         onOpenSearch={() => setModal('search')}
+        onStartInstantMeeting={() => void handleStartInstantMeeting()}
         onOpenSettings={onOpenSettings}
         onLogout={onLogout}
       />
@@ -847,7 +1020,9 @@ export const Chat: React.FC<ChatProps> = ({
                 </button>
                 <div className="chat-header-title-wrap">
                   <h1 className="chat-header-title">
-                    {activeRoom.kind === 'dm' ? null : activeRoom.is_private ? (
+                    {activeRoom.kind === 'dm' ? null : activeRoom.kind === 'meeting' ? (
+                      <Video size={16} aria-hidden="true" />
+                    ) : activeRoom.is_private ? (
                       <Lock size={16} aria-hidden="true" />
                     ) : (
                       <Hash size={16} aria-hidden="true" />
@@ -859,6 +1034,43 @@ export const Chat: React.FC<ChatProps> = ({
               </div>
 
               <div className="chat-header-actions">
+                {!activeRoom.closed_at && !inActiveRoomCall && (
+                  <>
+                    <button
+                      type="button"
+                      className="ky-header-call-btn"
+                      title="Start or join audio call (P2P-first)"
+                      aria-label="Audio call"
+                      disabled={joiningCall}
+                      onClick={() => void handleJoinCall(activeRoom.id, false)}
+                    >
+                      <Phone size={15} />
+                      <span>Call</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="ky-header-call-btn is-primary"
+                      title="Start or join video call (P2P-first)"
+                      aria-label="Video call"
+                      disabled={joiningCall}
+                      onClick={() => void handleJoinCall(activeRoom.id, true)}
+                    >
+                      <Video size={15} />
+                      <span>Video</span>
+                    </button>
+                  </>
+                )}
+                {inActiveRoomCall && (
+                  <button
+                    type="button"
+                    className="ky-header-call-btn is-danger"
+                    title="Leave active call"
+                    onClick={() => void handleLeaveCall()}
+                  >
+                    <PhoneOff size={15} />
+                    <span>Leave</span>
+                  </button>
+                )}
                 <button
                   type="button"
                   className="chat-icon-btn"
@@ -881,7 +1093,10 @@ export const Chat: React.FC<ChatProps> = ({
                   }}
                 >
                   {drawerOpen ? <PanelRightClose size={16} aria-hidden="true" /> : <PanelRightOpen size={16} aria-hidden="true" />}
-                  <span>{drawerOpen ? 'Hide' : 'Details'}</span>
+                  <span>
+                    {drawerOpen ? 'Hide' : 'Details'}
+                    {activeRoomLobby.length > 0 ? ` (${activeRoomLobby.length})` : ''}
+                  </span>
                 </button>
               </div>
             </header>
@@ -898,6 +1113,125 @@ export const Chat: React.FC<ChatProps> = ({
                   <X size={14} />
                 </button>
               </div>
+            )}
+
+            {inOtherRoomCall && callSnap && (
+              <div className="ky-call-mini-bar" role="status">
+                <span>
+                  In {callSnap.mode === 'p2p_mesh' ? 'P2P' : 'SFU'} call in <strong>{otherCallRoomName}</strong> ({callSnap.tiles.length})
+                </span>
+                <div className="ky-call-mini-actions">
+                  <button
+                    type="button"
+                    className="ky-lobby-btn is-admit"
+                    onClick={() => setActiveRoomId(callSnap.roomId)}
+                  >
+                    Return to call
+                  </button>
+                  <button
+                    type="button"
+                    className="ky-lobby-btn is-deny"
+                    onClick={() => void handleLeaveCall()}
+                  >
+                    Leave
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {guestLinkBanner && guestLinkBanner.roomId === activeRoom.id && (
+              <div className="ky-guest-banner" role="status">
+                <span>
+                  Guest waiting-room link ready: <code>{guestLinkBanner.url}</code>
+                </span>
+                <div className="ky-call-mini-actions">
+                  <button
+                    type="button"
+                    className="ky-lobby-btn is-admit"
+                    onClick={() => {
+                      void navigator.clipboard.writeText(guestLinkBanner.url).then(() => {
+                        setGuestLinkBanner((b) => (b ? { ...b, copied: true } : b));
+                      }).catch(() => undefined);
+                    }}
+                  >
+                    {guestLinkBanner.copied ? <Check size={12} /> : <Copy size={12} />}
+                    <span>{guestLinkBanner.copied ? 'Copied' : 'Copy'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="chat-icon-btn"
+                    onClick={() => setGuestLinkBanner(null)}
+                    aria-label="Dismiss guest link"
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {activeRoomLobby.length > 0 && (
+              <div className="ky-lobby-banner" role="status">
+                <span>
+                  <strong>{activeRoomLobby[0].display_name}</strong>
+                  {activeRoomLobby.length > 1 ? ` and ${activeRoomLobby.length - 1} other` : ''} waiting to join
+                </span>
+                <div className="ky-call-mini-actions">
+                  <button
+                    type="button"
+                    className="ky-lobby-btn is-admit"
+                    onClick={() => void handleDecideLobby(activeRoom.id, activeRoomLobby[0].guest_id, true)}
+                  >
+                    Admit
+                  </button>
+                  <button
+                    type="button"
+                    className="ky-lobby-btn is-deny"
+                    onClick={() => void handleDecideLobby(activeRoom.id, activeRoomLobby[0].guest_id, false)}
+                  >
+                    Deny
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {!inActiveRoomCall && activeRoomCall && !activeRoomCall.ended && activeRoomCall.peers.length > 0 && (
+              <div className="ky-active-call-banner" role="status">
+                <span>
+                  <strong>Call in progress</strong> · {activeRoomCall.peers.length}{' '}
+                  {activeRoomCall.peers.length === 1 ? 'person' : 'people'} ·{' '}
+                  {activeRoomCall.mode === 'p2p_mesh' ? 'P2P Direct' : 'LiveKit SFU'}
+                </span>
+                <div className="ky-call-mini-actions">
+                  <button
+                    type="button"
+                    className="ky-lobby-btn is-admit"
+                    disabled={joiningCall}
+                    onClick={() => void handleJoinCall(activeRoom.id, false)}
+                  >
+                    Join Audio
+                  </button>
+                  <button
+                    type="button"
+                    className="ky-lobby-btn is-admit"
+                    disabled={joiningCall}
+                    onClick={() => void handleJoinCall(activeRoom.id, true)}
+                  >
+                    Join Video
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {inActiveRoomCall && callSnap && (
+              <CallStage
+                snapshot={callSnap}
+                sfuAvailable={sfuAvailable}
+                onToggleAudio={() => void callCtrlRef.current?.toggleAudio()}
+                onToggleVideo={() => void callCtrlRef.current?.toggleVideo()}
+                onToggleScreenShare={() => void callCtrlRef.current?.toggleScreenShare()}
+                onToggleProtectIp={() => callCtrlRef.current?.setProtectIp(!callSnap.protectIp)}
+                onLeave={() => void handleLeaveCall()}
+              />
             )}
 
             {activeRoom.closed_at && (
@@ -1135,10 +1469,13 @@ export const Chat: React.FC<ChatProps> = ({
           isGlobalAdmin={currentUser?.role === 'admin'}
           directory={directory}
           messages={activeMessages}
+          lobbyGuests={activeRoomLobby}
           onClose={() => setDrawerOpen(false)}
           onRefresh={async () => {
             await Promise.all([refreshRoomDetail(activeRoom.id), refreshRoomsList()]);
           }}
+          onDecideLobby={(guestId, admit) => handleDecideLobby(activeRoom.id, guestId, admit)}
+          onCreateGuestLink={() => handleCreateGuestLink(activeRoom.id)}
           onLeftRoom={(leftId) => {
             setDrawerOpen(false);
             setRoomDetail(null);

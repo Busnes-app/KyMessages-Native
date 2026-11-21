@@ -1,7 +1,12 @@
 import { errorMessage, secureFetch } from '../api';
 import { arr, bool, count, obj, str } from '../dto';
 import {
+  parseAdminMediaPolicy,
   parseBootstrap,
+  parseCallJoinResponse,
+  parseCallState,
+  parseGuestMeetInfo,
+  parseLobbyGuest,
   parseMessage,
   parseMessagesPage,
   parseRoom,
@@ -10,6 +15,9 @@ import {
   parseUsersList,
   parseWebhook,
   parseWsEvent,
+  type AdminMediaPolicyResponse,
+  type CallJoinResponse,
+  type CallState,
   type ChatBootstrap,
   type ChatDirectoryUser,
   type ChatMessage,
@@ -18,6 +26,9 @@ import {
   type ChatRoomDetail,
   type ChatRoomSummary,
   type ChatRoomWebhook,
+  type GuestMeetInfo,
+  type LobbyGuest,
+  type MediaPolicyConfig,
   type WsServerEvent,
   type WsStatus,
 } from './types';
@@ -249,6 +260,213 @@ export async function revokeRoomWebhook(roomId: string, webhookId: string): Prom
   );
 }
 
+// ---------------------------------------------------------------------
+// Hybrid P2P / SFU Calls, Meeting Waiting Rooms & Admin Media Policy
+// ---------------------------------------------------------------------
+
+export async function joinRoomCall(
+  roomId: string,
+  opts: { audio: boolean; video: boolean; screenShare?: boolean; protectIp?: boolean },
+): Promise<CallJoinResponse> {
+  return parseCallJoinResponse(
+    await apiJSON(
+      `/api/v1/rooms/${encodeURIComponent(roomId)}/calls/join`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          audio: opts.audio,
+          video: opts.video,
+          screen_share: Boolean(opts.screenShare),
+          protect_ip: Boolean(opts.protectIp),
+        }),
+      },
+      'Could not join call',
+    ),
+  );
+}
+
+export async function leaveRoomCall(roomId: string): Promise<void> {
+  await apiJSON(
+    `/api/v1/rooms/${encodeURIComponent(roomId)}/calls/leave`,
+    { method: 'POST', body: '{}' },
+    'Could not leave call',
+  );
+}
+
+export async function escalateRoomCall(roomId: string, reason = 'user_requested'): Promise<CallState> {
+  const data = obj(
+    await apiJSON(
+      `/api/v1/rooms/${encodeURIComponent(roomId)}/calls/escalate`,
+      { method: 'POST', body: JSON.stringify({ reason }) },
+      'Could not escalate call to SFU',
+    ),
+  );
+  return parseCallState(data.call);
+}
+
+export async function fetchRoomLobby(roomId: string): Promise<LobbyGuest[]> {
+  const data = obj(
+    await apiJSON(`/api/v1/rooms/${encodeURIComponent(roomId)}/lobby`, {}, 'Could not load waiting room'),
+  );
+  return arr(data.guests ?? []).map(parseLobbyGuest);
+}
+
+export async function decideRoomLobby(roomId: string, guestId: string, admit: boolean): Promise<void> {
+  await apiJSON(
+    `/api/v1/rooms/${encodeURIComponent(roomId)}/lobby/${encodeURIComponent(guestId)}/${admit ? 'admit' : 'deny'}`,
+    { method: 'POST', body: '{}' },
+    admit ? 'Could not admit guest' : 'Could not deny guest',
+  );
+}
+
+export async function createInstantMeeting(params: {
+  title: string;
+  memberIds?: string[];
+}): Promise<{ room: ChatRoom; guestUrl: string; guestPath: string }> {
+  const data = obj(
+    await apiJSON(
+      '/api/v1/meetings',
+      {
+        method: 'POST',
+        body: JSON.stringify({ title: params.title, member_ids: params.memberIds ?? [] }),
+      },
+      'Could not create meeting',
+    ),
+  );
+  return {
+    room: parseRoom(data.room),
+    guestUrl: str(data.guest_url, 512),
+    guestPath: str(data.guest_path, 512),
+  };
+}
+
+export async function createRoomGuestLink(roomId: string): Promise<{ guestUrl: string; guestPath: string }> {
+  const data = obj(
+    await apiJSON(
+      `/api/v1/rooms/${encodeURIComponent(roomId)}/meeting/guest-link`,
+      { method: 'POST', body: '{}' },
+      'Could not create guest invite link',
+    ),
+  );
+  return {
+    guestUrl: str(data.guest_url, 512),
+    guestPath: str(data.guest_path, 512),
+  };
+}
+
+export async function fetchAdminMediaPolicy(): Promise<AdminMediaPolicyResponse> {
+  return parseAdminMediaPolicy(await apiJSON('/api/admin/media-policy', {}, 'Could not load media policy'));
+}
+
+export async function updateAdminMediaPolicy(policy: MediaPolicyConfig): Promise<MediaPolicyConfig> {
+  const data = obj(
+    await apiJSON(
+      '/api/admin/media-policy',
+      { method: 'PUT', body: JSON.stringify(policy) },
+      'Could not save media policy',
+    ),
+  );
+  const p = obj(data.policy);
+  return {
+    p2p_policy: p.p2p_policy === 'sfu_only' ? 'sfu_only' : 'hybrid',
+    p2p_max_video: count(p.p2p_max_video),
+    p2p_max_audio: count(p.p2p_max_audio),
+    guest_force_sfu: bool(p.guest_force_sfu),
+  };
+}
+
+// ---------------------------------------------------------------------
+// Confined External Guest API (/api/meet/{token}...)
+// ---------------------------------------------------------------------
+
+async function guestJSON(input: string, init: RequestInit = {}, fallback = 'Request failed'): Promise<unknown> {
+  const headers = new Headers(init.headers);
+  if (init.body && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json');
+  }
+  const res = await fetch(input, { credentials: 'same-origin', ...init, headers });
+  if (!res.ok) {
+    throw new Error(await errorMessage(res, fallback));
+  }
+  return res.json();
+}
+
+export async function fetchGuestMeetInfo(token: string): Promise<GuestMeetInfo> {
+  return parseGuestMeetInfo(
+    await guestJSON(`/api/meet/${encodeURIComponent(token)}`, {}, 'Could not load meeting'),
+  );
+}
+
+export async function knockGuestMeet(
+  token: string,
+  displayName: string,
+  captchaToken?: string,
+): Promise<{ guestId: string; displayName: string; status: string; roomId: string; meetingTitle: string }> {
+  const data = obj(
+    await guestJSON(
+      `/api/meet/${encodeURIComponent(token)}/knock`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ display_name: displayName, captcha_token: captchaToken }),
+      },
+      'Could not enter waiting room',
+    ),
+  );
+  return {
+    guestId: str(data.guest_id, 128),
+    displayName: str(data.display_name, 255),
+    status: str(data.status, 32),
+    roomId: str(data.room_id, 128),
+    meetingTitle: str(data.meeting_title, 255),
+  };
+}
+
+export async function joinGuestCall(
+  token: string,
+  opts: { audio: boolean; video: boolean; screenShare?: boolean; protectIp?: boolean },
+): Promise<CallJoinResponse> {
+  return parseCallJoinResponse(
+    await guestJSON(
+      `/api/meet/${encodeURIComponent(token)}/call/join`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          audio: opts.audio,
+          video: opts.video,
+          screen_share: Boolean(opts.screenShare),
+          protect_ip: Boolean(opts.protectIp),
+        }),
+      },
+      'Could not join meeting call',
+    ),
+  );
+}
+
+export async function leaveGuestCall(token: string): Promise<void> {
+  await guestJSON(
+    `/api/meet/${encodeURIComponent(token)}/call/leave`,
+    { method: 'POST', body: '{}' },
+    'Could not leave meeting call',
+  );
+}
+
+export async function fetchGuestMessages(token: string): Promise<ChatMessagesPage> {
+  return parseMessagesPage(
+    await guestJSON(`/api/meet/${encodeURIComponent(token)}/messages`, {}, 'Could not load meeting chat'),
+  );
+}
+
+export async function sendGuestMessage(token: string, body: string): Promise<ChatMessage> {
+  const data = obj(
+    await guestJSON(
+      `/api/meet/${encodeURIComponent(token)}/messages`,
+      { method: 'POST', body: JSON.stringify({ body }) },
+      'Could not send message',
+    ),
+  );
+  return parseMessage(data.message);
+}
+
 export function newIdempotencyKey(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
     return crypto.randomUUID();
@@ -262,7 +480,7 @@ export interface ChatSocketHandlers {
   onReconnect: () => void;
 }
 
-/** Single multiplexed WebSocket connection to /api/v1/ws with bounded exponential backoff. */
+/** Single multiplexed WebSocket connection to /api/v1/ws (or confined /api/meet/{token}/ws) with bounded exponential backoff. */
 export class ChatSocket {
   private ws: WebSocket | null = null;
   private closed = false;
@@ -273,7 +491,10 @@ export class ChatSocket {
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private lastTypingAt = new Map<string, number>();
 
-  constructor(private readonly handlers: ChatSocketHandlers) {}
+  constructor(
+    private readonly handlers: ChatSocketHandlers,
+    private readonly wsPath = '/api/v1/ws',
+  ) {}
 
   connect(): void {
     if (this.closed || this.revoked) return;
@@ -284,7 +505,7 @@ export class ChatSocket {
 
     this.handlers.onStatus(this.hasConnectedOnce ? 'reconnecting' : 'connecting');
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url = `${proto}//${window.location.host}/api/v1/ws`;
+    const url = `${proto}//${window.location.host}${this.wsPath}`;
 
     let socket: WebSocket;
     try {
@@ -341,6 +562,15 @@ export class ChatSocket {
     };
   }
 
+  private sendRaw(frame: Record<string, unknown>): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    try {
+      this.ws.send(JSON.stringify(frame));
+    } catch {
+      // Ignore transient write errors while closing.
+    }
+  }
+
   sendTyping(roomId: string, active: boolean): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     const now = Date.now();
@@ -351,11 +581,41 @@ export class ChatSocket {
     } else {
       this.lastTypingAt.delete(roomId);
     }
-    try {
-      this.ws.send(JSON.stringify({ t: 'typing', room: roomId, active }));
-    } catch {
-      // Ignore transient write errors while closing.
-    }
+    this.sendRaw({ t: 'typing', room: roomId, active });
+  }
+
+  sendCallSignal(
+    roomId: string,
+    callId: string,
+    to: string,
+    kind: 'offer' | 'answer' | 'ice',
+    payload: unknown,
+  ): void {
+    this.sendRaw({ t: 'call.signal', room: roomId, call_id: callId, to, kind, payload });
+  }
+
+  sendCallMedia(
+    roomId: string,
+    callId: string,
+    media: { audio: boolean; video: boolean; screenShare: boolean; protectIp: boolean },
+  ): void {
+    this.sendRaw({
+      t: 'call.media',
+      room: roomId,
+      call_id: callId,
+      audio: media.audio,
+      video: media.video,
+      screen_share: media.screenShare,
+      protect_ip: media.protectIp,
+    });
+  }
+
+  sendCallMigrated(roomId: string, callId: string): void {
+    this.sendRaw({ t: 'call.migrated', room: roomId, call_id: callId });
+  }
+
+  sendCallICEFailed(roomId: string, callId: string): void {
+    this.sendRaw({ t: 'call.ice_failed', room: roomId, call_id: callId });
   }
 
   close(): void {
@@ -379,11 +639,7 @@ export class ChatSocket {
     this.stopPing();
     this.pingTimer = setInterval(() => {
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        try {
-          this.ws.send(JSON.stringify({ t: 'ping' }));
-        } catch {
-          // Ignore.
-        }
+        this.sendRaw({ t: 'ping' });
       }
     }, 25000);
   }

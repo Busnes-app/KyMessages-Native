@@ -97,10 +97,115 @@ export interface ChatRoomWebhook {
   created_at: number;
 }
 
+export type CallMode = 'p2p_mesh' | 'sfu_livekit';
+
+export interface CallPeer {
+  user_id: string;
+  display_name: string;
+  is_guest: boolean;
+  audio: boolean;
+  video: boolean;
+  screen_share: boolean;
+  protect_ip: boolean;
+  joined_at: number;
+}
+
+export interface CallState {
+  call_id: string;
+  room_id: string;
+  mode: CallMode;
+  sfu_sticky: boolean;
+  livekit_room?: string;
+  ended?: boolean;
+  peers: CallPeer[];
+}
+
+export interface CallJoinResponse {
+  call_id: string;
+  room_id: string;
+  mode: CallMode;
+  sfu_sticky: boolean;
+  ice_servers: RTCIceServer[];
+  livekit_url?: string;
+  livekit_token?: string;
+  livekit_room?: string;
+  peers: CallPeer[];
+}
+
+export interface CallMigratePayload {
+  call_id: string;
+  room_id: string;
+  target_mode: CallMode;
+  reason?: string;
+  livekit_url?: string;
+  livekit_token?: string;
+  livekit_room?: string;
+  ice_servers?: RTCIceServer[];
+}
+
+export interface CallSignalData {
+  call_id: string;
+  from: string;
+  to: string;
+  kind: 'offer' | 'answer' | 'ice';
+  payload: unknown;
+}
+
+export interface LobbyGuest {
+  guest_id: string;
+  meeting_id: string;
+  room_id: string;
+  display_name: string;
+  status: 'waiting' | 'admitted' | 'denied';
+  knocked_at: number;
+}
+
+export interface MediaPolicyConfig {
+  p2p_policy: 'hybrid' | 'sfu_only';
+  p2p_max_video: number;
+  p2p_max_audio: number;
+  guest_force_sfu: boolean;
+}
+
+export interface AdminMediaPolicyResponse {
+  policy: MediaPolicyConfig;
+  rtc: {
+    sfu_available: boolean;
+    livekit_url: string;
+    stun_urls: string[];
+  };
+  stats: {
+    active_calls: number;
+    p2p_calls: number;
+    sfu_calls: number;
+    active_peers: number;
+    sfu_available: boolean;
+  };
+}
+
+export interface GuestMeetInfo {
+  meeting_title: string;
+  closed: boolean;
+  in_window: boolean;
+  pow_required: boolean;
+  sfu_available: boolean;
+  session?: {
+    guest_id: string;
+    display_name: string;
+    status: 'waiting' | 'admitted' | 'denied';
+    room_id: string;
+  };
+}
+
 export interface ChatBootstrap {
   user: ChatCurrentUser;
   tenant: ChatTenant;
   rooms: ChatRoomSummary[];
+  active_calls: Record<string, CallState>;
+  rtc: {
+    sfu_available: boolean;
+    ice_servers: RTCIceServer[];
+  };
 }
 
 export interface ChatRoomDetail {
@@ -126,6 +231,11 @@ export type WsServerEvent =
   | { kind: 'room.closed'; roomId: string }
   | { kind: 'typing'; roomId: string; userId: string; active: boolean }
   | { kind: 'read.sync'; roomId: string; lastReadSeq: number }
+  | { kind: 'call.state'; roomId: string; state: CallState }
+  | { kind: 'call.signal'; roomId: string; signal: CallSignalData }
+  | { kind: 'call.migrate'; roomId: string; migrate: CallMigratePayload }
+  | { kind: 'lobby.knock'; roomId: string; guest: LobbyGuest }
+  | { kind: 'lobby.decision'; roomId: string; guestId: string; decision: 'admitted' | 'denied'; meetingId: string }
   | { kind: 'auth.revoked' };
 
 const ROOM_KINDS: readonly RoomKind[] = ['dm', 'channel', 'meeting'];
@@ -253,12 +363,171 @@ export function parseWebhook(v: unknown): ChatRoomWebhook {
   };
 }
 
+const CALL_MODES: readonly CallMode[] = ['p2p_mesh', 'sfu_livekit'];
+
+export function parseICEServers(v: unknown): RTCIceServer[] {
+  if (!Array.isArray(v)) return [];
+  const out: RTCIceServer[] = [];
+  for (const item of v) {
+    try {
+      const o = obj(item);
+      const urls = Array.isArray(o.urls)
+        ? o.urls.filter((u): u is string => typeof u === 'string' && u.length > 0)
+        : typeof o.urls === 'string' && o.urls.length > 0
+          ? [o.urls]
+          : [];
+      if (urls.length > 0) {
+        const srv: RTCIceServer = { urls };
+        if (typeof o.username === 'string' && o.username) srv.username = o.username;
+        if (typeof o.credential === 'string' && o.credential) srv.credential = o.credential;
+        out.push(srv);
+      }
+    } catch {
+      // Ignore malformed entry.
+    }
+  }
+  return out;
+}
+
+export function parseCallPeer(v: unknown): CallPeer {
+  const o = obj(v);
+  return {
+    user_id: str(o.user_id, 128),
+    display_name: opt(o.display_name, (s) => str(s, 255)) ?? '',
+    is_guest: opt(o.is_guest, bool) ?? false,
+    audio: opt(o.audio, bool) ?? true,
+    video: opt(o.video, bool) ?? false,
+    screen_share: opt(o.screen_share, bool) ?? false,
+    protect_ip: opt(o.protect_ip, bool) ?? false,
+    joined_at: opt(o.joined_at, num) ?? 0,
+  };
+}
+
+export function parseCallState(v: unknown): CallState {
+  const o = obj(v);
+  return {
+    call_id: str(o.call_id, 128),
+    room_id: str(o.room_id, 128),
+    mode: opt(o.mode, (m) => oneOf(m, CALL_MODES)) ?? 'p2p_mesh',
+    sfu_sticky: opt(o.sfu_sticky, bool) ?? false,
+    livekit_room: opt(o.livekit_room, (s) => str(s, 256)),
+    ended: opt(o.ended, bool),
+    peers: opt(o.peers, (list) => arr(list).map(parseCallPeer)) ?? [],
+  };
+}
+
+export function parseCallJoinResponse(v: unknown): CallJoinResponse {
+  const o = obj(v);
+  return {
+    call_id: str(o.call_id, 128),
+    room_id: str(o.room_id, 128),
+    mode: oneOf(o.mode, CALL_MODES),
+    sfu_sticky: opt(o.sfu_sticky, bool) ?? false,
+    ice_servers: parseICEServers(o.ice_servers),
+    livekit_url: opt(o.livekit_url, (s) => str(s, 512)),
+    livekit_token: opt(o.livekit_token, (s) => str(s, 4096)),
+    livekit_room: opt(o.livekit_room, (s) => str(s, 256)),
+    peers: opt(o.peers, (list) => arr(list).map(parseCallPeer)) ?? [],
+  };
+}
+
+export function parseCallMigrate(v: unknown): CallMigratePayload {
+  const o = obj(v);
+  return {
+    call_id: str(o.call_id, 128),
+    room_id: str(o.room_id, 128),
+    target_mode: oneOf(o.target_mode, CALL_MODES),
+    reason: opt(o.reason, (s) => str(s, 128)),
+    livekit_url: opt(o.livekit_url, (s) => str(s, 512)),
+    livekit_token: opt(o.livekit_token, (s) => str(s, 4096)),
+    livekit_room: opt(o.livekit_room, (s) => str(s, 256)),
+    ice_servers: o.ice_servers !== undefined ? parseICEServers(o.ice_servers) : undefined,
+  };
+}
+
+export function parseLobbyGuest(v: unknown): LobbyGuest {
+  const o = obj(v);
+  return {
+    guest_id: str(o.guest_id, 128),
+    meeting_id: opt(o.meeting_id, (s) => str(s, 128)) ?? '',
+    room_id: opt(o.room_id, (s) => str(s, 128)) ?? '',
+    display_name: opt(o.display_name, (s) => str(s, 255)) ?? 'Guest',
+    status: oneOf(o.status ?? 'waiting', ['waiting', 'admitted', 'denied'] as const),
+    knocked_at: opt(o.knocked_at, num) ?? Date.now(),
+  };
+}
+
+export function parseAdminMediaPolicy(v: unknown): AdminMediaPolicyResponse {
+  const o = obj(v);
+  const p = obj(o.policy);
+  const r = obj(o.rtc);
+  const st = obj(o.stats);
+  return {
+    policy: {
+      p2p_policy: oneOf(p.p2p_policy, ['hybrid', 'sfu_only'] as const),
+      p2p_max_video: count(p.p2p_max_video),
+      p2p_max_audio: count(p.p2p_max_audio),
+      guest_force_sfu: bool(p.guest_force_sfu),
+    },
+    rtc: {
+      sfu_available: opt(r.sfu_available, bool) ?? false,
+      livekit_url: opt(r.livekit_url, (s) => str(s, 512)) ?? '',
+      stun_urls: opt(r.stun_urls, (list) => arr(list).map((s) => str(s, 512))) ?? [],
+    },
+    stats: {
+      active_calls: opt(st.active_calls, count) ?? 0,
+      p2p_calls: opt(st.p2p_calls, count) ?? 0,
+      sfu_calls: opt(st.sfu_calls, count) ?? 0,
+      active_peers: opt(st.active_peers, count) ?? 0,
+      sfu_available: opt(st.sfu_available, bool) ?? false,
+    },
+  };
+}
+
+export function parseGuestMeetInfo(v: unknown): GuestMeetInfo {
+  const o = obj(v);
+  let session: GuestMeetInfo['session'];
+  if (o.session && typeof o.session === 'object') {
+    const s = obj(o.session);
+    session = {
+      guest_id: str(s.guest_id, 128),
+      display_name: opt(s.display_name, (x) => str(x, 255)) ?? 'Guest',
+      status: oneOf(s.status, ['waiting', 'admitted', 'denied'] as const),
+      room_id: opt(s.room_id, (x) => str(x, 128)) ?? '',
+    };
+  }
+  return {
+    meeting_title: opt(o.meeting_title, (s) => str(s, 255)) ?? 'Meeting',
+    closed: opt(o.closed, bool) ?? false,
+    in_window: opt(o.in_window, bool) ?? false,
+    pow_required: opt(o.pow_required, bool) ?? false,
+    sfu_available: opt(o.sfu_available, bool) ?? false,
+    session,
+  };
+}
+
 export function parseBootstrap(v: unknown): ChatBootstrap {
   const o = obj(v);
+  const activeCalls: Record<string, CallState> = {};
+  if (o.active_calls && typeof o.active_calls === 'object' && !Array.isArray(o.active_calls)) {
+    for (const [rid, rawState] of Object.entries(o.active_calls as Record<string, unknown>)) {
+      try {
+        activeCalls[rid] = parseCallState(rawState);
+      } catch {
+        // Ignore malformed call state.
+      }
+    }
+  }
+  const rtcObj = o.rtc && typeof o.rtc === 'object' ? obj(o.rtc) : {};
   return {
     user: parseCurrentUser(o.user),
     tenant: parseTenant(o.tenant),
     rooms: opt(o.rooms, (list) => arr(list).map(parseRoomSummary)) ?? [],
+    active_calls: activeCalls,
+    rtc: {
+      sfu_available: opt(rtcObj.sfu_available, bool) ?? false,
+      ice_servers: parseICEServers(rtcObj.ice_servers),
+    },
   };
 }
 
@@ -372,6 +641,48 @@ export function parseWsEvent(raw: unknown): WsServerEvent | null {
           kind: 'read.sync',
           roomId: str(d.room_id, 128),
           lastReadSeq: count(d.last_read_seq),
+        };
+      }
+      case 'call.state': {
+        if (data === undefined || data === null) return null;
+        const state = parseCallState(data);
+        return { kind: 'call.state', roomId: roomId || state.room_id, state };
+      }
+      case 'call.signal': {
+        if (data === undefined || data === null) return null;
+        const d = obj(data);
+        const sigKind = oneOf(d.kind, ['offer', 'answer', 'ice'] as const);
+        return {
+          kind: 'call.signal',
+          roomId,
+          signal: {
+            call_id: str(d.call_id, 128),
+            from: str(d.from, 128),
+            to: str(d.to, 128),
+            kind: sigKind,
+            payload: d.payload,
+          },
+        };
+      }
+      case 'call.migrate': {
+        if (data === undefined || data === null) return null;
+        const migrate = parseCallMigrate(data);
+        return { kind: 'call.migrate', roomId: roomId || migrate.room_id, migrate };
+      }
+      case 'lobby.knock': {
+        if (data === undefined || data === null) return null;
+        const guest = parseLobbyGuest(data);
+        return { kind: 'lobby.knock', roomId: roomId || guest.room_id, guest };
+      }
+      case 'lobby.decision': {
+        if (data === undefined || data === null) return null;
+        const d = obj(data);
+        return {
+          kind: 'lobby.decision',
+          roomId: roomId || (opt(d.room_id, (s) => str(s, 128)) ?? ''),
+          guestId: str(d.guest_id, 128),
+          decision: oneOf(d.decision, ['admitted', 'denied'] as const),
+          meetingId: opt(d.meeting_id, (s) => str(s, 128)) ?? '',
         };
       }
       case 'auth.revoked':

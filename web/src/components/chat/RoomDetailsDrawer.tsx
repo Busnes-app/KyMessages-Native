@@ -22,6 +22,7 @@ import type {
   ChatMessage,
   ChatRoomDetail,
   ChatRoomWebhook,
+  LobbyGuest,
 } from '../../chat/types';
 import {
   addRoomMember,
@@ -87,11 +88,14 @@ interface RoomDetailsDrawerProps {
   isGlobalAdmin: boolean;
   directory: ChatDirectoryUser[];
   messages: ChatMessage[];
+  lobbyGuests?: LobbyGuest[];
   onClose: () => void;
   onRefresh: () => Promise<void>;
   onLeftRoom: (roomId: string) => void;
   onOpenSearch: () => void;
   onStartDM: (userId: string) => Promise<void>;
+  onDecideLobby?: (guestId: string, admit: boolean) => Promise<void>;
+  onCreateGuestLink?: () => Promise<string>;
 }
 
 export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
@@ -101,11 +105,14 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
   isGlobalAdmin,
   directory,
   messages,
+  lobbyGuests = [],
   onClose,
   onRefresh,
   onLeftRoom,
   onOpenSearch,
   onStartDM,
+  onDecideLobby,
+  onCreateGuestLink,
 }) => {
   const [tab, setTab] = useState<DrawerTab>('about');
   const [name, setName] = useState('');
@@ -119,6 +126,8 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
   const [createdToken, setCreatedToken] = useState<{ id: string; token: string } | null>(null);
   const [copiedCurl, setCopiedCurl] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
+  const [guestLink, setGuestLink] = useState('');
+  const [copiedGuestLink, setCopiedGuestLink] = useState(false);
   const [err, setErr] = useState('');
 
   const room = detail?.room;
@@ -401,6 +410,33 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
                     {copiedLink ? <Check size={14} aria-hidden="true" /> : <Copy size={14} aria-hidden="true" />}
                     <span>{copiedLink ? 'Copied' : 'Copy link'}</span>
                   </button>
+                  {!isDM && onCreateGuestLink && (
+                    <button
+                      type="button"
+                      className="chat-quick-btn"
+                      disabled={busyAction}
+                      onClick={() => {
+                        setBusyAction(true);
+                        setErr('');
+                        void onCreateGuestLink()
+                          .then(async (url) => {
+                            setGuestLink(url);
+                            try {
+                              await navigator.clipboard.writeText(url);
+                              setCopiedGuestLink(true);
+                              setTimeout(() => setCopiedGuestLink(false), 1800);
+                            } catch {
+                              // Clipboard unavailable; URL is still displayed below.
+                            }
+                          })
+                          .catch((e) => setErr(e instanceof Error ? e.message : 'Could not create guest link'))
+                          .finally(() => setBusyAction(false));
+                      }}
+                    >
+                      {copiedGuestLink ? <Check size={14} aria-hidden="true" /> : <Link2 size={14} aria-hidden="true" />}
+                      <span>{copiedGuestLink ? 'Copied!' : 'Guest link'}</span>
+                    </button>
+                  )}
                   {!isDM && (
                     <button
                       type="button"
@@ -413,6 +449,63 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
                     </button>
                   )}
                 </div>
+
+                {guestLink && (
+                  <section className="chat-drawer-section">
+                    <div className="chat-drawer-section-head">
+                      <h4>External guest invite link</h4>
+                    </div>
+                    <div className="ky-guest-link-box">
+                      <input type="text" readOnly value={guestLink} onFocus={(e) => e.currentTarget.select()} />
+                      <button
+                        type="button"
+                        className="chat-icon-btn"
+                        title="Copy guest link"
+                        onClick={() => {
+                          void navigator.clipboard.writeText(guestLink).then(() => {
+                            setCopiedGuestLink(true);
+                            setTimeout(() => setCopiedGuestLink(false), 1800);
+                          }).catch(() => undefined);
+                        }}
+                      >
+                        {copiedGuestLink ? <Check size={14} /> : <Copy size={14} />}
+                      </button>
+                    </div>
+                  </section>
+                )}
+
+                {lobbyGuests.length > 0 && onDecideLobby && (
+                  <section className="chat-drawer-section">
+                    <div className="chat-drawer-section-head">
+                      <h4>Waiting room ({lobbyGuests.length})</h4>
+                    </div>
+                    <div className="ky-lobby-list">
+                      {lobbyGuests.map((g) => (
+                        <div key={g.guest_id} className="ky-lobby-row">
+                          <span className="ky-lobby-name">{g.display_name}</span>
+                          <div className="ky-lobby-actions">
+                            <button
+                              type="button"
+                              className="ky-lobby-btn is-admit"
+                              disabled={busyAction}
+                              onClick={() => void onDecideLobby(g.guest_id, true)}
+                            >
+                              Admit
+                            </button>
+                            <button
+                              type="button"
+                              className="ky-lobby-btn is-deny"
+                              disabled={busyAction}
+                              onClick={() => void onDecideLobby(g.guest_id, false)}
+                            >
+                              Deny
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+                )}
 
                 {sharedLinks.length > 0 && (
                   <section className="chat-drawer-section">

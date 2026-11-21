@@ -13,6 +13,7 @@
     "pretest": "node src/ky-ui/check-vendor.mjs"
   },
   "dependencies": {
+    "livekit-client": "^2.25.0",
     "lucide-react": "^1.16.0",
     "qrcode": "^1.5.4",
     "react": "^19.0.0",
