@@ -56,11 +56,11 @@ type LobbyManager struct {
 	leaveGrace time.Duration
 	now        func() time.Time
 
-	mu             sync.Mutex
-	bySecret       map[string]*GuestSession            // sessionSecret -> session
-	byGuestID      map[string]*GuestSession            // guestID -> session
-	byRoom         map[string]map[string]*GuestSession // roomID -> guestID -> session
-	byMeetingKey   map[string]string                   // meetingID+"|"+guestKey -> guestID (1 live session per token)
+	mu           sync.Mutex
+	bySecret     map[string]*GuestSession            // sessionSecret -> session
+	byGuestID    map[string]*GuestSession            // guestID -> session
+	byRoom       map[string]map[string]*GuestSession // roomID -> guestID -> session
+	byMeetingKey map[string]string                   // meetingID+"|"+guestKey -> guestID (1 live session per token)
 }
 
 // NewLobbyManager constructs a LobbyManager wired to Hub and CallManager.
