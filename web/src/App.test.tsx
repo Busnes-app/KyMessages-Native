@@ -65,3 +65,14 @@ it('catches a render failure in a page and keeps a message on screen', () => {
   expect(screen.getByRole('alert').textContent).toContain('This page failed to load: boom');
   vi.restoreAllMocks();
 });
+
+it('opens preferences via the bottom settings gear and omits Pair Device', async () => {
+  stubServer(async () => json({ logged_out: true }));
+  render(<App />);
+  const gear = await screen.findByRole('button', { name: 'Settings' });
+  expect(screen.queryByRole('button', { name: /pair device/i })).toBeNull();
+  fireEvent.click(gear);
+  expect(await screen.findByRole('heading', { name: 'Preferences' })).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: /back to chat/i }));
+  expect(await screen.findByRole('button', { name: 'Settings' })).toBeTruthy();
+});

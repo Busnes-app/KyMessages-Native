@@ -13,6 +13,7 @@ import { Health } from './pages/Health';
 import { Audit } from './pages/Audit';
 import { ConfirmItsYou } from './components/ConfirmItsYou';
 import { TwoFactorSetup } from './components/TwoFactorSetup';
+import { ThemeSwitcher } from './components/ThemeSwitcher';
 import { Chat } from './pages/Chat';
 import './styles/theme.css';
 import './ky-ui/tokens.css';
@@ -112,12 +113,40 @@ export const App: React.FC = () => {
   }
 
   const isAdmin = user.role === 'admin';
-  const currentTab = isAdmin ? activeTab : 'chat';
+  const currentTab = isAdmin ? activeTab : activeTab === 'settings' ? 'settings' : 'chat';
+  const appName = settings?.app_name || 'KyMessages';
+
+  if (currentTab === 'chat') {
+    return (
+      <div className="app-shell app-shell-chat">
+        {isAdmin && <ConfirmItsYou />}
+        {error && (
+          <div className="dr-alert dr-alert-error app-floating-alert" role="alert">
+            <span>{error}</span>
+          </div>
+        )}
+        <main className="app-main">
+          <ErrorBoundary key="chat">
+            <Chat
+              appName={appName}
+              user={user}
+              onOpenSettings={() => setActiveTab('settings')}
+              onLogout={handleLogout}
+              onAuthRevoked={() => {
+                setUser(null);
+                setNotice('Your session ended. Sign in again to continue.');
+              }}
+            />
+          </ErrorBoundary>
+        </main>
+      </div>
+    );
+  }
 
   return (
     <div className="app-shell">
       <AppHeader
-        appName={settings?.app_name || 'KyMessages'}
+        appName={appName}
         activeTab={currentTab}
         onTabChange={(t) => setActiveTab(t)}
         user={user}
@@ -129,24 +158,36 @@ export const App: React.FC = () => {
       <main className="app-main">
         {errorAlert}
         <ErrorBoundary key={currentTab}>
-        {currentTab === 'chat' && (
-          <Chat
-            onAuthRevoked={() => {
-              setUser(null);
-              setNotice('Your session ended. Sign in again to continue.');
-            }}
-          />
-        )}
-        {isAdmin && activeTab === 'dashboard' && <Dashboard settings={settings} user={user} onNavigate={(t) => setActiveTab(t)} />}
-        {isAdmin && activeTab === 'users' && <Users />}
-        {isAdmin && activeTab === 'agents' && <Agents />}
-        {isAdmin && activeTab === 'rooms' && <Rooms />}
-        {isAdmin && activeTab === 'health' && <Health />}
-        {isAdmin && activeTab === 'audit' && <Audit />}
-        {isAdmin && activeTab === 'scim' && <SCIMAdmin />}
-        {isAdmin && activeTab === 'backup' && <Backup />}
-        {isAdmin && activeTab === 'settings' && <Settings settings={settings} onBrandingChanged={() => void loadSettings()} />}
-        {isAdmin && activeTab === 'settings' && <TwoFactorSetup />}
+          {!isAdmin && currentTab === 'settings' && (
+            <div style={{ maxWidth: '720px', margin: '0 auto', padding: '32px 20px' }}>
+              <h1 style={{ fontSize: '22px', fontWeight: 700, marginBottom: '6px' }}>Preferences</h1>
+              <p style={{ color: 'var(--ink)', fontSize: '14px', marginBottom: '20px' }}>
+                Appearance and account details for {user.display_name || user.username}.
+              </p>
+              <div className="panel" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                <div>
+                  <h3 style={{ fontSize: '15px', marginBottom: '6px' }}>Color theme</h3>
+                  <p style={{ color: 'var(--ink)', fontSize: '13px', marginBottom: '10px' }}>
+                    Choose a palette for this browser.
+                  </p>
+                  <ThemeSwitcher />
+                </div>
+                <div style={{ borderTop: '1px solid var(--line)', paddingTop: '14px', fontSize: '13px', color: 'var(--ink)' }}>
+                  Signed in as <strong style={{ color: 'var(--ink-strong)' }}>{user.display_name || user.username}</strong> (@{user.username})
+                </div>
+              </div>
+            </div>
+          )}
+          {isAdmin && activeTab === 'dashboard' && <Dashboard settings={settings} user={user} onNavigate={(t) => setActiveTab(t)} />}
+          {isAdmin && activeTab === 'users' && <Users />}
+          {isAdmin && activeTab === 'agents' && <Agents />}
+          {isAdmin && activeTab === 'rooms' && <Rooms />}
+          {isAdmin && activeTab === 'health' && <Health />}
+          {isAdmin && activeTab === 'audit' && <Audit />}
+          {isAdmin && activeTab === 'scim' && <SCIMAdmin />}
+          {isAdmin && activeTab === 'backup' && <Backup />}
+          {isAdmin && activeTab === 'settings' && <Settings settings={settings} onBrandingChanged={() => void loadSettings()} />}
+          {isAdmin && activeTab === 'settings' && <TwoFactorSetup />}
         </ErrorBoundary>
       </main>
     </div>

@@ -1,19 +1,34 @@
-import React from 'react';
-import { Hash, Lock, Plus, Search, X } from 'lucide-react';
+import React, { useState } from 'react';
+import {
+  ChevronDown,
+  ChevronRight,
+  Hash,
+  Lock,
+  LogOut,
+  Plus,
+  Search,
+  Settings as SettingsIcon,
+  X,
+} from 'lucide-react';
 import type { ChatRoomSummary, WsStatus } from '../../chat/types';
 import { initialsFor, sortRooms } from '../../chat/state';
+import type { SessionUser } from '../../dto';
 
 interface ChatSidebarProps {
+  appName?: string;
   tenantName: string;
   rooms: ChatRoomSummary[];
   activeRoomId: string | null;
   wsStatus: WsStatus;
   mobileOpen: boolean;
+  user?: SessionUser | null;
   onCloseMobile: () => void;
   onSelectRoom: (roomId: string) => void;
   onOpenNewChannel: () => void;
   onOpenNewDM: () => void;
   onOpenSearch: () => void;
+  onOpenSettings?: () => void;
+  onLogout?: () => void;
 }
 
 function statusLabel(status: WsStatus): string {
@@ -32,30 +47,48 @@ function statusLabel(status: WsStatus): string {
 }
 
 export const ChatSidebar: React.FC<ChatSidebarProps> = ({
+  appName,
   tenantName,
   rooms,
   activeRoomId,
   wsStatus,
   mobileOpen,
+  user,
   onCloseMobile,
   onSelectRoom,
   onOpenNewChannel,
   onOpenNewDM,
   onOpenSearch,
+  onOpenSettings,
+  onLogout,
 }) => {
+  const [channelsOpen, setChannelsOpen] = useState(true);
+  const [dmsOpen, setDmsOpen] = useState(true);
+
   const channels = sortRooms(rooms.filter((r) => r.kind !== 'dm'));
   const dms = sortRooms(rooms.filter((r) => r.kind === 'dm'));
 
+  const normalizedTenant = tenantName.trim();
+  const brandTitle =
+    normalizedTenant && normalizedTenant.toLowerCase() !== 'default'
+      ? normalizedTenant
+      : appName || 'KyMessages';
+
+  const userLabel = user ? user.display_name || user.username : '';
+
   return (
-    <aside className={mobileOpen ? 'chat-rail mobile-open' : 'chat-rail'} aria-label="Conversations">
+    <aside className={mobileOpen ? 'chat-rail mobile-open' : 'chat-rail'} aria-label="Workspace and conversations">
       <div className="chat-rail-top">
-        <span className="chat-rail-title" title={tenantName}>
-          {tenantName}
-        </span>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
-          <span className={`chat-conn ${wsStatus}`} aria-live="polite">
+        <div className="chat-rail-brand">
+          <img src="/app-icon.png" width={26} height={26} alt="" />
+          <span className="chat-rail-title" title={brandTitle}>
+            {brandTitle}
+          </span>
+        </div>
+        <div className="chat-rail-top-right">
+          <span className={`chat-conn ${wsStatus}`} aria-live="polite" title={`Connection: ${statusLabel(wsStatus)}`}>
             <span className="chat-conn-dot" aria-hidden="true" />
-            {statusLabel(wsStatus)}
+            <span className="chat-conn-label">{statusLabel(wsStatus)}</span>
           </span>
           {mobileOpen && (
             <button
@@ -81,9 +114,21 @@ export const ChatSidebar: React.FC<ChatSidebarProps> = ({
       <div className="chat-rail-list chat-scroll">
         <section aria-labelledby="chat-channels-heading">
           <div className="chat-section-head">
-            <span id="chat-channels-heading" className="chat-section-label">
-              Channels
-            </span>
+            <button
+              type="button"
+              id="chat-channels-heading"
+              className="chat-section-toggle"
+              aria-expanded={channelsOpen}
+              onClick={() => setChannelsOpen((o) => !o)}
+            >
+              {channelsOpen ? (
+                <ChevronDown size={13} aria-hidden="true" />
+              ) : (
+                <ChevronRight size={13} aria-hidden="true" />
+              )}
+              <span className="chat-section-label">Channels</span>
+              <span className="chat-section-count">{channels.length}</span>
+            </button>
             <button
               type="button"
               className="chat-icon-btn"
@@ -95,45 +140,59 @@ export const ChatSidebar: React.FC<ChatSidebarProps> = ({
             </button>
           </div>
 
-          <div className="chat-room-group">
-            {channels.length === 0 ? (
-              <p className="chat-rail-empty">No channels yet</p>
-            ) : (
-              channels.map((room) => {
-                const active = room.id === activeRoomId;
-                const unread = !active && room.unread_count > 0;
-                return (
-                  <button
-                    key={room.id}
-                    type="button"
-                    className={`chat-room-btn${active ? ' active' : ''}${unread ? ' unread' : ''}`}
-                    aria-current={active ? 'true' : undefined}
-                    onClick={() => {
-                      onSelectRoom(room.id);
-                      onCloseMobile();
-                    }}
-                  >
-                    <span className="chat-room-btn-left">
-                      {room.is_private ? (
-                        <Lock size={14} className="chat-room-icon" aria-hidden="true" />
-                      ) : (
-                        <Hash size={14} className="chat-room-icon" aria-hidden="true" />
-                      )}
-                      <span className="chat-room-btn-name">{room.name || 'Untitled'}</span>
-                    </span>
-                    {unread && <span className="chat-unread-pill">{room.unread_count}</span>}
-                  </button>
-                );
-              })
-            )}
-          </div>
+          {channelsOpen && (
+            <div className="chat-room-group">
+              {channels.length === 0 ? (
+                <p className="chat-rail-empty">No channels yet</p>
+              ) : (
+                channels.map((room) => {
+                  const active = room.id === activeRoomId;
+                  const unread = !active && room.unread_count > 0;
+                  return (
+                    <button
+                      key={room.id}
+                      type="button"
+                      className={`chat-room-btn${active ? ' active' : ''}${unread ? ' unread' : ''}`}
+                      aria-current={active ? 'true' : undefined}
+                      onClick={() => {
+                        onSelectRoom(room.id);
+                        onCloseMobile();
+                      }}
+                    >
+                      <span className="chat-room-btn-left">
+                        {room.is_private ? (
+                          <Lock size={14} className="chat-room-icon" aria-hidden="true" />
+                        ) : (
+                          <Hash size={14} className="chat-room-icon" aria-hidden="true" />
+                        )}
+                        <span className="chat-room-btn-name">{room.name || 'Untitled'}</span>
+                      </span>
+                      {unread && <span className="chat-unread-pill">{room.unread_count}</span>}
+                    </button>
+                  );
+                })
+              )}
+            </div>
+          )}
         </section>
 
         <section aria-labelledby="chat-dms-heading">
           <div className="chat-section-head">
-            <span id="chat-dms-heading" className="chat-section-label">
-              Direct messages
-            </span>
+            <button
+              type="button"
+              id="chat-dms-heading"
+              className="chat-section-toggle"
+              aria-expanded={dmsOpen}
+              onClick={() => setDmsOpen((o) => !o)}
+            >
+              {dmsOpen ? (
+                <ChevronDown size={13} aria-hidden="true" />
+              ) : (
+                <ChevronRight size={13} aria-hidden="true" />
+              )}
+              <span className="chat-section-label">Direct messages</span>
+              <span className="chat-section-count">{dms.length}</span>
+            </button>
             <button
               type="button"
               className="chat-icon-btn"
@@ -145,39 +204,79 @@ export const ChatSidebar: React.FC<ChatSidebarProps> = ({
             </button>
           </div>
 
-          <div className="chat-room-group">
-            {dms.length === 0 ? (
-              <p className="chat-rail-empty">No direct messages yet</p>
-            ) : (
-              dms.map((room) => {
-                const active = room.id === activeRoomId;
-                const unread = !active && room.unread_count > 0;
-                const label = room.name || 'Direct message';
-                return (
-                  <button
-                    key={room.id}
-                    type="button"
-                    className={`chat-room-btn${active ? ' active' : ''}${unread ? ' unread' : ''}`}
-                    aria-current={active ? 'true' : undefined}
-                    onClick={() => {
-                      onSelectRoom(room.id);
-                      onCloseMobile();
-                    }}
-                  >
-                    <span className="chat-room-btn-left">
-                      <span className="chat-dm-avatar" aria-hidden="true">
-                        {initialsFor(label)}
+          {dmsOpen && (
+            <div className="chat-room-group">
+              {dms.length === 0 ? (
+                <p className="chat-rail-empty">No direct messages yet</p>
+              ) : (
+                dms.map((room) => {
+                  const active = room.id === activeRoomId;
+                  const unread = !active && room.unread_count > 0;
+                  const label = room.name || 'Direct message';
+                  return (
+                    <button
+                      key={room.id}
+                      type="button"
+                      className={`chat-room-btn${active ? ' active' : ''}${unread ? ' unread' : ''}`}
+                      aria-current={active ? 'true' : undefined}
+                      onClick={() => {
+                        onSelectRoom(room.id);
+                        onCloseMobile();
+                      }}
+                    >
+                      <span className="chat-room-btn-left">
+                        <span className="chat-dm-avatar" aria-hidden="true">
+                          {initialsFor(label)}
+                        </span>
+                        <span className="chat-room-btn-name">{label}</span>
                       </span>
-                      <span className="chat-room-btn-name">{label}</span>
-                    </span>
-                    {unread && <span className="chat-unread-pill">{room.unread_count}</span>}
-                  </button>
-                );
-              })
-            )}
-          </div>
+                      {unread && <span className="chat-unread-pill">{room.unread_count}</span>}
+                    </button>
+                  );
+                })
+              )}
+            </div>
+          )}
         </section>
       </div>
+
+      {user && (
+        <div className="chat-rail-footer">
+          <div className="app-user">
+            <span className="app-user-avatar" aria-hidden="true">
+              {initialsFor(userLabel)}
+            </span>
+            <div className="app-user-copy">
+              <div className="app-user-name">{userLabel}</div>
+              <div className="app-user-role">{user.role}</div>
+            </div>
+            <div className="app-user-buttons">
+              {onOpenSettings && (
+                <button
+                  type="button"
+                  className="app-footer-icon"
+                  onClick={onOpenSettings}
+                  title="Settings"
+                  aria-label="Settings"
+                >
+                  <SettingsIcon size={16} />
+                </button>
+              )}
+              {onLogout && (
+                <button
+                  type="button"
+                  className="app-footer-icon danger"
+                  onClick={onLogout}
+                  title="Sign out"
+                  aria-label="Sign out"
+                >
+                  <LogOut size={16} />
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </aside>
   );
 };

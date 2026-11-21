@@ -5,12 +5,14 @@ import {
   Lock,
   Menu,
   MessageSquarePlus,
-  PanelRight,
+  PanelRightClose,
+  PanelRightOpen,
   Search,
   Send,
   X,
 } from 'lucide-react';
 import '../styles/chat.css';
+import type { SessionUser } from '../dto';
 import {
   ChatSocket,
   createChannel,
@@ -50,6 +52,10 @@ import { RoomDetailsDrawer } from '../components/chat/RoomDetailsDrawer';
 import { CreateChannelModal, SearchModal, StartDMModal } from '../components/chat/ChatModals';
 
 interface ChatProps {
+  appName?: string;
+  user?: SessionUser | null;
+  onOpenSettings?: () => void;
+  onLogout?: () => void;
   onAuthRevoked?: () => void;
 }
 
@@ -61,7 +67,13 @@ interface RoomMessageBucket {
   loaded: boolean;
 }
 
-export const Chat: React.FC<ChatProps> = ({ onAuthRevoked }) => {
+export const Chat: React.FC<ChatProps> = ({
+  appName,
+  user,
+  onOpenSettings,
+  onLogout,
+  onAuthRevoked,
+}) => {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
   const [bannerError, setBannerError] = useState('');
@@ -430,7 +442,9 @@ export const Chat: React.FC<ChatProps> = ({ onAuthRevoked }) => {
         setRooms(boot.rooms);
         setDirectory(users);
         if (boot.rooms.length > 0) {
-          setActiveRoomId(boot.rooms[0].id);
+          const requestedRoom = new URLSearchParams(window.location.search).get('room');
+          const matched = requestedRoom ? boot.rooms.find((r) => r.id === requestedRoom) : undefined;
+          setActiveRoomId(matched ? matched.id : boot.rooms[0].id);
         }
       } catch (e) {
         if (!cancelled) {
@@ -802,16 +816,20 @@ export const Chat: React.FC<ChatProps> = ({ onAuthRevoked }) => {
   return (
     <div className={drawerOpen && activeRoom ? 'chat-workspace has-drawer' : 'chat-workspace'}>
       <ChatSidebar
+        appName={appName}
         tenantName={tenantName}
         rooms={rooms}
         activeRoomId={activeRoomId}
         wsStatus={wsStatus}
         mobileOpen={mobileRailOpen}
+        user={user}
         onCloseMobile={() => setMobileRailOpen(false)}
         onSelectRoom={(id) => setActiveRoomId(id)}
         onOpenNewChannel={() => setModal('new-channel')}
         onOpenNewDM={() => setModal('new-dm')}
         onOpenSearch={() => setModal('search')}
+        onOpenSettings={onOpenSettings}
+        onLogout={onLogout}
       />
 
       <section className="chat-stage" aria-label="Conversation">
@@ -852,17 +870,18 @@ export const Chat: React.FC<ChatProps> = ({ onAuthRevoked }) => {
                 </button>
                 <button
                   type="button"
-                  className="chat-icon-btn"
-                  title="Room details"
-                  aria-label="Room details"
-                  aria-pressed={drawerOpen}
+                  className={drawerOpen ? 'chat-header-panel-btn active' : 'chat-header-panel-btn'}
+                  title={drawerOpen ? 'Collapse room panel' : 'Open room panel'}
+                  aria-label={drawerOpen ? 'Collapse room panel' : 'Room details'}
+                  aria-expanded={drawerOpen}
                   onClick={() => {
                     const next = !drawerOpen;
                     setDrawerOpen(next);
                     if (next) void refreshRoomDetail(activeRoom.id);
                   }}
                 >
-                  <PanelRight size={17} />
+                  {drawerOpen ? <PanelRightClose size={16} aria-hidden="true" /> : <PanelRightOpen size={16} aria-hidden="true" />}
+                  <span>{drawerOpen ? 'Hide' : 'Details'}</span>
                 </button>
               </div>
             </header>
@@ -1115,6 +1134,7 @@ export const Chat: React.FC<ChatProps> = ({ onAuthRevoked }) => {
           currentUserId={currentUser?.id ?? ''}
           isGlobalAdmin={currentUser?.role === 'admin'}
           directory={directory}
+          messages={activeMessages}
           onClose={() => setDrawerOpen(false)}
           onRefresh={async () => {
             await Promise.all([refreshRoomDetail(activeRoom.id), refreshRoomsList()]);
@@ -1128,6 +1148,8 @@ export const Chat: React.FC<ChatProps> = ({ onAuthRevoked }) => {
               return remaining;
             });
           }}
+          onOpenSearch={() => setModal('search')}
+          onStartDM={handleStartDM}
         />
       )}
 
