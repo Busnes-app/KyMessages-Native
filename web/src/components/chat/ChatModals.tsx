@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Hash, Search, X } from 'lucide-react';
 import type { ChatDirectoryUser, ChatMessage, ChatRoomSummary } from '../../chat/types';
 import { searchMessages } from '../../chat/client';
-import { formatTime } from '../../chat/state';
+import { formatTime, isWebhookSender } from '../../chat/state';
 
 interface CreateChannelModalProps {
   directory: ChatDirectoryUser[];
@@ -317,6 +317,7 @@ export const SearchModal: React.FC<SearchModalProps> = ({ rooms, activeRoomId, o
                       </span>
                       <span>·</span>
                       <span>{hit.sender_name || 'Member'}</span>
+                      {isWebhookSender(hit.sender_id) && <span className="chat-msg-badge">Webhook</span>}
                       <span>·</span>
                       <span>{formatTime(hit.created_at)}</span>
                     </div>
