@@ -477,3 +477,17 @@ func TestHubResyncLeavesAdmittedGuestsAlone(t *testing.T) {
 		t.Fatal("resync removed an admitted guest from the meeting room")
 	}
 }
+
+func TestHubResyncNeverRevivesAnUnregisteredClient(t *testing.T) {
+	hub := NewHub(NewMemoryBus())
+	c := &Client{userID: "alice", tenantID: "default", rooms: map[string]struct{}{}}
+	hub.register(c, nil)
+	hub.SetRoomSource(func(context.Context, string, string) ([]string, error) {
+		hub.unregister(c) // the socket closes while the list loads
+		return []string{"r1"}, nil
+	})
+	hub.resync(context.Background(), c)
+	if _, _, rooms := hub.Stats(); rooms != 0 {
+		t.Fatalf("rooms indexed = %d: resync re-added a closed client", rooms)
+	}
+}

@@ -420,6 +420,10 @@ func (h *Hub) resync(ctx context.Context, c *Client) {
 			return // keep the current rooms; the next ping retries
 		}
 		h.mu.Lock()
+		if _, live := h.clients[c]; !live {
+			h.mu.Unlock()
+			return // unregistered while the list loaded: never re-add it
+		}
 		if c.memberEvents != seen {
 			h.mu.Unlock()
 			continue
