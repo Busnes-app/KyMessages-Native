@@ -712,7 +712,17 @@ func runRestoreAttachments(args []string) {
 	if err != nil {
 		log.Fatalf("restore-attachments: load key: %v", err)
 	}
-	count, err := backup.RestoreAttachments(*mirrorDir, *targetDir, key)
+	referencedKeys, err := backup.LoadReferencedAttachmentKeys(*dataDir)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Fatalf("restore-attachments: read referenced attachments from %s: %v", filepath.Join(*dataDir, "ky_server.db"), err)
+	}
+	var count int
+	if errors.Is(err, os.ErrNotExist) {
+		log.Printf("restore-attachments: %s not found; restoring active mirror blobs only (skipping .pruned)", filepath.Join(*dataDir, "ky_server.db"))
+		count, err = backup.RestoreAttachments(*mirrorDir, *targetDir, key)
+	} else {
+		count, err = backup.RestoreAttachmentsForKeys(*mirrorDir, *targetDir, key, referencedKeys)
+	}
 	if err != nil {
 		log.Fatalf("restore-attachments failed: %v", err)
 	}

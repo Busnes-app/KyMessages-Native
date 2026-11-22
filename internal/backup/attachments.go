@@ -5,10 +5,12 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -341,11 +343,83 @@ func expirePrunedAttachments(ctx context.Context, mirrorDir string, mirrorRoot *
 	return expired
 }
 
-// RestoreAttachments decrypts all mirrored attachment blobs from mirrorDir — including
-// soft-pruned blobs retained in mirrorDir/.pruned — using the 32-byte key (restored from
-// data/attachments.key) into targetDir (the deployment's KY_ATTACHMENTS_DIR). Active blobs
-// take precedence and are never overwritten by .pruned entries.
+// LoadReferencedAttachmentKeys opens <dataDir>/ky_server.db read-only and returns the set of
+// attachment blob_key values referenced by the database. If ky_server.db does not exist it
+// returns os.ErrNotExist; if the attachments table does not exist (pre-attachment capsule) it
+// returns an empty non-nil set.
+func LoadReferencedAttachmentKeys(dataDir string) (map[string]struct{}, error) {
+	dbPath := filepath.Join(dataDir, "ky_server.db")
+	fi, err := os.Lstat(dbPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, os.ErrNotExist
+		}
+		return nil, fmt.Errorf("backup: stat restored database: %w", err)
+	}
+	if !fi.Mode().IsRegular() || fi.Size() == 0 {
+		return nil, errors.New("backup: restored database is empty or not a regular file")
+	}
+	absPath, err := filepath.Abs(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("backup: resolve restored database path: %w", err)
+	}
+	dsn := (&url.URL{
+		Scheme:   "file",
+		Path:     filepath.ToSlash(absPath),
+		RawQuery: "mode=ro&_pragma=busy_timeout(5000)",
+	}).String()
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("backup: open restored database: %w", err)
+	}
+	defer db.Close()
+
+	var tableName string
+	err = db.QueryRow("SELECT name FROM sqlite_master WHERE type='table' AND name='attachments'").Scan(&tableName)
+	if errors.Is(err, sql.ErrNoRows) {
+		return map[string]struct{}{}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("backup: inspect restored database schema: %w", err)
+	}
+
+	rows, err := db.Query("SELECT blob_key FROM attachments")
+	if err != nil {
+		return nil, fmt.Errorf("backup: query attachment keys: %w", err)
+	}
+	defer rows.Close()
+
+	keys := make(map[string]struct{})
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, fmt.Errorf("backup: scan attachment key: %w", err)
+		}
+		if blobs.ValidKey(key) {
+			keys[key] = struct{}{}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("backup: read attachment keys: %w", err)
+	}
+	return keys, nil
+}
+
+// RestoreAttachments decrypts all active mirrored attachment blobs from mirrorDir using the
+// 32-byte key (restored from data/attachments.key) into targetDir (KY_ATTACHMENTS_DIR).
+// Without a database key set it skips .pruned so deleted blobs are not resurrected; use
+// RestoreAttachmentsForKeys with LoadReferencedAttachmentKeys to also recover still-referenced
+// blobs from .pruned.
 func RestoreAttachments(mirrorDir, targetDir string, key []byte) (int, error) {
+	return RestoreAttachmentsForKeys(mirrorDir, targetDir, key, nil)
+}
+
+// RestoreAttachmentsForKeys decrypts mirrored attachment blobs from mirrorDir using the 32-byte
+// key into targetDir. When referencedKeys is non-nil, only keys in referencedKeys are restored,
+// checking active top-level blobs first and falling back to mirrorDir/.pruned without
+// overwriting active blobs or pre-existing live files. When referencedKeys is nil, all active
+// top-level blobs are restored and .pruned is skipped.
+func RestoreAttachmentsForKeys(mirrorDir, targetDir string, key []byte, referencedKeys map[string]struct{}) (int, error) {
 	gcm, err := newAttachmentGCM(key)
 	if err != nil {
 		return 0, err
@@ -366,9 +440,16 @@ func RestoreAttachments(mirrorDir, targetDir string, key []byte) (int, error) {
 	defer targetRoot.Close()
 
 	restoredKeys := make(map[string]struct{})
-	restored, err := restoreAttachmentDir(mirrorRoot, targetRoot, gcm, restoredKeys, false)
+	restored, err := restoreAttachmentDir(mirrorRoot, targetRoot, gcm, referencedKeys, restoredKeys, false)
 	if err != nil {
 		return restored, err
+	}
+
+	// Only consult .pruned when filtering against a database key set that still has
+	// un-restored keys; otherwise .pruned blobs (deleted attachments/orphans) would be
+	// resurrected with no DB row and permanently re-mirrored.
+	if referencedKeys == nil || len(restoredKeys) >= len(referencedKeys) {
+		return restored, nil
 	}
 
 	fi, err := mirrorRoot.Lstat(AttachmentMirrorPrunedDirName)
@@ -391,11 +472,11 @@ func RestoreAttachments(mirrorDir, targetDir string, key []byte) (int, error) {
 	}
 	defer prunedRoot.Close()
 
-	prunedRestored, err := restoreAttachmentDir(prunedRoot, targetRoot, gcm, restoredKeys, true)
+	prunedRestored, err := restoreAttachmentDir(prunedRoot, targetRoot, gcm, referencedKeys, restoredKeys, true)
 	return restored + prunedRestored, err
 }
 
-func restoreAttachmentDir(srcRoot, targetRoot *os.Root, gcm cipher.AEAD, restoredKeys map[string]struct{}, skipExisting bool) (int, error) {
+func restoreAttachmentDir(srcRoot, targetRoot *os.Root, gcm cipher.AEAD, referencedKeys, restoredKeys map[string]struct{}, skipExisting bool) (int, error) {
 	dir, err := srcRoot.Open(".")
 	if err != nil {
 		return 0, fmt.Errorf("backup: read attachment mirror: %w", err)
@@ -415,6 +496,11 @@ func restoreAttachmentDir(srcRoot, targetRoot *os.Root, gcm cipher.AEAD, restore
 		blobKey := strings.TrimSuffix(name, ".enc")
 		if !blobs.ValidKey(blobKey) {
 			continue
+		}
+		if referencedKeys != nil {
+			if _, wanted := referencedKeys[blobKey]; !wanted {
+				continue
+			}
 		}
 		if _, seen := restoredKeys[blobKey]; seen {
 			continue

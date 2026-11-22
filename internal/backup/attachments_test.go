@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Busnes-app/ky_server_base/internal/backup"
+	"github.com/Busnes-app/ky_server_base/internal/store"
 )
 
 func TestMirrorAttachmentsIdempotentPrunesAndAuthenticates(t *testing.T) {
@@ -101,12 +102,24 @@ func TestMirrorAttachmentsIdempotentPrunesAndAuthenticates(t *testing.T) {
 		t.Fatalf("LoadAttachmentKey: %v", err)
 	}
 
-	// Within the retention window, RestoreAttachments on the top-level mirror recovers both
-	// active blobs and soft-pruned blobs from .pruned/ without overwriting active blobs.
+	// Without a DB reference set, RestoreAttachments restores only active blobs and does NOT
+	// resurrect soft-pruned blobs from .pruned/.
+	restoredActiveOnly := t.TempDir()
+	n, err := backup.RestoreAttachments(mirrorDir, restoredActiveOnly, key)
+	if err != nil || n != 1 {
+		t.Fatalf("RestoreAttachments(mirrorDir) = (%d, %v), want (1, nil)", n, err)
+	}
+	if _, err := os.Stat(filepath.Join(restoredActiveOnly, k2)); !os.IsNotExist(err) {
+		t.Fatalf("RestoreAttachments without DB filter resurrected pruned blob k2: %v", err)
+	}
+
+	// With a DB reference set naming both k1 and k2 (e.g. older capsule), RestoreAttachmentsForKeys
+	// recovers both active k1 and soft-pruned k2 without overwriting active blobs.
+	referenced := map[string]struct{}{k1: {}, k2: {}}
 	restoredAll := t.TempDir()
-	n, err := backup.RestoreAttachments(mirrorDir, restoredAll, key)
+	n, err = backup.RestoreAttachmentsForKeys(mirrorDir, restoredAll, key, referenced)
 	if err != nil || n != 2 {
-		t.Fatalf("RestoreAttachments(mirrorDir) = (%d, %v), want (2, nil)", n, err)
+		t.Fatalf("RestoreAttachmentsForKeys(mirrorDir, {k1,k2}) = (%d, %v), want (2, nil)", n, err)
 	}
 	gotK1, err := os.ReadFile(filepath.Join(restoredAll, k1))
 	if err != nil || string(gotK1) != "first payload" {
@@ -122,9 +135,9 @@ func TestMirrorAttachmentsIdempotentPrunesAndAuthenticates(t *testing.T) {
 		t.Fatal(err)
 	}
 	restoredPrecedence := t.TempDir()
-	n, err = backup.RestoreAttachments(mirrorDir, restoredPrecedence, key)
+	n, err = backup.RestoreAttachmentsForKeys(mirrorDir, restoredPrecedence, key, referenced)
 	if err != nil || n != 2 {
-		t.Fatalf("RestoreAttachments(mirrorDir with duplicate .pruned) = (%d, %v), want (2, nil)", n, err)
+		t.Fatalf("RestoreAttachmentsForKeys(mirrorDir with duplicate .pruned) = (%d, %v), want (2, nil)", n, err)
 	}
 	gotK1, err = os.ReadFile(filepath.Join(restoredPrecedence, k1))
 	if err != nil || string(gotK1) != "first payload" {
@@ -186,10 +199,14 @@ func TestMirrorAttachmentsRefusesWipeWhenSourceEmptyAndRetainsPruned(t *testing.
 
 	k1 := "att_019a0000-0000-7000-8000-000000000201"
 	k2 := "att_019a0000-0000-7000-8000-000000000202"
+	kDeleted := "att_019a0000-0000-7000-8000-000000000299"
 	if err := os.WriteFile(filepath.Join(attDir, k1), []byte("alpha"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(attDir, k2), []byte("beta"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(attDir, kDeleted), []byte("deleted-before-capsule"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -199,6 +216,13 @@ func TestMirrorAttachmentsRefusesWipeWhenSourceEmptyAndRetainsPruned(t *testing.
 	}
 	if _, err := backup.MirrorAttachmentsAt(context.Background(), cfg, t0, backup.DefaultMirrorPruneRetention); err != nil {
 		t.Fatalf("initial mirror: %v", err)
+	}
+	// kDeleted was deleted by the user before the restored capsule was sealed; it sits in .pruned/.
+	if err := os.Remove(filepath.Join(attDir, kDeleted)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backup.MirrorAttachmentsAt(context.Background(), cfg, t0.Add(10*time.Minute), backup.DefaultMirrorPruneRetention); err != nil {
+		t.Fatalf("prune kDeleted: %v", err)
 	}
 
 	// Simulate starting the server after a DB restore before running restore-attachments:
@@ -230,8 +254,8 @@ func TestMirrorAttachmentsRefusesWipeWhenSourceEmptyAndRetainsPruned(t *testing.
 	}
 
 	// Even if one new blob is uploaded before restore-attachments runs, existing blobs are
-	// soft-pruned into .pruned/ (not destroyed) and the standard restore-attachments command
-	// on the top-level mirror recovers both active and retained .pruned/ blobs.
+	// soft-pruned into .pruned/ (not destroyed), and RestoreAttachmentsForKeys with the DB's
+	// referenced keys recovers active + referenced .pruned/ blobs WITHOUT resurrecting kDeleted.
 	k3 := "att_019a0000-0000-7000-8000-000000000203"
 	if err := os.WriteFile(filepath.Join(attDir, k3), []byte("gamma"), 0o600); err != nil {
 		t.Fatal(err)
@@ -243,16 +267,34 @@ func TestMirrorAttachmentsRefusesWipeWhenSourceEmptyAndRetainsPruned(t *testing.
 	if res2.Copied != 1 || res2.Pruned != 2 || res2.Expired != 0 {
 		t.Fatalf("mirror after single upload = %+v, want copied=1 pruned=2 expired=0", res2)
 	}
+	dbReferenced := map[string]struct{}{k1: {}, k2: {}, k3: {}}
 	recovered := t.TempDir()
-	n, err = backup.RestoreAttachments(mirrorDir, recovered, key)
+	n, err = backup.RestoreAttachmentsForKeys(mirrorDir, recovered, key, dbReferenced)
 	if err != nil || n != 3 {
-		t.Fatalf("RestoreAttachments(mirrorDir) = (%d, %v), want (3, nil)", n, err)
+		t.Fatalf("RestoreAttachmentsForKeys(mirrorDir) = (%d, %v), want (3, nil)", n, err)
 	}
 	for k, want := range map[string]string{k1: "alpha", k2: "beta", k3: "gamma"} {
 		got, err := os.ReadFile(filepath.Join(recovered, k))
 		if err != nil || string(got) != want {
 			t.Fatalf("recovered %s = %q (%v), want %q", k, string(got), err, want)
 		}
+	}
+	if _, err := os.Stat(filepath.Join(recovered, kDeleted)); !os.IsNotExist(err) {
+		t.Fatalf("unreferenced deleted blob %s was resurrected during restore: %v", kDeleted, err)
+	}
+
+	// Restoring an older capsule whose DB references only {k1, k2} also skips newer unreferenced
+	// active blob k3 and deleted blob kDeleted.
+	olderCapsuleRecovered := t.TempDir()
+	n, err = backup.RestoreAttachmentsForKeys(mirrorDir, olderCapsuleRecovered, key, map[string]struct{}{k1: {}, k2: {}})
+	if err != nil || n != 2 {
+		t.Fatalf("RestoreAttachmentsForKeys(older capsule) = (%d, %v), want (2, nil)", n, err)
+	}
+	if _, err := os.Stat(filepath.Join(olderCapsuleRecovered, k3)); !os.IsNotExist(err) {
+		t.Fatalf("unreferenced post-capsule blob %s should not be restored: %v", k3, err)
+	}
+	if _, err := os.Stat(filepath.Join(olderCapsuleRecovered, kDeleted)); !os.IsNotExist(err) {
+		t.Fatalf("unreferenced deleted blob %s should not be restored: %v", kDeleted, err)
 	}
 
 	// Restoring into a live directory that already has a blob matching a .pruned key
@@ -261,21 +303,72 @@ func TestMirrorAttachmentsRefusesWipeWhenSourceEmptyAndRetainsPruned(t *testing.
 	if err := os.WriteFile(filepath.Join(prePopulated, k1), []byte("live-k1"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	n, err = backup.RestoreAttachments(mirrorDir, prePopulated, key)
+	n, err = backup.RestoreAttachmentsForKeys(mirrorDir, prePopulated, key, dbReferenced)
 	if err != nil || n != 2 {
-		t.Fatalf("RestoreAttachments(prePopulated) = (%d, %v), want (2, nil)", n, err)
+		t.Fatalf("RestoreAttachmentsForKeys(prePopulated) = (%d, %v), want (2, nil)", n, err)
 	}
 	if got, err := os.ReadFile(filepath.Join(prePopulated, k1)); err != nil || string(got) != "live-k1" {
 		t.Fatalf("pre-existing live blob overwritten by .pruned: %q (%v)", string(got), err)
 	}
 
-	// A symlinked .pruned directory must be rejected.
+	// A symlinked .pruned directory must be rejected when consulting .pruned.
 	symMirror := t.TempDir()
 	outside := t.TempDir()
 	if err := os.Symlink(outside, filepath.Join(symMirror, backup.AttachmentMirrorPrunedDirName)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := backup.RestoreAttachments(symMirror, t.TempDir(), key); err == nil {
-		t.Fatal("RestoreAttachments accepted a symlinked .pruned directory")
+	if _, err := backup.RestoreAttachmentsForKeys(symMirror, t.TempDir(), key, map[string]struct{}{k1: {}}); err == nil {
+		t.Fatal("RestoreAttachmentsForKeys accepted a symlinked .pruned directory")
+	}
+}
+
+func TestLoadReferencedAttachmentKeysFromSQLite(t *testing.T) {
+	cfg, st := sqliteInstance(t)
+	ctx := context.Background()
+
+	// Seed a user, room, and two attachment rows in the SQLite database.
+	k1 := "att_019a0000-0000-7000-8000-000000000301"
+	k2 := "att_019a0000-0000-7000-8000-000000000302"
+	if err := st.Users().CreateUser(ctx, &store.User{
+		ID: "u_att_1", Username: "attuser", Email: "att@example.com", Role: "user", Status: "active",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	room := &store.Room{Kind: store.RoomKindChannel, Name: "att-room", CreatedBy: "u_att_1"}
+	if err := st.Chat().CreateRoom(ctx, room, []string{"u_att_1"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{k1, k2} {
+		if err := st.Chat().CreateAttachment(ctx, &store.Attachment{
+			ID:         k,
+			RoomID:     room.ID,
+			UploaderID: "u_att_1",
+			Filename:   k + ".txt",
+			MimeType:   "text/plain",
+			SizeBytes:  5,
+			BlobKey:    k,
+			SHA256Hex:  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	keys, err := backup.LoadReferencedAttachmentKeys(cfg.Database.DataDir)
+	if err != nil {
+		t.Fatalf("LoadReferencedAttachmentKeys: %v", err)
+	}
+	if len(keys) != 2 {
+		t.Fatalf("len(keys) = %d, want 2 (%v)", len(keys), keys)
+	}
+	if _, ok := keys[k1]; !ok {
+		t.Fatalf("missing key %s", k1)
+	}
+	if _, ok := keys[k2]; !ok {
+		t.Fatalf("missing key %s", k2)
+	}
+
+	// Missing ky_server.db returns os.ErrNotExist.
+	if _, err := backup.LoadReferencedAttachmentKeys(t.TempDir()); !os.IsNotExist(err) {
+		t.Fatalf("missing DB err = %v, want os.ErrNotExist", err)
 	}
 }

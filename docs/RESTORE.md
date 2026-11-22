@@ -95,12 +95,14 @@ AES-256-GCM, into `<KY_BACKUP_DIR>/attachments`; the capsule carries only the ke
 ./kymessages restore-attachments -mirror <KY_BACKUP_DIR>/attachments -data-dir ./restored/data -to <KY_ATTACHMENTS_DIR>
 ```
 
-`KY_ATTACHMENTS_DIR` defaults to `<data dir>/attachments`; the command creates it (0700)
-and restores both active mirrored blobs and any blobs still retained in `.pruned` without
-overwriting active ones. Until it runs, attachment downloads answer 404, because the
-database names blobs that are not on disk. Starting first does not lose the mirror: a
-backup skips pruning while the live directory is empty, and blobs it does prune stay in
-the mirror's `.pruned` for 7 days.
+`KY_ATTACHMENTS_DIR` defaults to `<data dir>/attachments`; the command creates it (0700),
+reads the attachment keys referenced by `<data-dir>/ky_server.db`, and restores only those
+blobs from the mirror (falling back to `.pruned` for blobs deleted after the capsule was
+sealed, without overwriting active blobs or resurrecting deleted blobs the database no
+longer references). Until it runs, attachment downloads answer 404, because the database
+names blobs that are not on disk. Starting first does not lose the mirror: a backup skips
+pruning while the live directory is empty, and blobs it does prune stay in the mirror's
+`.pruned` for 7 days.
 
 ## Restore the Matrix stack
 
