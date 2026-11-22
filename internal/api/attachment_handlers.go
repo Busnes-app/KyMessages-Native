@@ -21,10 +21,14 @@ const (
 	maxAttachmentsPerMessage = 10
 	// multipartEnvelopeOverhead leaves headroom for multipart boundaries and headers
 	// without allowing arbitrary request inflation beyond MaxUploadBytes.
-	multipartEnvelopeOverhead   = 64 << 10
-	attachmentUploadReadTimeout = 2 * time.Minute
-	attachmentReservationTTL    = 3 * time.Minute
+	multipartEnvelopeOverhead = 64 << 10
 )
+
+// attachmentUploadDeadline is a minute plus the upload limit at 128 KiB/s (about 1 Mbit/s),
+// so a slow uplink can finish the largest allowed file: 25 MiB gets about 4 minutes.
+func attachmentUploadDeadline(maxBytes int64) time.Duration {
+	return time.Minute + time.Duration(maxBytes/(128<<10))*time.Second
+}
 
 var chatLimitUploads = chatLimit{"chat-uploads:", 30}
 
@@ -114,7 +118,7 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Extend read deadline for larger uploads on real connections; ignored on httptest recorders.
-	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(attachmentUploadReadTimeout))
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(attachmentUploadDeadline(maxBytes)))
 	r.Body = http.MaxBytesReader(w, r.Body, maxBytes+multipartEnvelopeOverhead)
 
 	mr, err := r.MultipartReader()
@@ -156,7 +160,7 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 	if r.ContentLength > 0 && r.ContentLength < requestedBytes {
 		requestedBytes = r.ContentLength
 	}
-	res, err := s.store.Chat().ReserveAttachmentQuota(r.Context(), tenantID, user.ID, requestedBytes, limits, attachmentReservationTTL)
+	res, err := s.store.Chat().ReserveAttachmentQuota(r.Context(), tenantID, user.ID, requestedBytes, limits, attachmentUploadDeadline(maxBytes)+time.Minute)
 	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrAttachmentTenantQuotaExceeded):
