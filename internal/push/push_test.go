@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -385,5 +386,42 @@ func TestDispatcherCloseDeliversQueuedJobs(t *testing.T) {
 	disp.Close()
 	if got := delivered.Load(); got != jobs {
 		t.Fatalf("delivered %d of %d queued pushes before Close returned", got, jobs)
+	}
+}
+
+// Concurrent first starts agree on one complete key and leave no temp files behind.
+func TestLoadOrCreateVAPIDKeyIsAtomic(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vapid.key")
+	const n = 8
+	keys := make([]string, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			k, err := LoadOrCreateVAPIDKey(path)
+			errs[i] = err
+			if err == nil {
+				keys[i] = k.PublicKeyBase64()
+			}
+		}()
+	}
+	wg.Wait()
+	for i := range n {
+		if errs[i] != nil || keys[i] != keys[0] {
+			t.Fatalf("creator %d: key %q err %v, want %q", i, keys[i], errs[i], keys[0])
+		}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "vapid.key" {
+		t.Fatalf("directory holds %v, want only vapid.key", entries)
+	}
+	if info, _ := entries[0].Info(); info.Mode().Perm() != 0600 {
+		t.Fatalf("vapid.key mode = %v, want 0600", info.Mode().Perm())
 	}
 }
