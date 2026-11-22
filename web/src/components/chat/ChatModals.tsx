@@ -1,51 +1,73 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useMemo, useRef, useState, useEffect } from 'react';
+import { Autocomplete } from '@base-ui/react/autocomplete';
+import { Combobox } from '@base-ui/react/combobox';
+import { Dialog } from '@base-ui/react/dialog';
 import { Hash, Lock, MessageSquare, Search, Video, X } from 'lucide-react';
 import type { ChatDirectoryUser, ChatMessage, ChatRoomSummary } from '../../chat/types';
 import { searchMessages } from '../../chat/client';
 import { formatTime, isBotSender, isWebhookSender } from '../../chat/state';
 
-const FOCUSABLE_SELECTOR =
-  'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+interface ChatDialogProps {
+  title: React.ReactNode;
+  titleStyle?: React.CSSProperties;
+  closeLabel?: string;
+  onClose: () => void;
+  // While busy, a press outside the card does not close it; Escape and Close still do.
+  busy?: boolean;
+  onSubmit?: (e: React.FormEvent<HTMLFormElement>) => void;
+  // The body and footer, below the titled header.
+  children: React.ReactNode;
+}
 
-function useModalFocus(dialogRef: React.RefObject<HTMLElement | null>, onClose: () => void) {
-  const onCloseRef = useRef(onClose);
-  onCloseRef.current = onClose;
+// ChatDialog is a chat modal on Base UI's Dialog, portalled to body: focus moves in (an
+// autoFocus field that already holds it keeps it, otherwise the first control), Tab stays
+// inside, Escape, Close and a press on the backdrop close it, focus returns to the opener
+// and the page behind does not scroll.
+function ChatDialog({ title, titleStyle, closeLabel = 'Close', onClose, busy = false, onSubmit, children }: ChatDialogProps) {
+  const popup = useRef<HTMLDivElement | null>(null);
+  // The opener, read before an autoFocus field takes focus: Base UI notes the element focused
+  // when its popup mounts, which by then is that field, gone once the dialog closes.
+  const [opener] = useState(() => document.activeElement);
+  return (
+    <Dialog.Root
+      open
+      disablePointerDismissal={busy}
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+    >
+      <Dialog.Portal>
+        <Dialog.Backdrop className="modal-backdrop" />
+        <Dialog.Popup
+          ref={popup}
+          className="chat-modal-card chat-dialog"
+          initialFocus={() =>
+            popup.current?.contains(document.activeElement) ? (document.activeElement as HTMLElement) : true
+          }
+          finalFocus={() => (opener instanceof HTMLElement && opener !== document.body && opener.isConnected ? opener : true)}
+          render={onSubmit ? <form onSubmit={onSubmit} /> : undefined}
+        >
+          <div className="chat-modal-head">
+            <Dialog.Title render={<h3 style={titleStyle} />}>{title}</Dialog.Title>
+            <button type="button" className="chat-icon-btn" onClick={onClose} aria-label={closeLabel}>
+              <X size={16} />
+            </button>
+          </div>
+          {children}
+        </Dialog.Popup>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
+}
 
-  useEffect(() => {
-    const previous = document.activeElement as HTMLElement | null;
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.stopPropagation();
-        onCloseRef.current();
-        return;
-      }
-      if (e.key !== 'Tab') return;
-      const root = dialogRef.current;
-      if (!root) return;
-      const focusables = Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
-        (el) => el.offsetParent !== null || el === document.activeElement,
-      );
-      if (focusables.length === 0) return;
-      const first = focusables[0];
-      const last = focusables[focusables.length - 1];
-      if (e.shiftKey) {
-        if (document.activeElement === first || !root.contains(document.activeElement)) {
-          e.preventDefault();
-          last.focus();
-        }
-      } else if (document.activeElement === last || !root.contains(document.activeElement)) {
-        e.preventDefault();
-        first.focus();
-      }
-    };
-    window.addEventListener('keydown', onKeyDown, true);
-    return () => {
-      window.removeEventListener('keydown', onKeyDown, true);
-      if (previous && typeof previous.focus === 'function' && previous.isConnected) {
-        previous.focus();
-      }
-    };
-  }, [dialogRef]);
+// matchesUser is the teammate pickers' filter: display name or username, case-insensitive.
+function matchesUser(u: ChatDirectoryUser, q: string): boolean {
+  return !q || u.display_name.toLowerCase().includes(q) || u.username.toLowerCase().includes(q);
+}
+
+// Only typing changes a picker's query: Base UI also reports highlight, Escape and item presses.
+function typed(reason: string): boolean {
+  return reason === 'input-change' || reason === 'input-clear';
 }
 
 function escapeRegExp(s: string): string {
@@ -86,9 +108,6 @@ export const CreateChannelModal: React.FC<CreateChannelModalProps> = ({
   onClose,
   onCreate,
 }) => {
-  const dialogRef = useRef<HTMLFormElement | null>(null);
-  useModalFocus(dialogRef, onClose);
-
   const [name, setName] = useState('');
   const [topic, setTopic] = useState('');
   const [isPrivate, setIsPrivate] = useState(false);
@@ -96,11 +115,12 @@ export const CreateChannelModal: React.FC<CreateChannelModalProps> = ({
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
 
-  const others = directory.filter((u) => u.id !== currentUserId);
+  const [memberQuery, setMemberQuery] = useState('');
 
-  const toggleMember = (id: string) => {
-    setSelectedIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
-  };
+  const others = directory.filter((u) => u.id !== currentUserId);
+  const byId = new Map(others.map((u) => [u.id, u]));
+  const mq = memberQuery.trim().toLowerCase();
+  const shownIds = others.filter((u) => matchesUser(u, mq)).map((u) => u.id);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -119,86 +139,100 @@ export const CreateChannelModal: React.FC<CreateChannelModalProps> = ({
   };
 
   return (
-    <div
-      className="modal-backdrop"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="new-channel-title"
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget && !busy) onClose();
-      }}
-    >
-      <form ref={dialogRef} className="chat-modal-card" onSubmit={handleSubmit}>
-        <div className="chat-modal-head">
-          <h3 id="new-channel-title">Create channel</h3>
-          <button type="button" className="chat-icon-btn" onClick={onClose} aria-label="Close">
-            <X size={16} />
-          </button>
+    <ChatDialog title="Create channel" onClose={onClose} busy={busy} onSubmit={handleSubmit}>
+      <div className="chat-modal-body chat-scroll">
+        {err && (
+          <div className="dr-alert dr-alert-error" role="alert" style={{ padding: '0.5rem 0.65rem', fontSize: '0.82rem' }}>
+            {err}
+          </div>
+        )}
+        <div className="chat-field">
+          <label htmlFor="ch-name">Channel name</label>
+          <input
+            id="ch-name"
+            placeholder="engineering"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            maxLength={100}
+            required
+            autoFocus
+          />
         </div>
-        <div className="chat-modal-body chat-scroll">
-          {err && (
-            <div className="dr-alert dr-alert-error" role="alert" style={{ padding: '0.5rem 0.65rem', fontSize: '0.82rem' }}>
-              {err}
-            </div>
-          )}
-          <div className="chat-field">
-            <label htmlFor="ch-name">Channel name</label>
-            <input
-              id="ch-name"
-              placeholder="engineering"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              maxLength={100}
-              required
-              autoFocus
-            />
-          </div>
-          <div className="chat-field">
-            <label htmlFor="ch-topic">Topic (optional)</label>
-            <input
-              id="ch-topic"
-              placeholder="Release coordination and architecture notes"
-              value={topic}
-              onChange={(e) => setTopic(e.target.value)}
-              maxLength={500}
-            />
-          </div>
-          <label className="chat-checkbox-row">
-            <input type="checkbox" checked={isPrivate} onChange={(e) => setIsPrivate(e.target.checked)} />
-            <span>Private channel (invite only)</span>
-          </label>
+        <div className="chat-field">
+          <label htmlFor="ch-topic">Topic (optional)</label>
+          <input
+            id="ch-topic"
+            placeholder="Release coordination and architecture notes"
+            value={topic}
+            onChange={(e) => setTopic(e.target.value)}
+            maxLength={500}
+          />
+        </div>
+        <label className="chat-checkbox-row">
+          <input type="checkbox" checked={isPrivate} onChange={(e) => setIsPrivate(e.target.checked)} />
+          <span>Private channel (invite only)</span>
+        </label>
 
-          {others.length > 0 && (
-            <div className="chat-field">
-              <label>Add teammates</label>
-              <div className="chat-picker-list chat-scroll">
-                {others.map((u) => (
-                  <label key={u.id} className="chat-checkbox-row" style={{ padding: '0.32rem 0.45rem' }}>
-                    <input
-                      type="checkbox"
-                      checked={selectedIds.includes(u.id)}
-                      onChange={() => toggleMember(u.id)}
-                    />
-                    <span>
-                      {u.display_name}{' '}
-                      <span style={{ color: 'var(--ink)', fontSize: '0.78rem' }}>@{u.username}</span>
-                    </span>
-                  </label>
-                ))}
+        {others.length > 0 && (
+          <div className="chat-field">
+            <label htmlFor="ch-members">Add teammates</label>
+            {/* Base UI's multi-select Combobox: arrows move through the teammates from the
+                box, Enter or a click toggles one, and the box narrows the list. */}
+            <Combobox.Root
+              multiple
+              inline
+              open
+              items={shownIds}
+              filter={null}
+              itemToStringLabel={(id: string) => byId.get(id)?.display_name ?? id}
+              value={selectedIds}
+              onValueChange={(ids) => setSelectedIds(ids)}
+              inputValue={memberQuery}
+              onInputValueChange={(v, d) => {
+                if (typed(d.reason)) setMemberQuery(v);
+              }}
+            >
+              {/* Enter here toggles the highlighted teammate (Base UI handles it on the box
+                  first) and never submits the form, even with nothing highlighted. */}
+              <div
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.nativeEvent.isComposing) e.preventDefault();
+                }}
+              >
+                <Combobox.Input id="ch-members" placeholder="Search by name or username…" disabled={busy} />
               </div>
-            </div>
-          )}
-        </div>
-        <div className="chat-modal-foot">
-          <button type="button" className="btn-secondary" onClick={onClose} disabled={busy}>
-            Cancel
-          </button>
-          <button type="submit" disabled={busy || !name.trim()}>
-            {busy ? 'Creating…' : 'Create channel'}
-          </button>
-        </div>
-      </form>
-    </div>
+              <Combobox.List className="chat-picker-list chat-scroll" aria-label="Teammates">
+                {shownIds.length === 0 ? (
+                  <p style={{ fontSize: '0.82rem', color: 'var(--ink)', padding: '0.6rem' }}>No matching teammates.</p>
+                ) : (
+                  shownIds.map((id) => {
+                    const u = byId.get(id)!;
+                    return (
+                      <Combobox.Item key={id} value={id} className="chat-checkbox-row chat-member-option" disabled={busy}>
+                        {/* The native box keeps the old look; the option carries the state. */}
+                        <input type="checkbox" checked={selectedIds.includes(id)} readOnly tabIndex={-1} aria-hidden="true" />
+                        <span>
+                          {u.display_name}{' '}
+                          <span style={{ color: 'var(--ink)', fontSize: '0.78rem' }}>@{u.username}</span>
+                        </span>
+                      </Combobox.Item>
+                    );
+                  })
+                )}
+              </Combobox.List>
+            </Combobox.Root>
+          </div>
+        )}
+      </div>
+      <div className="chat-modal-foot">
+        <button type="button" className="btn-secondary" onClick={onClose} disabled={busy}>
+          Cancel
+        </button>
+        <button type="submit" disabled={busy || !name.trim()}>
+          {busy ? 'Creating…' : 'Create channel'}
+        </button>
+      </div>
+    </ChatDialog>
   );
 };
 
@@ -215,28 +249,16 @@ export const StartDMModal: React.FC<StartDMModalProps> = ({
   onClose,
   onSelectUser,
 }) => {
-  const dialogRef = useRef<HTMLDivElement | null>(null);
-  useModalFocus(dialogRef, onClose);
-
   const [filter, setFilter] = useState('');
-  const [activeIdx, setActiveIdx] = useState(0);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [err, setErr] = useState('');
 
   const q = filter.trim().toLowerCase();
   const candidates = useMemo(
     () =>
-      directory.filter((u) => {
-        if (u.id === currentUserId) return false;
-        if (!q) return true;
-        return u.display_name.toLowerCase().includes(q) || u.username.toLowerCase().includes(q);
-      }),
+      directory.filter((u) => u.id !== currentUserId && matchesUser(u, q)),
     [directory, currentUserId, q],
   );
-
-  useEffect(() => {
-    setActiveIdx(0);
-  }, [q]);
 
   const handlePick = async (userId: string) => {
     setBusyId(userId);
@@ -252,77 +274,54 @@ export const StartDMModal: React.FC<StartDMModalProps> = ({
   };
 
   return (
-    <div
-      className="modal-backdrop"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="new-dm-title"
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget && busyId === null) onClose();
-      }}
-    >
-      <div ref={dialogRef} className="chat-modal-card">
-        <div className="chat-modal-head">
-          <h3 id="new-dm-title">New direct message</h3>
-          <button type="button" className="chat-icon-btn" onClick={onClose} aria-label="Close">
-            <X size={16} />
-          </button>
-        </div>
-        <div className="chat-modal-body chat-scroll">
-          {err && (
-            <div className="dr-alert dr-alert-error" role="alert" style={{ padding: '0.5rem 0.65rem', fontSize: '0.82rem' }}>
-              {err}
-            </div>
-          )}
-          <input
-            aria-label="Filter teammates"
-            placeholder="Search by name or username…"
-            value={filter}
-            onChange={(e) => setFilter(e.target.value)}
-            onKeyDown={(e) => {
-              if (candidates.length === 0 || busyId !== null) return;
-              if (e.key === 'ArrowDown') {
-                e.preventDefault();
-                setActiveIdx((i) => (i + 1) % candidates.length);
-              } else if (e.key === 'ArrowUp') {
-                e.preventDefault();
-                setActiveIdx((i) => (i - 1 + candidates.length) % candidates.length);
-              } else if (e.key === 'Enter') {
-                e.preventDefault();
-                const target = candidates[activeIdx] ?? candidates[0];
-                if (target) void handlePick(target.id);
-              }
-            }}
-            autoFocus
-          />
-          <div className="chat-picker-list chat-scroll" role="listbox" aria-label="Teammates">
+    <ChatDialog title="New direct message" onClose={onClose} busy={busyId !== null}>
+      <div className="chat-modal-body chat-scroll">
+        {err && (
+          <div className="dr-alert dr-alert-error" role="alert" style={{ padding: '0.5rem 0.65rem', fontSize: '0.82rem' }}>
+            {err}
+          </div>
+        )}
+        {/* Base UI's Autocomplete: arrows move through the teammates from the box and Enter
+            opens the highlighted one (the first until the arrows or the pointer move it). */}
+        <Autocomplete.Root
+          inline
+          open
+          autoHighlight="always"
+          keepHighlight
+          items={candidates}
+          filter={null}
+          itemToStringValue={(u: ChatDirectoryUser) => u.display_name}
+          value={filter}
+          onValueChange={(v, d) => {
+            if (typed(d.reason)) setFilter(v);
+          }}
+        >
+          <Autocomplete.Input aria-label="Filter teammates" placeholder="Search by name or username…" autoFocus />
+          <Autocomplete.List className="chat-picker-list chat-scroll" aria-label="Teammates">
             {candidates.length === 0 ? (
               <p style={{ fontSize: '0.82rem', color: 'var(--ink)', padding: '0.6rem' }}>
                 {directory.length <= 1 ? 'No other active accounts yet.' : 'No matching teammates.'}
               </p>
             ) : (
-              candidates.map((u, idx) => (
-                <button
+              candidates.map((u) => (
+                <Autocomplete.Item
                   key={u.id}
-                  type="button"
-                  role="option"
-                  aria-selected={idx === activeIdx}
-                  className={`chat-picker-item${idx === activeIdx ? ' is-active' : ''}`}
+                  value={u}
+                  className="chat-picker-item"
                   disabled={busyId !== null}
-                  onMouseEnter={() => setActiveIdx(idx)}
                   onClick={() => void handlePick(u.id)}
                 >
                   <span>{u.display_name}</span>
                   <span style={{ fontSize: '0.78rem', color: 'var(--ink)' }}>
                     {busyId === u.id ? 'Opening…' : `@${u.username}`}
                   </span>
-                </button>
+                </Autocomplete.Item>
               ))
             )}
-          </div>
-        </div>
+          </Autocomplete.List>
+        </Autocomplete.Root>
       </div>
-    </div>
+    </ChatDialog>
   );
 };
 
@@ -334,13 +333,9 @@ interface SearchModalProps {
 }
 
 export const SearchModal: React.FC<SearchModalProps> = ({ rooms, activeRoomId, onClose, onSelectHit }) => {
-  const dialogRef = useRef<HTMLDivElement | null>(null);
-  useModalFocus(dialogRef, onClose);
-
   const [query, setQuery] = useState('');
   const [scopeCurrent, setScopeCurrent] = useState(false);
   const [hits, setHits] = useState<ChatMessage[]>([]);
-  const [activeIdx, setActiveIdx] = useState(0);
   const [searching, setSearching] = useState(false);
   const [err, setErr] = useState('');
 
@@ -357,15 +352,11 @@ export const SearchModal: React.FC<SearchModalProps> = ({ rooms, activeRoomId, o
     let cancelled = false;
     setSearching(true);
     setHits([]);
-    setActiveIdx(0);
     setErr('');
     const timer = setTimeout(() => {
       void searchMessages(trimmed, scopeCurrent && activeRoomId ? activeRoomId : undefined)
         .then((res) => {
-          if (!cancelled) {
-            setHits(res);
-            setActiveIdx(0);
-          }
+          if (!cancelled) setHits(res);
         })
         .catch((e) => {
           if (!cancelled) setErr(e instanceof Error ? e.message : 'Search failed');
@@ -387,47 +378,34 @@ export const SearchModal: React.FC<SearchModalProps> = ({ rooms, activeRoomId, o
   };
 
   return (
-    <div
-      className="modal-backdrop"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="chat-search-title"
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
+    <ChatDialog
+      title={
+        <>
+          <Search size={16} aria-hidden="true" />
+          Search messages
+        </>
+      }
+      titleStyle={{ display: 'inline-flex', alignItems: 'center', gap: '0.45rem' }}
+      closeLabel="Close search"
+      onClose={onClose}
     >
-      <div ref={dialogRef} className="chat-modal-card">
-        <div className="chat-modal-head">
-          <h3 id="chat-search-title" style={{ display: 'inline-flex', alignItems: 'center', gap: '0.45rem' }}>
-            <Search size={16} aria-hidden="true" />
-            Search messages
-          </h3>
-          <button type="button" className="chat-icon-btn" onClick={onClose} aria-label="Close search">
-            <X size={16} />
-          </button>
-        </div>
-        <div className="chat-modal-body chat-scroll">
-          <input
-            aria-label="Search messages"
-            placeholder="Search across your joined rooms…"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => {
-              if (hits.length === 0) return;
-              if (e.key === 'ArrowDown') {
-                e.preventDefault();
-                setActiveIdx((i) => (i + 1) % hits.length);
-              } else if (e.key === 'ArrowUp') {
-                e.preventDefault();
-                setActiveIdx((i) => (i - 1 + hits.length) % hits.length);
-              } else if (e.key === 'Enter') {
-                e.preventDefault();
-                const target = hits[activeIdx] ?? hits[0];
-                if (target) selectHit(target);
-              }
-            }}
-            autoFocus
-          />
+      <div className="chat-modal-body chat-scroll">
+        {/* Base UI's Autocomplete: arrows move through the results from the box and Enter
+            opens the highlighted one (the first until the arrows or the pointer move it). */}
+        <Autocomplete.Root
+          inline
+          open
+          autoHighlight="always"
+          keepHighlight
+          items={hits}
+          filter={null}
+          itemToStringValue={(hit: ChatMessage) => hit.body}
+          value={query}
+          onValueChange={(v, d) => {
+            if (typed(d.reason)) setQuery(v);
+          }}
+        >
+          <Autocomplete.Input aria-label="Search messages" placeholder="Search across your joined rooms…" autoFocus />
 
           {activeRoomId && (
             <label className="chat-checkbox-row" style={{ fontSize: '0.8rem' }}>
@@ -451,19 +429,14 @@ export const SearchModal: React.FC<SearchModalProps> = ({ rooms, activeRoomId, o
           ) : query.trim() && hits.length === 0 ? (
             <p style={{ fontSize: '0.82rem', color: 'var(--ink)' }}>No matching messages found.</p>
           ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem' }} role="listbox" aria-label="Search results">
-              {hits.map((hit, idx) => {
+            <Autocomplete.List
+              style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem' }}
+              aria-label="Search results"
+            >
+              {hits.map((hit) => {
                 const room = roomById.get(hit.room_id);
                 return (
-                  <button
-                    key={hit.id}
-                    type="button"
-                    role="option"
-                    aria-selected={idx === activeIdx}
-                    className={`chat-search-hit${idx === activeIdx ? ' is-active' : ''}`}
-                    onMouseEnter={() => setActiveIdx(idx)}
-                    onClick={() => selectHit(hit)}
-                  >
+                  <Autocomplete.Item key={hit.id} value={hit} className="chat-search-hit" onClick={() => selectHit(hit)}>
                     <div className="chat-search-hit-meta">
                       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3, fontWeight: 600 }}>
                         {room?.kind === 'meeting' ? (
@@ -485,13 +458,13 @@ export const SearchModal: React.FC<SearchModalProps> = ({ rooms, activeRoomId, o
                       <span>{formatTime(hit.created_at)}</span>
                     </div>
                     <div className="chat-search-hit-body">{highlightQuery(hit.body, query)}</div>
-                  </button>
+                  </Autocomplete.Item>
                 );
               })}
-            </div>
+            </Autocomplete.List>
           )}
-        </div>
+        </Autocomplete.Root>
       </div>
-    </div>
+    </ChatDialog>
   );
 };

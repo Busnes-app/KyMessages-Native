@@ -17,6 +17,8 @@ const server = spawn(fileURLToPath(new URL('../../.browser/server', import.meta.
     KY_HOST: '127.0.0.1', KY_PORT: port, KY_DB_DRIVER: 'sqlite',
     KY_DATA_DIR: join(dir, 'data'), KY_BACKUP_DIR: join(dir, 'backups'),
     KY_ADMIN_PASSWORD: 'BrowserInitial123!', KY_CAPTCHA_PROVIDER: captcha,
+    // Disposable, like the passwords: chat-pickers.spec.mjs adds teammates through SCIM.
+    KY_SCIM_TOKEN: 'browser-regression-scim-token',
   },
   stdio: 'inherit',
 });

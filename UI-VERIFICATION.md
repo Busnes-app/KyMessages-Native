@@ -49,3 +49,7 @@ Run npm ci, npm test (where configured), and npm run build in web/, then start t
 ## Approved interface polish — 2026-10-19
 
 See [UI-POLISH.md](UI-POLISH.md) for the implemented changes, preservation scope, checks, actual before/after screenshots and disposable capture conditions. Earlier captures above remain historical evidence.
+
+## Chat modals on Base UI — 2026-11-22
+
+Create channel, New direct message and Search messages moved to Base UI Dialog, Autocomplete and Combobox. Captured from a disposable built server (SQLite, three SCIM teammates, one channel with messages) in Chromium at light/dark × 390/1280, before and after, with widget geometry measured in the page. New direct message and Search rows match to 0.1 px (font, line height, alignment); Create channel is 41.6 px taller for its new teammate search box, and its teammate rows match the old checkbox rows. No `<style>` element is added. The page behind is scroll-locked while a modal is open, which it was not before. Screenshots are kept with the pull request's evidence, not in this repository.
