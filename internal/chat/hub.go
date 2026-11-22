@@ -38,7 +38,10 @@ type Hub struct {
 	callFrameHook  CallFrameHandler
 	disconnectHook DisconnectHandler
 	tenantRevoked  func(tenantID string)
-	pingInterval   time.Duration
+	// guestValid, when set, reports whether a guest still holds a lobby session. It is checked
+	// when the socket registers and on every ping, as sessionValid is for members.
+	guestValid   func(guestID string) bool
+	pingInterval time.Duration
 
 	// roomSource, when set, rebuilds each socket's rooms from the store after it registers
 	// and on every ping, so a membership change the bus never delivered (one made during
@@ -105,6 +108,11 @@ func (h *Hub) SetCallFrameHandler(fn CallFrameHandler) {
 // SetDisconnectHandler registers a callback invoked when a WebSocket client disconnects.
 func (h *Hub) SetDisconnectHandler(fn DisconnectHandler) {
 	h.disconnectHook = fn
+}
+
+// SetGuestCheck registers the guest session lookup. Call it before serving connections.
+func (h *Hub) SetGuestCheck(fn func(guestID string) bool) {
+	h.guestValid = fn
 }
 
 // SetTenantRevokeHandler registers what each pod does when a tenant's access is revoked.
@@ -521,6 +529,12 @@ func (h *Hub) serveClient(ctx context.Context, conn *websocket.Conn, tenantID, u
 		c.kick(websocket.StatusNormalClosure, "")
 		h.unregister(c)
 	}()
+	// A guest authenticated before a revocation swept its session may register after the
+	// sweep's kick; registered first, this check or the kick always catches it.
+	if isGuest && h.guestValid != nil && !h.guestValid(userID) {
+		_ = conn.Close(websocket.StatusPolicyViolation, "guest session ended")
+		return
+	}
 	// roomIDs was listed before register, so a change between the two reached no client.
 	rctx, rcancel := context.WithTimeout(ctx, clientWriteTimeout)
 	h.resync(rctx, c)
@@ -630,6 +644,10 @@ func (c *Client) writeLoop(ctx context.Context, cancel context.CancelFunc) {
 				return
 			}
 		case <-ticker.C:
+			if c.isGuest && c.hub.guestValid != nil && !c.hub.guestValid(c.userID) {
+				c.kick(websocket.StatusPolicyViolation, "guest session ended")
+				continue
+			}
 			if !c.isGuest && c.hub.sessionValid != nil {
 				vctx, vcancel := context.WithTimeout(ctx, clientWriteTimeout)
 				valid, err := c.hub.sessionValid(vctx, c.userID, c.sessionHash)

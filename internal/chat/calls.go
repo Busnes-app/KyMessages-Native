@@ -334,6 +334,12 @@ func (m *CallManager) Join(ctx context.Context, req JoinCallRequest) (*JoinCallR
 		lkURL = m.livekit.WSURL()
 		lkToken = m.livekit.JoinToken(lkRoom, peerID, req.DisplayName, "", rtc.DefaultTokenTTL)
 	}
+	// The token is handed out only if the peer outlived setup: a revocation during persistence
+	// or LiveKit room creation removed it, or left the org inactive.
+	if !m.peerRegistered(req.RoomID, peerID) || !m.tenantStillActive(ctx, req.TenantID) {
+		m.Leave(ctx, req.RoomID, req.UserID)
+		return nil, ErrTenantInactive
+	}
 
 	// Broadcast updated call state to the room.
 	m.broadcastState(ctx, req.RoomID, statePayload)
@@ -357,6 +363,33 @@ func (m *CallManager) Join(ctx context.Context, req JoinCallRequest) (*JoinCallR
 		Peers:        statePayload.Peers,
 		Started:      created,
 	}, nil
+}
+
+func (m *CallManager) peerRegistered(roomID, peerID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c := m.calls[roomID]
+	return c != nil && c.peers[peerID] != nil
+}
+
+// RevokeTenant takes every peer of tenantID's calls on this pod out of its call, members and
+// guests alike, whether or not they hold a chat socket here.
+func (m *CallManager) RevokeTenant(ctx context.Context, tenantID string) {
+	type seat struct{ roomID, userID string }
+	var seats []seat
+	m.mu.Lock()
+	for roomID, c := range m.calls {
+		if c.session.TenantID != tenantID {
+			continue
+		}
+		for _, p := range c.peers {
+			seats = append(seats, seat{roomID, p.UserID})
+		}
+	}
+	m.mu.Unlock()
+	for _, s := range seats {
+		m.Leave(ctx, s.roomID, s.userID)
+	}
 }
 
 func (m *CallManager) tenantStillActive(ctx context.Context, tenantID string) bool {

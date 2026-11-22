@@ -380,6 +380,13 @@ func (l *LobbyManager) RevokeMeeting(ctx context.Context, roomID string) {
 	}
 }
 
+// HasSession reports whether guestID still holds a lobby session on this pod.
+func (l *LobbyManager) HasSession(guestID string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.byGuestID[guestID] != nil
+}
+
 // RevokeTenant evicts every guest of tenantID this pod holds, waiting or admitted, and takes
 // them out of their calls.
 func (l *LobbyManager) RevokeTenant(ctx context.Context, tenantID string) {
