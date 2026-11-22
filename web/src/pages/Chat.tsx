@@ -181,6 +181,8 @@ export const Chat: React.FC<ChatProps> = ({
   const previewUrlsRef = useRef<Set<string>>(new Set());
   const dragDepthRef = useRef(0);
   const stagedByRoomRef = useRef<Record<string, StagedAttachment[]>>({});
+  const cancelledUploadsRef = useRef<Set<string>>(new Set());
+  const uploadControllersRef = useRef<Map<string, AbortController>>(new Map());
   const nearBottomRef = useRef(true);
   const activeRoomIdRef = useRef<string | null>(null);
   const currentUserRef = useRef<ChatCurrentUser | null>(null);
@@ -208,7 +210,14 @@ export const Chat: React.FC<ChatProps> = ({
 
   useEffect(() => {
     const urls = previewUrlsRef.current;
+    const controllers = uploadControllersRef.current;
+    const cancelled = cancelledUploadsRef.current;
     return () => {
+      for (const [id, ctrl] of controllers) {
+        cancelled.add(id);
+        ctrl.abort();
+      }
+      controllers.clear();
       for (const u of urls) {
         URL.revokeObjectURL(u);
       }
@@ -1006,6 +1015,13 @@ export const Chat: React.FC<ChatProps> = ({
         void deleteAttachment(existing.attachment.id).catch(() => {
           // Best-effort cleanup; orphan sweep also expires abandoned uploads.
         });
+      } else {
+        cancelledUploadsRef.current.add(localId);
+        const ctrl = uploadControllersRef.current.get(localId);
+        if (ctrl) {
+          uploadControllersRef.current.delete(localId);
+          ctrl.abort();
+        }
       }
       setStagedByRoom((prev) => {
         const current = prev[roomId] ?? [];
@@ -1088,13 +1104,30 @@ export const Chat: React.FC<ChatProps> = ({
           ],
         }));
 
-        void uploadAttachment(roomId, file)
+        const controller = new AbortController();
+        uploadControllersRef.current.set(localId, controller);
+
+        void uploadAttachment(roomId, file, controller.signal)
           .then((att) => {
+            uploadControllersRef.current.delete(localId);
+            let cleanedOrphan = false;
+            const cleanupOrphan = () => {
+              if (cleanedOrphan) return;
+              cleanedOrphan = true;
+              releasePreviewUrl(previewUrl);
+              void deleteAttachment(att.id).catch(() => {
+                // Best-effort cleanup; orphan sweep also expires abandoned uploads.
+              });
+            };
+            if (cancelledUploadsRef.current.delete(localId)) {
+              cleanupOrphan();
+              return;
+            }
             setStagedByRoom((prev) => {
               const list = prev[roomId] ?? [];
               const exists = list.some((item) => item.localId === localId);
               if (!exists) {
-                releasePreviewUrl(previewUrl);
+                cleanupOrphan();
                 return prev;
               }
               const inlineSafe = isInlineImageAttachment(att);
@@ -1117,6 +1150,8 @@ export const Chat: React.FC<ChatProps> = ({
             });
           })
           .catch((e) => {
+            uploadControllersRef.current.delete(localId);
+            cancelledUploadsRef.current.delete(localId);
             releasePreviewUrl(previewUrl);
             const msg = e instanceof Error ? e.message : 'Upload failed';
             setStagedByRoom((prev) => {

@@ -100,6 +100,29 @@ type Attachment struct {
 	CreatedAt  int64  `json:"created_at"` // Unix milliseconds
 }
 
+// AttachmentQuotaLimits bounds workspace total and per-uploader pending attachment bytes.
+// Zero or negative values leave the corresponding quota unenforced.
+type AttachmentQuotaLimits struct {
+	MaxTotalBytes       int64
+	MaxPendingUserBytes int64
+}
+
+// AttachmentQuotaLimitKind identifies which cap constrained a reservation.
+type AttachmentQuotaLimitKind string
+
+const (
+	AttachmentQuotaLimitUpload  AttachmentQuotaLimitKind = "upload"
+	AttachmentQuotaLimitPending AttachmentQuotaLimitKind = "pending"
+	AttachmentQuotaLimitTenant  AttachmentQuotaLimitKind = "tenant"
+)
+
+// AttachmentQuotaReservation holds in-flight capacity reserved for a single upload.
+type AttachmentQuotaReservation struct {
+	ID            string
+	ReservedBytes int64
+	LimitingKind  AttachmentQuotaLimitKind
+}
+
 // Message is one ordered message inside a room.
 type Message struct {
 	ID             string            `json:"id"`

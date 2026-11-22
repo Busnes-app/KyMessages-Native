@@ -254,11 +254,22 @@ ALTER TABLE mfa_challenges ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';`,
 	{Version: 23, Name: "native_chat", SQLite: nativeChatSchemaSQLite, Postgres: nativeChatSchemaPostgres},
 	// Native chat bot/agent accounts backed directly by users and hashed bearer tokens.
 	{Version: 24, Name: "native_agents", SQLite: nativeAgentsSchema("DATETIME"), Postgres: nativeAgentsSchema("TIMESTAMPTZ")},
-	// Index attachments by message_id for fast attachment hydration when listing messages.
-	{Version: 25, Name: "attachments_message_index", SQLite: attachmentsMessageIndex, Postgres: attachmentsMessageIndex},
+	// Index attachments by message_id and quota columns, and track in-flight upload quota reservations.
+	{Version: 25, Name: "attachments_message_index", SQLite: attachmentsQuotaSchema, Postgres: attachmentsQuotaSchema},
 }
 
-const attachmentsMessageIndex = `CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);`
+const attachmentsQuotaSchema = `
+CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
+CREATE INDEX IF NOT EXISTS idx_attachments_quota ON attachments(tenant_id, uploader_id, message_id);
+CREATE TABLE IF NOT EXISTS attachment_upload_reservations (
+    id VARCHAR(64) PRIMARY KEY,
+    tenant_id VARCHAR(64) NOT NULL,
+    uploader_id VARCHAR(64) NOT NULL,
+    reserved_bytes BIGINT NOT NULL,
+    expires_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_attachment_reservations_quota ON attachment_upload_reservations(tenant_id, uploader_id, expires_at);
+`
 
 func nativeAgentsSchema(timestamp string) string {
 	return `

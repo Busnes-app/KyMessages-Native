@@ -152,7 +152,11 @@ export async function fetchMessages(
   );
 }
 
-export async function uploadAttachment(roomId: string, file: File): Promise<ChatAttachment> {
+export async function uploadAttachment(
+  roomId: string,
+  file: File,
+  signal?: AbortSignal,
+): Promise<ChatAttachment> {
   const form = new FormData();
   form.append('file', file, file.name);
   // Leave Content-Type unset so the browser supplies the multipart boundary; secureFetch adds X-CSRF-Token.
@@ -160,6 +164,7 @@ export async function uploadAttachment(roomId: string, file: File): Promise<Chat
     method: 'POST',
     credentials: 'same-origin',
     body: form,
+    signal,
   });
   if (!res.ok) {
     throw new Error(await errorMessage(res, 'Could not upload file'));

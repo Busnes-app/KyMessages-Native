@@ -3,7 +3,11 @@ package store_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Busnes-app/ky_server_base/internal/store"
 	"github.com/Busnes-app/ky_server_base/internal/testdb"
@@ -406,4 +410,160 @@ func TestChatStoreAttachments(t *testing.T) {
 	if _, err := chat.GetAttachment(ctx, store.DefaultTenantID, attA.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("GetAttachment after DeleteMessage = %v, want ErrNotFound", err)
 	}
+}
+
+func TestAttachmentQuotaAtomicConcurrencyAndReservationRelease(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	chat := st.Chat()
+
+	room := &store.Room{Kind: store.RoomKindChannel, Name: "quota-race", CreatedBy: "u_alice"}
+	if err := chat.CreateRoom(ctx, room, []string{"u_alice", "u_bob", "u_carol", "u_dave"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Reservation blocks concurrent over-admission, and release immediately frees capacity.
+	limits := store.AttachmentQuotaLimits{MaxTotalBytes: 2500, MaxPendingUserBytes: 1500}
+	res1, err := chat.ReserveAttachmentQuota(ctx, store.DefaultTenantID, "u_alice", 1500, limits, time.Minute)
+	if err != nil || res1.ReservedBytes != 1500 {
+		t.Fatalf("ReserveAttachmentQuota res1 = (%+v, %v), want 1500", res1, err)
+	}
+	if _, err := chat.ReserveAttachmentQuota(ctx, store.DefaultTenantID, "u_alice", 100, limits, time.Minute); !errors.Is(err, store.ErrAttachmentPendingQuotaExceeded) {
+		t.Fatalf("second alice reservation while full = %v, want ErrAttachmentPendingQuotaExceeded", err)
+	}
+	if err := chat.ReleaseAttachmentQuota(ctx, store.DefaultTenantID, res1.ID); err != nil {
+		t.Fatalf("ReleaseAttachmentQuota: %v", err)
+	}
+	res2, err := chat.ReserveAttachmentQuota(ctx, store.DefaultTenantID, "u_alice", 1500, limits, 5*time.Millisecond)
+	if err != nil || res2.ReservedBytes != 1500 {
+		t.Fatalf("ReserveAttachmentQuota after release = (%+v, %v)", res2, err)
+	}
+	// Expired reservation is automatically reclaimed on the next admission check.
+	time.Sleep(15 * time.Millisecond)
+	res3, err := chat.ReserveAttachmentQuota(ctx, store.DefaultTenantID, "u_alice", 1500, limits, time.Minute)
+	if err != nil || res3.ReservedBytes != 1500 {
+		t.Fatalf("ReserveAttachmentQuota after expiry = (%+v, %v)", res3, err)
+	}
+	if err := chat.ReleaseAttachmentQuota(ctx, store.DefaultTenantID, res3.ID); err != nil {
+		t.Fatalf("ReleaseAttachmentQuota res3: %v", err)
+	}
+
+	// 2. Direct concurrent CommitAttachmentWithQuota calls (even without pre-reservation)
+	// must serialize atomically per tenant/uploader and never exceed MaxPendingUserBytes.
+	t.Run("concurrent_commit_pending_quota", func(t *testing.T) {
+		const (
+			workers    = 20
+			fileSize   = int64(400)
+			pendingCap = int64(1500) // at most 3 * 400 = 1200 bytes
+		)
+		capLimits := store.AttachmentQuotaLimits{MaxTotalBytes: 100000, MaxPendingUserBytes: pendingCap}
+		start := make(chan struct{})
+		var accepted atomic.Int64
+		var wg sync.WaitGroup
+		errs := make(chan error, workers)
+
+		for i := range workers {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				<-start
+				att := &store.Attachment{
+					RoomID:     room.ID,
+					UploaderID: "u_alice",
+					Filename:   fmt.Sprintf("p-%d.bin", idx),
+					MimeType:   "application/octet-stream",
+					SizeBytes:  fileSize,
+					SHA256Hex:  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				}
+				err := chat.CommitAttachmentWithQuota(ctx, "", att, capLimits)
+				if err == nil {
+					accepted.Add(1)
+				} else if !errors.Is(err, store.ErrAttachmentPendingQuotaExceeded) {
+					errs <- err
+				}
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatalf("unexpected commit error: %v", err)
+		}
+
+		used, err := chat.SumPendingAttachmentBytesByUploader(ctx, store.DefaultTenantID, "u_alice")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if accepted.Load() != 3 || used != 3*fileSize || used > pendingCap {
+			t.Fatalf("accepted=%d used=%d, want 3 uploads (1200 bytes <= %d)", accepted.Load(), used, pendingCap)
+		}
+	})
+
+	// 3. Multi-user concurrent Reserve + Commit calls must never exceed MaxTotalBytes.
+	t.Run("concurrent_multi_user_tenant_quota", func(t *testing.T) {
+		const (
+			fileSize  = int64(500)
+			tenantCap = int64(3200) // alice already holds 1200 -> at most 4 more (2000 bytes)
+		)
+		capLimits := store.AttachmentQuotaLimits{MaxTotalBytes: tenantCap, MaxPendingUserBytes: 10000}
+		users := []string{"u_alice", "u_bob", "u_carol", "u_dave"}
+		start := make(chan struct{})
+		var accepted atomic.Int64
+		var wg sync.WaitGroup
+		errs := make(chan error, len(users)*5)
+
+		for _, uid := range users {
+			for j := range 5 {
+				wg.Add(1)
+				go func(uploader string, idx int) {
+					defer wg.Done()
+					<-start
+					res, err := chat.ReserveAttachmentQuota(ctx, store.DefaultTenantID, uploader, fileSize, capLimits, time.Minute)
+					if err != nil {
+						if !errors.Is(err, store.ErrAttachmentTenantQuotaExceeded) {
+							errs <- fmt.Errorf("reserve: %w", err)
+						}
+						return
+					}
+					if res.ReservedBytes < fileSize {
+						_ = chat.ReleaseAttachmentQuota(ctx, store.DefaultTenantID, res.ID)
+						return
+					}
+					att := &store.Attachment{
+						RoomID:     room.ID,
+						UploaderID: uploader,
+						Filename:   fmt.Sprintf("t-%s-%d.bin", uploader, idx),
+						MimeType:   "application/octet-stream",
+						SizeBytes:  fileSize,
+						SHA256Hex:  "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+					}
+					if err := chat.CommitAttachmentWithQuota(ctx, res.ID, att, capLimits); err != nil {
+						_ = chat.ReleaseAttachmentQuota(ctx, store.DefaultTenantID, res.ID)
+						if !errors.Is(err, store.ErrAttachmentTenantQuotaExceeded) {
+							errs <- fmt.Errorf("commit: %w", err)
+						}
+						return
+					}
+					accepted.Add(1)
+				}(uid, j)
+			}
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		totalUsed, err := chat.SumAttachmentBytesByTenant(ctx, store.DefaultTenantID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if totalUsed > tenantCap {
+			t.Fatalf("tenant totalUsed = %d exceeds cap %d (accepted=%d)", totalUsed, tenantCap, accepted.Load())
+		}
+		if accepted.Load() != 4 || totalUsed != 1200+4*fileSize {
+			t.Fatalf("accepted=%d totalUsed=%d, want 4 new uploads (total 3200)", accepted.Load(), totalUsed)
+		}
+	})
 }

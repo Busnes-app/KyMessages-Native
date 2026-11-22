@@ -21,7 +21,9 @@ const (
 	maxAttachmentsPerMessage = 10
 	// multipartEnvelopeOverhead leaves headroom for multipart boundaries and headers
 	// without allowing arbitrary request inflation beyond MaxUploadBytes.
-	multipartEnvelopeOverhead = 64 << 10
+	multipartEnvelopeOverhead   = 64 << 10
+	attachmentUploadReadTimeout = 2 * time.Minute
+	attachmentReservationTTL    = 3 * time.Minute
 )
 
 var chatLimitUploads = chatLimit{"chat-uploads:", 30}
@@ -105,45 +107,15 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	maxTotal := s.maxTotalAttachmentBytes()
-	totalUsed, err := s.store.Chat().SumAttachmentBytesByTenant(r.Context(), tenantID)
-	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "Failed to check attachment storage quota")
-		return
-	}
-	totalRemaining := maxTotal - totalUsed
-	if totalRemaining <= 0 {
-		s.writeError(w, http.StatusRequestEntityTooLarge, "Workspace attachment storage quota exceeded")
-		return
-	}
-
-	maxPending := s.maxPendingUserBytes()
-	pendingUsed, err := s.store.Chat().SumPendingAttachmentBytesByUploader(r.Context(), tenantID, user.ID)
-	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "Failed to check pending upload quota")
-		return
-	}
-	pendingRemaining := maxPending - pendingUsed
-	if pendingRemaining <= 0 {
-		s.writeError(w, http.StatusRequestEntityTooLarge, "Pending attachment quota exceeded; send or remove staged uploads first")
-		return
-	}
-
 	maxBytes := s.maxUploadBytes()
-	effectiveMax := maxBytes
-	quotaErrMsg := fmt.Sprintf("File exceeds maximum size of %d bytes", maxBytes)
-	if pendingRemaining < effectiveMax {
-		effectiveMax = pendingRemaining
-		quotaErrMsg = "Pending attachment quota exceeded; send or remove staged uploads first"
-	}
-	if totalRemaining < effectiveMax {
-		effectiveMax = totalRemaining
-		quotaErrMsg = "Workspace attachment storage quota exceeded"
+	limits := store.AttachmentQuotaLimits{
+		MaxTotalBytes:       s.maxTotalAttachmentBytes(),
+		MaxPendingUserBytes: s.maxPendingUserBytes(),
 	}
 
 	// Extend read deadline for larger uploads on real connections; ignored on httptest recorders.
-	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(2 * time.Minute))
-	r.Body = http.MaxBytesReader(w, r.Body, effectiveMax+multipartEnvelopeOverhead)
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(attachmentUploadReadTimeout))
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes+multipartEnvelopeOverhead)
 
 	mr, err := r.MultipartReader()
 	if err != nil {
@@ -161,7 +133,7 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 		if err != nil {
 			var maxErr *http.MaxBytesError
 			if errors.As(err, &maxErr) {
-				s.writeError(w, http.StatusRequestEntityTooLarge, quotaErrMsg)
+				s.writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("File exceeds maximum size of %d bytes", maxBytes))
 				return
 			}
 			s.writeError(w, http.StatusBadRequest, "Malformed multipart upload")
@@ -180,8 +152,42 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 	}
 	defer filePart.Close()
 
+	requestedBytes := maxBytes
+	if r.ContentLength > 0 && r.ContentLength < requestedBytes {
+		requestedBytes = r.ContentLength
+	}
+	res, err := s.store.Chat().ReserveAttachmentQuota(r.Context(), tenantID, user.ID, requestedBytes, limits, attachmentReservationTTL)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrAttachmentTenantQuotaExceeded):
+			s.writeError(w, http.StatusRequestEntityTooLarge, "Workspace attachment storage quota exceeded")
+		case errors.Is(err, store.ErrAttachmentPendingQuotaExceeded):
+			s.writeError(w, http.StatusRequestEntityTooLarge, "Pending attachment quota exceeded; send or remove staged uploads first")
+		default:
+			s.writeError(w, http.StatusInternalServerError, "Failed to reserve attachment storage quota")
+		}
+		return
+	}
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		relCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+		defer cancel()
+		_ = s.store.Chat().ReleaseAttachmentQuota(relCtx, tenantID, res.ID)
+	}()
+
+	quotaErrMsg := fmt.Sprintf("File exceeds maximum size of %d bytes", maxBytes)
+	switch res.LimitingKind {
+	case store.AttachmentQuotaLimitPending:
+		quotaErrMsg = "Pending attachment quota exceeded; send or remove staged uploads first"
+	case store.AttachmentQuotaLimitTenant:
+		quotaErrMsg = "Workspace attachment storage quota exceeded"
+	}
+
 	attID := "att_" + uuid.Must(uuid.NewV7()).String()
-	putRes, err := s.blobs.Put(attID, filePart, effectiveMax)
+	putRes, err := s.blobs.Put(attID, filePart, res.ReservedBytes)
 	if err != nil {
 		var maxErr *http.MaxBytesError
 		switch {
@@ -192,26 +198,6 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 		default:
 			s.writeError(w, http.StatusInternalServerError, "Failed to store uploaded file")
 		}
-		return
-	}
-
-	// Re-check quotas after streaming to catch concurrent uploads racing on remaining headroom.
-	if freshTotal, err := s.store.Chat().SumAttachmentBytesByTenant(r.Context(), tenantID); err != nil {
-		_ = s.blobs.Delete(putRes.Key)
-		s.writeError(w, http.StatusInternalServerError, "Failed to verify attachment storage quota")
-		return
-	} else if freshTotal+putRes.SizeBytes > maxTotal {
-		_ = s.blobs.Delete(putRes.Key)
-		s.writeError(w, http.StatusRequestEntityTooLarge, "Workspace attachment storage quota exceeded")
-		return
-	}
-	if freshPending, err := s.store.Chat().SumPendingAttachmentBytesByUploader(r.Context(), tenantID, user.ID); err != nil {
-		_ = s.blobs.Delete(putRes.Key)
-		s.writeError(w, http.StatusInternalServerError, "Failed to verify pending upload quota")
-		return
-	} else if freshPending+putRes.SizeBytes > maxPending {
-		_ = s.blobs.Delete(putRes.Key)
-		s.writeError(w, http.StatusRequestEntityTooLarge, "Pending attachment quota exceeded; send or remove staged uploads first")
 		return
 	}
 
@@ -226,11 +212,19 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 		SizeBytes:  putRes.SizeBytes,
 		SHA256Hex:  putRes.SHA256Hex,
 	}
-	if err := s.store.Chat().CreateAttachment(r.Context(), att); err != nil {
+	if err := s.store.Chat().CommitAttachmentWithQuota(r.Context(), res.ID, att, limits); err != nil {
 		_ = s.blobs.Delete(putRes.Key)
-		s.writeError(w, http.StatusInternalServerError, "Failed to save attachment metadata")
+		switch {
+		case errors.Is(err, store.ErrAttachmentTenantQuotaExceeded):
+			s.writeError(w, http.StatusRequestEntityTooLarge, "Workspace attachment storage quota exceeded")
+		case errors.Is(err, store.ErrAttachmentPendingQuotaExceeded):
+			s.writeError(w, http.StatusRequestEntityTooLarge, "Pending attachment quota exceeded; send or remove staged uploads first")
+		default:
+			s.writeError(w, http.StatusInternalServerError, "Failed to save attachment metadata")
+		}
 		return
 	}
+	committed = true
 
 	w.Header().Set("Cache-Control", "no-store")
 	s.writeJSON(w, http.StatusCreated, map[string]any{"attachment": att})

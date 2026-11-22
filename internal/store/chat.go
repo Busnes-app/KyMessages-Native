@@ -1201,6 +1201,177 @@ func (c *chatStore) DeleteStagedAttachment(ctx context.Context, tenantID, attach
 	return blobKey, nil
 }
 
+func (c *chatStore) lockAttachmentQuotaTx(ctx context.Context, tx *sql.Tx, tenantID string) error {
+	if c.store.driver == "postgres" {
+		// Transaction-scoped advisory lock isolates quota admission per schema and tenant
+		// across all connections and replicas, releasing automatically on commit or rollback.
+		_, err := tx.ExecContext(ctx,
+			`SELECT pg_advisory_xact_lock(hashtext('kymessages:attachment-quota:' || current_schema()), hashtext($1))`,
+			tenantID,
+		)
+		return err
+	}
+	return nil
+}
+
+func (c *chatStore) attachmentQuotaUsageTx(ctx context.Context, tx *sql.Tx, tenantID, uploaderID string, nowMs int64) (tenantUsed, pendingUsed int64, err error) {
+	pruneQ := c.store.rebind(`DELETE FROM attachment_upload_reservations WHERE tenant_id = ? AND expires_at <= ?`)
+	if _, err := tx.ExecContext(ctx, pruneQ, tenantID, nowMs); err != nil {
+		return 0, 0, err
+	}
+
+	var tenantAtts, tenantRes, pendingAtts, pendingRes int64
+	if err := tx.QueryRowContext(ctx,
+		c.store.rebind(`SELECT COALESCE(SUM(size_bytes), 0) FROM attachments WHERE tenant_id = ?`),
+		tenantID,
+	).Scan(&tenantAtts); err != nil {
+		return 0, 0, err
+	}
+	if err := tx.QueryRowContext(ctx,
+		c.store.rebind(`SELECT COALESCE(SUM(reserved_bytes), 0) FROM attachment_upload_reservations WHERE tenant_id = ?`),
+		tenantID,
+	).Scan(&tenantRes); err != nil {
+		return 0, 0, err
+	}
+	if err := tx.QueryRowContext(ctx,
+		c.store.rebind(`SELECT COALESCE(SUM(size_bytes), 0) FROM attachments WHERE tenant_id = ? AND uploader_id = ? AND message_id IS NULL`),
+		tenantID, uploaderID,
+	).Scan(&pendingAtts); err != nil {
+		return 0, 0, err
+	}
+	if err := tx.QueryRowContext(ctx,
+		c.store.rebind(`SELECT COALESCE(SUM(reserved_bytes), 0) FROM attachment_upload_reservations WHERE tenant_id = ? AND uploader_id = ?`),
+		tenantID, uploaderID,
+	).Scan(&pendingRes); err != nil {
+		return 0, 0, err
+	}
+	return tenantAtts + tenantRes, pendingAtts + pendingRes, nil
+}
+
+func (c *chatStore) ReserveAttachmentQuota(ctx context.Context, tenantID, uploaderID string, requestedBytes int64, limits AttachmentQuotaLimits, ttl time.Duration) (*AttachmentQuotaReservation, error) {
+	tenantID = normalizeTenant(tenantID)
+	if requestedBytes <= 0 {
+		return nil, fmt.Errorf("requestedBytes must be positive")
+	}
+	if ttl <= 0 {
+		ttl = 3 * time.Minute
+	}
+	tx, err := c.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := c.lockAttachmentQuotaTx(ctx, tx, tenantID); err != nil {
+		return nil, err
+	}
+	now := nowMilli()
+	tenantUsed, pendingUsed, err := c.attachmentQuotaUsageTx(ctx, tx, tenantID, uploaderID, now)
+	if err != nil {
+		return nil, err
+	}
+
+	granted := requestedBytes
+	limiting := AttachmentQuotaLimitUpload
+
+	if limits.MaxTotalBytes > 0 {
+		totalRem := limits.MaxTotalBytes - tenantUsed
+		if totalRem <= 0 {
+			return nil, ErrAttachmentTenantQuotaExceeded
+		}
+		if totalRem < granted {
+			granted = totalRem
+			limiting = AttachmentQuotaLimitTenant
+		}
+	}
+	if limits.MaxPendingUserBytes > 0 {
+		pendingRem := limits.MaxPendingUserBytes - pendingUsed
+		if pendingRem <= 0 {
+			return nil, ErrAttachmentPendingQuotaExceeded
+		}
+		if pendingRem < granted {
+			granted = pendingRem
+			limiting = AttachmentQuotaLimitPending
+		}
+	}
+
+	resID := "res_" + uuid.Must(uuid.NewV7()).String()
+	insQ := c.store.rebind(`
+		INSERT INTO attachment_upload_reservations (id, tenant_id, uploader_id, reserved_bytes, expires_at)
+		VALUES (?, ?, ?, ?, ?)`)
+	if _, err := tx.ExecContext(ctx, insQ, resID, tenantID, uploaderID, granted, now+ttl.Milliseconds()); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &AttachmentQuotaReservation{
+		ID:            resID,
+		ReservedBytes: granted,
+		LimitingKind:  limiting,
+	}, nil
+}
+
+func (c *chatStore) ReleaseAttachmentQuota(ctx context.Context, tenantID, reservationID string) error {
+	if reservationID == "" {
+		return nil
+	}
+	tenantID = normalizeTenant(tenantID)
+	q := c.store.rebind(`DELETE FROM attachment_upload_reservations WHERE tenant_id = ? AND id = ?`)
+	_, err := c.store.db.ExecContext(ctx, q, tenantID, reservationID)
+	return err
+}
+
+func (c *chatStore) CommitAttachmentWithQuota(ctx context.Context, reservationID string, a *Attachment, limits AttachmentQuotaLimits) error {
+	a.TenantID = normalizeTenant(a.TenantID)
+	if a.ID == "" {
+		a.ID = "att_" + uuid.Must(uuid.NewV7()).String()
+	}
+	if a.BlobKey == "" {
+		a.BlobKey = a.ID
+	}
+	if a.CreatedAt == 0 {
+		a.CreatedAt = nowMilli()
+	}
+
+	tx, err := c.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := c.lockAttachmentQuotaTx(ctx, tx, a.TenantID); err != nil {
+		return err
+	}
+	if reservationID != "" {
+		delResQ := c.store.rebind(`DELETE FROM attachment_upload_reservations WHERE tenant_id = ? AND id = ?`)
+		if _, err := tx.ExecContext(ctx, delResQ, a.TenantID, reservationID); err != nil {
+			return err
+		}
+	}
+	tenantUsed, pendingUsed, err := c.attachmentQuotaUsageTx(ctx, tx, a.TenantID, a.UploaderID, nowMilli())
+	if err != nil {
+		return err
+	}
+	if limits.MaxTotalBytes > 0 && tenantUsed+a.SizeBytes > limits.MaxTotalBytes {
+		return ErrAttachmentTenantQuotaExceeded
+	}
+	if limits.MaxPendingUserBytes > 0 && a.MessageID == "" && pendingUsed+a.SizeBytes > limits.MaxPendingUserBytes {
+		return ErrAttachmentPendingQuotaExceeded
+	}
+
+	insQ := c.store.rebind(`
+		INSERT INTO attachments (id, tenant_id, room_id, message_id, uploader_id, blob_key, filename, mime_type, size_bytes, sha256_hex, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	if _, err := tx.ExecContext(ctx, insQ,
+		a.ID, a.TenantID, a.RoomID, nullString(a.MessageID), a.UploaderID,
+		a.BlobKey, a.Filename, a.MimeType, a.SizeBytes, a.SHA256Hex, a.CreatedAt,
+	); err != nil {
+		return uniqueError(err)
+	}
+	return tx.Commit()
+}
+
 func (c *chatStore) SumAttachmentBytesByTenant(ctx context.Context, tenantID string) (int64, error) {
 	tenantID = normalizeTenant(tenantID)
 	q := c.store.rebind(`SELECT COALESCE(SUM(size_bytes), 0) FROM attachments WHERE tenant_id = ?`)
@@ -1231,6 +1402,10 @@ func (c *chatStore) PurgeOrphanAttachments(ctx context.Context, olderThanMilli i
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	if _, err := tx.ExecContext(ctx, c.store.rebind(`DELETE FROM attachment_upload_reservations WHERE expires_at <= ?`), nowMilli()); err != nil {
+		return nil, err
+	}
+
 	selQ := c.store.rebind(`
 		SELECT id, blob_key FROM attachments
 		WHERE message_id IS NULL AND created_at < ?
@@ -1259,6 +1434,9 @@ func (c *chatStore) PurgeOrphanAttachments(ctx context.Context, olderThanMilli i
 	}
 	_ = rows.Close()
 	if len(candidates) == 0 {
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
 		return nil, nil
 	}
 

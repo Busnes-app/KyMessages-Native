@@ -267,4 +267,99 @@ describe('Native Chat page', () => {
     fireEvent.click(btn);
     expect(await screen.findByRole('heading', { name: 'Welcome to #general' })).toBeTruthy();
   });
+
+  it('aborts and deletes a staged attachment removed while its upload is still in flight', async () => {
+    let resolveUpload!: (res: Response) => void;
+    let uploadSignal: AbortSignal | undefined;
+    const deletedUrls: string[] = [];
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? 'GET';
+        if (url === '/api/v1/bootstrap') {
+          return Promise.resolve(
+            json({
+              user: { id: 'u_alice', username: 'alice', display_name: 'Alice', role: 'user' },
+              tenant: { id: 'default', slug: 'default', display_name: 'Busnes HQ', plan: 'self_hosted' },
+              rooms: [
+                {
+                  id: 'rm_gen',
+                  tenant_id: 'default',
+                  kind: 'channel',
+                  name: 'general',
+                  topic: '',
+                  is_private: false,
+                  last_seq: 0,
+                  created_by: 'u_alice',
+                  created_at: Date.now(),
+                  role: 'owner',
+                  last_read_seq: 0,
+                  unread_count: 0,
+                  notify_mode: 'all',
+                },
+              ],
+              attachments: { max_upload_bytes: 10 * 1024 * 1024, max_per_message: 10 },
+            }),
+          );
+        }
+        if (url.startsWith('/api/v1/rooms/rm_gen/messages')) {
+          return Promise.resolve(json({ messages: [], has_more: false }));
+        }
+        if (url === '/api/v1/rooms/rm_gen/attachments' && method === 'POST') {
+          uploadSignal = init?.signal ?? undefined;
+          return new Promise<Response>((resolve) => {
+            resolveUpload = resolve;
+          });
+        }
+        if (url.startsWith('/api/v1/attachments/') && method === 'DELETE') {
+          deletedUrls.push(url);
+          return Promise.resolve(new Response(null, { status: 204 }));
+        }
+        return Promise.resolve(json({ error: 'not found' }, 404));
+      }),
+    );
+
+    const { container } = render(<Chat />);
+    await screen.findByRole('heading', { name: 'Welcome to #general' });
+
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement;
+    expect(fileInput).toBeTruthy();
+    const file = new File(['hello world'], 'report.txt', { type: 'text/plain' });
+    fireEvent.change(fileInput, { target: { files: [file] } });
+
+    const removeBtn = await screen.findByRole('button', { name: 'Remove report.txt' });
+    expect(uploadSignal?.aborted).toBe(false);
+
+    // User removes chip while upload is still in flight.
+    fireEvent.click(removeBtn);
+    expect(uploadSignal?.aborted).toBe(true);
+
+    // Even if the server had already finished and resolves with 201, the client must DELETE it.
+    await act(async () => {
+      resolveUpload(
+        json(
+          {
+            attachment: {
+              id: 'att_late_orphan',
+              tenant_id: 'default',
+              room_id: 'rm_gen',
+              uploader_id: 'u_alice',
+              filename: 'report.txt',
+              mime_type: 'text/plain',
+              size_bytes: 11,
+              sha256_hex: 'a'.repeat(64),
+              created_at: Date.now(),
+            },
+          },
+          201,
+        ),
+      );
+    });
+
+    await waitFor(() => {
+      expect(deletedUrls).toEqual(['/api/v1/attachments/att_late_orphan']);
+    });
+  });
 });

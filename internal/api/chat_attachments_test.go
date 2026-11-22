@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"image"
 	"image/color"
 	"image/png"
@@ -14,6 +15,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -418,4 +421,195 @@ func TestChatAttachmentQuotasDeleteAndOrphanSweep(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(cfg.Attachments.Dir, linkedResp.Attachment.ID)); err != nil {
 		t.Fatalf("linked attachment blob should survive orphan sweep: %v", err)
 	}
+}
+
+func TestChatAttachmentConcurrentUploadsRespectPendingAndTenantQuotas(t *testing.T) {
+	t.Run("pending_user_quota", func(t *testing.T) {
+		_, st, cfg := setupTestServer(t)
+		cfg.Attachments.MaxUploadBytes = 2048
+		cfg.Attachments.MaxPendingUserBytes = 2500
+		cfg.Attachments.MaxTotalBytes = 100000
+		srv := api.NewServer(cfg, st)
+		startChatBus(t, srv)
+		defer srv.CloseChat()
+
+		alice, aliceTok := createChatTestUser(t, st, "u_race_alice", "race_alice", "user")
+		room := &store.Room{Kind: store.RoomKindChannel, Name: "race-pending", CreatedBy: alice.ID}
+		if err := st.Chat().CreateRoom(context.Background(), room, []string{alice.ID}); err != nil {
+			t.Fatal(err)
+		}
+		roomID := room.ID
+
+		const (
+			workers  = 12
+			fileSize = 800
+		)
+		start := make(chan struct{})
+		var acceptedCount atomic.Int64
+		var acceptedBytes atomic.Int64
+		errs := make(chan string, workers)
+		var wg sync.WaitGroup
+
+		for i := range workers {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				<-start
+				rec := doMultipartUpload(t, srv, "/api/v1/rooms/"+roomID+"/attachments", aliceTok, "file", fmt.Sprintf("u%d.txt", idx), bytes.Repeat([]byte("a"), fileSize))
+				switch rec.Code {
+				case http.StatusCreated:
+					var resp struct {
+						Attachment store.Attachment `json:"attachment"`
+					}
+					if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+						errs <- fmt.Sprintf("decode 201: %v", err)
+						return
+					}
+					acceptedCount.Add(1)
+					acceptedBytes.Add(resp.Attachment.SizeBytes)
+				case http.StatusRequestEntityTooLarge:
+					// Expected rejection once pending quota is exhausted.
+				default:
+					errs <- fmt.Sprintf("worker %d got status %d: %s", idx, rec.Code, rec.Body.String())
+				}
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+		for msg := range errs {
+			t.Fatal(msg)
+		}
+
+		if acceptedCount.Load() < 1 {
+			t.Fatal("expected at least 1 upload to succeed")
+		}
+		if acceptedBytes.Load() > cfg.Attachments.MaxPendingUserBytes {
+			t.Fatalf("acceptedBytes = %d exceeds MaxPendingUserBytes %d", acceptedBytes.Load(), cfg.Attachments.MaxPendingUserBytes)
+		}
+		dbPending, err := st.Chat().SumPendingAttachmentBytesByUploader(context.Background(), store.DefaultTenantID, alice.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dbPending != acceptedBytes.Load() || dbPending > cfg.Attachments.MaxPendingUserBytes {
+			t.Fatalf("dbPending = %d, acceptedBytes = %d, cap = %d", dbPending, acceptedBytes.Load(), cfg.Attachments.MaxPendingUserBytes)
+		}
+
+		// Verify rejected uploads left no orphaned blobs on disk.
+		entries, err := os.ReadDir(cfg.Attachments.Dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if int64(len(entries)) != acceptedCount.Load() {
+			t.Fatalf("blob dir entries = %d, want %d (no leaked blobs for rejected uploads)", len(entries), acceptedCount.Load())
+		}
+
+		// Verify rejected uploads released their in-flight reservations: a follow-up upload
+		// fitting inside the remaining headroom must succeed.
+		remaining := cfg.Attachments.MaxPendingUserBytes - dbPending
+		if remaining >= 100 {
+			rec := doMultipartUpload(t, srv, "/api/v1/rooms/"+roomID+"/attachments", aliceTok, "file", "followup.txt", bytes.Repeat([]byte("z"), 100))
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("follow-up upload within remaining headroom (%d) = %d: %s", remaining, rec.Code, rec.Body.String())
+			}
+		}
+	})
+
+	t.Run("workspace_total_quota", func(t *testing.T) {
+		_, st, cfg := setupTestServer(t)
+		cfg.Attachments.MaxUploadBytes = 2048
+		cfg.Attachments.MaxPendingUserBytes = 10000
+		cfg.Attachments.MaxTotalBytes = 3000
+		srv := api.NewServer(cfg, st)
+		startChatBus(t, srv)
+		defer srv.CloseChat()
+
+		names := []string{"tot_alice", "tot_bob", "tot_carol", "tot_dave"}
+		memberIDs := make([]string, len(names))
+		tokens := make([]string, len(names))
+		for i, name := range names {
+			u, tok := createChatTestUser(t, st, "u_"+name, name, "user")
+			memberIDs[i] = u.ID
+			tokens[i] = tok
+		}
+		room := &store.Room{Kind: store.RoomKindChannel, Name: "race-total", CreatedBy: memberIDs[0]}
+		if err := st.Chat().CreateRoom(context.Background(), room, memberIDs); err != nil {
+			t.Fatal(err)
+		}
+		roomID := room.ID
+
+		const (
+			perUser  = 3
+			fileSize = 800
+		)
+		start := make(chan struct{})
+		var acceptedCount atomic.Int64
+		var acceptedBytes atomic.Int64
+		errs := make(chan string, len(names)*perUser)
+		var wg sync.WaitGroup
+
+		for uIdx, tok := range tokens {
+			for j := range perUser {
+				wg.Add(1)
+				go func(userIdx, idx int, token string) {
+					defer wg.Done()
+					<-start
+					rec := doMultipartUpload(t, srv, "/api/v1/rooms/"+roomID+"/attachments", token, "file", fmt.Sprintf("u%d_%d.txt", userIdx, idx), bytes.Repeat([]byte("b"), fileSize))
+					switch rec.Code {
+					case http.StatusCreated:
+						var resp struct {
+							Attachment store.Attachment `json:"attachment"`
+						}
+						if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+							errs <- fmt.Sprintf("decode 201: %v", err)
+							return
+						}
+						acceptedCount.Add(1)
+						acceptedBytes.Add(resp.Attachment.SizeBytes)
+					case http.StatusRequestEntityTooLarge:
+						// Expected once workspace quota is reached.
+					default:
+						errs <- fmt.Sprintf("user %d upload %d got status %d: %s", userIdx, idx, rec.Code, rec.Body.String())
+					}
+				}(uIdx, j, tok)
+			}
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+		for msg := range errs {
+			t.Fatal(msg)
+		}
+
+		if acceptedCount.Load() < 1 {
+			t.Fatal("expected at least 1 upload to succeed")
+		}
+		if acceptedBytes.Load() > cfg.Attachments.MaxTotalBytes {
+			t.Fatalf("acceptedBytes = %d exceeds MaxTotalBytes %d", acceptedBytes.Load(), cfg.Attachments.MaxTotalBytes)
+		}
+		dbTotal, err := st.Chat().SumAttachmentBytesByTenant(context.Background(), store.DefaultTenantID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dbTotal != acceptedBytes.Load() || dbTotal > cfg.Attachments.MaxTotalBytes {
+			t.Fatalf("dbTotal = %d, acceptedBytes = %d, cap = %d", dbTotal, acceptedBytes.Load(), cfg.Attachments.MaxTotalBytes)
+		}
+
+		entries, err := os.ReadDir(cfg.Attachments.Dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if int64(len(entries)) != acceptedCount.Load() {
+			t.Fatalf("blob dir entries = %d, want %d", len(entries), acceptedCount.Load())
+		}
+
+		// Confirm reservations were released on rejected uploads.
+		remaining := cfg.Attachments.MaxTotalBytes - dbTotal
+		if remaining >= 100 {
+			rec := doMultipartUpload(t, srv, "/api/v1/rooms/"+roomID+"/attachments", tokens[0], "file", "followup.txt", bytes.Repeat([]byte("z"), 100))
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("follow-up upload within remaining tenant headroom (%d) = %d: %s", remaining, rec.Code, rec.Body.String())
+			}
+		}
+	})
 }
