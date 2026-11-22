@@ -1,5 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AtSign,
+  Bell,
+  BellOff,
   Check,
   Copy,
   ExternalLink,
@@ -25,6 +28,7 @@ import type {
   ChatRoomDetail,
   ChatRoomWebhook,
   LobbyGuest,
+  NotifyMode,
 } from '../../chat/types';
 import {
   addRoomMember,
@@ -33,6 +37,7 @@ import {
   removeRoomMember,
   revokeRoomWebhook,
   updateRoomInfo,
+  updateRoomNotifyMode,
 } from '../../chat/client';
 import { formatTime, initialsFor, isBotSender } from '../../chat/state';
 
@@ -101,6 +106,7 @@ interface RoomDetailsDrawerProps {
   onDecideLobby?: (guestId: string, admit: boolean) => Promise<void>;
   onAdmitAllLobby?: () => Promise<void>;
   onCreateGuestLink?: () => Promise<string>;
+  onNotifyModeChanged?: (roomId: string, mode: NotifyMode) => void;
 }
 
 export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
@@ -120,11 +126,14 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
   onDecideLobby,
   onAdmitAllLobby,
   onCreateGuestLink,
+  onNotifyModeChanged,
 }) => {
   const [tab, setTab] = useState<DrawerTab>('about');
   const [name, setName] = useState('');
   const [topic, setTopic] = useState('');
   const [savingInfo, setSavingInfo] = useState(false);
+  const [notifyMode, setNotifyMode] = useState<NotifyMode>('all');
+  const [savingNotify, setSavingNotify] = useState(false);
   const [memberFilter, setMemberFilter] = useState('');
   const [addUserId, setAddUserId] = useState('');
   const [busyAction, setBusyAction] = useState(false);
@@ -177,6 +186,15 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
     setName(room.name);
     setTopic(room.topic);
   }, [room?.id, room?.name, room?.topic]);
+
+  useEffect(() => {
+    const raw = detail?.member.notify_mode;
+    if (raw === 'mentions' || raw === 'mute' || raw === 'all') {
+      setNotifyMode(raw);
+    } else {
+      setNotifyMode('all');
+    }
+  }, [room?.id, detail?.member.notify_mode]);
 
   useEffect(() => {
     if (!room || !canModerate || isDM) {
@@ -579,6 +597,55 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
                     </div>
                   </div>
                 )}
+
+                <section className="chat-drawer-section" aria-label="Room notifications">
+                  <div className="chat-drawer-section-head">
+                    <h4>Notifications</h4>
+                  </div>
+                  <div className="chat-notify-segment" role="radiogroup" aria-label="Notification preference">
+                    {(
+                      [
+                        { value: 'all', label: 'All', icon: Bell },
+                        { value: 'mentions', label: 'Mentions', icon: AtSign },
+                        { value: 'mute', label: 'Mute', icon: BellOff },
+                      ] as const
+                    ).map(({ value, label, icon: Icon }) => {
+                      const active = notifyMode === value;
+                      return (
+                        <button
+                          key={value}
+                          type="button"
+                          role="radio"
+                          aria-checked={active}
+                          disabled={savingNotify}
+                          className={`chat-notify-option${active ? ' active' : ''}`}
+                          onClick={() => {
+                            if (active || savingNotify) return;
+                            const prevMode = notifyMode;
+                            setNotifyMode(value);
+                            setSavingNotify(true);
+                            setErr('');
+                            void updateRoomNotifyMode(room.id, value)
+                              .then((saved) => {
+                                setNotifyMode(saved);
+                                onNotifyModeChanged?.(room.id, saved);
+                              })
+                              .catch((e) => {
+                                setNotifyMode(prevMode);
+                                setErr(
+                                  e instanceof Error ? e.message : 'Could not update notification preference',
+                                );
+                              })
+                              .finally(() => setSavingNotify(false));
+                          }}
+                        >
+                          <Icon size={13} aria-hidden="true" />
+                          <span>{label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </section>
 
                 {guestLink && (
                   <section className="chat-drawer-section">

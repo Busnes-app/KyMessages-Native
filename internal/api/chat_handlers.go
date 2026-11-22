@@ -165,6 +165,10 @@ func (s *Server) handleChatBootstrap(w http.ResponseWriter, r *http.Request) {
 			"max_upload_bytes": s.maxUploadBytes(),
 			"max_per_message":  maxAttachmentsPerMessage,
 		},
+		"push": map[string]any{
+			"available":        s.push != nil,
+			"vapid_public_key": s.PushVAPIDPublicKey(),
+		},
 	})
 }
 
@@ -734,6 +738,7 @@ func (s *Server) handleChatSendMessage(w http.ResponseWriter, r *http.Request) {
 			Seq:    msg.Seq,
 			Data:   chat.MustMarshalData(msg),
 		})
+		s.pushAsync(r.Context(), func(ctx context.Context) { s.dispatchMessagePush(ctx, tenantID, roomID, msg) })
 	}
 	status := http.StatusOK
 	if created {
@@ -1202,6 +1207,7 @@ func (s *Server) handleChatIncomingWebhook(w http.ResponseWriter, r *http.Reques
 			Seq:    msg.Seq,
 			Data:   chat.MustMarshalData(msg),
 		})
+		s.pushAsync(r.Context(), func(ctx context.Context) { s.dispatchMessagePush(ctx, wh.TenantID, wh.RoomID, msg) })
 	}
 	status := http.StatusOK
 	if created {

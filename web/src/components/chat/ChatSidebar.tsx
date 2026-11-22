@@ -1,5 +1,7 @@
 import React, { useState } from 'react';
 import {
+  Bell,
+  BellOff,
   ChevronDown,
   ChevronRight,
   Hash,
@@ -13,6 +15,7 @@ import {
   Video,
   X,
 } from 'lucide-react';
+import type { PushState } from '../../chat/push';
 import type { CallState, ChatRoomSummary, LobbyGuest, WsStatus } from '../../chat/types';
 import { initialsFor, sortRooms } from '../../chat/state';
 import type { SessionUser } from '../../dto';
@@ -28,6 +31,9 @@ interface ChatSidebarProps {
   mobileOpen: boolean;
   user?: SessionUser | null;
   creatingMeeting?: boolean;
+  pushState?: PushState;
+  pushBusy?: boolean;
+  onTogglePush?: () => void;
   onCloseMobile: () => void;
   onSelectRoom: (roomId: string) => void;
   onOpenNewChannel: () => void;
@@ -76,6 +82,9 @@ export const ChatSidebar: React.FC<ChatSidebarProps> = ({
   mobileOpen,
   user,
   creatingMeeting = false,
+  pushState,
+  pushBusy = false,
+  onTogglePush,
   onCloseMobile,
   onSelectRoom,
   onOpenNewChannel,
@@ -107,12 +116,19 @@ export const ChatSidebar: React.FC<ChatSidebarProps> = ({
 
   const renderRoomBadges = (room: ChatRoomSummary, active: boolean) => {
     const unread = !active && room.unread_count > 0;
+    const muted = room.notify_mode === 'mute';
     const call = activeCalls?.[room.id];
     const callCount = call && !call.ended ? call.peers.length : 0;
     const lobbyCount = lobbyByRoom?.[room.id]?.length ?? 0;
 
     return (
       <span className="chat-room-btn-right">
+        {muted && (
+          <span className="chat-muted-icon" title="Notifications muted">
+            <BellOff size={11} aria-hidden="true" />
+            <span className="sr-only"> muted</span>
+          </span>
+        )}
         {lobbyCount > 0 && (
           <span
             className="chat-lobby-pill"
@@ -389,6 +405,34 @@ export const ChatSidebar: React.FC<ChatSidebarProps> = ({
               <div className="app-user-role">{user.role}</div>
             </div>
             <div className="app-user-buttons">
+              {onTogglePush &&
+                pushState &&
+                pushState.kind !== 'unsupported' &&
+                pushState.kind !== 'unavailable' && (
+                  <button
+                    type="button"
+                    className={`app-footer-icon${pushState.kind === 'enabled' ? ' active' : ''}`}
+                    disabled={pushBusy || pushState.kind === 'denied'}
+                    onClick={onTogglePush}
+                    title={
+                      pushState.kind === 'enabled'
+                        ? 'Desktop notifications enabled — click to disable'
+                        : pushState.kind === 'denied'
+                          ? 'Notifications are blocked in your browser settings'
+                          : 'Enable desktop notifications'
+                    }
+                    aria-label={
+                      pushState.kind === 'enabled'
+                        ? 'Disable desktop notifications'
+                        : pushState.kind === 'denied'
+                          ? 'Desktop notifications blocked in browser settings'
+                          : 'Enable desktop notifications'
+                    }
+                    aria-pressed={pushState.kind === 'enabled'}
+                  >
+                    {pushState.kind === 'enabled' ? <Bell size={16} /> : <BellOff size={16} />}
+                  </button>
+                )}
               {onOpenSettings && (
                 <button
                   type="button"

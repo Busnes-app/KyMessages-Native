@@ -1203,6 +1203,53 @@
   gap: 0.5rem;
 }
 
+.chat-notify-segment {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.3rem;
+  padding: 0.25rem;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.chat-notify-option {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.3rem;
+  padding: 0.42rem 0.35rem;
+  background: transparent;
+  color: var(--ink-muted);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  font-size: 0.74rem;
+  font-weight: 600;
+}
+
+.chat-notify-option:hover {
+  color: var(--ink-strong);
+  background: var(--panel-hover);
+  opacity: 1;
+}
+
+.chat-notify-option.active {
+  background: var(--panel);
+  color: var(--ink-strong);
+  border-color: var(--line-strong);
+}
+
+.chat-muted-icon {
+  display: inline-flex;
+  align-items: center;
+  color: var(--ink-muted);
+  opacity: 0.75;
+}
+
+.app-footer-icon.active {
+  color: var(--accent, var(--ink-strong));
+}
+
 .chat-drawer-section h4 {
   font-size: 0.74rem;
   font-weight: 700;

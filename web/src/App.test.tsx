@@ -2,6 +2,13 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { App } from './App';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import { browserPushEndpoint, unsubscribeBrowserPush } from './chat/push';
+
+vi.mock('./chat/push', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./chat/push')>()),
+  browserPushEndpoint: vi.fn(async () => 'https://push.example/ep'),
+  unsubscribeBrowserPush: vi.fn(async () => {}),
+}));
 
 const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { 'Content-Type': 'application/json' } });
 const member = { username: 'bob', display_name: 'Bob', role: 'user', must_change_password: false };
@@ -25,7 +32,7 @@ function stubServer(logout: () => Promise<Response>, me: unknown = { authenticat
   }));
 }
 
-afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.mocked(unsubscribeBrowserPush).mockClear(); });
 
 it('stays signed in and says so when the server refuses sign-out', async () => {
   stubServer(async () => json({ error: 'Invalid CSRF token' }, 403));
@@ -75,4 +82,58 @@ it('opens preferences via the bottom settings gear and omits Pair Device', async
   expect(await screen.findByRole('heading', { name: 'Preferences' })).toBeTruthy();
   fireEvent.click(screen.getByRole('button', { name: /back to chat/i }));
   expect(await screen.findByRole('button', { name: 'Settings' })).toBeTruthy();
+});
+
+it('drops the push subscription with the session when signing out from Settings', async () => {
+  let sent: unknown;
+  stubServer(async () => json({ logged_out: true }));
+  const stubbed = vi.mocked(fetch).getMockImplementation()!;
+  vi.mocked(fetch).mockImplementation(async (input, init) => {
+    if (String(input) === '/api/auth/logout') sent = JSON.parse(String(init?.body));
+    return stubbed(input, init);
+  });
+  render(<App />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
+  await screen.findByRole('heading', { name: 'Preferences' });
+  fireEvent.click(screen.getAllByRole('button', { name: 'Sign out' })[0]);
+  expect(await screen.findByLabelText('Username')).toBeTruthy();
+  expect(sent).toEqual({ push_endpoint: 'https://push.example/ep' });
+  expect(browserPushEndpoint).toHaveBeenCalled();
+  expect(unsubscribeBrowserPush).toHaveBeenCalledTimes(1);
+});
+
+it('keeps push on when the server refuses sign-out', async () => {
+  stubServer(async () => json({ error: 'Invalid CSRF token' }, 403));
+  render(<App />);
+  fireEvent.click((await screen.findAllByRole('button', { name: 'Sign out' }))[0]);
+  await screen.findByRole('alert');
+  expect(unsubscribeBrowserPush).not.toHaveBeenCalled();
+});
+
+it('opens Chat on the room a notification click names, from another page', async () => {
+  const listeners: Array<(ev: MessageEvent) => void> = [];
+  vi.stubGlobal('navigator', Object.assign(Object.create(navigator), {
+    serviceWorker: {
+      addEventListener: (_: string, fn: (ev: MessageEvent) => void) => listeners.push(fn),
+      removeEventListener: () => {},
+    },
+  }));
+  stubServer(async () => json({ logged_out: true }));
+  render(<App />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
+  await screen.findByRole('heading', { name: 'Preferences' });
+  for (const fn of listeners) fn(new MessageEvent('message', { data: { type: 'kymessages.navigate', roomId: 'rm 1' } }));
+  expect(await screen.findByRole('button', { name: 'Settings' })).toBeTruthy();
+  expect(screen.queryByRole('heading', { name: 'Preferences' })).toBeNull();
+  expect(window.location.hash).toBe('#room=rm%201');
+});
+
+it('clears the room hash when Chat gives way to Settings', async () => {
+  stubServer(async () => json({ logged_out: true }));
+  render(<App />);
+  const gear = await screen.findByRole('button', { name: 'Settings' });
+  window.history.replaceState(null, '', '/#room=rm_seen');
+  fireEvent.click(gear);
+  await screen.findByRole('heading', { name: 'Preferences' });
+  expect(window.location.hash).toBe('');
 });

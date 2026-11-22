@@ -56,6 +56,7 @@ type JoinCallResponse struct {
 	LiveKitURL   string          `json:"livekit_url,omitempty"`
 	LiveKitToken string          `json:"livekit_token,omitempty"`
 	Peers        []CallPeerState `json:"peers"`
+	Started      bool            `json:"-"`
 }
 
 // ICEServer matches the browser RTCIceServer JSON shape.
@@ -341,6 +342,7 @@ func (m *CallManager) Join(ctx context.Context, req JoinCallRequest) (*JoinCallR
 		LiveKitURL:   lkURL,
 		LiveKitToken: lkToken,
 		Peers:        statePayload.Peers,
+		Started:      created,
 	}, nil
 }
 

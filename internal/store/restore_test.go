@@ -49,6 +49,11 @@ func seedGrants(t *testing.T, st store.Store) (roomID, callID, agentID string) {
 	if err := st.Agents().CreateAgent(ctx, agent); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := st.Chat().UpsertPushSubscription(ctx, "session", &store.PushSubscription{
+		TenantID: store.DefaultTenantID, UserID: "u", Endpoint: "https://fcm.googleapis.com/fcm/send/restored", P256DH: "k", AuthSecret: "a",
+	}, 20); err != nil {
+		t.Fatal(err)
+	}
 	return room.ID, cs.ID, agent.ID
 }
 
@@ -72,6 +77,9 @@ func TestRestoreInvalidatesGrants(t *testing.T) {
 	}
 	if _, err := st.Chat().GetActiveCallSession(ctx, store.DefaultTenantID, roomID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatal("active call survived", err)
+	}
+	if subs, err := st.Chat().ListPushSubscriptions(ctx, store.DefaultTenantID, "u"); err != nil || len(subs) != 0 {
+		t.Fatalf("push subscriptions survived restore: %d (err %v)", len(subs), err)
 	}
 	agent, err := st.Agents().GetAgent(ctx, agentID)
 	if err != nil {

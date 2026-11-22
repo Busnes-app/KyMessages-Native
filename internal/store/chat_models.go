@@ -18,12 +18,32 @@ const (
 	RoomRoleBot    = "bot"
 )
 
+// Room notification modes.
+const (
+	NotifyModeAll      = "all"
+	NotifyModeMentions = "mentions"
+	NotifyModeMute     = "mute"
+)
+
 // Message payload encodings.
 const (
 	MessageEncodingPlainV1    = "plain_v1"
 	MessageEncodingE2EERoomV1 = "e2ee_room_v1"
 	MessageEncodingSystemV1   = "system_v1"
 )
+
+// PushSubscription stores one browser Web Push subscription owned by a user.
+type PushSubscription struct {
+	ID         string `json:"id"`
+	TenantID   string `json:"tenant_id"`
+	UserID     string `json:"user_id"`
+	Endpoint   string `json:"endpoint"`
+	P256DH     string `json:"-"`
+	AuthSecret string `json:"-"`
+	UserAgent  string `json:"user_agent,omitempty"`
+	CreatedAt  int64  `json:"created_at"`
+	LastUsedAt int64  `json:"last_used_at,omitempty"`
+}
 
 // Tenant P2P media policies.
 const (

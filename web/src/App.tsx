@@ -19,6 +19,7 @@ import './styles/theme.css';
 import './ky-ui/tokens.css';
 import './ky-ui/navigation.css';
 import { errorMessage, secureFetch } from './api';
+import { browserPushEndpoint, unsubscribeBrowserPush } from './chat/push';
 import { parseSettings, parseUser, type SessionUser, type SiteSettings } from './dto';
 import { ErrorBoundary } from './components/ErrorBoundary';
 
@@ -37,6 +38,21 @@ export const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<string>('chat');
   const [settings, setSettings] = useState<SiteSettings | null>(null);
   const [activeCallSummary, setActiveCallSummary] = useState<ActiveCallSummary | null>(null);
+
+  // A notification click names a room: show Chat on it from any page. A mounted Chat also
+  // switches rooms itself; one still loading picks the room up from the hash.
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return;
+    const onSwMessage = (ev: MessageEvent) => {
+      const data: unknown = ev.data;
+      if (!data || typeof data !== 'object' || !('type' in data) || data.type !== 'kymessages.navigate') return;
+      if (!('roomId' in data) || typeof data.roomId !== 'string' || !data.roomId) return;
+      window.location.hash = `#room=${encodeURIComponent(data.roomId)}`;
+      setActiveTab('chat');
+    };
+    navigator.serviceWorker.addEventListener('message', onSwMessage);
+    return () => navigator.serviceWorker.removeEventListener('message', onSwMessage);
+  }, []);
 
   useEffect(() => {
     if (meetToken) {
@@ -87,8 +103,16 @@ export const App: React.FC = () => {
   const handleLogout = async () => {
     setError('');
     try {
-      const res = await secureFetch('/api/auth/logout', { method: 'POST' });
+      // The server drops this browser's push subscription with the session, so a refused
+      // sign-out leaves notifications as they were.
+      const pushEndpoint = await browserPushEndpoint();
+      const res = await secureFetch('/api/auth/logout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ push_endpoint: pushEndpoint }),
+      });
       if (!res.ok) throw new Error(await errorMessage(res, 'Sign-out failed'));
+      if (pushEndpoint) void unsubscribeBrowserPush();
       setActiveCallSummary(null);
       setUser(null);
     } catch (err) {

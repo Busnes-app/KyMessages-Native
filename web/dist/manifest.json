@@ -1,6 +1,8 @@
 {
+  "id": "/",
   "short_name": "KyMessages",
   "name": "KyMessages",
+  "description": "Private team messaging, channels, and voice/video calls.",
   "icons": [
     {
       "src": "/app-icon-192.png",
@@ -16,6 +18,7 @@
     }
   ],
   "start_url": "/",
+  "scope": "/",
   "display": "standalone",
   "theme_color": "#182326",
   "background_color": "#f8f6f0"

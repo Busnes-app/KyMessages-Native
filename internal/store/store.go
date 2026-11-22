@@ -203,6 +203,16 @@ type ChatStore interface {
 	GetRoomMember(ctx context.Context, tenantID, roomID, userID string) (*RoomMember, error)
 	ListRoomMembers(ctx context.Context, tenantID, roomID string) ([]*RoomMember, error)
 	UpdateReadCursor(ctx context.Context, tenantID, roomID, userID string, seq int64) (int64, error)
+	UpdateRoomNotifyMode(ctx context.Context, tenantID, roomID, userID, mode string) error
+
+	// Web Push Subscriptions
+	UpsertPushSubscription(ctx context.Context, sessionHash string, sub *PushSubscription, maxPerUser int) (*PushSubscription, error)
+	ListPushSubscriptions(ctx context.Context, tenantID, userID string) ([]*PushSubscription, error)
+	ListPushRecipients(ctx context.Context, tenantID, roomID string, userIDs []string) ([]*PushSubscription, error)
+	DeletePushSubscriptionByEndpoint(ctx context.Context, tenantID, userID, endpoint string) error
+	DeletePushSubscriptionByID(ctx context.Context, tenantID, userID, id string) error
+	DeletePushSubscriptionInternal(ctx context.Context, id string) error
+	TouchPushSubscription(ctx context.Context, id string, usedAt int64) error
 
 	// Messages & Reactions
 	CreateMessage(ctx context.Context, p CreateMessageParams) (*Message, bool, error)

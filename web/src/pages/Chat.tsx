@@ -58,6 +58,12 @@ import {
   upsertMessage,
 } from '../chat/state';
 import {
+  disableBrowserPush,
+  enableBrowserPush,
+  syncExistingPushSubscription,
+  type PushState,
+} from '../chat/push';
+import {
   DEFAULT_ATTACHMENT_LIMITS,
   attachmentUrl,
   formatBytes,
@@ -68,9 +74,11 @@ import {
   type ChatCurrentUser,
   type ChatDirectoryUser,
   type ChatMessage,
+  type ChatPushConfig,
   type ChatRoomDetail,
   type ChatRoomSummary,
   type LobbyGuest,
+  type NotifyMode,
   type WsServerEvent,
   type WsStatus,
 } from '../chat/types';
@@ -172,6 +180,9 @@ export const Chat: React.FC<ChatProps> = ({
   const [callExpanded, setCallExpanded] = useState(false);
   const [joiningCall, setJoiningCall] = useState(false);
   const [guestLinkBanner, setGuestLinkBanner] = useState<{ roomId: string; url: string; copied: boolean } | null>(null);
+  const [pushConfig, setPushConfig] = useState<ChatPushConfig>({ available: false, vapid_public_key: '' });
+  const [pushState, setPushState] = useState<PushState>({ kind: 'unavailable' });
+  const [pushBusy, setPushBusy] = useState(false);
 
   const socketRef = useRef<ChatSocket | null>(null);
   const callCtrlRef = useRef<HybridCallController | null>(null);
@@ -792,13 +803,27 @@ export const Chat: React.FC<ChatProps> = ({
         setDirectory(users);
         setSfuAvailable(boot.rtc.sfu_available);
         setAttachmentLimits(boot.attachments);
+        setPushConfig(boot.push);
+        void syncExistingPushSubscription(boot.push).then((state) => {
+          if (!cancelled) setPushState(state);
+        });
         const callMap: Record<string, CallState> = {};
         for (const [rid, c] of Object.entries(boot.active_calls)) {
           if (!c.ended && c.active !== false && c.peers.length > 0) callMap[rid] = c;
         }
         setActiveCalls(callMap);
         if (boot.rooms.length > 0) {
-          const requestedRoom = new URLSearchParams(window.location.search).get('room');
+          const queryRoom = new URLSearchParams(window.location.search).get('room');
+          const hashMatch = window.location.hash.match(/^#room=([^&]+)/);
+          let hashRoom: string | null = null;
+          if (hashMatch) {
+            try {
+              hashRoom = decodeURIComponent(hashMatch[1]);
+            } catch {
+              hashRoom = null;
+            }
+          }
+          const requestedRoom = hashRoom || queryRoom;
           const matched = requestedRoom ? boot.rooms.find((r) => r.id === requestedRoom) : undefined;
           setActiveRoomId(matched ? matched.id : boot.rooms[0].id);
         }
@@ -1628,6 +1653,70 @@ export const Chat: React.FC<ChatProps> = ({
   const activeRoomLobby = activeRoomId ? lobbyByRoom[activeRoomId] ?? [] : [];
   const otherLobbyCount = activeRoomLobby.length - 1;
 
+  // The hash names the room on screen, and the service worker skips that room's notifications,
+  // so it is cleared while Chat is hidden behind Settings or a console page.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const base = `${window.location.pathname}${window.location.search}`;
+    if (!isActive) {
+      if (window.location.hash.startsWith('#room=')) window.history.replaceState(null, '', base);
+      return;
+    }
+    if (!activeRoomId) return;
+    const nextHash = `#room=${encodeURIComponent(activeRoomId)}`;
+    if (window.location.hash !== nextHash) {
+      window.history.replaceState(null, '', `${base}${nextHash}`);
+    }
+  }, [activeRoomId, isActive]);
+
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return;
+    const onSwMessage = (ev: MessageEvent) => {
+      const data: unknown = ev.data;
+      if (!data || typeof data !== 'object') return;
+      if (
+        'type' in data &&
+        data.type === 'kymessages.navigate' &&
+        'roomId' in data &&
+        typeof data.roomId === 'string' &&
+        data.roomId
+      ) {
+        const target = roomsRef.current.find((r) => r.id === data.roomId);
+        if (target) {
+          setActiveRoomId(target.id);
+        }
+      }
+    };
+    navigator.serviceWorker.addEventListener('message', onSwMessage);
+    return () => navigator.serviceWorker.removeEventListener('message', onSwMessage);
+  }, []);
+
+  const handleTogglePush = useCallback(async () => {
+    if (pushBusy) return;
+    setPushBusy(true);
+    setBannerError('');
+    try {
+      if (pushState.kind === 'enabled') {
+        const next = await disableBrowserPush();
+        setPushState(next);
+      } else {
+        const next = await enableBrowserPush(pushConfig.vapid_public_key);
+        setPushState(next);
+      }
+    } catch (e) {
+      setBannerError(e instanceof Error ? e.message : 'Could not update desktop notifications');
+    } finally {
+      setPushBusy(false);
+    }
+  }, [pushBusy, pushConfig.vapid_public_key, pushState.kind]);
+
+  const handleNotifyModeChanged = useCallback((roomId: string, mode: NotifyMode) => {
+    setRooms((prev) => prev.map((r) => (r.id === roomId ? { ...r, notify_mode: mode } : r)));
+    setRoomDetail((prev) =>
+      prev && prev.room.id === roomId ? { ...prev, member: { ...prev.member, notify_mode: mode } } : prev,
+    );
+  }, []);
+
   if (loading) {
     return (
       <div className="chat-empty-stage" style={{ height: '100dvh' }} role="status">
@@ -1685,6 +1774,9 @@ export const Chat: React.FC<ChatProps> = ({
         mobileOpen={mobileRailOpen}
         user={user}
         creatingMeeting={creatingMeeting}
+        pushState={pushState}
+        pushBusy={pushBusy}
+        onTogglePush={() => void handleTogglePush()}
         onCloseMobile={() => setMobileRailOpen(false)}
         onSelectRoom={(id) => setActiveRoomId(id)}
         onOpenNewChannel={() => setModal('new-channel')}
@@ -2392,6 +2484,7 @@ export const Chat: React.FC<ChatProps> = ({
           onDecideLobby={(guestId, admit) => handleDecideLobby(activeRoom.id, guestId, admit)}
           onAdmitAllLobby={() => handleAdmitAllLobby(activeRoom.id)}
           onCreateGuestLink={() => handleCreateGuestLink(activeRoom.id)}
+          onNotifyModeChanged={handleNotifyModeChanged}
           onLeftRoom={(leftId) => {
             setDrawerOpen(false);
             setRoomDetail(null);

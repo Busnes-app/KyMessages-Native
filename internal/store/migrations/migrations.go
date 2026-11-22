@@ -256,7 +256,25 @@ ALTER TABLE mfa_challenges ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';`,
 	{Version: 24, Name: "native_agents", SQLite: nativeAgentsSchema("DATETIME"), Postgres: nativeAgentsSchema("TIMESTAMPTZ")},
 	// Index attachments by message_id and quota columns, and track in-flight upload quota reservations.
 	{Version: 25, Name: "attachments_message_index", SQLite: attachmentsQuotaSchema, Postgres: attachmentsQuotaSchema},
+	// Web Push (RFC 8291/8292) per-user browser subscriptions.
+	{Version: 26, Name: "web_push_subscriptions", SQLite: pushSubscriptionsSchema, Postgres: pushSubscriptionsSchema},
 }
+
+const pushSubscriptionsSchema = `
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+    id VARCHAR(64) PRIMARY KEY,
+    tenant_id VARCHAR(64) NOT NULL,
+    user_id VARCHAR(64) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    endpoint TEXT NOT NULL,
+    p256dh VARCHAR(255) NOT NULL,
+    auth_secret VARCHAR(128) NOT NULL,
+    user_agent VARCHAR(255) NOT NULL DEFAULT '',
+    created_at BIGINT NOT NULL,
+    last_used_at BIGINT NOT NULL DEFAULT 0,
+    UNIQUE (endpoint)
+);
+CREATE INDEX IF NOT EXISTS idx_push_subs_user ON push_subscriptions(tenant_id, user_id);
+`
 
 const attachmentsQuotaSchema = `
 CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);

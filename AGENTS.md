@@ -315,6 +315,7 @@ the compose checks. `make matrix-acceptance` also needs node, openssl, certutil 
 - [internal/synapseadmin/AGENTS.md](internal/synapseadmin/AGENTS.md): Synapse admin API client for the console, used with 5-minute console sessions.
 - [internal/health/AGENTS.md](internal/health/AGENTS.md): Per-request component probes, version pins generated from docker-compose.matrix.yml, upstream source links.
 - [internal/blobs/AGENTS.md](internal/blobs/AGENTS.md): Local chat attachment blob store: confined keys, atomic writes, sniffed MIME types.
+- [internal/push/AGENTS.md](internal/push/AGENTS.md): Web Push: VAPID key, payload encryption, endpoint validation and the bounded delivery pool.
 - [internal/backup/AGENTS.md](internal/backup/AGENTS.md): Product-side adapters over `ky-primitives/recoveryclient`: payload collection, drill checks, settings and sealer glue.
 - [internal/devices/AGENTS.md](internal/devices/AGENTS.md): 90-second ephemeral QR device pairing and push registration.
 - [internal/testdb/AGENTS.md](internal/testdb/AGENTS.md): Test-only isolated database provisioning (SQLite or PostgreSQL).

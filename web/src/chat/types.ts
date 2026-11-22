@@ -2,8 +2,14 @@ import { arr, bool, count, obj, oneOf, opt, str } from '../dto';
 
 export type RoomKind = 'dm' | 'channel' | 'meeting';
 export type RoomRole = 'owner' | 'admin' | 'member' | 'bot';
+export type NotifyMode = 'all' | 'mentions' | 'mute';
 export type MessageEncoding = 'plain_v1' | 'e2ee_room_v1' | 'system_v1';
 export type WsStatus = 'connecting' | 'live' | 'reconnecting' | 'revoked' | 'offline';
+
+export interface ChatPushConfig {
+  available: boolean;
+  vapid_public_key: string;
+}
 
 export interface ChatCurrentUser {
   id: string;
@@ -262,6 +268,7 @@ export interface ChatBootstrap {
     ice_servers: RTCIceServer[];
   };
   attachments: ChatAttachmentLimits;
+  push: ChatPushConfig;
 }
 
 export interface ChatRoomDetail {
@@ -602,6 +609,7 @@ export function parseBootstrap(v: unknown): ChatBootstrap {
   }
   const rtcObj = o.rtc && typeof o.rtc === 'object' ? obj(o.rtc) : {};
   const attObj = o.attachments && typeof o.attachments === 'object' ? obj(o.attachments) : {};
+  const pushObj = o.push && typeof o.push === 'object' ? obj(o.push) : {};
   return {
     user: parseCurrentUser(o.user),
     tenant: parseTenant(o.tenant),
@@ -615,6 +623,10 @@ export function parseBootstrap(v: unknown): ChatBootstrap {
       available: opt(attObj.available, bool) ?? DEFAULT_ATTACHMENT_LIMITS.available,
       max_upload_bytes: opt(attObj.max_upload_bytes, count) ?? DEFAULT_ATTACHMENT_LIMITS.max_upload_bytes,
       max_per_message: opt(attObj.max_per_message, count) ?? DEFAULT_ATTACHMENT_LIMITS.max_per_message,
+    },
+    push: {
+      available: opt(pushObj.available, bool) ?? false,
+      vapid_public_key: opt(pushObj.vapid_public_key, (s) => str(s, 256)) ?? '',
     },
   };
 }
