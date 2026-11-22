@@ -57,6 +57,10 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
   `KY_PUSH_ENABLED=false`).
 - Per-room notification preferences (`all`, `mentions`, `mute`), push subscription management
   (`/api/v1/push/*`), and automatic pruning of stale `404`/`410` browser endpoints.
+- Only current room members with active human accounts in an active org get a push. A message's
+  sender, room and a short preview pass through the browser vendor's push service, encrypted to
+  the browser (RFC 8291). Signing out, offboarding, org suspension and a restore remove
+  subscriptions.
 
 **Sign-in, tenancy & offboarding.**
 - Primary sign-in via KyIdentity OIDC (`KY_KYIDENTITY_*`) with PKCE and step-up freshness checks

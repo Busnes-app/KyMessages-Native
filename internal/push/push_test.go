@@ -425,3 +425,32 @@ func TestLoadOrCreateVAPIDKeyIsAtomic(t *testing.T) {
 		t.Fatalf("vapid.key mode = %v, want 0600", info.Mode().Perm())
 	}
 }
+
+// The VAPID audience is the push service's origin: an explicit default port is dropped.
+func TestVAPIDAudienceOmitsTheDefaultPort(t *testing.T) {
+	key, err := GenerateVAPIDKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for raw, want := range map[string]string{
+		"https://wns2-bl2p.notify.windows.com:443/w/?token=abc": "https://wns2-bl2p.notify.windows.com",
+		"https://push.example.com/wpush":                        "https://push.example.com",
+		"https://push.example.com:8443/wpush":                   "https://push.example.com:8443",
+		"https://[2001:db8::1]:443/p":                           "https://[2001:db8::1]",
+	} {
+		u, _ := url.Parse(raw)
+		hdr, err := key.AuthorizationHeader(u, "mailto:ops@example.com", time.Hour, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		jwt := strings.TrimPrefix(strings.Split(hdr, ", k=")[0], "vapid t=")
+		claims, _ := base64.RawURLEncoding.DecodeString(strings.Split(jwt, ".")[1])
+		var c struct {
+			Aud string `json:"aud"`
+		}
+		_ = json.Unmarshal(claims, &c)
+		if c.Aud != want {
+			t.Errorf("aud for %s = %q, want %q", raw, c.Aud, want)
+		}
+	}
+}
