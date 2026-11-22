@@ -130,7 +130,7 @@ describe('StartDMModal', () => {
 describe('SearchModal', () => {
   const rooms = [{ id: 'r1', name: 'release-notes', kind: 'channel', is_private: false }] as ChatRoomSummary[];
   const hit = (id: string, seq: number, body: string) =>
-    ({ id, seq, body, tenant_id: 't', room_id: 'r1', sender_id: 'me', sender_name: 'Administrator', encoding: 'plain_v1', created_at: 1795334400000, reactions: [], delivery: { kind: 'synced' } }) satisfies ChatMessage;
+    ({ id, seq, body, tenant_id: 't', room_id: 'r1', sender_id: 'me', sender_name: 'Administrator', encoding: 'plain_v1', created_at: 1795334400000, reactions: [], attachments: [], delivery: { kind: 'synced' } }) satisfies ChatMessage;
 
   it('moves through results with the arrows from the box and Enter opens one', async () => {
     searchMessages.mockResolvedValue([hit('m1', 4, 'Budget review moves'), hit('m2', 7, 'Check the budget sheet')]);

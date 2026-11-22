@@ -2,6 +2,7 @@ import { errorMessage, secureFetch } from '../api';
 import { arr, bool, count, obj, str } from '../dto';
 import {
   parseAdminMediaPolicy,
+  parseAttachment,
   parseBootstrap,
   parseCallJoinResponse,
   parseCallState,
@@ -18,6 +19,7 @@ import {
   type AdminMediaPolicyResponse,
   type CallJoinResponse,
   type CallState,
+  type ChatAttachment,
   type ChatBootstrap,
   type ChatDirectoryUser,
   type ChatMessage,
@@ -150,10 +152,50 @@ export async function fetchMessages(
   );
 }
 
+export async function uploadAttachment(
+  roomId: string,
+  file: File,
+  signal?: AbortSignal,
+): Promise<ChatAttachment> {
+  const form = new FormData();
+  form.append('file', file, file.name);
+  // Leave Content-Type unset so the browser supplies the multipart boundary; secureFetch adds X-CSRF-Token.
+  const res = await secureFetch(`/api/v1/rooms/${encodeURIComponent(roomId)}/attachments`, {
+    method: 'POST',
+    credentials: 'same-origin',
+    body: form,
+    signal,
+  });
+  if (!res.ok) {
+    throw new Error(await errorMessage(res, 'Could not upload file'));
+  }
+  const data = obj(await res.json());
+  return parseAttachment(data.attachment);
+}
+
+// The caller's staged (unposted) uploads in a room, which still count against their quota.
+export async function listStagedAttachments(roomId: string): Promise<ChatAttachment[]> {
+  const data = obj(
+    await apiJSON(`/api/v1/rooms/${encodeURIComponent(roomId)}/attachments`, {}, 'Could not load staged files'),
+  );
+  return arr(data.attachments).map(parseAttachment);
+}
+
+export async function deleteAttachment(attachmentId: string): Promise<void> {
+  const res = await secureFetch(`/api/v1/attachments/${encodeURIComponent(attachmentId)}`, {
+    method: 'DELETE',
+    credentials: 'same-origin',
+  });
+  if (!res.ok && res.status !== 404) {
+    throw new Error(await errorMessage(res, 'Could not remove attachment'));
+  }
+}
+
 export async function sendMessage(params: {
   roomId: string;
   body: string;
   replyToId?: string;
+  attachmentIds?: string[];
   idempotencyKey: string;
 }): Promise<ChatMessage> {
   const data = obj(
@@ -165,6 +207,8 @@ export async function sendMessage(params: {
         body: JSON.stringify({
           body: params.body,
           reply_to_id: params.replyToId || undefined,
+          attachment_ids:
+            params.attachmentIds && params.attachmentIds.length > 0 ? params.attachmentIds : undefined,
           idempotency_key: params.idempotencyKey,
         }),
       },

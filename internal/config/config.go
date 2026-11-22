@@ -21,15 +21,40 @@ import (
 
 // Config encapsulates all runtime configuration for KyMessages.
 type Config struct {
-	InstallerSSO *applysetup.SSO `json:"-"`
-	Server       ServerConfig    `json:"server"`
-	Database     DatabaseConfig  `json:"database"`
-	Security     SecurityConfig  `json:"security"`
-	SSO          SSOConfig       `json:"sso"`
-	SCIM         SCIMConfig      `json:"scim"`
-	Backup       BackupConfig    `json:"backup"`
-	Captcha      CaptchaConfig   `json:"captcha"`
-	RTC          RTCConfig       `json:"rtc"`
+	InstallerSSO *applysetup.SSO   `json:"-"`
+	Server       ServerConfig      `json:"server"`
+	Database     DatabaseConfig    `json:"database"`
+	Security     SecurityConfig    `json:"security"`
+	SSO          SSOConfig         `json:"sso"`
+	SCIM         SCIMConfig        `json:"scim"`
+	Backup       BackupConfig      `json:"backup"`
+	Captcha      CaptchaConfig     `json:"captcha"`
+	RTC          RTCConfig         `json:"rtc"`
+	Attachments  AttachmentsConfig `json:"attachments"`
+}
+
+// DefaultMaxUploadBytes is the default per-attachment upload size limit (25 MiB).
+const DefaultMaxUploadBytes int64 = 25 << 20
+
+// MaxAllowedUploadBytes caps KY_MAX_UPLOAD_BYTES at 100 MiB so single uploads stay bounded.
+const MaxAllowedUploadBytes int64 = 100 << 20
+
+// DefaultMaxTotalAttachmentBytes caps aggregate stored attachment bytes per tenant (1 GiB).
+const DefaultMaxTotalAttachmentBytes int64 = 1 << 30
+
+// DefaultMaxPendingUserBytes caps unposted staged attachment bytes per uploader (50 MiB).
+const DefaultMaxPendingUserBytes int64 = 50 << 20
+
+// DefaultPendingAttachmentTTL is how long unposted staged attachments survive before expiry.
+const DefaultPendingAttachmentTTL = 24 * time.Hour
+
+// AttachmentsConfig configures local blob storage for chat file and image attachments.
+type AttachmentsConfig struct {
+	Dir                 string        `json:"dir"`
+	MaxUploadBytes      int64         `json:"max_upload_bytes"`
+	MaxTotalBytes       int64         `json:"max_total_bytes"`
+	MaxPendingUserBytes int64         `json:"max_pending_user_bytes"`
+	PendingTTL          time.Duration `json:"pending_ttl"`
 }
 
 // RTCConfig holds native hybrid P2P + LiveKit SFU calling and KyCalendar meeting settings.
@@ -268,6 +293,49 @@ func LoadFromEnv() (*Config, error) {
 			DifficultyPoW: getEnvInt("KY_CAPTCHA_POW_DIFFICULTY", 50000),
 		},
 		RTC: rtcCfg,
+		Attachments: AttachmentsConfig{
+			Dir:                 getEnv("KY_ATTACHMENTS_DIR", filepath.Join(dataDir, "attachments")),
+			MaxUploadBytes:      DefaultMaxUploadBytes,
+			MaxTotalBytes:       DefaultMaxTotalAttachmentBytes,
+			MaxPendingUserBytes: DefaultMaxPendingUserBytes,
+			PendingTTL:          DefaultPendingAttachmentTTL,
+		},
+	}
+	if rawMax := strings.TrimSpace(os.Getenv("KY_MAX_UPLOAD_BYTES")); rawMax != "" {
+		n, err := strconv.ParseInt(rawMax, 10, 64)
+		if err != nil || n < 1024 || n > MaxAllowedUploadBytes {
+			return nil, fmt.Errorf("KY_MAX_UPLOAD_BYTES: must be between 1024 and %d bytes", MaxAllowedUploadBytes)
+		}
+		cfg.Attachments.MaxUploadBytes = n
+	}
+	if rawTotal := strings.TrimSpace(os.Getenv("KY_ATTACHMENTS_MAX_TOTAL_BYTES")); rawTotal != "" {
+		n, err := strconv.ParseInt(rawTotal, 10, 64)
+		if err != nil || n < 1024 {
+			return nil, errors.New("KY_ATTACHMENTS_MAX_TOTAL_BYTES: must be at least 1024 bytes")
+		}
+		cfg.Attachments.MaxTotalBytes = n
+	}
+	if rawPending := strings.TrimSpace(os.Getenv("KY_ATTACHMENTS_MAX_PENDING_USER_BYTES")); rawPending != "" {
+		n, err := strconv.ParseInt(rawPending, 10, 64)
+		if err != nil || n < 1024 {
+			return nil, errors.New("KY_ATTACHMENTS_MAX_PENDING_USER_BYTES: must be at least 1024 bytes")
+		}
+		cfg.Attachments.MaxPendingUserBytes = n
+	}
+	if rawTTL := strings.TrimSpace(os.Getenv("KY_ATTACHMENTS_PENDING_TTL")); rawTTL != "" {
+		d, err := time.ParseDuration(rawTTL)
+		if err != nil || d < time.Minute || d > 30*24*time.Hour {
+			return nil, errors.New("KY_ATTACHMENTS_PENDING_TTL: must be a duration between 1m and 720h")
+		}
+		cfg.Attachments.PendingTTL = d
+	}
+	// Every upload is staged before it can be attached to a message, so a single-file limit
+	// above the pending or total quota would advertise an unreachable maximum to clients.
+	if cfg.Attachments.MaxUploadBytes > cfg.Attachments.MaxPendingUserBytes {
+		return nil, fmt.Errorf("KY_MAX_UPLOAD_BYTES (%d) cannot exceed KY_ATTACHMENTS_MAX_PENDING_USER_BYTES (%d)", cfg.Attachments.MaxUploadBytes, cfg.Attachments.MaxPendingUserBytes)
+	}
+	if cfg.Attachments.MaxUploadBytes > cfg.Attachments.MaxTotalBytes {
+		return nil, fmt.Errorf("KY_MAX_UPLOAD_BYTES (%d) cannot exceed KY_ATTACHMENTS_MAX_TOTAL_BYTES (%d)", cfg.Attachments.MaxUploadBytes, cfg.Attachments.MaxTotalBytes)
 	}
 	// Login verifies only proof-of-work. Accepting another name would silently disable it.
 	if p := cfg.Captcha.Provider; p != "pow" && p != "none" {

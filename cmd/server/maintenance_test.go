@@ -74,3 +74,27 @@ func TestAgentExpiryLoopRunsAtStartAndStops(t *testing.T) {
 		t.Fatal("agentExpiryLoop did not close done after cancel")
 	}
 }
+
+func TestAttachmentSweepLoopRunsAtStartAndStops(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	called := make(chan struct{}, 1)
+	done := make(chan struct{})
+	go attachmentSweepLoop(ctx, func(ctx context.Context, now time.Time) (int, error) {
+		if _, ok := ctx.Deadline(); !ok || now.IsZero() {
+			t.Error("attachment sweep runs without a deadline or a time")
+		}
+		called <- struct{}{}
+		return 1, nil
+	}, done)
+	select {
+	case <-called:
+	case <-time.After(5 * time.Second):
+		t.Fatal("attachment sweep did not run at start")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("attachmentSweepLoop did not close done after cancel")
+	}
+}

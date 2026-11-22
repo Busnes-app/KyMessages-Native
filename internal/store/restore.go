@@ -20,6 +20,7 @@ func (s *SQLStore) InvalidateRestoredGrants(ctx context.Context) error {
 		`DELETE FROM sessions`,
 		`DELETE FROM mfa_challenges`,
 		`DELETE FROM device_pairings`,
+		`DELETE FROM attachment_upload_reservations`,
 	} {
 		if _, err := tx.ExecContext(ctx, query); err != nil {
 			return err

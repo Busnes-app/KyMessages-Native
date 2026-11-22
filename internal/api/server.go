@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"net/netip"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +18,7 @@ import (
 	"github.com/Busnes-app/ky-primitives/recoveryclient"
 	"github.com/Busnes-app/ky-primitives/syncauth"
 	"github.com/Busnes-app/ky_server_base/internal/auth"
+	"github.com/Busnes-app/ky_server_base/internal/blobs"
 	"github.com/Busnes-app/ky_server_base/internal/chat"
 	"github.com/Busnes-app/ky_server_base/internal/config"
 	"github.com/Busnes-app/ky_server_base/internal/devices"
@@ -37,6 +40,8 @@ type recoveryClient interface {
 type Server struct {
 	config           *config.Config
 	store            store.Store
+	blobs            *blobs.Store
+	blobsErr         error
 	sessions         *auth.SessionManager
 	pairing          *devices.PairingService
 	kyidentity       *sso.KyIdentityClient
@@ -58,6 +63,11 @@ type Server struct {
 	// connection. http.Server.Shutdown does not know about them, so runServer waits on this
 	// before the store closes.
 	detached detachedCounter
+}
+
+// BlobsError returns any initialization error encountered while opening the attachment blob store.
+func (s *Server) BlobsError() error {
+	return s.blobsErr
 }
 
 // detachedCounter is a WaitGroup that tolerates a registration arriving while the wait is
@@ -190,9 +200,27 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 		}
 	})
 
+	var blobStore *blobs.Store
+	var blobsErr error
+	attDir := strings.TrimSpace(cfg.Attachments.Dir)
+	if attDir == "" && strings.TrimSpace(cfg.Database.DataDir) != "" {
+		attDir = filepath.Join(cfg.Database.DataDir, "attachments")
+	}
+	if attDir != "" {
+		bs, err := blobs.NewStore(attDir)
+		if err != nil {
+			blobsErr = err
+			log.Printf("[ATTACHMENTS] failed to initialize attachment storage at %q: %v", attDir, err)
+		} else {
+			blobStore = bs
+		}
+	}
+
 	s := &Server{
 		config:          cfg,
 		store:           st,
+		blobs:           blobStore,
+		blobsErr:        blobsErr,
 		sessions:        sessions,
 		pairing:         pairing,
 		kyidentity:      kyidentity,
@@ -392,6 +420,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("DELETE /api/v1/rooms/{id}/members/{uid}", s.requireAuthenticated(s.handleChatRemoveMember))
 	s.mux.HandleFunc("GET /api/v1/rooms/{id}/messages", s.requireAuthenticated(s.handleChatListMessages))
 	s.mux.HandleFunc("POST /api/v1/rooms/{id}/messages", s.requireAuthenticated(s.handleChatSendMessage))
+	s.mux.HandleFunc("POST /api/v1/rooms/{id}/attachments", s.requireAuthenticated(s.handleChatUploadAttachment))
+	s.mux.HandleFunc("GET /api/v1/rooms/{id}/attachments", s.requireAuthenticated(s.handleChatListStagedAttachments))
+	s.mux.HandleFunc("GET /api/v1/attachments/{id}", s.requireAuthenticated(s.handleChatDownloadAttachment))
+	s.mux.HandleFunc("DELETE /api/v1/attachments/{id}", s.requireAuthenticated(s.handleChatDeleteAttachment))
 	s.mux.HandleFunc("PATCH /api/v1/rooms/{id}/messages/{mid}", s.requireAuthenticated(s.handleChatEditMessage))
 	s.mux.HandleFunc("DELETE /api/v1/rooms/{id}/messages/{mid}", s.requireAuthenticated(s.handleChatDeleteMessage))
 	s.mux.HandleFunc("PUT /api/v1/rooms/{id}/messages/{mid}/reactions/{emoji}", s.requireAuthenticated(s.handleChatAddReaction))
@@ -543,7 +575,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusForbidden, "Invalid CSRF token")
 		return
 	}
-	if r.Body != nil {
+	if r.Body != nil && !(r.Method == http.MethodPost && isAttachmentUploadPath(r.URL.Path)) {
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	}
 

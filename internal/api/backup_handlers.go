@@ -353,6 +353,17 @@ func (s *Server) handleRunBackup(w http.ResponseWriter, r *http.Request) {
 		res, err = recoveryclient.Run(ctx, rc, settings, func() (recoveryclient.Payload, error) {
 			return backup.CollectForRun(ctx, s.config, settings, appVersion)
 		}, s.recovery)
+		if err == nil {
+			if mres, merr := backup.MirrorAttachments(ctx, s.config); merr != nil {
+				log.Printf("[BACKUP] attachment mirror sync warning: %s", recoveryclient.AuditSafe(merr.Error()))
+			} else if mres.KeyMissing {
+				log.Printf("[BACKUP] attachment mirror waits for the next backup: its key is sealed into that capsule first")
+			} else if mres.PruneSkipped {
+				log.Printf("[BACKUP] attachment mirror prune skipped: live attachments directory is empty while mirror holds %d encrypted blob(s) (run restore-attachments if restoring)", mres.MirrorBlobs)
+			} else if mres.Copied > 0 || mres.Pruned > 0 || mres.Expired > 0 {
+				log.Printf("[BACKUP] attachment mirror synced: copied=%d skipped=%d pruned=%d expired=%d", mres.Copied, mres.Skipped, mres.Pruned, mres.Expired)
+			}
+		}
 		unlock()
 	}
 

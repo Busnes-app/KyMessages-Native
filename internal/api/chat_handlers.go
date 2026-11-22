@@ -160,6 +160,11 @@ func (s *Server) handleChatBootstrap(w http.ResponseWriter, r *http.Request) {
 			"sfu_available": s.calls != nil && s.calls.SFUAvailable(),
 			"ice_servers":   s.calls.ICEServers(),
 		},
+		"attachments": map[string]any{
+			"available":        s.blobs != nil,
+			"max_upload_bytes": s.maxUploadBytes(),
+			"max_per_message":  maxAttachmentsPerMessage,
+		},
 	})
 }
 
@@ -626,10 +631,11 @@ func (s *Server) handleChatListMessages(w http.ResponseWriter, r *http.Request) 
 }
 
 type sendMessageRequest struct {
-	Body           string `json:"body"`
-	ReplyToID      string `json:"reply_to_id"`
-	Encoding       string `json:"encoding"`
-	IdempotencyKey string `json:"idempotency_key"`
+	Body           string   `json:"body"`
+	ReplyToID      string   `json:"reply_to_id"`
+	Encoding       string   `json:"encoding"`
+	IdempotencyKey string   `json:"idempotency_key"`
+	AttachmentIDs  []string `json:"attachment_ids"`
 }
 
 // POST /api/v1/rooms/{id}/messages
@@ -650,9 +656,26 @@ func (s *Server) handleChatSendMessage(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
+	attIDs := make([]string, 0, len(req.AttachmentIDs))
+	seenAtt := make(map[string]struct{}, len(req.AttachmentIDs))
+	for _, rawID := range req.AttachmentIDs {
+		id := strings.TrimSpace(rawID)
+		if id == "" {
+			continue
+		}
+		if _, dup := seenAtt[id]; dup {
+			continue
+		}
+		seenAtt[id] = struct{}{}
+		attIDs = append(attIDs, id)
+	}
+	if len(attIDs) > maxAttachmentsPerMessage {
+		s.writeError(w, http.StatusBadRequest, "At most 10 attachments per message")
+		return
+	}
 	body := strings.TrimSpace(req.Body)
-	if body == "" || len(body) > maxMessageBodyLen {
-		s.writeError(w, http.StatusBadRequest, "Message body must be 1 to 16384 bytes")
+	if len(body) > maxMessageBodyLen || (body == "" && len(attIDs) == 0) {
+		s.writeError(w, http.StatusBadRequest, "Message body must be 1 to 16384 bytes (or include at least one attachment)")
 		return
 	}
 	encoding := strings.TrimSpace(req.Encoding)
@@ -681,6 +704,7 @@ func (s *Server) handleChatSendMessage(w http.ResponseWriter, r *http.Request) {
 		Encoding:       encoding,
 		Body:           body,
 		IdempotencyKey: idemKey,
+		AttachmentIDs:  attIDs,
 	})
 	if errors.Is(err, store.ErrNotFound) {
 		s.writeError(w, http.StatusNotFound, "Room not found")
@@ -692,6 +716,10 @@ func (s *Server) handleChatSendMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	if errors.Is(err, store.ErrReplyNotFound) {
 		s.writeError(w, http.StatusBadRequest, "reply_to_id is not a message in this room")
+		return
+	}
+	if errors.Is(err, store.ErrAttachmentInvalid) {
+		s.writeError(w, http.StatusBadRequest, "One or more attachments are invalid, already used, or belong to another room or user")
 		return
 	}
 	if err != nil {
@@ -788,6 +816,8 @@ func (s *Server) handleChatDeleteMessage(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	linkedAttachments, _ := s.store.Chat().ListMessageAttachments(r.Context(), tenantID, roomID, msgID)
+
 	msg, err := s.store.Chat().DeleteMessage(r.Context(), tenantID, roomID, msgID, user.ID, isRoomModerator(member, user))
 	if errors.Is(err, store.ErrNotFound) {
 		s.writeError(w, http.StatusNotFound, "Message not found")
@@ -800,6 +830,12 @@ func (s *Server) handleChatDeleteMessage(w http.ResponseWriter, r *http.Request)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to delete message")
 		return
+	}
+
+	if s.blobs != nil {
+		for _, att := range linkedAttachments {
+			_ = s.blobs.Delete(att.BlobKey)
+		}
 	}
 
 	_ = s.chatHub.PublishRoom(r.Context(), roomID, chat.Event{

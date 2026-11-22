@@ -31,10 +31,12 @@ const recoveryPubPath = "data/recovery.pub"
 var ErrNoDatabaseSnapshot = errors.New("backup: no consistent database snapshot for this driver")
 
 // Collect assembles the payload every sealing caller uses: the local application files
-// (SQLite database containing native chat rooms, messages, calls, webhooks, bots/agents,
-// users, settings, and audit log; plus server configuration) and the secrets that may only
-// ever travel inside a sealed capsule (the encryption key, the pinned recovery public key,
-// and managed installer credentials). Nothing returned from here may leave the process except
+// (SQLite database containing native chat rooms, messages, attachment references, calls,
+// webhooks, bots/agents, users, settings, and audit log; plus server configuration) and the
+// secrets that may only ever travel inside a sealed capsule (the encryption key, the pinned
+// recovery public key, the attachment mirror key when present, and managed installer
+// credentials). Attachment blobs are mirrored separately via MirrorAttachments so uploads
+// never consume the capsule budget. Nothing returned from here may leave the process except
 // through a Sealer. A payload past the expanded limit returns *SizeError.
 func Collect(ctx context.Context, cfg *config.Config, appVersion string) (recoveryclient.Payload, error) {
 	if strings.ToLower(cfg.Database.Driver) != "sqlite" {
@@ -65,6 +67,17 @@ func Collect(ctx context.Context, cfg *config.Config, appVersion string) (recove
 
 	if pub, err := os.ReadFile(recoveryclient.RecoveryKeyPath(cfg.Database.DataDir)); err == nil {
 		files = append(files, recoveryclient.File{Path: recoveryPubPath, Data: pub, Mode: 0600})
+	}
+	if attachmentKeyNeeded(cfg) {
+		key, err := EnsureAttachmentKey(cfg.Database.DataDir)
+		if err != nil {
+			return recoveryclient.Payload{}, err
+		}
+		files = append(files, recoveryclient.File{
+			Path: AttachmentKeyPath,
+			Data: []byte(hex.EncodeToString(key) + "\n"),
+			Mode: 0600,
+		})
 	}
 	if managed := cfg.InstallerSSO; managed != nil {
 		paths := map[string]string{}
@@ -172,11 +185,22 @@ func snapshotFile(ctx context.Context, dsn, dataDir string) (string, func(), err
 	return path, cleanup, nil
 }
 
+// attachmentsDir returns the configured local attachment blob directory or <DataDir>/attachments.
+func attachmentsDir(cfg *config.Config) string {
+	if strings.TrimSpace(cfg.Attachments.Dir) != "" {
+		return cfg.Attachments.Dir
+	}
+	return filepath.Join(cfg.Database.DataDir, "attachments")
+}
+
 // Members names what a capsule carries, for the screen; it is what Collect would seal now.
 func Members(cfg *config.Config) []string {
 	m := []string{"data/ky_server.db", "config/settings.json", encryptionKeyPath}
 	if _, err := os.Stat(recoveryclient.RecoveryKeyPath(cfg.Database.DataDir)); err == nil {
 		m = append(m, recoveryPubPath)
+	}
+	if attachmentKeyNeeded(cfg) {
+		m = append(m, AttachmentKeyPath)
 	}
 	if cfg.InstallerSSO != nil {
 		m = append(m, "installer/client.secret", "installer/directory.secret", "installer/credential-paths.json")

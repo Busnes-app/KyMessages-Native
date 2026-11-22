@@ -85,6 +85,44 @@ type RoomMember struct {
 	JoinedAt    int64  `json:"joined_at"` // Unix milliseconds
 }
 
+// Attachment represents a file or image uploaded to a room (optionally linked to a message).
+type Attachment struct {
+	ID         string `json:"id"`
+	TenantID   string `json:"tenant_id"`
+	RoomID     string `json:"room_id"`
+	MessageID  string `json:"message_id,omitempty"`
+	UploaderID string `json:"uploader_id"`
+	BlobKey    string `json:"-"`
+	Filename   string `json:"filename"`
+	MimeType   string `json:"mime_type"`
+	SizeBytes  int64  `json:"size_bytes"`
+	SHA256Hex  string `json:"sha256_hex"`
+	CreatedAt  int64  `json:"created_at"` // Unix milliseconds
+}
+
+// AttachmentQuotaLimits bounds workspace total and per-uploader pending attachment bytes.
+// Zero or negative values leave the corresponding quota unenforced.
+type AttachmentQuotaLimits struct {
+	MaxTotalBytes       int64
+	MaxPendingUserBytes int64
+}
+
+// AttachmentQuotaLimitKind identifies which cap constrained a reservation.
+type AttachmentQuotaLimitKind string
+
+const (
+	AttachmentQuotaLimitUpload  AttachmentQuotaLimitKind = "upload"
+	AttachmentQuotaLimitPending AttachmentQuotaLimitKind = "pending"
+	AttachmentQuotaLimitTenant  AttachmentQuotaLimitKind = "tenant"
+)
+
+// AttachmentQuotaReservation holds in-flight capacity reserved for a single upload.
+type AttachmentQuotaReservation struct {
+	ID            string
+	ReservedBytes int64
+	LimitingKind  AttachmentQuotaLimitKind
+}
+
 // Message is one ordered message inside a room.
 type Message struct {
 	ID             string            `json:"id"`
@@ -101,6 +139,7 @@ type Message struct {
 	IdempotencyKey string            `json:"-"`
 	CreatedAt      int64             `json:"created_at"` // Unix milliseconds
 	Reactions      []ReactionSummary `json:"reactions,omitempty"`
+	Attachments    []Attachment      `json:"attachments,omitempty"`
 }
 
 // ReactionSummary aggregates reactions by emoji for a single message.
@@ -130,6 +169,7 @@ type CreateMessageParams struct {
 	Encoding        string
 	Body            string
 	IdempotencyKey  string
+	AttachmentIDs   []string
 	SkipMemberCheck bool // True only for verified room webhooks or system events
 }
 

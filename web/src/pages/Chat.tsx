@@ -3,6 +3,8 @@ import {
   Check,
   ChevronDown,
   Copy,
+  Download,
+  FileText,
   Hash,
   Loader2,
   Lock,
@@ -12,6 +14,7 @@ import {
   MicOff,
   PanelRightClose,
   PanelRightOpen,
+  Paperclip,
   Phone,
   PhoneOff,
   Search,
@@ -39,9 +42,12 @@ import {
   leaveRoomCall,
   markRoomRead,
   newIdempotencyKey,
+  deleteAttachment,
+  listStagedAttachments,
   openDirectMessage,
   sendMessage,
   setReaction,
+  uploadAttachment,
 } from '../chat/client';
 import {
   applyReactionDelta,
@@ -51,16 +57,22 @@ import {
   sameCalendarDay,
   upsertMessage,
 } from '../chat/state';
-import type {
-  CallState,
-  ChatCurrentUser,
-  ChatDirectoryUser,
-  ChatMessage,
-  ChatRoomDetail,
-  ChatRoomSummary,
-  LobbyGuest,
-  WsServerEvent,
-  WsStatus,
+import {
+  DEFAULT_ATTACHMENT_LIMITS,
+  attachmentUrl,
+  formatBytes,
+  isInlineImageAttachment,
+  type CallState,
+  type ChatAttachment,
+  type ChatAttachmentLimits,
+  type ChatCurrentUser,
+  type ChatDirectoryUser,
+  type ChatMessage,
+  type ChatRoomDetail,
+  type ChatRoomSummary,
+  type LobbyGuest,
+  type WsServerEvent,
+  type WsStatus,
 } from '../chat/types';
 import { ChatSidebar } from '../components/chat/ChatSidebar';
 import { MessageRow } from '../components/chat/MessageRow';
@@ -98,6 +110,11 @@ interface RoomMessageBucket {
   hasGapAfter?: boolean;
 }
 
+type StagedAttachment =
+  | { kind: 'uploading'; localId: string; filename: string; sizeBytes: number; previewUrl?: string }
+  | { kind: 'ready'; localId: string; attachment: ChatAttachment; previewUrl?: string }
+  | { kind: 'error'; localId: string; filename: string; error: string };
+
 const isMac =
   typeof navigator !== 'undefined' && /mac|iphone|ipad|ipod/i.test(navigator.platform || navigator.userAgent);
 const SEARCH_HINT = isMac ? '⌘K' : 'Ctrl+K';
@@ -125,6 +142,10 @@ export const Chat: React.FC<ChatProps> = ({
   const [wsStatus, setWsStatus] = useState<WsStatus>('connecting');
   const [draftsByRoom, setDraftsByRoom] = useState<Record<string, string>>({});
   const [replyByRoom, setReplyByRoom] = useState<Record<string, ChatMessage | null>>({});
+  const [stagedByRoom, setStagedByRoom] = useState<Record<string, StagedAttachment[]>>({});
+  const [attachmentLimits, setAttachmentLimits] = useState<ChatAttachmentLimits>(DEFAULT_ATTACHMENT_LIMITS);
+  const [lightboxAttachment, setLightboxAttachment] = useState<ChatAttachment | null>(null);
+  const [dragActive, setDragActive] = useState(false);
   const [modal, setModal] = useState<ActiveModal>('none');
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [requestedDrawerTab, setRequestedDrawerTab] = useState<{ tab: DrawerTab; seq: number } | null>(null);
@@ -157,6 +178,12 @@ export const Chat: React.FC<ChatProps> = ({
   const callStageRef = useRef<HTMLElement | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const previewUrlsRef = useRef<Set<string>>(new Set());
+  const dragDepthRef = useRef(0);
+  const stagedByRoomRef = useRef<Record<string, StagedAttachment[]>>({});
+  const cancelledUploadsRef = useRef<Set<string>>(new Set());
+  const uploadControllersRef = useRef<Map<string, AbortController>>(new Map());
   const nearBottomRef = useRef(true);
   const activeRoomIdRef = useRef<string | null>(null);
   const currentUserRef = useRef<ChatCurrentUser | null>(null);
@@ -174,12 +201,64 @@ export const Chat: React.FC<ChatProps> = ({
   currentUserRef.current = currentUser;
   bucketsRef.current = buckets;
   roomsRef.current = rooms;
+  stagedByRoomRef.current = stagedByRoom;
   drawerOpenRef.current = drawerOpen;
   isActiveRef.current = isActive;
   onAuthRevokedRef.current = onAuthRevoked;
   onActiveCallChangeRef.current = onActiveCallChange;
   pendingJumpRef.current = pendingJump;
   callRoomIdRef.current = callSnap?.roomId ?? null;
+
+  useEffect(() => {
+    const urls = previewUrlsRef.current;
+    const controllers = uploadControllersRef.current;
+    const cancelled = cancelledUploadsRef.current;
+    return () => {
+      for (const [id, ctrl] of controllers) {
+        cancelled.add(id);
+        ctrl.abort();
+      }
+      controllers.clear();
+      for (const u of urls) {
+        URL.revokeObjectURL(u);
+      }
+      urls.clear();
+    };
+  }, []);
+
+  // Rebuild the tray from the server once per room: a reload or another tab may have left
+  // staged uploads that still count against the pending quota.
+  const stagedFetchedRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!activeRoomId || stagedFetchedRef.current.has(activeRoomId)) return;
+    const roomId = activeRoomId;
+    stagedFetchedRef.current.add(roomId);
+    listStagedAttachments(roomId)
+      .then((list) => {
+        setStagedByRoom((prev) => {
+          const current = prev[roomId] ?? [];
+          const known = new Set(
+            current.flatMap((item) => (item.kind === 'ready' ? [item.attachment.id] : [])),
+          );
+          const restored: StagedAttachment[] = list
+            .filter((a) => !known.has(a.id))
+            .map((a) => ({ kind: 'ready', localId: a.id, attachment: a }));
+          return restored.length ? { ...prev, [roomId]: [...restored, ...current] } : prev;
+        });
+      })
+      .catch(() => {
+        stagedFetchedRef.current.delete(roomId);
+      });
+  }, [activeRoomId]);
+
+  useEffect(() => {
+    if (!lightboxAttachment) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setLightboxAttachment(null);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [lightboxAttachment]);
 
   const activeRoom = useMemo(
     () => rooms.find((r) => r.id === activeRoomId) ?? null,
@@ -190,6 +269,11 @@ export const Chat: React.FC<ChatProps> = ({
   const activeMessages = activeBucket?.messages ?? [];
   const draft = activeRoomId ? draftsByRoom[activeRoomId] ?? '' : '';
   const replyTo = activeRoomId ? replyByRoom[activeRoomId] ?? null : null;
+  const activeStaged = activeRoomId ? stagedByRoom[activeRoomId] ?? [] : [];
+  const hasUploadingAttachments = activeStaged.some((item) => item.kind === 'uploading');
+  const readyStagedAttachments = activeStaged
+    .filter((item): item is Extract<StagedAttachment, { kind: 'ready' }> => item.kind === 'ready')
+    .map((item) => item.attachment);
 
   const setActiveDraft = useCallback((value: string) => {
     const rid = activeRoomIdRef.current;
@@ -538,7 +622,7 @@ export const Chat: React.FC<ChatProps> = ({
                 ...current,
                 messages: current.messages.map((m) =>
                   m.id === event.messageId
-                    ? { ...m, body: '', deleted_at: event.deletedAt ?? Date.now() }
+                    ? { ...m, body: '', attachments: [], deleted_at: event.deletedAt ?? Date.now() }
                     : m,
                 ),
               },
@@ -707,6 +791,7 @@ export const Chat: React.FC<ChatProps> = ({
         setRooms(boot.rooms);
         setDirectory(users);
         setSfuAvailable(boot.rtc.sfu_available);
+        setAttachmentLimits(boot.attachments);
         const callMap: Record<string, CallState> = {};
         for (const [rid, c] of Object.entries(boot.active_calls)) {
           if (!c.ended && c.active !== false && c.peers.length > 0) callMap[rid] = c;
@@ -941,7 +1026,185 @@ export const Chat: React.FC<ChatProps> = ({
     }
   };
 
-  const dispatchSend = async (roomId: string, body: string, replyToId: string | undefined, clientKey: string) => {
+  const releasePreviewUrl = useCallback((url?: string) => {
+    if (!url) return;
+    if (previewUrlsRef.current.has(url)) {
+      URL.revokeObjectURL(url);
+      previewUrlsRef.current.delete(url);
+    }
+  }, []);
+
+  const removeStagedAttachment = useCallback(
+    (roomId: string, localId: string) => {
+      const existing = (stagedByRoomRef.current[roomId] ?? []).find((item) => item.localId === localId);
+      if (existing && existing.kind === 'ready') {
+        void deleteAttachment(existing.attachment.id).catch(() => {
+          // Best-effort cleanup; orphan sweep also expires abandoned uploads.
+        });
+      } else {
+        cancelledUploadsRef.current.add(localId);
+        const ctrl = uploadControllersRef.current.get(localId);
+        if (ctrl) {
+          uploadControllersRef.current.delete(localId);
+          ctrl.abort();
+        }
+      }
+      setStagedByRoom((prev) => {
+        const current = prev[roomId] ?? [];
+        const target = current.find((item) => item.localId === localId);
+        if (target && target.kind !== 'error') {
+          releasePreviewUrl(target.previewUrl);
+        }
+        return {
+          ...prev,
+          [roomId]: current.filter((item) => item.localId !== localId),
+        };
+      });
+    },
+    [releasePreviewUrl],
+  );
+
+  const uploadFilesForRoom = useCallback(
+    (roomId: string, files: File[]) => {
+      if (files.length === 0 || !attachmentLimits.available) return;
+      const room = roomsRef.current.find((r) => r.id === roomId);
+      if (room?.closed_at) return;
+
+      const existingCount = (stagedByRoomRef.current[roomId] ?? []).filter((item) => item.kind !== 'error').length;
+      const availableSlots = Math.max(0, attachmentLimits.max_per_message - existingCount);
+      if (availableSlots === 0) {
+        setBannerError(`You can attach up to ${attachmentLimits.max_per_message} files per message.`);
+        return;
+      }
+
+      const accepted = files.slice(0, availableSlots);
+      if (files.length > availableSlots) {
+        setBannerError(`Only the first ${availableSlots} file(s) were added (max ${attachmentLimits.max_per_message} per message).`);
+      }
+
+      for (const file of accepted) {
+        const localId = newIdempotencyKey();
+        if (file.size <= 0) {
+          setStagedByRoom((prev) => ({
+            ...prev,
+            [roomId]: [
+              ...(prev[roomId] ?? []),
+              { kind: 'error', localId, filename: file.name || 'file', error: 'File is empty' },
+            ],
+          }));
+          continue;
+        }
+        if (file.size > attachmentLimits.max_upload_bytes) {
+          setStagedByRoom((prev) => ({
+            ...prev,
+            [roomId]: [
+              ...(prev[roomId] ?? []),
+              {
+                kind: 'error',
+                localId,
+                filename: file.name || 'file',
+                error: `Exceeds ${formatBytes(attachmentLimits.max_upload_bytes)} limit`,
+              },
+            ],
+          }));
+          continue;
+        }
+
+        let previewUrl: string | undefined;
+        if (isInlineImageAttachment({ mime_type: file.type })) {
+          previewUrl = URL.createObjectURL(file);
+          previewUrlsRef.current.add(previewUrl);
+        }
+
+        setStagedByRoom((prev) => ({
+          ...prev,
+          [roomId]: [
+            ...(prev[roomId] ?? []),
+            {
+              kind: 'uploading',
+              localId,
+              filename: file.name || 'file',
+              sizeBytes: file.size,
+              previewUrl,
+            },
+          ],
+        }));
+
+        const controller = new AbortController();
+        uploadControllersRef.current.set(localId, controller);
+
+        void uploadAttachment(roomId, file, controller.signal)
+          .then((att) => {
+            uploadControllersRef.current.delete(localId);
+            let cleanedOrphan = false;
+            const cleanupOrphan = () => {
+              if (cleanedOrphan) return;
+              cleanedOrphan = true;
+              releasePreviewUrl(previewUrl);
+              void deleteAttachment(att.id).catch(() => {
+                // Best-effort cleanup; orphan sweep also expires abandoned uploads.
+              });
+            };
+            if (cancelledUploadsRef.current.delete(localId)) {
+              cleanupOrphan();
+              return;
+            }
+            setStagedByRoom((prev) => {
+              const list = prev[roomId] ?? [];
+              const exists = list.some((item) => item.localId === localId);
+              if (!exists) {
+                cleanupOrphan();
+                return prev;
+              }
+              const inlineSafe = isInlineImageAttachment(att);
+              if (!inlineSafe) {
+                releasePreviewUrl(previewUrl);
+              }
+              return {
+                ...prev,
+                [roomId]: list.map((item) =>
+                  item.localId === localId
+                    ? {
+                        kind: 'ready',
+                        localId,
+                        attachment: att,
+                        previewUrl: inlineSafe ? previewUrl : undefined,
+                      }
+                    : item,
+                ),
+              };
+            });
+          })
+          .catch((e) => {
+            uploadControllersRef.current.delete(localId);
+            cancelledUploadsRef.current.delete(localId);
+            releasePreviewUrl(previewUrl);
+            const msg = e instanceof Error ? e.message : 'Upload failed';
+            setStagedByRoom((prev) => {
+              const list = prev[roomId] ?? [];
+              if (!list.some((item) => item.localId === localId)) return prev;
+              return {
+                ...prev,
+                [roomId]: list.map((item) =>
+                  item.localId === localId
+                    ? { kind: 'error', localId, filename: file.name || 'file', error: msg }
+                    : item,
+                ),
+              };
+            });
+          });
+      }
+    },
+    [attachmentLimits, releasePreviewUrl],
+  );
+
+  const dispatchSend = async (
+    roomId: string,
+    body: string,
+    replyToId: string | undefined,
+    clientKey: string,
+    attachments: ChatAttachment[] = [],
+  ) => {
     const me = currentUserRef.current;
     if (!me) return;
 
@@ -957,6 +1220,7 @@ export const Chat: React.FC<ChatProps> = ({
       body,
       created_at: Date.now(),
       reactions: [],
+      attachments,
       delivery: { kind: 'sending', idempotencyKey: clientKey },
     };
 
@@ -977,7 +1241,13 @@ export const Chat: React.FC<ChatProps> = ({
     requestAnimationFrame(scrollToBottom);
 
     try {
-      const confirmed = await sendMessage({ roomId, body, replyToId, idempotencyKey: clientKey });
+      const confirmed = await sendMessage({
+        roomId,
+        body,
+        replyToId,
+        attachmentIds: attachments.map((a) => a.id),
+        idempotencyKey: clientKey,
+      });
       setBuckets((prev) => {
         const current = prev[roomId] ?? { messages: [], hasMore: false, loaded: true };
         return {
@@ -1025,18 +1295,30 @@ export const Chat: React.FC<ChatProps> = ({
   const handleComposerSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!activeRoomId || activeRoom?.closed_at) return;
+    if (hasUploadingAttachments) return;
     const trimmed = draft.trim();
-    if (!trimmed) return;
+    const attachmentsToSend = readyStagedAttachments;
+    if (!trimmed && attachmentsToSend.length === 0) return;
     const clientKey = newIdempotencyKey();
     const targetReply = replyTo?.id;
     setActiveDraft('');
     setActiveReplyTo(null);
+    setStagedByRoom((prev) => {
+      const current = prev[activeRoomId] ?? [];
+      for (const item of current) {
+        if (item.kind === 'ready') {
+          releasePreviewUrl(item.previewUrl);
+        }
+      }
+      const remaining = current.filter((item) => item.kind === 'uploading');
+      return { ...prev, [activeRoomId]: remaining };
+    });
     setUnreadDividerSeq(null);
     socketRef.current?.sendTyping(activeRoomId, false);
     if (composerRef.current) {
       composerRef.current.style.height = 'auto';
     }
-    void dispatchSend(activeRoomId, trimmed, targetReply, clientKey);
+    void dispatchSend(activeRoomId, trimmed, targetReply, clientKey, attachmentsToSend);
   };
 
   const handleToggleReaction = (messageId: string, emoji: string, currentlyReacted: boolean) => {
@@ -1413,7 +1695,51 @@ export const Chat: React.FC<ChatProps> = ({
         onLogout={onLogout}
       />
 
-      <section className="chat-stage" aria-label="Conversation">
+      <section
+        className={`chat-stage${dragActive ? ' is-drag-over' : ''}`}
+        aria-label="Conversation"
+        onDragEnter={(e) => {
+          if (!activeRoom || activeRoom.closed_at || !attachmentLimits.available) return;
+          if (!Array.from(e.dataTransfer.types).includes('Files')) return;
+          e.preventDefault();
+          dragDepthRef.current += 1;
+          setDragActive(true);
+        }}
+        onDragOver={(e) => {
+          if (!activeRoom || activeRoom.closed_at || !attachmentLimits.available) return;
+          if (!Array.from(e.dataTransfer.types).includes('Files')) return;
+          e.preventDefault();
+          e.dataTransfer.dropEffect = 'copy';
+        }}
+        onDragLeave={(e) => {
+          if (!activeRoom || !attachmentLimits.available) return;
+          if (!Array.from(e.dataTransfer.types).includes('Files')) return;
+          e.preventDefault();
+          dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+          if (dragDepthRef.current === 0) setDragActive(false);
+        }}
+        onDrop={(e) => {
+          if (!activeRoom || activeRoom.closed_at || !attachmentLimits.available) return;
+          e.preventDefault();
+          dragDepthRef.current = 0;
+          setDragActive(false);
+          const dropped = Array.from(e.dataTransfer.files);
+          if (dropped.length > 0) {
+            uploadFilesForRoom(activeRoom.id, dropped);
+          }
+        }}
+      >
+        {dragActive && activeRoom && !activeRoom.closed_at && attachmentLimits.available && (
+          <div className="chat-drop-overlay" aria-hidden="true">
+            <div className="chat-drop-card">
+              <Paperclip size={24} />
+              <strong>
+                Drop files to attach to {activeRoom.kind === 'dm' ? activeRoom.name || 'this chat' : `#${activeRoom.name}`}
+              </strong>
+              <span>Up to {formatBytes(attachmentLimits.max_upload_bytes)} per file</span>
+            </div>
+          </div>
+        )}
         {activeRoom ? (
           <>
             <header className="chat-header">
@@ -1754,6 +2080,7 @@ export const Chat: React.FC<ChatProps> = ({
                           onJumpToMessage={(seq) => {
                             void jumpToMessageSeq(activeRoom.id, seq);
                           }}
+                          onPreviewImage={(att) => setLightboxAttachment(att)}
                           onToggleReaction={handleToggleReaction}
                           onEdit={handleEditMessage}
                           onDelete={handleDeleteMessage}
@@ -1764,10 +2091,20 @@ export const Chat: React.FC<ChatProps> = ({
                                 failed.body,
                                 failed.reply_to_id,
                                 failed.delivery.idempotencyKey,
+                                failed.attachments,
                               );
                             }
                           }}
                           onDismissFailed={(key) => {
+                            // A dismissed send's uploads are never posted: free their quota now.
+                            const dismissed = bucketsRef.current[activeRoom.id]?.messages.find(
+                              (m) => m.delivery.kind === 'failed' && m.delivery.idempotencyKey === key,
+                            );
+                            for (const a of dismissed?.attachments ?? []) {
+                              void deleteAttachment(a.id).catch(() => {
+                                // Best-effort; the orphan sweep expires it otherwise.
+                              });
+                            }
                             setBuckets((prevBuckets) => {
                               const current = prevBuckets[activeRoom.id];
                               if (!current) return prevBuckets;
@@ -1820,7 +2157,11 @@ export const Chat: React.FC<ChatProps> = ({
               {replyTo && (
                 <div className="chat-reply-banner">
                   <span className="chat-reply-banner-copy">
-                    Replying to <strong>{replyTo.sender_name || 'Member'}</strong>: {replyTo.body}
+                    Replying to <strong>{replyTo.sender_name || 'Member'}</strong>:{' '}
+                    {replyTo.body ||
+                      (replyTo.attachments.length === 1
+                        ? `Attachment: ${replyTo.attachments[0].filename}`
+                        : `${replyTo.attachments.length} attachments`)}
                   </span>
                   <button
                     type="button"
@@ -1833,10 +2174,93 @@ export const Chat: React.FC<ChatProps> = ({
                 </div>
               )}
 
+              {activeStaged.length > 0 && (
+                <div
+                  className={replyTo ? 'chat-staged-tray has-reply' : 'chat-staged-tray'}
+                  role="list"
+                  aria-label="Pending attachments"
+                >
+                  {activeStaged.map((item) => (
+                    <div
+                      key={item.localId}
+                      role="listitem"
+                      className={`chat-staged-chip${item.kind === 'error' ? ' is-error' : ''}${item.kind === 'uploading' ? ' is-uploading' : ''}`}
+                    >
+                      {item.kind !== 'error' && item.previewUrl ? (
+                        <img
+                          src={item.previewUrl}
+                          alt=""
+                          className="chat-staged-thumb"
+                        />
+                      ) : (
+                        <span className="chat-staged-icon" aria-hidden="true">
+                          {item.kind === 'uploading' ? (
+                            <Loader2 size={14} className="ky-spin" />
+                          ) : (
+                            <FileText size={14} />
+                          )}
+                        </span>
+                      )}
+                      <span className="chat-staged-meta">
+                        <span
+                          className="chat-staged-name"
+                          title={item.kind === 'ready' ? item.attachment.filename : item.filename}
+                        >
+                          {item.kind === 'ready' ? item.attachment.filename : item.filename}
+                        </span>
+                        <span className="chat-staged-sub">
+                          {item.kind === 'uploading'
+                            ? `Uploading (${formatBytes(item.sizeBytes)})…`
+                            : item.kind === 'ready'
+                              ? formatBytes(item.attachment.size_bytes)
+                              : item.error}
+                        </span>
+                      </span>
+                      <button
+                        type="button"
+                        className="chat-icon-btn chat-staged-remove"
+                        aria-label={`Remove ${item.kind === 'ready' ? item.attachment.filename : item.filename}`}
+                        onClick={() => removeStagedAttachment(activeRoom.id, item.localId)}
+                      >
+                        <X size={13} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                className="sr-only"
+                aria-label="Upload files"
+                disabled={Boolean(activeRoom.closed_at)}
+                onChange={(e) => {
+                  const picked = e.target.files ? Array.from(e.target.files) : [];
+                  e.target.value = '';
+                  if (picked.length > 0 && activeRoomId) {
+                    uploadFilesForRoom(activeRoomId, picked);
+                  }
+                }}
+              />
+
               <form
-                className={replyTo ? 'chat-composer has-reply' : 'chat-composer'}
+                className={replyTo || activeStaged.length > 0 ? 'chat-composer has-reply' : 'chat-composer'}
                 onSubmit={handleComposerSubmit}
               >
+                {attachmentLimits.available && (
+                  <button
+                    type="button"
+                    className="chat-attach-btn"
+                    disabled={Boolean(activeRoom.closed_at)}
+                    title={`Attach files (max ${formatBytes(attachmentLimits.max_upload_bytes)} each)`}
+                    aria-label="Attach files"
+                    onClick={() => fileInputRef.current?.click()}
+                  >
+                    <Paperclip size={16} aria-hidden="true" />
+                  </button>
+                )}
                 <textarea
                   ref={composerRef}
                   rows={1}
@@ -1860,6 +2284,14 @@ export const Chat: React.FC<ChatProps> = ({
                       socketRef.current?.sendTyping(activeRoomId, true);
                     }
                   }}
+                  onPaste={(e) => {
+                    if (!activeRoomId || activeRoom.closed_at) return;
+                    const files = Array.from(e.clipboardData.files);
+                    if (files.length > 0) {
+                      e.preventDefault();
+                      uploadFilesForRoom(activeRoomId, files);
+                    }
+                  }}
                   onKeyDown={(e) => {
                     if (e.nativeEvent.isComposing || e.keyCode === 229) return;
                     if (e.key === 'Enter' && !e.shiftKey) {
@@ -1880,7 +2312,11 @@ export const Chat: React.FC<ChatProps> = ({
                 <button
                   type="submit"
                   className="chat-send-btn"
-                  disabled={Boolean(activeRoom.closed_at) || !draft.trim()}
+                  disabled={
+                    Boolean(activeRoom.closed_at) ||
+                    hasUploadingAttachments ||
+                    (!draft.trim() && readyStagedAttachments.length === 0)
+                  }
                   aria-label="Send message"
                 >
                   <Send size={15} aria-hidden="true" />
@@ -2002,6 +2438,50 @@ export const Chat: React.FC<ChatProps> = ({
             }
           }}
         />
+      )}
+
+      {lightboxAttachment && (
+        <div
+          className="chat-lightbox-backdrop"
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Image preview: ${lightboxAttachment.filename}`}
+          onClick={() => setLightboxAttachment(null)}
+        >
+          <div className="chat-lightbox-dialog" onClick={(e) => e.stopPropagation()}>
+            <div className="chat-lightbox-header">
+              <div className="chat-lightbox-title">
+                <strong>{lightboxAttachment.filename}</strong>
+                <span>{formatBytes(lightboxAttachment.size_bytes)}</span>
+              </div>
+              <div className="chat-lightbox-actions">
+                <a
+                  href={attachmentUrl(lightboxAttachment.id)}
+                  download={lightboxAttachment.filename}
+                  className="btn-secondary chat-lightbox-dl"
+                >
+                  <Download size={14} aria-hidden="true" />
+                  <span>Download</span>
+                </a>
+                <button
+                  type="button"
+                  className="chat-icon-btn"
+                  aria-label="Close image preview"
+                  onClick={() => setLightboxAttachment(null)}
+                >
+                  <X size={16} />
+                </button>
+              </div>
+            </div>
+            <div className="chat-lightbox-body">
+              <img
+                src={attachmentUrl(lightboxAttachment.id, true)}
+                alt={lightboxAttachment.filename}
+                className="chat-lightbox-img"
+              />
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

@@ -52,3 +52,26 @@ func agentExpiryLoop(ctx context.Context, expire func(context.Context, time.Time
 		}
 	}
 }
+
+// attachmentSweepLoop expires abandoned unposted (staged) attachments at start and every
+// 15 minutes. done closes between runs so shutdown waits cleanly before the store closes.
+func attachmentSweepLoop(ctx context.Context, sweep func(context.Context, time.Time) (int, error), done chan<- struct{}) {
+	defer close(done)
+	ticker := time.NewTicker(15 * time.Minute)
+	defer ticker.Stop()
+	for {
+		run, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		removed, err := sweep(run, time.Now())
+		cancel()
+		if err != nil && ctx.Err() == nil {
+			log.Printf("[ATTACHMENTS] orphan sweep failed: %v", err)
+		} else if removed > 0 {
+			log.Printf("[ATTACHMENTS] purged %d expired staged attachment(s)", removed)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}

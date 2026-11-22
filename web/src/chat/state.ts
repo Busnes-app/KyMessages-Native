@@ -1,5 +1,13 @@
 import type { ChatMessage, ChatReactionSummary, ChatRoomSummary } from './types';
 
+function sameAttachmentIds(a: ChatMessage, b: ChatMessage): boolean {
+  if (a.attachments.length !== b.attachments.length) return false;
+  for (let i = 0; i < a.attachments.length; i++) {
+    if (a.attachments[i].id !== b.attachments[i].id) return false;
+  }
+  return true;
+}
+
 /** Insert or replace a server-confirmed message, reconciling any optimistic pending copy. */
 export function upsertMessage(
   list: ChatMessage[],
@@ -19,9 +27,13 @@ export function upsertMessage(
       reactions: incoming.reactions.length > 0 ? incoming.reactions : withoutOptimistic[idx].reactions,
     };
   } else {
-    // Also drop any pending optimistic message from the same sender with identical body when WS races ahead of REST.
+    // Also drop any pending optimistic message from the same sender with identical body and attachments when WS races ahead of REST.
     const dupIdx = withoutOptimistic.findIndex(
-      (m) => m.delivery.kind === 'sending' && m.sender_id === incoming.sender_id && m.body === incoming.body,
+      (m) =>
+        m.delivery.kind === 'sending' &&
+        m.sender_id === incoming.sender_id &&
+        m.body === incoming.body &&
+        sameAttachmentIds(m, incoming),
     );
     if (dupIdx >= 0) {
       next = [...withoutOptimistic];

@@ -66,6 +66,51 @@ export interface ChatReactionSummary {
   count: number;
 }
 
+export interface ChatAttachment {
+  id: string;
+  tenant_id: string;
+  room_id: string;
+  message_id?: string;
+  uploader_id: string;
+  filename: string;
+  mime_type: string;
+  size_bytes: number;
+  sha256_hex: string;
+  created_at: number;
+}
+
+export interface ChatAttachmentLimits {
+  available: boolean;
+  max_upload_bytes: number;
+  max_per_message: number;
+}
+
+export const DEFAULT_ATTACHMENT_LIMITS: ChatAttachmentLimits = {
+  available: true,
+  max_upload_bytes: 25 * 1024 * 1024,
+  max_per_message: 10,
+};
+
+const INLINE_IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+
+export function isInlineImageAttachment(att: Pick<ChatAttachment, 'mime_type'>): boolean {
+  return INLINE_IMAGE_MIMES.has(att.mime_type.toLowerCase());
+}
+
+export function attachmentUrl(id: string, inline = false): string {
+  const base = `/api/v1/attachments/${encodeURIComponent(id)}`;
+  return inline ? `${base}?inline=1` : base;
+}
+
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return '0 B';
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb >= 10 ? Math.round(kb) : kb.toFixed(1)} KB`;
+  const mb = kb / 1024;
+  return `${mb >= 10 ? Math.round(mb) : mb.toFixed(1)} MB`;
+}
+
 export type MessageDeliveryState =
   | { kind: 'synced' }
   | { kind: 'sending'; idempotencyKey: string }
@@ -85,6 +130,7 @@ export interface ChatMessage {
   deleted_at?: number;
   created_at: number;
   reactions: ChatReactionSummary[];
+  attachments: ChatAttachment[];
   delivery: MessageDeliveryState;
 }
 
@@ -215,6 +261,7 @@ export interface ChatBootstrap {
     sfu_available: boolean;
     ice_servers: RTCIceServer[];
   };
+  attachments: ChatAttachmentLimits;
 }
 
 export interface ChatRoomDetail {
@@ -340,6 +387,22 @@ export function parseReactionSummary(v: unknown): ChatReactionSummary {
   };
 }
 
+export function parseAttachment(v: unknown): ChatAttachment {
+  const o = obj(v);
+  return {
+    id: str(o.id, 128),
+    tenant_id: opt(o.tenant_id, (s) => str(s, 128)) ?? 'default',
+    room_id: str(o.room_id, 128),
+    message_id: opt(o.message_id, (s) => str(s, 128)),
+    uploader_id: opt(o.uploader_id, (s) => str(s, 128)) ?? '',
+    filename: opt(o.filename, (s) => str(s, 255)) ?? 'file',
+    mime_type: opt(o.mime_type, (s) => str(s, 128)) ?? 'application/octet-stream',
+    size_bytes: opt(o.size_bytes, count) ?? 0,
+    sha256_hex: opt(o.sha256_hex, (s) => str(s, 128)) ?? '',
+    created_at: opt(o.created_at, num) ?? 0,
+  };
+}
+
 export function parseMessage(v: unknown): ChatMessage {
   const o = obj(v);
   return {
@@ -356,6 +419,7 @@ export function parseMessage(v: unknown): ChatMessage {
     deleted_at: opt(o.deleted_at, num),
     created_at: opt(o.created_at, num) ?? Date.now(),
     reactions: opt(o.reactions, (list) => arr(list).map(parseReactionSummary)) ?? [],
+    attachments: opt(o.attachments, (list) => arr(list).map(parseAttachment)) ?? [],
     delivery: { kind: 'synced' },
   };
 }
@@ -537,6 +601,7 @@ export function parseBootstrap(v: unknown): ChatBootstrap {
     }
   }
   const rtcObj = o.rtc && typeof o.rtc === 'object' ? obj(o.rtc) : {};
+  const attObj = o.attachments && typeof o.attachments === 'object' ? obj(o.attachments) : {};
   return {
     user: parseCurrentUser(o.user),
     tenant: parseTenant(o.tenant),
@@ -545,6 +610,11 @@ export function parseBootstrap(v: unknown): ChatBootstrap {
     rtc: {
       sfu_available: opt(rtcObj.sfu_available, bool) ?? false,
       ice_servers: parseICEServers(rtcObj.ice_servers),
+    },
+    attachments: {
+      available: opt(attObj.available, bool) ?? DEFAULT_ATTACHMENT_LIMITS.available,
+      max_upload_bytes: opt(attObj.max_upload_bytes, count) ?? DEFAULT_ATTACHMENT_LIMITS.max_upload_bytes,
+      max_per_message: opt(attObj.max_per_message, count) ?? DEFAULT_ATTACHMENT_LIMITS.max_per_message,
     },
   };
 }
