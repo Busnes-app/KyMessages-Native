@@ -258,14 +258,21 @@ func (k *KyIdentityClient) applyOrgLifecycle(ctx context.Context, eventType stri
 	if orgID == "" {
 		return ErrSyncMalformed
 	}
-	if _, err := k.store.Chat().EnsureTenant(ctx, orgID); err != nil {
+	tenant, err := k.store.Chat().EnsureTenant(ctx, orgID)
+	if err != nil {
 		return err
 	}
 	var nextStatus string
 	switch eventType {
 	case "org.suspended":
+		if tenant.Status == store.TenantStatusDeleted {
+			return nil
+		}
 		nextStatus = store.TenantStatusSuspended
 	case "org.unsuspended":
+		if tenant.Status == store.TenantStatusDeleted {
+			return nil
+		}
 		nextStatus = store.TenantStatusActive
 	case "org.deleted":
 		nextStatus = store.TenantStatusDeleted
@@ -276,14 +283,20 @@ func (k *KyIdentityClient) applyOrgLifecycle(ctx context.Context, eventType stri
 		return err
 	}
 	if nextStatus != store.TenantStatusActive {
-		users, _, err := k.store.Users().ListUsers(ctx, 0, 10000, store.UserFilter{OrgID: orgID})
-		if err != nil {
-			return err
-		}
-		for _, u := range users {
-			_ = k.store.Sessions().DeleteUserSessions(ctx, u.ID)
-			if k.onUserRevoked != nil {
-				k.onUserRevoked(ctx, u.ID)
+		const pageSize = 1000
+		for offset := 0; ; offset += pageSize {
+			users, total, err := k.store.Users().ListUsers(ctx, offset, pageSize, store.UserFilter{OrgID: orgID})
+			if err != nil {
+				return err
+			}
+			for _, u := range users {
+				_ = k.store.Sessions().DeleteUserSessions(ctx, u.ID)
+				if k.onUserRevoked != nil {
+					k.onUserRevoked(ctx, u.ID)
+				}
+			}
+			if len(users) == 0 || offset+len(users) >= total {
+				break
 			}
 		}
 	}

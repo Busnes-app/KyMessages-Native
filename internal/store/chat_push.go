@@ -186,7 +186,8 @@ func (c *chatStore) ListPushSubscriptionsForUsers(ctx context.Context, tenantID 
 		SELECT ps.id, ps.tenant_id, ps.user_id, ps.endpoint, ps.p256dh, ps.auth_secret, ps.user_agent, ps.created_at, ps.last_used_at
 		FROM push_subscriptions ps
 		INNER JOIN users u ON u.id = ps.user_id
-		WHERE ps.tenant_id = ? AND ps.user_id IN (` + placeholders + `) AND u.status = 'active'
+		INNER JOIN tenants t ON t.id = ps.tenant_id
+		WHERE ps.tenant_id = ? AND ps.user_id IN (` + placeholders + `) AND u.status = 'active' AND t.status = 'active'
 		ORDER BY ps.created_at DESC
 	`)
 	rows, err := c.store.readDB.QueryContext(ctx, q, args...)
