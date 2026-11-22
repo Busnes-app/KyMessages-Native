@@ -385,4 +385,3 @@ func TestTenancyModeFromEnv(t *testing.T) {
 		}
 	})
 }
-
