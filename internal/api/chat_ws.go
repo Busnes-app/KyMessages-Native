@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Busnes-app/ky_server_base/internal/auth"
 	"github.com/Busnes-app/ky_server_base/internal/chat"
@@ -23,7 +24,32 @@ func (s *Server) RunChatBus(ctx context.Context) error {
 		<-ctx.Done()
 		return ctx.Err()
 	}
+	done := make(chan struct{})
+	go func() { defer close(done); s.reconcileCallsLoop(ctx) }()
+	defer func() { <-done }()
 	return s.chatHub.Run(ctx)
+}
+
+// callReconcileInterval bounds how long a call seat outlives its org after a missed
+// tenant.revoked notification.
+const callReconcileInterval = 30 * time.Second
+
+func (s *Server) reconcileCallsLoop(ctx context.Context) {
+	if s.calls == nil || !s.config.Tenancy.IsMultiTenant() {
+		return
+	}
+	t := time.NewTicker(callReconcileInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			s.calls.ReconcileTenants(rctx)
+			cancel()
+		}
+	}
 }
 
 // CloseChat gracefully disconnects all live WebSocket clients during shutdown.

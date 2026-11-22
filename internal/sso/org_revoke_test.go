@@ -62,3 +62,31 @@ func TestOrgSuspensionRetriesFailedRevocation(t *testing.T) {
 		t.Fatalf("session after the retried suspension: %v, want gone", err)
 	}
 }
+
+// A suspension whose cross-pod revocation could not be published is not acknowledged either.
+func TestOrgSuspensionRetriesFailedPublication(t *testing.T) {
+	d := newDirectory(t)
+	ctx := context.Background()
+	d.client.SetTenancy(config.TenancyConfig{Mode: config.TenancyMulti})
+	var down atomic.Bool
+	published := 0
+	d.client.OnTenantRevoked(func(context.Context, string) error {
+		if down.Load() {
+			return errors.New("bus unavailable")
+		}
+		published++
+		return nil
+	})
+	if _, err := d.st.Chat().EnsureTenant(ctx, "org-y"); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"org_id":"org-y","revision":1}`)
+	down.Store(true)
+	if err := d.sendID("evt-y", "org.suspended", body); err == nil {
+		t.Fatal("suspension acknowledged although its revocation was never published")
+	}
+	down.Store(false)
+	if err := d.sendID("evt-y", "org.suspended", body); err != nil || published != 1 {
+		t.Fatalf("redelivery = %v, published %d times, want nil and 1", err, published)
+	}
+}

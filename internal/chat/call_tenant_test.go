@@ -179,3 +179,113 @@ func TestGuestSocketRevalidatedAgainstItsSession(t *testing.T) {
 	live.Store(false)
 	closed(c)
 }
+
+// leavesMidJoin removes the joining peer during setup, as a concurrent Leave or a replacing join
+// would, while the org stays active.
+type leavesMidJoin struct {
+	store.ChatStore
+	reads  atomic.Int32
+	onRead func(n int32)
+}
+
+func (s *leavesMidJoin) GetTenant(ctx context.Context, id string) (*store.Tenant, error) {
+	n := s.reads.Add(1)
+	if s.onRead != nil {
+		s.onRead(n)
+	}
+	return s.ChatStore.GetTenant(ctx, id)
+}
+
+func TestCallJoinSeatLostIsNotASuspension(t *testing.T) {
+	ctx := context.Background()
+	st := openChatTestStore(t)
+	if _, err := st.Chat().EnsureTenant(ctx, "org-a"); err != nil {
+		t.Fatal(err)
+	}
+	room := &store.Room{TenantID: "org-a", Kind: store.RoomKindChannel, Name: "seat", CreatedBy: "u1"}
+	if err := st.Chat().CreateRoom(ctx, room, []string{"u1", "u2"}); err != nil {
+		t.Fatal(err)
+	}
+	wrapped := &leavesMidJoin{ChatStore: st.Chat()}
+	mgr := NewCallManager(wrapped, NewHub(&captureBus{}), fakeLiveKitClient(t), nil)
+	if _, err := mgr.Join(ctx, JoinCallRequest{TenantID: "org-a", RoomID: room.ID, UserID: "u2", DisplayName: "u2", Audio: true, ProtectIP: true}); err != nil {
+		t.Fatal(err)
+	}
+	wrapped.reads.Store(0)
+	wrapped.onRead = func(n int32) {
+		if n == 3 { // the final check, after setup
+			mgr.Leave(ctx, room.ID, "u1")
+		}
+	}
+	resp, err := mgr.Join(ctx, JoinCallRequest{TenantID: "org-a", RoomID: room.ID, UserID: "u1", DisplayName: "u1", Audio: true, ProtectIP: true})
+	if !errors.Is(err, ErrCallSeatLost) || resp != nil {
+		t.Fatalf("join whose seat vanished = %+v, %v; want ErrCallSeatLost and no token", resp, err)
+	}
+	if state := mgr.GetState(room.ID); state == nil || len(state.Peers) != 1 || state.Peers[0].UserID != "u2" {
+		t.Fatalf("other member's seat disturbed: %+v", state)
+	}
+}
+
+// A call whose org went inactive without a tenant.revoked reaching this pod is emptied by the
+// reconcile sweep.
+func TestReconcileTenantsEmptiesInactiveOrgCalls(t *testing.T) {
+	ctx := context.Background()
+	st := openChatTestStore(t)
+	for _, org := range []string{"org-a", "org-b"} {
+		if _, err := st.Chat().EnsureTenant(ctx, org); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mgr := NewCallManager(st.Chat(), NewHub(&captureBus{}), fakeLiveKitClient(t), nil)
+	rooms := map[string]string{}
+	for _, org := range []string{"org-a", "org-b"} {
+		room := &store.Room{TenantID: org, Kind: store.RoomKindChannel, Name: org, CreatedBy: "u-" + org}
+		if err := st.Chat().CreateRoom(ctx, room, []string{"u-" + org}); err != nil {
+			t.Fatal(err)
+		}
+		rooms[org] = room.ID
+		if _, err := mgr.Join(ctx, JoinCallRequest{TenantID: org, RoomID: room.ID, UserID: "u-" + org, DisplayName: org, Audio: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.Chat().SetTenantStatus(ctx, "org-a", store.TenantStatusSuspended); err != nil {
+		t.Fatal(err)
+	}
+	mgr.ReconcileTenants(ctx)
+	if state := mgr.GetState(rooms["org-a"]); state != nil && len(state.Peers) != 0 {
+		t.Fatalf("suspended org's call still seated: %+v", state.Peers)
+	}
+	if state := mgr.GetState(rooms["org-b"]); state == nil || len(state.Peers) != 1 {
+		t.Fatalf("active org's call disturbed: %+v", state)
+	}
+}
+
+// The guest check closes a guest whose org went inactive, and keeps one open through an outage.
+func TestGuestCheckFollowsOrgStatus(t *testing.T) {
+	ctx := context.Background()
+	lobby := NewLobbyManager(nil, nil)
+	now := time.Now().UTC()
+	s, err := lobby.Knock(ctx, &store.MeetingGuest{ID: "gst", MeetingID: "mtg", GuestKey: "k"},
+		&store.Meeting{ID: "mtg", TenantID: "org-a", RoomID: "rm"},
+		[]store.MeetingWindow{{StartsAt: now.Add(-time.Minute).UnixMilli(), EndsAt: now.Add(time.Hour).UnixMilli()}}, "g")
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := map[string]bool{"org-a": true}
+	var lookupErr error
+	check := lobby.GuestCheck(func(_ context.Context, tenantID string) (bool, error) { return status[tenantID], lookupErr })
+	if !check(s.GuestID) {
+		t.Fatal("guest of an active org refused")
+	}
+	if check("gst-unknown") {
+		t.Fatal("guest without a session accepted")
+	}
+	status["org-a"] = false
+	if check(s.GuestID) {
+		t.Fatal("guest of an inactive org accepted")
+	}
+	lookupErr = errors.New("database unavailable")
+	if !check(s.GuestID) {
+		t.Fatal("an outage closed the guest")
+	}
+}

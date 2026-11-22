@@ -249,12 +249,12 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 		s.revokeAgentsForOwner(ctx, userID)
 	}
 	kyidentity.OnUserRevoked(revokeUser)
-	chatHub.SetGuestCheck(lobbyMgr.HasSession)
+	chatHub.SetGuestCheck(lobbyMgr.GuestCheck(s.isTenantActive))
 	chatHub.SetTenantRevokeHandler(func(tenantID string) {
 		lobbyMgr.RevokeTenant(context.Background(), tenantID)
 		callMgr.RevokeTenant(context.Background(), tenantID)
 	})
-	kyidentity.OnTenantRevoked(func(ctx context.Context, orgID string) { _ = chatHub.RevokeTenant(ctx, orgID) })
+	kyidentity.OnTenantRevoked(chatHub.RevokeTenant)
 	scimSrv.OnUserRevoked(revokeUser)
 
 	s.routes()

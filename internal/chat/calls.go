@@ -26,6 +26,8 @@ var (
 	ErrSFUUnavailable = errors.New("livekit sfu is not configured on this server")
 	// ErrTenantInactive is returned when the call's organization is suspended or deleted.
 	ErrTenantInactive = errors.New("organization is suspended or inactive")
+	// ErrCallSeatLost is returned when the joining peer left or was replaced during setup.
+	ErrCallSeatLost = errors.New("call seat ended while joining")
 	// ErrCallNotActive is returned when operating on a room without an active call.
 	ErrCallNotActive = errors.New("no active call in this room")
 )
@@ -334,11 +336,14 @@ func (m *CallManager) Join(ctx context.Context, req JoinCallRequest) (*JoinCallR
 		lkURL = m.livekit.WSURL()
 		lkToken = m.livekit.JoinToken(lkRoom, peerID, req.DisplayName, "", rtc.DefaultTokenTTL)
 	}
-	// The token is handed out only if the peer outlived setup: a revocation during persistence
-	// or LiveKit room creation removed it, or left the org inactive.
-	if !m.peerRegistered(req.RoomID, peerID) || !m.tenantStillActive(ctx, req.TenantID) {
+	// The token is handed out only if the org is still active and the peer outlived setup. A
+	// peer that left or was replaced by a newer join is not touched: that seat is not ours now.
+	if !m.tenantStillActive(ctx, req.TenantID) {
 		m.Leave(ctx, req.RoomID, req.UserID)
 		return nil, ErrTenantInactive
+	}
+	if !m.peerRegistered(req.RoomID, peerID) {
+		return nil, ErrCallSeatLost
 	}
 
 	// Broadcast updated call state to the room.
@@ -389,6 +394,23 @@ func (m *CallManager) RevokeTenant(ctx context.Context, tenantID string) {
 	m.mu.Unlock()
 	for _, s := range seats {
 		m.Leave(ctx, s.roomID, s.userID)
+	}
+}
+
+// ReconcileTenants takes the peers of every call whose org is no longer active out of their
+// calls, so a tenant.revoked notification this pod missed still takes effect.
+func (m *CallManager) ReconcileTenants(ctx context.Context) {
+	m.mu.Lock()
+	tenants := map[string]struct{}{}
+	for _, c := range m.calls {
+		tenants[c.session.TenantID] = struct{}{}
+	}
+	m.mu.Unlock()
+	for tenantID := range tenants {
+		tenant, err := m.chatStore.GetTenant(ctx, tenantID)
+		if err == nil && tenant.Status != store.TenantStatusActive {
+			m.RevokeTenant(ctx, tenantID)
+		}
 	}
 }
 

@@ -36,7 +36,7 @@ type KyIdentityClient struct {
 	// onUserRevoked fires after a user's sessions are revoked (deactivation, role change, deletion).
 	onUserRevoked func(ctx context.Context, userID string)
 	// onTenantRevoked fires when an org is suspended or deleted, before its members are revoked.
-	onTenantRevoked func(ctx context.Context, orgID string)
+	onTenantRevoked func(ctx context.Context, orgID string) error
 }
 
 func NewKyIdentityClient(cfg config.SSOConfig, st store.Store) *KyIdentityClient {
@@ -54,7 +54,7 @@ func (k *KyIdentityClient) SetTenancy(t config.TenancyConfig) {
 }
 
 // OnTenantRevoked registers a callback invoked when an org is suspended or deleted.
-func (k *KyIdentityClient) OnTenantRevoked(fn func(ctx context.Context, orgID string)) {
+func (k *KyIdentityClient) OnTenantRevoked(fn func(ctx context.Context, orgID string) error) {
 	k.onTenantRevoked = fn
 }
 
@@ -291,12 +291,14 @@ func (k *KyIdentityClient) applyOrgLifecycle(ctx context.Context, eventType stri
 		return err
 	}
 	if tenant.Status != store.TenantStatusActive {
-		if k.onTenantRevoked != nil {
-			k.onTenantRevoked(ctx, orgID)
-		}
 		// Revoke every member, then fail the delivery if any revocation failed, so KyIdentity
 		// redelivers and the retry sweeps what is left.
 		var failed []error
+		if k.onTenantRevoked != nil {
+			if err := k.onTenantRevoked(ctx, orgID); err != nil {
+				failed = append(failed, fmt.Errorf("publish tenant revocation: %w", err))
+			}
+		}
 		const pageSize = 1000
 		for offset := 0; ; offset += pageSize {
 			users, total, err := k.store.Users().ListUsers(ctx, offset, pageSize, store.UserFilter{OrgID: orgID})

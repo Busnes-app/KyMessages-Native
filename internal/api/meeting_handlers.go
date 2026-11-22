@@ -723,6 +723,10 @@ func (s *Server) handleGuestCallJoin(w http.ResponseWriter, r *http.Request) {
 		ProtectIP:   body.ProtectIP,
 		ECDHPubJWK:  body.ECDHPubJWK,
 	})
+	if errors.Is(err, chat.ErrCallSeatLost) {
+		s.writeError(w, http.StatusConflict, "The call seat ended while joining; join again")
+		return
+	}
 	if errors.Is(err, chat.ErrTenantInactive) {
 		s.writeError(w, http.StatusForbidden, "Meeting is not available")
 		return

@@ -380,11 +380,22 @@ func (l *LobbyManager) RevokeMeeting(ctx context.Context, roomID string) {
 	}
 }
 
-// HasSession reports whether guestID still holds a lobby session on this pod.
-func (l *LobbyManager) HasSession(guestID string) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.byGuestID[guestID] != nil
+// GuestCheck returns the hub's guest check: a guest needs its lobby session on this pod and an
+// active org (isActive, read from the primary), so a missed tenant.revoked notification still
+// closes it on the next ping. A lookup error keeps it open: an outage must not eject everyone.
+func (l *LobbyManager) GuestCheck(isActive func(ctx context.Context, tenantID string) (bool, error)) func(guestID string) bool {
+	return func(guestID string) bool {
+		l.mu.Lock()
+		s := l.byGuestID[guestID]
+		l.mu.Unlock()
+		if s == nil {
+			return false
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		active, err := isActive(ctx, s.TenantID)
+		return err != nil || active
+	}
 }
 
 // RevokeTenant evicts every guest of tenantID this pod holds, waiting or admitted, and takes
