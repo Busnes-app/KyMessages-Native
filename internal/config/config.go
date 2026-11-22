@@ -329,6 +329,14 @@ func LoadFromEnv() (*Config, error) {
 		}
 		cfg.Attachments.PendingTTL = d
 	}
+	// Every upload is staged before it can be attached to a message, so a single-file limit
+	// above the pending or total quota would advertise an unreachable maximum to clients.
+	if cfg.Attachments.MaxUploadBytes > cfg.Attachments.MaxPendingUserBytes {
+		return nil, fmt.Errorf("KY_MAX_UPLOAD_BYTES (%d) cannot exceed KY_ATTACHMENTS_MAX_PENDING_USER_BYTES (%d)", cfg.Attachments.MaxUploadBytes, cfg.Attachments.MaxPendingUserBytes)
+	}
+	if cfg.Attachments.MaxUploadBytes > cfg.Attachments.MaxTotalBytes {
+		return nil, fmt.Errorf("KY_MAX_UPLOAD_BYTES (%d) cannot exceed KY_ATTACHMENTS_MAX_TOTAL_BYTES (%d)", cfg.Attachments.MaxUploadBytes, cfg.Attachments.MaxTotalBytes)
+	}
 	// Login verifies only proof-of-work. Accepting another name would silently disable it.
 	if p := cfg.Captcha.Provider; p != "pow" && p != "none" {
 		return nil, fmt.Errorf("KY_CAPTCHA_PROVIDER: %q is not supported (use pow or none)", p)

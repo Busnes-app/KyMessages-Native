@@ -101,16 +101,36 @@ func TestMirrorAttachmentsIdempotentPrunesAndAuthenticates(t *testing.T) {
 		t.Fatalf("LoadAttachmentKey: %v", err)
 	}
 
-	// Within the retention window, soft-pruned blobs are still restorable.
-	restoredPruned := t.TempDir()
-	n, err := backup.RestoreAttachments(filepath.Join(mirrorDir, backup.AttachmentMirrorPrunedDirName), restoredPruned, key)
-	if err != nil || n != 1 {
-		t.Fatalf("RestoreAttachments(.pruned) = (%d, %v), want (1, nil)", n, err)
+	// Within the retention window, RestoreAttachments on the top-level mirror recovers both
+	// active blobs and soft-pruned blobs from .pruned/ without overwriting active blobs.
+	restoredAll := t.TempDir()
+	n, err := backup.RestoreAttachments(mirrorDir, restoredAll, key)
+	if err != nil || n != 2 {
+		t.Fatalf("RestoreAttachments(mirrorDir) = (%d, %v), want (2, nil)", n, err)
 	}
-	gotK2, err := os.ReadFile(filepath.Join(restoredPruned, k2))
+	gotK1, err := os.ReadFile(filepath.Join(restoredAll, k1))
+	if err != nil || string(gotK1) != "first payload" {
+		t.Fatalf("restored active blob = %q (%v), want %q", string(gotK1), err, "first payload")
+	}
+	gotK2, err := os.ReadFile(filepath.Join(restoredAll, k2))
 	if err != nil || string(gotK2) != "second payload" {
 		t.Fatalf("restored pruned blob = %q (%v), want %q", string(gotK2), err, "second payload")
 	}
+
+	// A stale duplicate in .pruned/ must never overwrite an active top-level blob.
+	if err := os.WriteFile(filepath.Join(mirrorDir, backup.AttachmentMirrorPrunedDirName, k1+".enc"), []byte("corrupt-stale-pruned"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restoredPrecedence := t.TempDir()
+	n, err = backup.RestoreAttachments(mirrorDir, restoredPrecedence, key)
+	if err != nil || n != 2 {
+		t.Fatalf("RestoreAttachments(mirrorDir with duplicate .pruned) = (%d, %v), want (2, nil)", n, err)
+	}
+	gotK1, err = os.ReadFile(filepath.Join(restoredPrecedence, k1))
+	if err != nil || string(gotK1) != "first payload" {
+		t.Fatalf("active blob overwritten by .pruned duplicate: %q (%v)", string(gotK1), err)
+	}
+	_ = os.Remove(filepath.Join(mirrorDir, backup.AttachmentMirrorPrunedDirName, k1+".enc"))
 
 	// After the retention window elapses, k2.enc is permanently expired.
 	res4, err := backup.MirrorAttachmentsAt(context.Background(), cfg, t0.Add(2*time.Minute+backup.DefaultMirrorPruneRetention), backup.DefaultMirrorPruneRetention)
@@ -210,7 +230,8 @@ func TestMirrorAttachmentsRefusesWipeWhenSourceEmptyAndRetainsPruned(t *testing.
 	}
 
 	// Even if one new blob is uploaded before restore-attachments runs, existing blobs are
-	// soft-pruned into .pruned/ (not destroyed) and stay restorable for the retention window.
+	// soft-pruned into .pruned/ (not destroyed) and the standard restore-attachments command
+	// on the top-level mirror recovers both active and retained .pruned/ blobs.
 	k3 := "att_019a0000-0000-7000-8000-000000000203"
 	if err := os.WriteFile(filepath.Join(attDir, k3), []byte("gamma"), 0o600); err != nil {
 		t.Fatal(err)
@@ -223,8 +244,38 @@ func TestMirrorAttachmentsRefusesWipeWhenSourceEmptyAndRetainsPruned(t *testing.
 		t.Fatalf("mirror after single upload = %+v, want copied=1 pruned=2 expired=0", res2)
 	}
 	recovered := t.TempDir()
-	n, err = backup.RestoreAttachments(filepath.Join(mirrorDir, backup.AttachmentMirrorPrunedDirName), recovered, key)
+	n, err = backup.RestoreAttachments(mirrorDir, recovered, key)
+	if err != nil || n != 3 {
+		t.Fatalf("RestoreAttachments(mirrorDir) = (%d, %v), want (3, nil)", n, err)
+	}
+	for k, want := range map[string]string{k1: "alpha", k2: "beta", k3: "gamma"} {
+		got, err := os.ReadFile(filepath.Join(recovered, k))
+		if err != nil || string(got) != want {
+			t.Fatalf("recovered %s = %q (%v), want %q", k, string(got), err, want)
+		}
+	}
+
+	// Restoring into a live directory that already has a blob matching a .pruned key
+	// preserves the existing live file rather than overwriting it from .pruned.
+	prePopulated := t.TempDir()
+	if err := os.WriteFile(filepath.Join(prePopulated, k1), []byte("live-k1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	n, err = backup.RestoreAttachments(mirrorDir, prePopulated, key)
 	if err != nil || n != 2 {
-		t.Fatalf("RestoreAttachments(.pruned) = (%d, %v), want (2, nil)", n, err)
+		t.Fatalf("RestoreAttachments(prePopulated) = (%d, %v), want (2, nil)", n, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(prePopulated, k1)); err != nil || string(got) != "live-k1" {
+		t.Fatalf("pre-existing live blob overwritten by .pruned: %q (%v)", string(got), err)
+	}
+
+	// A symlinked .pruned directory must be rejected.
+	symMirror := t.TempDir()
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(symMirror, backup.AttachmentMirrorPrunedDirName)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backup.RestoreAttachments(symMirror, t.TempDir(), key); err == nil {
+		t.Fatal("RestoreAttachments accepted a symlinked .pruned directory")
 	}
 }

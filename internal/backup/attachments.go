@@ -341,19 +341,14 @@ func expirePrunedAttachments(ctx context.Context, mirrorDir string, mirrorRoot *
 	return expired
 }
 
-// RestoreAttachments decrypts all mirrored attachment blobs from mirrorDir using the 32-byte
-// key (restored from data/attachments.key) into targetDir (the deployment's KY_ATTACHMENTS_DIR).
+// RestoreAttachments decrypts all mirrored attachment blobs from mirrorDir — including
+// soft-pruned blobs retained in mirrorDir/.pruned — using the 32-byte key (restored from
+// data/attachments.key) into targetDir (the deployment's KY_ATTACHMENTS_DIR). Active blobs
+// take precedence and are never overwritten by .pruned entries.
 func RestoreAttachments(mirrorDir, targetDir string, key []byte) (int, error) {
 	gcm, err := newAttachmentGCM(key)
 	if err != nil {
 		return 0, err
-	}
-	entries, err := os.ReadDir(mirrorDir)
-	if err != nil {
-		return 0, fmt.Errorf("backup: read attachment mirror: %w", err)
-	}
-	if err := os.MkdirAll(targetDir, 0o700); err != nil {
-		return 0, fmt.Errorf("backup: create restore attachments directory: %w", err)
 	}
 	mirrorRoot, err := os.OpenRoot(mirrorDir)
 	if err != nil {
@@ -361,11 +356,55 @@ func RestoreAttachments(mirrorDir, targetDir string, key []byte) (int, error) {
 	}
 	defer mirrorRoot.Close()
 
+	if err := os.MkdirAll(targetDir, 0o700); err != nil {
+		return 0, fmt.Errorf("backup: create restore attachments directory: %w", err)
+	}
 	targetRoot, err := os.OpenRoot(targetDir)
 	if err != nil {
 		return 0, fmt.Errorf("backup: open restore attachments root: %w", err)
 	}
 	defer targetRoot.Close()
+
+	restoredKeys := make(map[string]struct{})
+	restored, err := restoreAttachmentDir(mirrorRoot, targetRoot, gcm, restoredKeys, false)
+	if err != nil {
+		return restored, err
+	}
+
+	fi, err := mirrorRoot.Lstat(AttachmentMirrorPrunedDirName)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return restored, nil
+		}
+		return restored, fmt.Errorf("backup: stat pruned attachment mirror: %w", err)
+	}
+	if !fi.IsDir() {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return restored, errors.New("backup: pruned attachment mirror must not be a symlink")
+		}
+		return restored, nil
+	}
+
+	prunedRoot, err := mirrorRoot.OpenRoot(AttachmentMirrorPrunedDirName)
+	if err != nil {
+		return restored, fmt.Errorf("backup: open pruned attachment mirror root: %w", err)
+	}
+	defer prunedRoot.Close()
+
+	prunedRestored, err := restoreAttachmentDir(prunedRoot, targetRoot, gcm, restoredKeys, true)
+	return restored + prunedRestored, err
+}
+
+func restoreAttachmentDir(srcRoot, targetRoot *os.Root, gcm cipher.AEAD, restoredKeys map[string]struct{}, skipExisting bool) (int, error) {
+	dir, err := srcRoot.Open(".")
+	if err != nil {
+		return 0, fmt.Errorf("backup: read attachment mirror: %w", err)
+	}
+	entries, err := dir.ReadDir(-1)
+	_ = dir.Close()
+	if err != nil {
+		return 0, fmt.Errorf("backup: read attachment mirror: %w", err)
+	}
 
 	restored := 0
 	for _, entry := range entries {
@@ -377,7 +416,17 @@ func RestoreAttachments(mirrorDir, targetDir string, key []byte) (int, error) {
 		if !blobs.ValidKey(blobKey) {
 			continue
 		}
-		sealed, err := mirrorRoot.ReadFile(name)
+		if _, seen := restoredKeys[blobKey]; seen {
+			continue
+		}
+		if skipExisting {
+			if _, err := targetRoot.Stat(blobKey); err == nil {
+				continue
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return restored, fmt.Errorf("backup: stat restore target %s: %w", blobKey, err)
+			}
+		}
+		sealed, err := srcRoot.ReadFile(name)
 		if err != nil {
 			return restored, fmt.Errorf("backup: read mirrored blob %s: %w", blobKey, err)
 		}
@@ -388,6 +437,7 @@ func RestoreAttachments(mirrorDir, targetDir string, key []byte) (int, error) {
 		if err := writeFileAtomicRoot(targetRoot, blobKey, plain); err != nil {
 			return restored, fmt.Errorf("backup: restore blob %s: %w", blobKey, err)
 		}
+		restoredKeys[blobKey] = struct{}{}
 		restored++
 	}
 	return restored, nil

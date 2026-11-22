@@ -282,3 +282,68 @@ func TestAdminUsernameFromEnv(t *testing.T) {
 		}
 	}
 }
+
+// Every attachment upload is staged first, so KY_MAX_UPLOAD_BYTES above either the pending
+// per-user quota or the workspace total quota would advertise an unreachable maximum.
+func TestAttachmentLimitsConsistency(t *testing.T) {
+	t.Run("max_upload_above_default_pending_quota_fails", func(t *testing.T) {
+		t.Setenv("KY_DATA_DIR", t.TempDir())
+		t.Setenv("KY_MAX_UPLOAD_BYTES", "104857600") // 100 MiB > 50 MiB default pending cap
+		t.Setenv("KY_ATTACHMENTS_MAX_PENDING_USER_BYTES", "")
+		t.Setenv("KY_ATTACHMENTS_MAX_TOTAL_BYTES", "")
+		_, err := config.LoadFromEnv()
+		if err == nil || !strings.Contains(err.Error(), "KY_MAX_UPLOAD_BYTES") || !strings.Contains(err.Error(), "KY_ATTACHMENTS_MAX_PENDING_USER_BYTES") {
+			t.Fatalf("got %v, want error naming KY_MAX_UPLOAD_BYTES and KY_ATTACHMENTS_MAX_PENDING_USER_BYTES", err)
+		}
+	})
+
+	t.Run("max_upload_matching_raised_pending_quota_succeeds", func(t *testing.T) {
+		t.Setenv("KY_DATA_DIR", t.TempDir())
+		t.Setenv("KY_MAX_UPLOAD_BYTES", "104857600")
+		t.Setenv("KY_ATTACHMENTS_MAX_PENDING_USER_BYTES", "104857600")
+		t.Setenv("KY_ATTACHMENTS_MAX_TOTAL_BYTES", "")
+		cfg, err := config.LoadFromEnv()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Attachments.MaxUploadBytes != 104857600 || cfg.Attachments.MaxPendingUserBytes != 104857600 {
+			t.Fatalf("unexpected attachment limits: %+v", cfg.Attachments)
+		}
+	})
+
+	t.Run("lowered_pending_quota_below_default_upload_fails", func(t *testing.T) {
+		t.Setenv("KY_DATA_DIR", t.TempDir())
+		t.Setenv("KY_MAX_UPLOAD_BYTES", "")
+		t.Setenv("KY_ATTACHMENTS_MAX_PENDING_USER_BYTES", "10485760") // 10 MiB < 25 MiB default max upload
+		t.Setenv("KY_ATTACHMENTS_MAX_TOTAL_BYTES", "")
+		_, err := config.LoadFromEnv()
+		if err == nil || !strings.Contains(err.Error(), "KY_ATTACHMENTS_MAX_PENDING_USER_BYTES") {
+			t.Fatalf("got %v, want error naming KY_ATTACHMENTS_MAX_PENDING_USER_BYTES", err)
+		}
+	})
+
+	t.Run("lowered_total_quota_below_default_upload_fails", func(t *testing.T) {
+		t.Setenv("KY_DATA_DIR", t.TempDir())
+		t.Setenv("KY_MAX_UPLOAD_BYTES", "")
+		t.Setenv("KY_ATTACHMENTS_MAX_PENDING_USER_BYTES", "")
+		t.Setenv("KY_ATTACHMENTS_MAX_TOTAL_BYTES", "10485760") // 10 MiB < 25 MiB default max upload
+		_, err := config.LoadFromEnv()
+		if err == nil || !strings.Contains(err.Error(), "KY_ATTACHMENTS_MAX_TOTAL_BYTES") {
+			t.Fatalf("got %v, want error naming KY_ATTACHMENTS_MAX_TOTAL_BYTES", err)
+		}
+	})
+
+	t.Run("consistent_lowered_limits_succeed", func(t *testing.T) {
+		t.Setenv("KY_DATA_DIR", t.TempDir())
+		t.Setenv("KY_MAX_UPLOAD_BYTES", "10485760")
+		t.Setenv("KY_ATTACHMENTS_MAX_PENDING_USER_BYTES", "10485760")
+		t.Setenv("KY_ATTACHMENTS_MAX_TOTAL_BYTES", "10485760")
+		cfg, err := config.LoadFromEnv()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Attachments.MaxUploadBytes != 10485760 || cfg.Attachments.MaxTotalBytes != 10485760 {
+			t.Fatalf("unexpected attachment limits: %+v", cfg.Attachments)
+		}
+	})
+}
