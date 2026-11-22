@@ -60,6 +60,13 @@ jobs:
           name: coverage
           path: coverage.out
 
+      # Bounded fuzzing, roughly 10-20 s per target. Minimising a new input may take the
+      # default 60 s and stalls the exec count meanwhile, so it is capped at 5 s.
+      - run: go test -fuzz=FuzzClientIP -fuzztime=200000x -fuzzminimizetime=5s ./internal/auth
+      - run: go test -fuzz=FuzzParseTrustedProxies -fuzztime=600000x -fuzzminimizetime=5s ./internal/config
+      - run: go test -fuzz=FuzzValidateName -fuzztime=400000x -fuzzminimizetime=5s ./internal/branding
+      - run: go test -fuzz=FuzzNormalizePNG -fuzztime=50000x -fuzzminimizetime=5s ./internal/branding
+
   postgres:
     name: Go tests (PostgreSQL)
     runs-on: ubuntu-latest
