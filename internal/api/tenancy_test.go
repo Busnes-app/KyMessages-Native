@@ -761,3 +761,30 @@ func TestEnsureTenancyModeRefusesMultiOnAUsedDatabase(t *testing.T) {
 		t.Fatalf("single boot after the refusal: %v", err)
 	}
 }
+
+// Org-less directory accounts mark a database as single-tenant even before any room exists; a
+// local bootstrap admin alone does not.
+func TestEnsureTenancyModeCountsDirectoryAccounts(t *testing.T) {
+	ctx := context.Background()
+	open := func() store.Store {
+		st, err := store.Open(ctx, testdb.Config(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		if err := st.Users().CreateUser(ctx, &store.User{ID: "u_admin", Username: "admin", Role: "admin", Status: "active", SSOProvider: "local"}); err != nil {
+			t.Fatal(err)
+		}
+		return st
+	}
+	synced := open()
+	if err := synced.Users().CreateUser(ctx, &store.User{ID: "u_dir", Username: "dir", Role: "user", Status: "active", SSOProvider: "kyidentity", SSOSubject: "sub-dir"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := api.EnsureTenancyMode(ctx, synced, config.TenancyConfig{Mode: config.TenancyMulti}); err == nil {
+		t.Fatal("a database with org-less directory accounts was locked to multi")
+	}
+	if err := api.EnsureTenancyMode(ctx, open(), config.TenancyConfig{Mode: config.TenancyMulti}); err != nil {
+		t.Fatalf("a fresh database with only the bootstrap admin: %v", err)
+	}
+}

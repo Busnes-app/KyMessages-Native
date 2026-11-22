@@ -148,10 +148,14 @@ func (c *chatStore) SetTenantStatus(ctx context.Context, tenantID, status string
 	return oneRow(c.store.db.ExecContext(ctx, q, status, tenantID))
 }
 
-// HasRooms reports whether any room exists, in any tenant: a database that has served chat.
-func (c *chatStore) HasRooms(ctx context.Context) (bool, error) {
+// HoldsSingleTenantData reports whether the database already serves single-tenant use: any room,
+// or any org-less account other than a local password one (directory-synced, SSO or bot). Local
+// accounts are the bootstrap and recovery operators every fresh database has.
+func (c *chatStore) HoldsSingleTenantData(ctx context.Context) (bool, error) {
 	var one int
-	err := c.store.db.QueryRowContext(ctx, `SELECT 1 FROM rooms LIMIT 1`).Scan(&one)
+	err := c.store.db.QueryRowContext(ctx, `
+		SELECT 1 WHERE EXISTS (SELECT 1 FROM rooms)
+		   OR EXISTS (SELECT 1 FROM users WHERE org_id = '' AND sso_provider <> 'local')`).Scan(&one)
 	if errorsIs(err, sql.ErrNoRows) {
 		return false, nil
 	}

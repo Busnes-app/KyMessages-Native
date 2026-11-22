@@ -191,16 +191,18 @@ func (c *chatStore) ListPushSubscriptions(ctx context.Context, tenantID, userID 
 	return scanPushSubscriptions(rows)
 }
 
-// ListPushSubscriptionsForUsers batch-loads active human-account push subscriptions for userIDs in tenantID.
-func (c *chatStore) ListPushSubscriptionsForUsers(ctx context.Context, tenantID string, userIDs []string) ([]*PushSubscription, error) {
+// ListPushRecipients loads the push subscriptions of those userIDs who are, right now, members
+// of roomID with an active human account. It reads the primary: a lagging replica could still
+// list a removed member or a deactivated account and leak them a preview.
+func (c *chatStore) ListPushRecipients(ctx context.Context, tenantID, roomID string, userIDs []string) ([]*PushSubscription, error) {
 	if len(userIDs) == 0 {
 		return nil, nil
 	}
 	tenantID = normalizeTenant(tenantID)
 	placeholders := strings.Repeat("?,", len(userIDs))
 	placeholders = placeholders[:len(placeholders)-1]
-	args := make([]any, 0, 1+len(userIDs))
-	args = append(args, tenantID)
+	args := make([]any, 0, 2+len(userIDs))
+	args = append(args, roomID, tenantID)
 	for _, uid := range userIDs {
 		args = append(args, uid)
 	}
@@ -209,10 +211,11 @@ func (c *chatStore) ListPushSubscriptionsForUsers(ctx context.Context, tenantID 
 		FROM push_subscriptions ps
 		INNER JOIN users u ON u.id = ps.user_id
 		INNER JOIN tenants t ON t.id = ps.tenant_id
+		INNER JOIN room_members rm ON rm.tenant_id = ps.tenant_id AND rm.room_id = ? AND rm.user_id = ps.user_id
 		WHERE ps.tenant_id = ? AND ps.user_id IN (` + placeholders + `) AND u.status = 'active' AND u.role <> 'bot' AND t.status = 'active'
 		ORDER BY ps.created_at DESC
 	`)
-	rows, err := c.store.readDB.QueryContext(ctx, q, args...)
+	rows, err := c.store.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}

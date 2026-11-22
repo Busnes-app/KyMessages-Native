@@ -127,12 +127,22 @@ func TestPushSubscriptionsLifecycleAndRevocation(t *testing.T) {
 	}, 20); err != nil {
 		t.Fatalf("upsert u2: %v", err)
 	}
-	batch, err := st.Chat().ListPushSubscriptionsForUsers(ctx, store.DefaultTenantID, []string{u1.ID, u2.ID})
+	room := &store.Room{Kind: store.RoomKindChannel, Name: "push-batch", CreatedBy: u1.ID}
+	if err := st.Chat().CreateRoom(ctx, room, []string{u1.ID, u2.ID}); err != nil {
+		t.Fatal(err)
+	}
+	batch, err := st.Chat().ListPushRecipients(ctx, store.DefaultTenantID, room.ID, []string{u1.ID, u2.ID})
 	if err != nil {
 		t.Fatalf("batch list: %v", err)
 	}
 	if len(batch) != 3 {
 		t.Fatalf("expected 3 batch subs, got %d", len(batch))
+	}
+	if _, err := st.Chat().RemoveRoomMember(ctx, store.DefaultTenantID, room.ID, u2.ID); err != nil {
+		t.Fatal(err)
+	}
+	if batch, err := st.Chat().ListPushRecipients(ctx, store.DefaultTenantID, room.ID, []string{u1.ID, u2.ID}); err != nil || len(batch) != 2 {
+		t.Fatalf("after removing u2, recipients = %d (err %v), want u1's 2", len(batch), err)
 	}
 
 	// DeleteUserSessions MUST atomically wipe u1's push subscriptions (offboarding guarantee).

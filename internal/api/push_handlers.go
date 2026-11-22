@@ -289,7 +289,7 @@ func (s *Server) dispatchMessagePush(ctx context.Context, tenantID, roomID strin
 		return
 	}
 
-	subs, err := s.store.Chat().ListPushSubscriptionsForUsers(ctx, tenantID, recipientIDs)
+	subs, err := s.store.Chat().ListPushRecipients(ctx, tenantID, roomID, recipientIDs)
 	if err != nil || len(subs) == 0 {
 		return
 	}
@@ -362,7 +362,7 @@ func (s *Server) dispatchCallPush(ctx context.Context, tenantID, roomID, starter
 		return
 	}
 
-	subs, err := s.store.Chat().ListPushSubscriptionsForUsers(ctx, tenantID, recipientIDs)
+	subs, err := s.store.Chat().ListPushRecipients(ctx, tenantID, roomID, recipientIDs)
 	if err != nil || len(subs) == 0 {
 		return
 	}
