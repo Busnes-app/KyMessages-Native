@@ -294,6 +294,9 @@ func (k *KyIdentityClient) applyOrgLifecycle(ctx context.Context, eventType stri
 		if k.onTenantRevoked != nil {
 			k.onTenantRevoked(ctx, orgID)
 		}
+		// Revoke every member, then fail the delivery if any revocation failed, so KyIdentity
+		// redelivers and the retry sweeps what is left.
+		var failed []error
 		const pageSize = 1000
 		for offset := 0; ; offset += pageSize {
 			users, total, err := k.store.Users().ListUsers(ctx, offset, pageSize, store.UserFilter{OrgID: orgID})
@@ -301,7 +304,9 @@ func (k *KyIdentityClient) applyOrgLifecycle(ctx context.Context, eventType stri
 				return err
 			}
 			for _, u := range users {
-				_ = k.store.Sessions().DeleteUserSessions(ctx, u.ID)
+				if err := k.store.Sessions().DeleteUserSessions(ctx, u.ID); err != nil {
+					failed = append(failed, fmt.Errorf("revoke %s: %w", u.ID, err))
+				}
 				if k.onUserRevoked != nil {
 					k.onUserRevoked(ctx, u.ID)
 				}
@@ -310,6 +315,7 @@ func (k *KyIdentityClient) applyOrgLifecycle(ctx context.Context, eventType stri
 				break
 			}
 		}
+		return errors.Join(failed...)
 	}
 	return nil
 }
