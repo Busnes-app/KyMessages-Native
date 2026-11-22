@@ -78,8 +78,9 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
 - In `KY_TENANCY_MODE=multi`, customer orgs have no administrators. An `admin` role from KyIdentity
   is honoured only for the staff org named by `KY_STAFF_ORG_ID` (unset: no directory
   administrators), and the console refuses any account bound to another org or to an inactive
-  staff org. Local operator
-  accounts, which belong to no org, keep console access.
+  staff org. Local operator accounts, which belong to no org, keep the install-wide console
+  (backups, audit, health, settings); per-org pages (Agents, Media policy) need a staff-org
+  administrator and answer 403 to an account with no org.
 - Local operator login remains available for single-tenant recovery/console access, with mandatory
   initial password replacement and optional TOTP MFA with recovery codes.
 

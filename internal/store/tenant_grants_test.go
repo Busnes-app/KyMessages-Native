@@ -68,3 +68,45 @@ func TestGrantIssuanceFencedByOrgStatus(t *testing.T) {
 		}
 	}
 }
+
+// Overlapping deletion and unsuspension always leave the org deleted, whichever lands first.
+func TestTenantDeletionIsTerminalUnderOverlap(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	if _, err := st.Chat().EnsureTenant(ctx, "org-del"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Chat().ApplyTenantLifecycle(ctx, "org-del", store.TenantStatusDeleted, 2); err != nil {
+		t.Fatal(err)
+	}
+	if applied, err := st.Chat().ApplyTenantLifecycle(ctx, "org-del", store.TenantStatusActive, 3); err != nil || applied {
+		t.Fatalf("unsuspend after delete applied=%v err=%v, want ignored", applied, err)
+	}
+	for i := range 20 {
+		org := fmt.Sprintf("org-del-%d", i)
+		if _, err := st.Chat().EnsureTenant(ctx, org); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.Chat().ApplyTenantLifecycle(ctx, org, store.TenantStatusSuspended, 1); err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if _, err := st.Chat().ApplyTenantLifecycle(ctx, org, store.TenantStatusDeleted, 2); err != nil {
+				t.Errorf("delete: %v", err)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			if _, err := st.Chat().ApplyTenantLifecycle(ctx, org, store.TenantStatusActive, 3); err != nil {
+				t.Errorf("unsuspend: %v", err)
+			}
+		}()
+		wg.Wait()
+		if tenant, err := st.Chat().GetTenant(ctx, org); err != nil || tenant.Status != store.TenantStatusDeleted {
+			t.Fatalf("round %d: tenant = %+v (err %v), want deleted", i, tenant, err)
+		}
+	}
+}
