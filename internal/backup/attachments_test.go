@@ -3,8 +3,10 @@ package backup_test
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,6 +32,31 @@ func TestMirrorAttachmentsIdempotentPrunesAndAuthenticates(t *testing.T) {
 	}
 
 	t0 := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+
+	// Before any capsule carries a key, the mirror mints none and writes nothing.
+	res0, err := backup.MirrorAttachmentsAt(context.Background(), cfg, t0, backup.DefaultMirrorPruneRetention)
+	if err != nil || !res0.KeyMissing || res0.Copied != 0 {
+		t.Fatalf("keyless mirror = (%+v, %v), want KeyMissing and nothing copied", res0, err)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.Database.DataDir, "attachments.key")); !os.IsNotExist(err) {
+		t.Fatalf("mirror created the key: %v", err)
+	}
+	// The next capsule creates the key and seals it.
+	payload, err := backup.Collect(context.Background(), cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := backup.LoadAttachmentKey(cfg.Database.DataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed := false
+	for _, f := range payload.Files {
+		sealed = sealed || f.Path == backup.AttachmentKeyPath && strings.TrimSpace(string(f.Data)) == hex.EncodeToString(key)
+	}
+	if !sealed {
+		t.Fatal("the capsule does not carry the attachment key the mirror uses")
+	}
 
 	// First run copies both blobs.
 	res1, err := backup.MirrorAttachmentsAt(context.Background(), cfg, t0, backup.DefaultMirrorPruneRetention)
@@ -69,7 +96,7 @@ func TestMirrorAttachmentsIdempotentPrunesAndAuthenticates(t *testing.T) {
 		t.Fatalf("soft-pruned blob should remain in %s during retention window: %v", backup.AttachmentMirrorPrunedDirName, err)
 	}
 
-	key, err := backup.LoadAttachmentKey(cfg.Database.DataDir)
+	key, err = backup.LoadAttachmentKey(cfg.Database.DataDir)
 	if err != nil {
 		t.Fatalf("LoadAttachmentKey: %v", err)
 	}
@@ -147,6 +174,9 @@ func TestMirrorAttachmentsRefusesWipeWhenSourceEmptyAndRetainsPruned(t *testing.
 	}
 
 	t0 := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+	if _, err := backup.EnsureAttachmentKey(cfg.Database.DataDir); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := backup.MirrorAttachmentsAt(context.Background(), cfg, t0, backup.DefaultMirrorPruneRetention); err != nil {
 		t.Fatalf("initial mirror: %v", err)
 	}

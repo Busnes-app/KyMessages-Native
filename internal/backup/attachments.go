@@ -44,6 +44,9 @@ type AttachmentMirrorResult struct {
 	Expired      int
 	PruneSkipped bool
 	MirrorBlobs  int
+	// KeyMissing: no capsule carries a key yet, so nothing was mirrored. The next capsule
+	// creates and seals one (Collect), and that run's mirror proceeds.
+	KeyMissing bool
 }
 
 // EnsureAttachmentKey loads the 32-byte attachment mirror key from <dataDir>/attachments.key,
@@ -210,7 +213,13 @@ func MirrorAttachmentsAt(ctx context.Context, cfg *config.Config, now time.Time,
 		}
 	}
 
-	key, err := EnsureAttachmentKey(cfg.Database.DataDir)
+	// Only a key a capsule already carries: one minted here would encrypt a mirror that no
+	// deposited capsule can decrypt.
+	key, err := LoadAttachmentKey(cfg.Database.DataDir)
+	if errors.Is(err, os.ErrNotExist) {
+		res.KeyMissing = true
+		return res, nil
+	}
 	if err != nil {
 		return res, err
 	}

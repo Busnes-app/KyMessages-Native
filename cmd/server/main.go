@@ -296,6 +296,10 @@ func mirrorAttachments(ctx context.Context, cfg *config.Config) {
 		log.Printf("[BACKUP] attachment mirror sync warning: %s", recoveryclient.AuditSafe(merr.Error()))
 		return
 	}
+	if mres.KeyMissing {
+		log.Printf("[BACKUP] attachment mirror waits for the next backup: its key is sealed into that capsule first")
+		return
+	}
 	if mres.PruneSkipped {
 		log.Printf("[BACKUP] attachment mirror prune skipped: live attachments directory is empty while mirror holds %d encrypted blob(s) (run restore-attachments if restoring)", mres.MirrorBlobs)
 		return
