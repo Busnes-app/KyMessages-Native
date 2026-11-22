@@ -115,29 +115,34 @@ func LoadOrCreateVAPIDKey(path string) (*VAPIDKey, error) {
 	}
 	content := []byte(key.PrivateKeyBase64() + "\n")
 
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if errors.Is(err, os.ErrExist) {
+	// Write a synced temp file and hard-link it into place, so a crash never leaves a partial key.
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".vapid-*.tmp")
+	if err != nil {
+		return nil, fmt.Errorf("push: create vapid key file: %w", err)
+	}
+	defer os.Remove(tmp.Name())
+	_, err = tmp.Write(content)
+	if err == nil {
+		err = tmp.Sync()
+	}
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return nil, fmt.Errorf("push: write vapid key file: %w", err)
+	}
+	if err := os.Link(tmp.Name(), path); errors.Is(err, os.ErrExist) {
 		raw, readErr := os.ReadFile(path)
 		if readErr != nil {
 			return nil, fmt.Errorf("push: read raced vapid key: %w", readErr)
 		}
 		return ParseVAPIDPrivateKey(string(raw))
+	} else if err != nil {
+		return nil, fmt.Errorf("push: link vapid key file: %w", err)
 	}
-	if err != nil {
-		return nil, fmt.Errorf("push: create vapid key file: %w", err)
-	}
-	if _, err := f.Write(content); err != nil {
-		_ = f.Close()
-		_ = os.Remove(path)
-		return nil, fmt.Errorf("push: write vapid key file: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		_ = os.Remove(path)
-		return nil, fmt.Errorf("push: sync vapid key file: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		return nil, fmt.Errorf("push: close vapid key file: %w", err)
+	if d, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
 	}
 	return key, nil
 }
