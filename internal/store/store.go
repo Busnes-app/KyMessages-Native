@@ -208,7 +208,7 @@ type ChatStore interface {
 	// Web Push Subscriptions
 	UpsertPushSubscription(ctx context.Context, sessionHash string, sub *PushSubscription, maxPerUser int) (*PushSubscription, error)
 	ListPushSubscriptions(ctx context.Context, tenantID, userID string) ([]*PushSubscription, error)
-	ListPushSubscriptionsForUsers(ctx context.Context, tenantID string, userIDs []string) ([]*PushSubscription, error)
+	ListPushRecipients(ctx context.Context, tenantID, roomID string, userIDs []string) ([]*PushSubscription, error)
 	DeletePushSubscriptionByEndpoint(ctx context.Context, tenantID, userID, endpoint string) error
 	DeletePushSubscriptionByID(ctx context.Context, tenantID, userID, id string) error
 	DeletePushSubscriptionInternal(ctx context.Context, id string) error

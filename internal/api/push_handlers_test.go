@@ -319,7 +319,7 @@ func attachTestPushDispatcher(t *testing.T, srv *api.Server, st store.Store, pus
 	srv.SetPushDispatcher(disp)
 }
 
-// P1 verify: installer-managed deactivation deletes push_subscriptions AND ListPushSubscriptionsForUsers
+// P1 verify: installer-managed deactivation deletes push_subscriptions AND ListPushRecipients
 // excludes non-active accounts so neither message nor call pushes reach revoked users.
 func TestPushExcludedForRevokedAndInstallerDeactivatedUsers(t *testing.T) {
 	srv, st := newPushTestServer(t, true)
