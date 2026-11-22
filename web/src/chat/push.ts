@@ -71,18 +71,42 @@ export async function getBrowserPushState(config: ChatPushConfig): Promise<PushS
   }
 }
 
+function subscriptionMatchesVapidKey(sub: PushSubscription, vapidPublicKey: string): boolean {
+  const existingKey = bytesToBase64Url(sub.options.applicationServerKey);
+  if (!existingKey) return true;
+  return existingKey === vapidPublicKey;
+}
+
+async function ensureFreshSubscription(
+  reg: ServiceWorkerRegistration,
+  vapidPublicKey: string,
+): Promise<PushSubscription> {
+  const existing = await reg.pushManager.getSubscription();
+  if (existing && subscriptionMatchesVapidKey(existing, vapidPublicKey)) {
+    return existing;
+  }
+  if (existing) {
+    await existing.unsubscribe().catch(() => {});
+  }
+  return reg.pushManager.subscribe({
+    userVisibleOnly: true,
+    applicationServerKey: urlBase64ToUint8Array(vapidPublicKey),
+  });
+}
+
 /**
  * Quietly re-registers an already-granted browser subscription with the server so
- * a fresh login or restored server keeps delivering notifications without re-prompting.
+ * a fresh login, restored server, or rotated VAPID key keeps delivering notifications
+ * without re-prompting.
  */
 export async function syncExistingPushSubscription(config: ChatPushConfig): Promise<PushState> {
   const state = await getBrowserPushState(config);
-  if (state.kind !== 'enabled') return state;
+  if (state.kind !== 'enabled' || !config.vapid_public_key) return state;
 
   try {
     const reg = await navigator.serviceWorker.getRegistration('/');
-    const sub = await reg?.pushManager.getSubscription();
-    if (!sub) return { kind: 'disabled' };
+    if (!reg) return { kind: 'disabled' };
+    const sub = await ensureFreshSubscription(reg, config.vapid_public_key);
     const keys = extractKeys(sub);
     if (!keys) return { kind: 'disabled' };
     await registerPushSubscription(keys);
@@ -103,13 +127,7 @@ export async function enableBrowserPush(vapidPublicKey: string): Promise<PushSta
   }
 
   const reg = await getReadyRegistration();
-  let sub = await reg.pushManager.getSubscription();
-  if (!sub) {
-    sub = await reg.pushManager.subscribe({
-      userVisibleOnly: true,
-      applicationServerKey: urlBase64ToUint8Array(vapidPublicKey),
-    });
-  }
+  const sub = await ensureFreshSubscription(reg, vapidPublicKey);
   const keys = extractKeys(sub);
   if (!keys) {
     throw new Error('Browser push subscription did not include encryption keys');

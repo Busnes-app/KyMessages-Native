@@ -62,14 +62,13 @@ func (c *chatStore) UpsertPushSubscription(ctx context.Context, sub *PushSubscri
 	}
 	defer tx.Rollback()
 
-	var existingID string
-	var existingCreated int64
-	var existingUsed int64
+	var existingID, existingTenant, existingUser string
+	var existingCreated, existingUsed int64
 	err = tx.QueryRowContext(ctx, c.store.rebind(`
-		SELECT id, created_at, last_used_at
+		SELECT id, tenant_id, user_id, created_at, last_used_at
 		FROM push_subscriptions
-		WHERE tenant_id = ? AND user_id = ? AND endpoint = ?
-	`), tenantID, sub.UserID, sub.Endpoint).Scan(&existingID, &existingCreated, &existingUsed)
+		WHERE endpoint = ?
+	`), sub.Endpoint).Scan(&existingID, &existingTenant, &existingUser, &existingCreated, &existingUsed)
 
 	out := &PushSubscription{
 		TenantID:   tenantID,
@@ -81,7 +80,7 @@ func (c *chatStore) UpsertPushSubscription(ctx context.Context, sub *PushSubscri
 	}
 
 	switch {
-	case err == nil:
+	case err == nil && existingTenant == tenantID && existingUser == sub.UserID:
 		out.ID = existingID
 		out.CreatedAt = existingCreated
 		out.LastUsedAt = existingUsed
@@ -92,7 +91,17 @@ func (c *chatStore) UpsertPushSubscription(ctx context.Context, sub *PushSubscri
 		`), out.P256DH, out.AuthSecret, out.UserAgent, out.ID); err != nil {
 			return nil, err
 		}
-	case errors.Is(err, sql.ErrNoRows):
+	case err == nil || errors.Is(err, sql.ErrNoRows):
+		// Transfer endpoint ownership atomically when a shared browser switches accounts:
+		// delete the prior owner's row and insert a fresh ID so in-flight delivery handles
+		// for the previous owner cannot touch the new owner's subscription.
+		if err == nil {
+			if _, err := tx.ExecContext(ctx, c.store.rebind(`
+				DELETE FROM push_subscriptions WHERE endpoint = ?
+			`), sub.Endpoint); err != nil {
+				return nil, err
+			}
+		}
 		out.ID = "ps_" + uuid.Must(uuid.NewV7()).String()
 		out.CreatedAt = now
 		out.LastUsedAt = 0
@@ -160,7 +169,7 @@ func (c *chatStore) ListPushSubscriptions(ctx context.Context, tenantID, userID 
 	return scanPushSubscriptions(rows)
 }
 
-// ListPushSubscriptionsForUsers batch-loads all push subscriptions for a set of user IDs in tenantID.
+// ListPushSubscriptionsForUsers batch-loads active-account push subscriptions for userIDs in tenantID.
 func (c *chatStore) ListPushSubscriptionsForUsers(ctx context.Context, tenantID string, userIDs []string) ([]*PushSubscription, error) {
 	if len(userIDs) == 0 {
 		return nil, nil
@@ -174,10 +183,11 @@ func (c *chatStore) ListPushSubscriptionsForUsers(ctx context.Context, tenantID 
 		args = append(args, uid)
 	}
 	q := c.store.rebind(`
-		SELECT id, tenant_id, user_id, endpoint, p256dh, auth_secret, user_agent, created_at, last_used_at
-		FROM push_subscriptions
-		WHERE tenant_id = ? AND user_id IN (` + placeholders + `)
-		ORDER BY created_at DESC
+		SELECT ps.id, ps.tenant_id, ps.user_id, ps.endpoint, ps.p256dh, ps.auth_secret, ps.user_agent, ps.created_at, ps.last_used_at
+		FROM push_subscriptions ps
+		INNER JOIN users u ON u.id = ps.user_id
+		WHERE ps.tenant_id = ? AND ps.user_id IN (` + placeholders + `) AND u.status = 'active'
+		ORDER BY ps.created_at DESC
 	`)
 	rows, err := c.store.readDB.QueryContext(ctx, q, args...)
 	if err != nil {

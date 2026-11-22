@@ -114,7 +114,7 @@ func (s *SQLStore) ApplyInstallerDirectory(ctx context.Context, issuer, subject,
 		if _, err = tx.ExecContext(ctx, s.rebind("UPDATE users SET password_hash=? WHERE id=?"), "revoked:"+rand.Text(), owned.UserID); err != nil {
 			return "", err
 		}
-		for _, table := range []string{"sessions", "device_pairings", "mfa_challenges"} {
+		for _, table := range []string{"sessions", "device_pairings", "mfa_challenges", "push_subscriptions"} {
 			if _, err = tx.ExecContext(ctx, s.rebind("DELETE FROM "+table+" WHERE user_id=?"), owned.UserID); err != nil {
 				return "", err
 			}

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Busnes-app/ky-primitives/applysetup"
 	"github.com/Busnes-app/ky_server_base/internal/api"
 	"github.com/Busnes-app/ky_server_base/internal/config"
 	"github.com/Busnes-app/ky_server_base/internal/push"
@@ -298,3 +299,248 @@ func TestPushMessageNotifyModesCallsAndGonePruning(t *testing.T) {
 	}
 	t.Fatalf("expected 410 Gone to prune Bob's push subscription")
 }
+
+func attachTestPushDispatcher(t *testing.T, srv *api.Server, st store.Store, pushSrv *httptest.Server) {
+	t.Helper()
+	vapidKey, err := push.GenerateVAPIDKey()
+	if err != nil {
+		t.Fatalf("GenerateVAPIDKey: %v", err)
+	}
+	sender := push.NewSender(push.SenderOptions{
+		VAPID:        vapidKey,
+		Subject:      "mailto:ops@example.com",
+		AllowPrivate: true,
+		TLSConfig:    pushSrv.Client().Transport.(*http.Transport).TLSClientConfig,
+	})
+	disp := push.NewDispatcher(sender, func(ctx context.Context, subID string) {
+		_ = st.Chat().DeletePushSubscriptionInternal(ctx, subID)
+	}, nil)
+	srv.SetPushDispatcher(disp)
+}
+
+// P1 verify: installer-managed deactivation deletes push_subscriptions AND ListPushSubscriptionsForUsers
+// excludes non-active accounts so neither message nor call pushes reach revoked users.
+func TestPushExcludedForRevokedAndInstallerDeactivatedUsers(t *testing.T) {
+	srv, st := newPushTestServer(t, true)
+	ctx := context.Background()
+
+	gotPaths := make(chan string, 16)
+	fakePush := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPaths <- r.URL.Path
+		w.WriteHeader(http.StatusCreated)
+	}))
+	t.Cleanup(fakePush.Close)
+	attachTestPushDispatcher(t, srv, st, fakePush)
+
+	// Provision installer-managed user ("daily") alongside regular users.
+	bundle := applysetup.Common{
+		Schema:  applysetup.Schema,
+		Service: "kymessage",
+		SetupID: "12345678-1234-1234-1234-123456789abc",
+		SSO: &applysetup.SSO{
+			IssuerURL:           "https://identity.example",
+			ClientID:            "message",
+			ClientSecretFile:    "/data/installer/client.secret",
+			DirectorySecretFile: "/data/installer/directory.secret",
+			RedirectURI:         "https://message.example/api/sso/kyidentity/callback",
+		},
+		Admins:   []applysetup.Identity{{Issuer: "https://identity.example", Subject: "owner", Username: "owner-admin"}},
+		Everyday: []applysetup.Identity{{Issuer: "https://identity.example", Subject: "daily", Username: "everyday"}},
+	}
+	if _, err := st.ApplyInstaller(ctx, bundle, false); err != nil {
+		t.Fatalf("ApplyInstaller: %v", err)
+	}
+	managedUser, err := st.Users().GetUserBySSO(ctx, "kyidentity", "daily")
+	if err != nil {
+		t.Fatalf("GetUserBySSO(daily): %v", err)
+	}
+
+	alice, aliceTok := createChatTestUser(t, st, "usr_rev_alice", "alice-rev", "user")
+	inactiveUser, _ := createChatTestUser(t, st, "usr_rev_bob", "bob-rev", "user")
+	activeUser, _ := createChatTestUser(t, st, "usr_rev_carol", "carol-rev", "user")
+
+	rm := &store.Room{
+		TenantID:  store.DefaultTenantID,
+		Kind:      store.RoomKindChannel,
+		Name:      "revocation-room",
+		CreatedBy: alice.ID,
+	}
+	if err := st.Chat().CreateRoom(ctx, rm, []string{alice.ID, managedUser.ID, inactiveUser.ID, activeUser.ID}); err != nil {
+		t.Fatalf("CreateRoom: %v", err)
+	}
+
+	register := func(uid, suffix string) {
+		p256dh, auth := newTestPushKeys(t)
+		if _, err := st.Chat().UpsertPushSubscription(ctx, &store.PushSubscription{
+			TenantID:   store.DefaultTenantID,
+			UserID:     uid,
+			Endpoint:   fakePush.URL + "/push/" + suffix,
+			P256DH:     p256dh,
+			AuthSecret: auth,
+		}, 10); err != nil {
+			t.Fatalf("UpsertPushSubscription(%s): %v", suffix, err)
+		}
+	}
+	register(managedUser.ID, "managed")
+	register(inactiveUser.ID, "inactive")
+	register(activeUser.ID, "active")
+
+	// 1. Deactivate installer-managed user via ApplyInstallerDirectory -> must delete push_subscriptions.
+	revokedID, err := st.ApplyInstallerDirectory(ctx, bundle.SSO.IssuerURL, "daily", "user.deactivated", "1", "digest-deact", false, false)
+	if err != nil || revokedID != managedUser.ID {
+		t.Fatalf("ApplyInstallerDirectory deactivation = (%q, %v), want (%q, nil)", revokedID, err, managedUser.ID)
+	}
+	managedSubs, err := st.Chat().ListPushSubscriptions(ctx, store.DefaultTenantID, managedUser.ID)
+	if err != nil {
+		t.Fatalf("ListPushSubscriptions(managed): %v", err)
+	}
+	if len(managedSubs) != 0 {
+		t.Fatalf("expected installer deactivation to delete push_subscriptions, still had %d", len(managedSubs))
+	}
+
+	// 2. Defense-in-depth: mark inactiveUser inactive directly without clearing push_subscriptions.
+	inactiveUser.Status = "inactive"
+	if err := st.Users().UpdateUser(ctx, inactiveUser); err != nil {
+		t.Fatalf("UpdateUser(inactive): %v", err)
+	}
+
+	// 3. Send a message: ONLY activeUser should receive a push.
+	rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+rm.ID+"/messages", aliceTok, map[string]any{
+		"body": "Secret message after revocation",
+	}, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("send msg: %d %s", rec.Code, rec.Body.String())
+	}
+	select {
+	case path := <-gotPaths:
+		if path != "/push/active" {
+			t.Fatalf("expected push only for /push/active, got %q", path)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for active user's message push")
+	}
+	select {
+	case extra := <-gotPaths:
+		t.Fatalf("unexpected message push delivered to revoked user: %q", extra)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// 4. Start a call: ONLY activeUser should receive a call push.
+	rec = doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+rm.ID+"/calls/join", aliceTok, map[string]any{
+		"audio": true,
+	}, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("call join: %d %s", rec.Code, rec.Body.String())
+	}
+	select {
+	case path := <-gotPaths:
+		if path != "/push/active" {
+			t.Fatalf("expected call push only for /push/active, got %q", path)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for active user's call push")
+	}
+	select {
+	case extra := <-gotPaths:
+		t.Fatalf("unexpected call push delivered to revoked user: %q", extra)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// P2 verify: reusing a browser push endpoint under a new account transfers ownership atomically
+// and stops delivering the previous account's messages to the shared browser.
+func TestPushEndpointOwnershipTransfersOnAccountSwitch(t *testing.T) {
+	srv, st := newPushTestServer(t, true)
+	ctx := context.Background()
+
+	gotPaths := make(chan string, 16)
+	fakePush := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPaths <- r.URL.Path
+		w.WriteHeader(http.StatusCreated)
+	}))
+	t.Cleanup(fakePush.Close)
+	attachTestPushDispatcher(t, srv, st, fakePush)
+
+	userA, tokA := createChatTestUser(t, st, "usr_sw_a", "shared-a", "user")
+	userB, tokB := createChatTestUser(t, st, "usr_sw_b", "shared-b", "user")
+	sender, senderTok := createChatTestUser(t, st, "usr_sw_sender", "shared-sender", "user")
+
+	roomA := &store.Room{TenantID: store.DefaultTenantID, Kind: store.RoomKindChannel, Name: "private-a", CreatedBy: sender.ID}
+	if err := st.Chat().CreateRoom(ctx, roomA, []string{sender.ID, userA.ID}); err != nil {
+		t.Fatalf("CreateRoom(roomA): %v", err)
+	}
+	roomB := &store.Room{TenantID: store.DefaultTenantID, Kind: store.RoomKindChannel, Name: "private-b", CreatedBy: sender.ID}
+	if err := st.Chat().CreateRoom(ctx, roomB, []string{sender.ID, userB.ID}); err != nil {
+		t.Fatalf("CreateRoom(roomB): %v", err)
+	}
+
+	sharedEndpoint := fakePush.URL + "/push/shared-browser"
+	p256dhA, authA := newTestPushKeys(t)
+	rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/push/subscriptions", tokA, map[string]any{
+		"endpoint": sharedEndpoint,
+		"keys":     map[string]string{"p256dh": p256dhA, "auth": authA},
+	}, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("subscribe userA: %d %s", rec.Code, rec.Body.String())
+	}
+	subsA, _ := st.Chat().ListPushSubscriptions(ctx, store.DefaultTenantID, userA.ID)
+	if len(subsA) != 1 {
+		t.Fatalf("expected 1 sub for userA, got %d", len(subsA))
+	}
+	oldID := subsA[0].ID
+
+	// User B logs into the same browser and registers the same endpoint.
+	p256dhB, authB := newTestPushKeys(t)
+	rec = doBearerJSON(t, srv, http.MethodPost, "/api/v1/push/subscriptions", tokB, map[string]any{
+		"endpoint": sharedEndpoint,
+		"keys":     map[string]string{"p256dh": p256dhB, "auth": authB},
+	}, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("subscribe userB: %d %s", rec.Code, rec.Body.String())
+	}
+
+	subsA, err := st.Chat().ListPushSubscriptions(ctx, store.DefaultTenantID, userA.ID)
+	if err != nil {
+		t.Fatalf("ListPushSubscriptions(userA): %v", err)
+	}
+	if len(subsA) != 0 {
+		t.Fatalf("expected userA to lose endpoint on account switch, still has %d rows", len(subsA))
+	}
+	subsB, err := st.Chat().ListPushSubscriptions(ctx, store.DefaultTenantID, userB.ID)
+	if err != nil {
+		t.Fatalf("ListPushSubscriptions(userB): %v", err)
+	}
+	if len(subsB) != 1 || subsB[0].ID == oldID || subsB[0].P256DH != p256dhB || subsB[0].AuthSecret != authB {
+		t.Fatalf("expected fresh subscription owned by userB, got %+v (oldID=%q)", subsB, oldID)
+	}
+
+	// Posting to user A's private room MUST NOT push to the shared browser.
+	rec = doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+roomA.ID+"/messages", senderTok, map[string]any{
+		"body": "Confidential for User A only",
+	}, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("send roomA: %d %s", rec.Code, rec.Body.String())
+	}
+	select {
+	case leaked := <-gotPaths:
+		t.Fatalf("User A's message leaked to User B's shared browser endpoint: %q", leaked)
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	// Posting to user B's private room MUST push to the shared browser.
+	rec = doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+roomB.ID+"/messages", senderTok, map[string]any{
+		"body": "Hello User B",
+	}, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("send roomB: %d %s", rec.Code, rec.Body.String())
+	}
+	select {
+	case path := <-gotPaths:
+		if path != "/push/shared-browser" {
+			t.Fatalf("unexpected push path: %q", path)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for User B's push notification")
+	}
+}
+

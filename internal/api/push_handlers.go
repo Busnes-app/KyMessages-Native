@@ -214,7 +214,8 @@ func (s *Server) dispatchMessagePush(ctx context.Context, tenantID, roomID strin
 	}
 
 	isPlain := msg.Encoding == store.MessageEncodingPlainV1
-	broadcastMention := isPlain && (bodyHasMention(msg.Body, "all") || bodyHasMention(msg.Body, "here") || bodyHasMention(msg.Body, "channel"))
+	hasAtSign := isPlain && strings.Contains(msg.Body, "@")
+	broadcastMention := hasAtSign && (bodyHasMention(msg.Body, "all") || bodyHasMention(msg.Body, "here") || bodyHasMention(msg.Body, "channel"))
 
 	var recipientIDs []string
 	var checkMentionMembers []*store.RoomMember
@@ -228,7 +229,7 @@ func (s *Server) dispatchMessagePush(ctx context.Context, tenantID, roomID strin
 		case store.NotifyModeMentions:
 			if room.Kind == store.RoomKindDM || broadcastMention {
 				recipientIDs = append(recipientIDs, m.UserID)
-			} else if isPlain {
+			} else if hasAtSign {
 				checkMentionMembers = append(checkMentionMembers, m)
 			}
 		default: // "all" or unset

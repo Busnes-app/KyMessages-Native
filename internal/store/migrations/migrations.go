@@ -271,7 +271,7 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
     user_agent VARCHAR(255) NOT NULL DEFAULT '',
     created_at BIGINT NOT NULL,
     last_used_at BIGINT NOT NULL DEFAULT 0,
-    UNIQUE (tenant_id, user_id, endpoint)
+    UNIQUE (endpoint)
 );
 CREATE INDEX IF NOT EXISTS idx_push_subs_user ON push_subscriptions(tenant_id, user_id);
 `
