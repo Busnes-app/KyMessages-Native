@@ -25,7 +25,7 @@ func (s *SQLStore) InvalidateRestoredGrants(ctx context.Context) error {
 			return err
 		}
 	}
-	if _, err := tx.ExecContext(ctx, s.rebind(`UPDATE call_sessions SET ended_at = ? WHERE ended_at IS NULL`), now); err != nil {
+	if _, err := tx.ExecContext(ctx, s.rebind(`UPDATE call_sessions SET ended_at = ? WHERE ended_at IS NULL`), now.UnixMilli()); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, s.rebind(`UPDATE agents SET token_hash = '', token_state = ? WHERE token_state = ?`), AgentTokenRevoked, AgentTokenActive); err != nil {
