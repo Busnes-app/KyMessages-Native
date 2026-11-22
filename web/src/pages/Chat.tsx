@@ -815,7 +815,14 @@ export const Chat: React.FC<ChatProps> = ({
         if (boot.rooms.length > 0) {
           const queryRoom = new URLSearchParams(window.location.search).get('room');
           const hashMatch = window.location.hash.match(/^#room=([^&]+)/);
-          const hashRoom = hashMatch ? decodeURIComponent(hashMatch[1]) : null;
+          let hashRoom: string | null = null;
+          if (hashMatch) {
+            try {
+              hashRoom = decodeURIComponent(hashMatch[1]);
+            } catch {
+              hashRoom = null;
+            }
+          }
           const requestedRoom = hashRoom || queryRoom;
           const matched = requestedRoom ? boot.rooms.find((r) => r.id === requestedRoom) : undefined;
           setActiveRoomId(matched ? matched.id : boot.rooms[0].id);

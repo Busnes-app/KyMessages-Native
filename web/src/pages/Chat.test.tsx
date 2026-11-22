@@ -41,6 +41,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  window.history.replaceState(null, '', '/');
 });
 
 describe('Native Chat page', () => {
@@ -474,5 +475,63 @@ describe('Native Chat page', () => {
     render(<Chat />);
     await screen.findByRole('heading', { name: 'Welcome to #general' });
     expect(screen.queryByRole('button', { name: 'Attach files' })).toBeNull();
+  });
+
+  it('falls back to the first room when the #room= hash has a malformed percent-escape', async () => {
+    window.history.replaceState(null, '', '/#room=%E0');
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === '/api/v1/bootstrap') {
+          return Promise.resolve(
+            json({
+              user: { id: 'u_alice', username: 'alice', display_name: 'Alice', role: 'user' },
+              tenant: { id: 'default', slug: 'default', display_name: 'Busnes HQ', plan: 'self_hosted' },
+              rooms: [
+                {
+                  id: 'rm_gen',
+                  tenant_id: 'default',
+                  kind: 'channel',
+                  name: 'general',
+                  topic: '',
+                  is_private: false,
+                  last_seq: 0,
+                  created_by: 'u_alice',
+                  created_at: Date.now(),
+                  role: 'owner',
+                  last_read_seq: 0,
+                  unread_count: 0,
+                  notify_mode: 'all',
+                },
+                {
+                  id: 'rm_rand',
+                  tenant_id: 'default',
+                  kind: 'channel',
+                  name: 'random',
+                  topic: '',
+                  is_private: false,
+                  last_seq: 0,
+                  created_by: 'u_alice',
+                  created_at: Date.now(),
+                  role: 'member',
+                  last_read_seq: 0,
+                  unread_count: 0,
+                  notify_mode: 'all',
+                },
+              ],
+            }),
+          );
+        }
+        if (url.startsWith('/api/v1/rooms/rm_gen/messages')) {
+          return Promise.resolve(json({ messages: [], has_more: false }));
+        }
+        return Promise.resolve(json({ error: 'not found' }, 404));
+      }),
+    );
+
+    render(<Chat />);
+    await screen.findByRole('heading', { name: 'Welcome to #general' });
+    expect(window.location.hash).toBe('#room=rm_gen');
   });
 });
