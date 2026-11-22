@@ -521,6 +521,12 @@ func (s *Server) admin(h http.HandlerFunc, fresh bool) http.HandlerFunc {
 			s.writeError(w, http.StatusForbidden, "Administrator role required")
 			return
 		}
+		if user.OrgID != "" {
+			if active, err := s.isTenantActive(r.Context(), user.OrgID); err != nil || !active {
+				s.writeError(w, http.StatusForbidden, "Organization is suspended or inactive")
+				return
+			}
+		}
 		if fresh && time.Since(sess.CreatedAt) > stepUpWindow {
 			s.writeStepUp(w, user)
 			return

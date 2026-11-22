@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -362,6 +363,14 @@ func TestMultiTenantDirectoryAdminsOnlyFromStaffOrg(t *testing.T) {
 	if rec := doBearerJSON(t, srv, http.MethodGet, "/api/admin/audit", staffTok, nil, nil); rec.Code != http.StatusOK {
 		t.Fatalf("staff admin audit = %d, want 200: %s", rec.Code, rec.Body.String())
 	}
+
+	// A suspended staff org loses the console even before its sessions are swept.
+	if err := st.Chat().SetTenantStatus(ctx, testStaffOrg, store.TenantStatusSuspended); err != nil {
+		t.Fatal(err)
+	}
+	if rec := doBearerJSON(t, srv, http.MethodGet, "/api/admin/audit", staffTok, nil, nil); rec.Code != http.StatusForbidden {
+		t.Fatalf("suspended staff admin audit = %d, want 403: %s", rec.Code, rec.Body.String())
+	}
 }
 
 func TestMultiTenantKyCalendarMeetingSync(t *testing.T) {
@@ -603,20 +612,22 @@ func TestMultiTenantDirectoryWebhookAndOrgLifecycle(t *testing.T) {
 		}
 	}
 
-	// Eva's old session was revoked (401). Even a freshly minted session gets 403 because tenant is suspended.
+	// Eva's old session was revoked (401), and no new one can be issued while the org is suspended.
 	if rec := doBearerJSON(t, srv, http.MethodGet, "/api/v1/rooms", evaTok, nil, nil); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("revoked session after org.suspended = %d, want 401", rec.Code)
 	}
 	evaTok2 := "tok_eva2_" + uuid.NewString()
-	_ = st.Sessions().CreateSession(context.Background(), &store.Session{
-		UserID:    eva.ID,
-		TokenHash: crypto.SHA256Hex([]byte(evaTok2)),
-		IPAddress: "127.0.0.1",
-		UserAgent: "test",
-		ExpiresAt: time.Now().Add(time.Hour),
-	}, "")
-	if rec := doBearerJSON(t, srv, http.MethodGet, "/api/v1/rooms", evaTok2, nil, nil); rec.Code != http.StatusForbidden {
-		t.Fatalf("session against suspended org = %d, want 403: %s", rec.Code, rec.Body.String())
+	mint := func() error {
+		return st.Sessions().CreateSession(context.Background(), &store.Session{
+			UserID:    eva.ID,
+			TokenHash: crypto.SHA256Hex([]byte(evaTok2)),
+			IPAddress: "127.0.0.1",
+			UserAgent: "test",
+			ExpiresAt: time.Now().Add(time.Hour),
+		}, "")
+	}
+	if err := mint(); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("session issued for a suspended org: err=%v, want ErrNotFound", err)
 	}
 
 	// Incoming webhook for suspended org returns 403.
@@ -640,6 +651,9 @@ func TestMultiTenantDirectoryWebhookAndOrgLifecycle(t *testing.T) {
 	// 6. org.unsuspended restores org-alpha.
 	if rec := postSync("org.unsuspended", []byte(`{"org_id":"org-alpha"}`)); rec.Code != http.StatusOK {
 		t.Fatalf("org.unsuspended = %d: %s", rec.Code, rec.Body.String())
+	}
+	if err := mint(); err != nil {
+		t.Fatalf("session after org.unsuspended: %v", err)
 	}
 	if rec := doBearerJSON(t, srv, http.MethodGet, "/api/v1/rooms", evaTok2, nil, nil); rec.Code != http.StatusOK {
 		t.Fatalf("org-alpha rooms after org.unsuspended = %d, want 200: %s", rec.Code, rec.Body.String())

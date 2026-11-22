@@ -581,6 +581,24 @@ func (s *SQLStore) withPassword(ctx context.Context, userID, expectedHash string
 	if n != 1 {
 		return ErrNotFound
 	}
+	// An org-bound account gets a grant only while its org is active. Locking the org row
+	// orders this against a suspension: one that committed first refuses the grant, and one
+	// that waits for it then deletes it with the org's other grants.
+	var orgID string
+	if err := tx.QueryRowContext(ctx, s.rebind("SELECT org_id FROM users WHERE id = ?"), userID).Scan(&orgID); err != nil {
+		return err
+	}
+	if orgID != "" {
+		org, err := tx.ExecContext(ctx, s.rebind("UPDATE tenants SET id = id WHERE id = ? AND status = ?"), orgID, TenantStatusActive)
+		if err != nil {
+			return err
+		}
+		if n, err := org.RowsAffected(); err != nil {
+			return err
+		} else if n != 1 {
+			return ErrNotFound
+		}
+	}
 	if err := apply(tx); err != nil {
 		return err
 	}
