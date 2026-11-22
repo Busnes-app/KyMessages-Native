@@ -347,3 +347,42 @@ func TestAttachmentLimitsConsistency(t *testing.T) {
 		}
 	})
 }
+
+func TestTenancyModeFromEnv(t *testing.T) {
+	t.Run("default_is_single", func(t *testing.T) {
+		t.Setenv("KY_DATA_DIR", t.TempDir())
+		t.Setenv("KY_TENANCY_MODE", "")
+		cfg, err := config.LoadFromEnv()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Tenancy.EffectiveMode() != config.TenancySingle || cfg.Tenancy.IsMultiTenant() {
+			t.Fatalf("unexpected default tenancy: %+v", cfg.Tenancy)
+		}
+	})
+
+	t.Run("multi_forces_scim_off", func(t *testing.T) {
+		t.Setenv("KY_DATA_DIR", t.TempDir())
+		t.Setenv("KY_TENANCY_MODE", "multi")
+		t.Setenv("KY_SCIM_ENABLED", "true")
+		cfg, err := config.LoadFromEnv()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !cfg.Tenancy.IsMultiTenant() || cfg.Tenancy.EffectiveMode() != config.TenancyMulti {
+			t.Fatalf("unexpected multi tenancy: %+v", cfg.Tenancy)
+		}
+		if cfg.SCIM.Enabled {
+			t.Fatal("expected KY_TENANCY_MODE=multi to force SCIM.Enabled=false")
+		}
+	})
+
+	t.Run("invalid_mode_fails", func(t *testing.T) {
+		t.Setenv("KY_DATA_DIR", t.TempDir())
+		t.Setenv("KY_TENANCY_MODE", "hybrid")
+		if _, err := config.LoadFromEnv(); err == nil || !strings.Contains(err.Error(), "KY_TENANCY_MODE") {
+			t.Fatalf("want KY_TENANCY_MODE error, got %v", err)
+		}
+	})
+}
+

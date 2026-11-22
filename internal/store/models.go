@@ -15,6 +15,7 @@ type User struct {
 	Status             string     `json:"status"`       // "active", "suspended", "inactive"
 	SSOProvider        string     `json:"sso_provider"` // "local", "kyidentity", "scim"
 	SSOSubject         string     `json:"sso_subject,omitempty"`
+	OrgID              string     `json:"org_id,omitempty"`
 	TOTPSecretEnc      string     `json:"-"` // AES-256-GCM encrypted
 	TOTPEnabled        bool       `json:"totp_enabled"`
 	TOTPLastCounter    int64      `json:"-"` // last RFC 6238 counter accepted; refuses replay inside the skew window

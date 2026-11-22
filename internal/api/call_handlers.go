@@ -18,8 +18,12 @@ func (s *Server) handleCallState(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	roomID := r.PathValue("id")
-	if _, ok := s.requireRoomMember(w, r, store.DefaultTenantID, roomID, user.ID); !ok {
+	if _, ok := s.requireRoomMember(w, r, tenantID, roomID, user.ID); !ok {
 		return
 	}
 	state := s.calls.GetState(roomID)
@@ -42,11 +46,15 @@ func (s *Server) handleCallJoin(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusForbidden, "Bot accounts cannot join calls")
 		return
 	}
-	roomID := r.PathValue("id")
-	if _, ok := s.requireRoomMember(w, r, store.DefaultTenantID, roomID, user.ID); !ok {
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
 		return
 	}
-	room, err := s.store.Chat().GetRoom(r.Context(), store.DefaultTenantID, roomID)
+	roomID := r.PathValue("id")
+	if _, ok := s.requireRoomMember(w, r, tenantID, roomID, user.ID); !ok {
+		return
+	}
+	room, err := s.store.Chat().GetRoom(r.Context(), tenantID, roomID)
 	if errors.Is(err, store.ErrNotFound) {
 		s.writeError(w, http.StatusNotFound, "Room not found")
 		return
@@ -76,7 +84,7 @@ func (s *Server) handleCallJoin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp, err := s.calls.Join(r.Context(), chat.JoinCallRequest{
-		TenantID:    store.DefaultTenantID,
+		TenantID:    tenantID,
 		RoomID:      roomID,
 		UserID:      user.ID,
 		DisplayName: displayNameFor(user),
@@ -99,7 +107,7 @@ func (s *Server) handleCallJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if resp.Started {
-		s.dispatchCallPush(r.Context(), store.DefaultTenantID, roomID, user.ID, displayNameFor(user))
+		s.dispatchCallPush(r.Context(), tenantID, roomID, user.ID, displayNameFor(user))
 	}
 	s.writeJSON(w, http.StatusOK, resp)
 }
@@ -112,8 +120,12 @@ func (s *Server) handleCallLeave(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	roomID := r.PathValue("id")
-	if _, ok := s.requireRoomMember(w, r, store.DefaultTenantID, roomID, user.ID); !ok {
+	if _, ok := s.requireRoomMember(w, r, tenantID, roomID, user.ID); !ok {
 		return
 	}
 	s.calls.Leave(r.Context(), roomID, user.ID)
@@ -128,8 +140,12 @@ func (s *Server) handleCallEscalate(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	roomID := r.PathValue("id")
-	if _, ok := s.requireRoomMember(w, r, store.DefaultTenantID, roomID, user.ID); !ok {
+	if _, ok := s.requireRoomMember(w, r, tenantID, roomID, user.ID); !ok {
 		return
 	}
 	var body struct {
@@ -164,8 +180,12 @@ func (s *Server) handleRoomLobbyList(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	roomID := r.PathValue("id")
-	if _, ok := s.requireRoomMember(w, r, store.DefaultTenantID, roomID, user.ID); !ok {
+	if _, ok := s.requireRoomMember(w, r, tenantID, roomID, user.ID); !ok {
 		return
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{
@@ -190,9 +210,13 @@ func (s *Server) handleRoomLobbyDecide(w http.ResponseWriter, r *http.Request, a
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	roomID := r.PathValue("id")
 	guestID := r.PathValue("gid")
-	if _, ok := s.requireRoomMember(w, r, store.DefaultTenantID, roomID, user.ID); !ok {
+	if _, ok := s.requireRoomMember(w, r, tenantID, roomID, user.ID); !ok {
 		return
 	}
 	sess, err := s.lobby.Decide(r.Context(), roomID, guestID, user.ID, admit)
@@ -210,7 +234,16 @@ func (s *Server) handleRoomLobbyDecide(w http.ResponseWriter, r *http.Request, a
 // GET /api/admin/media-policy
 func (s *Server) handleAdminGetMediaPolicy(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	tenant, err := s.store.Chat().GetTenant(r.Context(), store.DefaultTenantID)
+	user, _, ok := s.currentUser(r)
+	if !ok {
+		s.writeError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
+	tenant, err := s.store.Chat().GetTenant(r.Context(), tenantID)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to load tenant media policy")
 		return
@@ -239,6 +272,10 @@ func (s *Server) handleAdminUpdateMediaPolicy(w http.ResponseWriter, r *http.Req
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	var req struct {
 		P2PPolicy     string `json:"p2p_policy"`
 		P2PMaxVideo   int    `json:"p2p_max_video"`
@@ -263,7 +300,7 @@ func (s *Server) handleAdminUpdateMediaPolicy(w http.ResponseWriter, r *http.Req
 	}
 	updated, err := s.store.Chat().UpdateTenantMediaPolicy(
 		r.Context(),
-		store.DefaultTenantID,
+		tenantID,
 		req.P2PPolicy,
 		req.P2PMaxVideo,
 		req.P2PMaxAudio,

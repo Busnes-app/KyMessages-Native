@@ -88,6 +88,24 @@ func (s *Server) handleKyIdentityCallback(w http.ResponseWriter, r *http.Request
 		s.writeError(w, http.StatusForbidden, "Identity is not assigned")
 		return
 	}
+	orgID := strings.TrimSpace(claims.OrgID)
+	if s.config.Tenancy.IsMultiTenant() {
+		if orgID == "" {
+			s.audit(r.Context(), "", r, "sso.missing_org_id", "session", fmt.Sprintf("subject=%q", claims.Subject))
+			s.writeError(w, http.StatusForbidden, "Organization claim (org_id) is required")
+			return
+		}
+		tenant, err := s.store.Chat().EnsureTenant(r.Context(), orgID)
+		if err != nil {
+			s.writeError(w, http.StatusInternalServerError, "Failed to verify organization")
+			return
+		}
+		if tenant.Status != store.TenantStatusActive {
+			s.audit(r.Context(), "", r, "sso.tenant_inactive", "tenant:"+orgID, fmt.Sprintf("status=%q", tenant.Status))
+			s.writeError(w, http.StatusForbidden, "Organization is suspended or inactive")
+			return
+		}
+	}
 	// Accounts are matched by subject only; a username never links to an existing account.
 	user, err := s.store.Users().GetUserBySSO(r.Context(), "kyidentity", claims.Subject)
 	if errors.Is(err, store.ErrNotFound) {
@@ -105,6 +123,9 @@ func (s *Server) handleKyIdentityCallback(w http.ResponseWriter, r *http.Request
 			SSOProvider: "kyidentity",
 			SSOSubject:  claims.Subject,
 		}
+		if s.config.Tenancy.IsMultiTenant() {
+			user.OrgID = orgID
+		}
 		err = s.store.Users().CreateUser(r.Context(), user)
 		if errors.Is(err, store.ErrUsernameTaken) {
 			log.Printf("[SSO] sign-in by %q refused: username %q is held by another KyMessages account", claims.Subject, user.Username)
@@ -118,6 +139,11 @@ func (s *Server) handleKyIdentityCallback(w http.ResponseWriter, r *http.Request
 		}
 	} else if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to look up SSO user")
+		return
+	}
+	if s.config.Tenancy.IsMultiTenant() && user.OrgID != orgID {
+		s.audit(r.Context(), user.ID, r, "sso.org_mismatch", "session", fmt.Sprintf("expected=%q got=%q", user.OrgID, orgID))
+		s.writeError(w, http.StatusForbidden, "Account belongs to a different organization")
 		return
 	}
 	if user.Status != "active" {
@@ -165,7 +191,7 @@ func (s *Server) handleKyIdentitySyncWebhook(w http.ResponseWriter, r *http.Requ
 	case errors.Is(err, sso.ErrSyncMalformed):
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
-	case errors.Is(err, sso.ErrSyncUsernameConflict):
+	case errors.Is(err, sso.ErrSyncUsernameConflict), errors.Is(err, sso.ErrSyncOrgMismatch):
 		// Received and explained: KyIdentity fences a 500 as an uncertain write.
 		s.writeError(w, http.StatusConflict, err.Error())
 		return

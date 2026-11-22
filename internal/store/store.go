@@ -56,12 +56,17 @@ type DirectoryEvent struct {
 	Revision int64
 }
 
+// TenancyModeSettingKey persists the database's tenancy mode ("single" or "multi") so an
+// instance cannot silently flip modes across restarts.
+const TenancyModeSettingKey = "tenancy.mode"
+
 // UserFilter selects users by one exact attribute; the zero value matches everyone.
-// Provider, when set, also limits the result to that sso_provider.
+// Provider and OrgID, when set, also limit the result to that sso_provider / org_id.
 type UserFilter struct {
 	Field    UserField
 	Value    string
 	Provider string
+	OrgID    string
 }
 
 type UserField int
@@ -184,7 +189,9 @@ type AgentStore interface {
 type ChatStore interface {
 	// Tenants
 	CreateTenant(ctx context.Context, t *Tenant) error
+	EnsureTenant(ctx context.Context, tenantID string) (*Tenant, error)
 	GetTenant(ctx context.Context, tenantID string) (*Tenant, error)
+	SetTenantStatus(ctx context.Context, tenantID, status string) error
 	UpdateTenantMediaPolicy(ctx context.Context, tenantID, policy string, maxVideo, maxAudio int, guestForceSFU bool) (*Tenant, error)
 
 	// Rooms & Membership

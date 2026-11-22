@@ -104,6 +104,9 @@ func runServer() {
 	if err := bootstrapAdmin(ctx, st, cfg.Security.AdminUsername, os.Getenv("KY_ADMIN_PASSWORD")); err != nil {
 		log.Fatalf("Failed to create bootstrap admin: %v", err)
 	}
+	if err := api.EnsureTenancyMode(ctx, st, cfg.Tenancy); err != nil {
+		log.Fatalf("Tenancy mode check failed: %v", err)
+	}
 
 	srv := api.NewServer(cfg, st)
 	if err := srv.BlobsError(); err != nil {

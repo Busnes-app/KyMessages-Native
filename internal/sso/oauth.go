@@ -104,6 +104,7 @@ func (f *oauthFlow) exchangeIDToken(ctx context.Context, code, verifier, redirec
 func claimsFromIDToken(idToken *oidc.IDToken) (*IdentityClaims, error) {
 	var raw struct {
 		Sub               string `json:"sub"`
+		OrgID             string `json:"org_id"`
 		Email             string `json:"email"`
 		Name              string `json:"name"`
 		PreferredUsername string `json:"preferred_username"`
@@ -120,7 +121,15 @@ func claimsFromIDToken(idToken *oidc.IDToken) (*IdentityClaims, error) {
 	if username == "" {
 		username = raw.Sub
 	}
-	claims := &IdentityClaims{Issuer: idToken.Issuer, Subject: raw.Sub, Email: raw.Email, Name: raw.Name, PreferredUsername: username, Role: raw.Role}
+	claims := &IdentityClaims{
+		Issuer:            idToken.Issuer,
+		Subject:           raw.Sub,
+		OrgID:             strings.TrimSpace(raw.OrgID),
+		Email:             raw.Email,
+		Name:              raw.Name,
+		PreferredUsername: username,
+		Role:              raw.Role,
+	}
 	if raw.AuthTime > 0 && raw.AuthTime <= idToken.IssuedAt.Unix() && raw.AuthTime <= time.Now().Unix() {
 		claims.AuthenticatedAt = time.Unix(raw.AuthTime, 0).UTC()
 	}

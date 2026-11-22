@@ -59,6 +59,9 @@ func (c *chatStore) CreateTenant(ctx context.Context, t *Tenant) error {
 	if t.Plan == "" {
 		t.Plan = "business"
 	}
+	if t.Status == "" {
+		t.Status = TenantStatusActive
+	}
 	if t.P2PPolicy == "" {
 		t.P2PPolicy = P2PPolicyHybrid
 	}
@@ -72,24 +75,52 @@ func (c *chatStore) CreateTenant(ctx context.Context, t *Tenant) error {
 		t.CreatedAt = nowMilli()
 	}
 	q := c.store.rebind(`
-		INSERT INTO tenants (id, slug, display_name, plan, p2p_policy, p2p_max_video, p2p_max_audio, guest_force_sfu, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		INSERT INTO tenants (id, slug, display_name, plan, status, p2p_policy, p2p_max_video, p2p_max_audio, guest_force_sfu, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	_, err := c.store.db.ExecContext(ctx, q,
-		t.ID, t.Slug, t.DisplayName, t.Plan, t.P2PPolicy,
+		t.ID, t.Slug, t.DisplayName, t.Plan, t.Status, t.P2PPolicy,
 		t.P2PMaxVideo, t.P2PMaxAudio, boolToInt(t.GuestForceSFU), t.CreatedAt,
 	)
 	return uniqueError(err)
 }
 
+// EnsureTenant idempotently provisions a tenant row for a verified org_id and returns it.
+func (c *chatStore) EnsureTenant(ctx context.Context, tenantID string) (*Tenant, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return nil, errors.New("tenant id is required")
+	}
+	if existing, err := c.GetTenant(ctx, tenantID); err == nil {
+		return existing, nil
+	} else if !errors.Is(err, ErrNotFound) {
+		return nil, err
+	}
+	t := &Tenant{
+		ID:          tenantID,
+		Slug:        tenantID,
+		DisplayName: tenantID,
+		Plan:        "business",
+		Status:      TenantStatusActive,
+		P2PPolicy:   P2PPolicyHybrid,
+		P2PMaxVideo: 2,
+		P2PMaxAudio: 4,
+		CreatedAt:   nowMilli(),
+	}
+	if err := c.CreateTenant(ctx, t); err != nil && !errors.Is(err, ErrAlreadyExists) {
+		return nil, err
+	}
+	return c.GetTenant(ctx, tenantID)
+}
+
 func (c *chatStore) GetTenant(ctx context.Context, tenantID string) (*Tenant, error) {
 	tenantID = normalizeTenant(tenantID)
 	q := c.store.rebind(`
-		SELECT id, slug, display_name, plan, p2p_policy, p2p_max_video, p2p_max_audio, guest_force_sfu, created_at
+		SELECT id, slug, display_name, plan, status, p2p_policy, p2p_max_video, p2p_max_audio, guest_force_sfu, created_at
 		FROM tenants WHERE id = ?`)
 	var t Tenant
 	var guestForce int
 	err := c.store.read().QueryRowContext(ctx, q, tenantID).Scan(
-		&t.ID, &t.Slug, &t.DisplayName, &t.Plan, &t.P2PPolicy,
+		&t.ID, &t.Slug, &t.DisplayName, &t.Plan, &t.Status, &t.P2PPolicy,
 		&t.P2PMaxVideo, &t.P2PMaxAudio, &guestForce, &t.CreatedAt,
 	)
 	if errorsIs(err, sql.ErrNoRows) {
@@ -98,8 +129,22 @@ func (c *chatStore) GetTenant(ctx context.Context, tenantID string) (*Tenant, er
 	if err != nil {
 		return nil, err
 	}
+	if t.Status == "" {
+		t.Status = TenantStatusActive
+	}
 	t.GuestForceSFU = guestForce != 0
 	return &t, nil
+}
+
+func (c *chatStore) SetTenantStatus(ctx context.Context, tenantID, status string) error {
+	tenantID = strings.TrimSpace(tenantID)
+	switch status {
+	case TenantStatusActive, TenantStatusSuspended, TenantStatusDeleted:
+	default:
+		return fmt.Errorf("invalid tenant status %q", status)
+	}
+	q := c.store.rebind(`UPDATE tenants SET status = ? WHERE id = ?`)
+	return oneRow(c.store.db.ExecContext(ctx, q, status, tenantID))
 }
 
 // ---------------------------------------------------------------------

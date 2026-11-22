@@ -123,7 +123,10 @@ func (s *Server) handleChatWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tenantID := store.DefaultTenantID
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	roomIDs, err := s.store.Chat().ListUserRoomIDs(r.Context(), tenantID, user.ID)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to load room memberships")
