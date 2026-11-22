@@ -297,6 +297,14 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, sess, _ := s.sessions.AuthenticateRequest(r)
+	// The browser names its push endpoint so it stops getting previews in the same request
+	// that signs it out; a refused sign-out leaves push untouched.
+	var body struct {
+		PushEndpoint string `json:"push_endpoint"`
+	}
+	if sess != nil && json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&body) == nil && body.PushEndpoint != "" {
+		_ = s.store.Chat().DeletePushSubscriptionByEndpoint(r.Context(), store.DefaultTenantID, sess.UserID, body.PushEndpoint)
+	}
 	_ = s.sessions.RevokeSession(r.Context(), w, r)
 	if sess != nil && s.chatHub != nil {
 		_ = s.chatHub.RevokeSession(r.Context(), sess.UserID, sess.TokenHash)

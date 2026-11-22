@@ -16,6 +16,7 @@ import (
 	"github.com/Busnes-app/ky-primitives/applysetup"
 	"github.com/Busnes-app/ky_server_base/internal/api"
 	"github.com/Busnes-app/ky_server_base/internal/config"
+	"github.com/Busnes-app/ky_server_base/internal/crypto"
 	"github.com/Busnes-app/ky_server_base/internal/push"
 	"github.com/Busnes-app/ky_server_base/internal/store"
 	"github.com/Busnes-app/ky_server_base/internal/testdb"
@@ -372,7 +373,15 @@ func TestPushExcludedForRevokedAndInstallerDeactivatedUsers(t *testing.T) {
 
 	register := func(uid, suffix string) {
 		p256dh, auth := newTestPushKeys(t)
-		if _, err := st.Chat().UpsertPushSubscription(ctx, &store.PushSubscription{
+		hash := "sess_" + uid + "_" + suffix
+		owner, err := st.Users().GetUserByID(ctx, uid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.Sessions().CreateSession(ctx, &store.Session{TokenHash: hash, UserID: uid, CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)}, owner.PasswordHash); err != nil {
+			t.Fatalf("CreateSession(%s): %v", suffix, err)
+		}
+		if _, err := st.Chat().UpsertPushSubscription(ctx, hash, &store.PushSubscription{
 			TenantID:   store.DefaultTenantID,
 			UserID:     uid,
 			Endpoint:   fakePush.URL + "/push/" + suffix,
@@ -552,5 +561,31 @@ func TestPushEndpointOwnershipTransfersOnAccountSwitch(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for User B's push notification")
+	}
+}
+
+// Signing out removes the push subscription the browser names, in the same request, and no other.
+func TestLogoutDropsTheNamedPushSubscription(t *testing.T) {
+	srv, st := newPushTestServer(t, true)
+	ctx := context.Background()
+	alice, aliceTok := createChatTestUser(t, st, "usr_lo_alice", "alice-lo", "user")
+	for _, ep := range []string{"https://push.example/this-browser", "https://push.example/other-device"} {
+		p256dh, auth := newTestPushKeys(t)
+		if _, err := st.Chat().UpsertPushSubscription(ctx, crypto.SHA256Hex([]byte(aliceTok)), &store.PushSubscription{
+			TenantID: store.DefaultTenantID, UserID: alice.ID, Endpoint: ep, P256DH: p256dh, AuthSecret: auth,
+		}, 10); err != nil {
+			t.Fatalf("UpsertPushSubscription(%s): %v", ep, err)
+		}
+	}
+	rec := doBearerJSON(t, srv, http.MethodPost, "/api/auth/logout", aliceTok, map[string]any{"push_endpoint": "https://push.example/this-browser"}, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("logout = %d: %s", rec.Code, rec.Body.String())
+	}
+	subs, err := st.Chat().ListPushSubscriptions(ctx, store.DefaultTenantID, alice.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(subs) != 1 || subs[0].Endpoint != "https://push.example/other-device" {
+		t.Fatalf("subscriptions after logout = %+v, want only the other device", subs)
 	}
 }

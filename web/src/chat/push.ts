@@ -136,6 +136,28 @@ export async function enableBrowserPush(vapidPublicKey: string): Promise<PushSta
   return { kind: 'enabled', endpoint: keys.endpoint };
 }
 
+/** This browser's push endpoint, if it is subscribed. */
+export async function browserPushEndpoint(): Promise<string> {
+  if (!isBrowserPushSupported()) return '';
+  try {
+    const reg = await navigator.serviceWorker.getRegistration('/');
+    return (await reg?.pushManager.getSubscription())?.endpoint ?? '';
+  } catch {
+    return '';
+  }
+}
+
+/** Unsubscribes this browser only; the server record goes with sign-out. */
+export async function unsubscribeBrowserPush(): Promise<void> {
+  if (!isBrowserPushSupported()) return;
+  try {
+    const reg = await navigator.serviceWorker.getRegistration('/');
+    await (await reg?.pushManager.getSubscription())?.unsubscribe();
+  } catch {
+    // Best-effort: the server no longer delivers to it.
+  }
+}
+
 export async function disableBrowserPush(): Promise<PushState> {
   if (!isBrowserPushSupported()) return { kind: 'unsupported' };
   try {

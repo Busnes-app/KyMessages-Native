@@ -390,7 +390,8 @@ func (d *Dispatcher) Enqueue(job Job) bool {
 	}
 }
 
-// Close stops accepting new jobs, cancels in-flight deliveries, and waits for workers to exit.
+// Close stops accepting new jobs and lets the workers deliver what is queued for up to
+// sendTimeout, then cancels the rest and waits for the workers to exit.
 func (d *Dispatcher) Close() {
 	if d == nil {
 		return
@@ -402,9 +403,16 @@ func (d *Dispatcher) Close() {
 	}
 	d.closed = true
 	close(d.jobs)
-	d.cancel()
 	d.mu.Unlock()
-	d.wg.Wait()
+	drained := make(chan struct{})
+	go func() { d.wg.Wait(); close(drained) }()
+	select {
+	case <-drained:
+	case <-time.After(sendTimeout):
+		d.cancel()
+		<-drained
+	}
+	d.cancel()
 }
 
 func (d *Dispatcher) worker() {

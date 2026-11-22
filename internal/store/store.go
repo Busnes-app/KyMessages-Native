@@ -206,7 +206,7 @@ type ChatStore interface {
 	UpdateRoomNotifyMode(ctx context.Context, tenantID, roomID, userID, mode string) error
 
 	// Web Push Subscriptions
-	UpsertPushSubscription(ctx context.Context, sub *PushSubscription, maxPerUser int) (*PushSubscription, error)
+	UpsertPushSubscription(ctx context.Context, sessionHash string, sub *PushSubscription, maxPerUser int) (*PushSubscription, error)
 	ListPushSubscriptions(ctx context.Context, tenantID, userID string) ([]*PushSubscription, error)
 	ListPushSubscriptionsForUsers(ctx context.Context, tenantID string, userIDs []string) ([]*PushSubscription, error)
 	DeletePushSubscriptionByEndpoint(ctx context.Context, tenantID, userID, endpoint string) error

@@ -2,12 +2,71 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Busnes-app/ky_server_base/internal/store"
 )
+
+// liveSession signs userID in and returns the session's token hash.
+func liveSession(t *testing.T, st store.Store, userID string) string {
+	t.Helper()
+	hash := fmt.Sprintf("sess-%s-%d", userID, time.Now().UnixNano())
+	if err := st.Sessions().CreateSession(context.Background(), &store.Session{
+		TokenHash: hash, UserID: userID, CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour),
+	}, ""); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	return hash
+}
+
+// A registration racing a grant revocation never leaves a subscription behind, and one made
+// with a session that is already revoked is refused.
+func TestPushRegistrationSerializesWithRevocation(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	u := &store.User{ID: "usr_push_race", Username: "pushrace", Role: "user", Status: "active", CreatedAt: time.Now()}
+	if err := st.Users().CreateUser(ctx, u); err != nil {
+		t.Fatal(err)
+	}
+	sub := func(i int) *store.PushSubscription {
+		return &store.PushSubscription{TenantID: store.DefaultTenantID, UserID: u.ID,
+			Endpoint: fmt.Sprintf("https://fcm.googleapis.com/fcm/send/race-%d", i), P256DH: "k", AuthSecret: "a"}
+	}
+
+	revoked := liveSession(t, st, u.ID)
+	if err := st.Sessions().DeleteUserSessions(ctx, u.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Chat().UpsertPushSubscription(ctx, revoked, sub(0), 20); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("register with a revoked session = %v, want ErrNotFound", err)
+	}
+
+	for i := 1; i <= 20; i++ {
+		hash := liveSession(t, st, u.ID)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if _, err := st.Chat().UpsertPushSubscription(ctx, hash, sub(i), 20); err != nil && !errors.Is(err, store.ErrNotFound) {
+				t.Errorf("register: %v", err)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			if err := st.Sessions().DeleteUserSessions(ctx, u.ID); err != nil {
+				t.Errorf("revoke: %v", err)
+			}
+		}()
+		wg.Wait()
+		if subs, _ := st.Chat().ListPushSubscriptions(ctx, store.DefaultTenantID, u.ID); len(subs) != 0 {
+			t.Fatalf("round %d: %d subscriptions survived revocation", i, len(subs))
+		}
+	}
+}
 
 func TestPushSubscriptionsLifecycleAndRevocation(t *testing.T) {
 	st := openTestStore(t)
@@ -23,8 +82,9 @@ func TestPushSubscriptionsLifecycleAndRevocation(t *testing.T) {
 	}
 
 	// Upsert + cap enforcement (max 2 per user).
+	u1Sess, u2Sess := liveSession(t, st, u1.ID), liveSession(t, st, u2.ID)
 	for i := 1; i <= 3; i++ {
-		_, err := st.Chat().UpsertPushSubscription(ctx, &store.PushSubscription{
+		_, err := st.Chat().UpsertPushSubscription(ctx, u1Sess, &store.PushSubscription{
 			TenantID:   store.DefaultTenantID,
 			UserID:     u1.ID,
 			Endpoint:   fmt.Sprintf("https://fcm.googleapis.com/fcm/send/ep-%d", i),
@@ -56,7 +116,7 @@ func TestPushSubscriptionsLifecycleAndRevocation(t *testing.T) {
 	}
 
 	// Add u2 subscription and test batch lookup.
-	if _, err := st.Chat().UpsertPushSubscription(ctx, &store.PushSubscription{
+	if _, err := st.Chat().UpsertPushSubscription(ctx, u2Sess, &store.PushSubscription{
 		TenantID:   store.DefaultTenantID,
 		UserID:     u2.ID,
 		Endpoint:   "https://web.push.apple.com/bob-ep",

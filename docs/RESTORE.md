@@ -77,7 +77,8 @@ SQLite copies and database rollbacks bypass the preparation below and are unsupp
 The product then requires a nonempty regular SQLite file and a valid 32-byte
 hexadecimal deployment key. It opens/migrates the offline snapshot (refusing a database
 migrated by a newer build: restore with that build or newer) and, in one
-transaction, deletes sessions, MFA challenges and device pairings and records
+transaction, deletes sessions, MFA challenges, device pairings and Web Push
+subscriptions (browsers register again after sign-in) and records
 `restore.grants_invalidated`. It closes the store before reporting success.
 
 If extraction fails, the library rolls it back. If preparation fails, or the target

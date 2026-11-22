@@ -19,7 +19,7 @@ import './styles/theme.css';
 import './ky-ui/tokens.css';
 import './ky-ui/navigation.css';
 import { errorMessage, secureFetch } from './api';
-import { disableBrowserPush } from './chat/push';
+import { browserPushEndpoint, unsubscribeBrowserPush } from './chat/push';
 import { parseSettings, parseUser, type SessionUser, type SiteSettings } from './dto';
 import { ErrorBoundary } from './components/ErrorBoundary';
 
@@ -88,10 +88,16 @@ export const App: React.FC = () => {
   const handleLogout = async () => {
     setError('');
     try {
-      // Drop this browser's push subscription while the session can still delete it.
-      await disableBrowserPush();
-      const res = await secureFetch('/api/auth/logout', { method: 'POST' });
+      // The server drops this browser's push subscription with the session, so a refused
+      // sign-out leaves notifications as they were.
+      const pushEndpoint = await browserPushEndpoint();
+      const res = await secureFetch('/api/auth/logout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ push_endpoint: pushEndpoint }),
+      });
       if (!res.ok) throw new Error(await errorMessage(res, 'Sign-out failed'));
+      if (pushEndpoint) void unsubscribeBrowserPush();
       setActiveCallSummary(null);
       setUser(null);
     } catch (err) {

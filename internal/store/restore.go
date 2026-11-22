@@ -6,7 +6,8 @@ import (
 )
 
 // InvalidateRestoredGrants is an offline restore operation, before accepting any
-// traffic. It clears ephemeral sessions/challenges/pairings, closes any active calls
+// traffic. It clears ephemeral sessions/challenges/pairings and push subscriptions (a
+// snapshot cannot prove which were revoked after backup), closes any active calls
 // from snapshot time, and revokes active bot tokens (since a snapshot cannot prove
 // which tokens were revoked after backup).
 func (s *SQLStore) InvalidateRestoredGrants(ctx context.Context) error {
@@ -20,6 +21,7 @@ func (s *SQLStore) InvalidateRestoredGrants(ctx context.Context) error {
 		`DELETE FROM sessions`,
 		`DELETE FROM mfa_challenges`,
 		`DELETE FROM device_pairings`,
+		`DELETE FROM push_subscriptions`,
 		`DELETE FROM attachment_upload_reservations`,
 	} {
 		if _, err := tx.ExecContext(ctx, query); err != nil {
@@ -33,7 +35,7 @@ func (s *SQLStore) InvalidateRestoredGrants(ctx context.Context) error {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, s.rebind(`INSERT INTO audit_records (action, details, created_at) VALUES (?, ?, ?)`),
-		"restore.grants_invalidated", "Sessions, challenges, pairings, active calls, and bot tokens invalidated. Users sign in again and rotate bot tokens.", now); err != nil {
+		"restore.grants_invalidated", "Sessions, challenges, pairings, push subscriptions, active calls, and bot tokens invalidated. Users sign in again and rotate bot tokens.", now); err != nil {
 		return err
 	}
 	return tx.Commit()

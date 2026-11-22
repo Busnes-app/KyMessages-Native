@@ -2,11 +2,12 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { App } from './App';
 import { ErrorBoundary } from './components/ErrorBoundary';
-import { disableBrowserPush } from './chat/push';
+import { browserPushEndpoint, unsubscribeBrowserPush } from './chat/push';
 
 vi.mock('./chat/push', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./chat/push')>()),
-  disableBrowserPush: vi.fn(async () => ({ kind: 'disabled' })),
+  browserPushEndpoint: vi.fn(async () => 'https://push.example/ep'),
+  unsubscribeBrowserPush: vi.fn(async () => {}),
 }));
 
 const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { 'Content-Type': 'application/json' } });
@@ -31,7 +32,7 @@ function stubServer(logout: () => Promise<Response>, me: unknown = { authenticat
   }));
 }
 
-afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.mocked(disableBrowserPush).mockClear(); });
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.mocked(unsubscribeBrowserPush).mockClear(); });
 
 it('stays signed in and says so when the server refuses sign-out', async () => {
   stubServer(async () => json({ error: 'Invalid CSRF token' }, 403));
@@ -83,14 +84,28 @@ it('opens preferences via the bottom settings gear and omits Pair Device', async
   expect(await screen.findByRole('button', { name: 'Settings' })).toBeTruthy();
 });
 
-it('removes the browser push subscription before signing out from Settings', async () => {
-  const order: string[] = [];
-  vi.mocked(disableBrowserPush).mockImplementationOnce(async () => { order.push('push'); return { kind: 'disabled' }; });
-  stubServer(async () => { order.push('logout'); return json({ logged_out: true }); });
+it('drops the push subscription with the session when signing out from Settings', async () => {
+  let sent: unknown;
+  stubServer(async () => json({ logged_out: true }));
+  const stubbed = vi.mocked(fetch).getMockImplementation()!;
+  vi.mocked(fetch).mockImplementation(async (input, init) => {
+    if (String(input) === '/api/auth/logout') sent = JSON.parse(String(init?.body));
+    return stubbed(input, init);
+  });
   render(<App />);
   fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
   await screen.findByRole('heading', { name: 'Preferences' });
   fireEvent.click(screen.getAllByRole('button', { name: 'Sign out' })[0]);
   expect(await screen.findByLabelText('Username')).toBeTruthy();
-  expect(order).toEqual(['push', 'logout']);
+  expect(sent).toEqual({ push_endpoint: 'https://push.example/ep' });
+  expect(browserPushEndpoint).toHaveBeenCalled();
+  expect(unsubscribeBrowserPush).toHaveBeenCalledTimes(1);
+});
+
+it('keeps push on when the server refuses sign-out', async () => {
+  stubServer(async () => json({ error: 'Invalid CSRF token' }, 403));
+  render(<App />);
+  fireEvent.click((await screen.findAllByRole('button', { name: 'Sign out' }))[0]);
+  await screen.findByRole('alert');
+  expect(unsubscribeBrowserPush).not.toHaveBeenCalled();
 });
