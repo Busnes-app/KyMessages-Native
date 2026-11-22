@@ -182,3 +182,52 @@ func TestCollectSweepsStaleSnapshots(t *testing.T) {
 		}
 	}
 }
+
+func TestCollectCarriesAttachmentBlobs(t *testing.T) {
+	cfg, _ := payloadConfig(t)
+	attDir := filepath.Join(cfg.Database.DataDir, "attachments")
+	if err := os.MkdirAll(attDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	wantKey := "att_019a0000-0000-7000-8000-000000000001"
+	wantBytes := []byte("hello attachment backup payload")
+	if err := os.WriteFile(filepath.Join(attDir, wantKey), wantBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Temp and empty files must be skipped so restore drills never fail on zero-byte files.
+	if err := os.WriteFile(filepath.Join(attDir, ".upload-inprogress"), []byte("tmp"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(attDir, "att_019a0000-0000-7000-8000-000000000002"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	payload, err := backup.Collect(context.Background(), cfg, "1.0.0")
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	wantRel := "data/attachments/" + wantKey
+	f := findFile(payload.Files, wantRel)
+	if f == nil {
+		t.Fatalf("payload missing %s", wantRel)
+	}
+	if string(f.Data) != string(wantBytes) {
+		t.Errorf("blob data mismatch: got %q, want %q", f.Data, wantBytes)
+	}
+	if f.Mode != 0600 {
+		t.Errorf("blob mode = %o, want 600", f.Mode)
+	}
+	if findFile(payload.Files, "data/attachments/.upload-inprogress") != nil {
+		t.Error("temp upload file should not be packed into capsule")
+	}
+	if findFile(payload.Files, "data/attachments/att_019a0000-0000-7000-8000-000000000002") != nil {
+		t.Error("empty file should not be packed into capsule")
+	}
+	req, _ := payload.VerificationRecipe["required_files"].([]string)
+	if !slices.Contains(req, wantRel) {
+		t.Errorf("required_files missing %s: %v", wantRel, req)
+	}
+	if !slices.Contains(backup.Members(cfg), "data/attachments/") {
+		t.Errorf("backup.Members missing data/attachments/: %v", backup.Members(cfg))
+	}
+}

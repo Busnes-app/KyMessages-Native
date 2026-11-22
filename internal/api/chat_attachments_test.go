@@ -1,0 +1,289 @@
+package api_test
+
+import (
+	"bytes"
+	"encoding/json"
+	"image"
+	"image/color"
+	"image/png"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/Busnes-app/ky_server_base/internal/api"
+	"github.com/Busnes-app/ky_server_base/internal/store"
+)
+
+func makeTestPNG(t *testing.T, width, height int) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			img.Set(x, y, color.RGBA{R: uint8((x * 7) % 256), G: uint8((y * 13) % 256), B: uint8((x + y) % 256), A: 255})
+		}
+	}
+	var buf bytes.Buffer
+	enc := png.Encoder{CompressionLevel: png.NoCompression}
+	if err := enc.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func doMultipartUpload(t *testing.T, handler http.Handler, path, bearer, fieldName, filename string, data []byte) *httptest.ResponseRecorder {
+	t.Helper()
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	fw, err := mw.CreateFormFile(fieldName, filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(fw, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, path, &body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestChatAttachmentsUploadLinkDownloadAndCleanup(t *testing.T) {
+	srv, st, cfg := setupTestServer(t)
+	startChatBus(t, srv)
+	defer srv.CloseChat()
+
+	_, aliceTok := createChatTestUser(t, st, "u_att_alice", "attalice", "user")
+	_, bobTok := createChatTestUser(t, st, "u_att_bob", "attbob", "user")
+	_, charlieTok := createChatTestUser(t, st, "u_att_charlie", "attcharlie", "user")
+
+	// Alice creates a channel with Bob; Charlie is not a member.
+	rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", aliceTok, map[string]any{
+		"kind":       store.RoomKindChannel,
+		"name":       "files-room",
+		"member_ids": []string{"u_att_bob"},
+	}, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create room = %d: %s", rec.Code, rec.Body.String())
+	}
+	var roomResp struct {
+		Room store.Room `json:"room"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &roomResp); err != nil {
+		t.Fatal(err)
+	}
+	roomID := roomResp.Room.ID
+
+	// Bootstrap exposes attachment limits.
+	bootRec := doBearerJSON(t, srv, http.MethodGet, "/api/v1/bootstrap", aliceTok, nil, nil)
+	if bootRec.Code != http.StatusOK {
+		t.Fatalf("bootstrap = %d", bootRec.Code)
+	}
+	var bootBody struct {
+		Attachments struct {
+			MaxUploadBytes int64 `json:"max_upload_bytes"`
+			MaxPerMessage  int   `json:"max_per_message"`
+		} `json:"attachments"`
+	}
+	if err := json.Unmarshal(bootRec.Body.Bytes(), &bootBody); err != nil {
+		t.Fatal(err)
+	}
+	if bootBody.Attachments.MaxUploadBytes <= 1<<20 || bootBody.Attachments.MaxPerMessage != 10 {
+		t.Fatalf("unexpected bootstrap attachment limits: %+v", bootBody.Attachments)
+	}
+
+	// Non-member Charlie cannot upload to the room (404, not 403).
+	smallPNG := makeTestPNG(t, 4, 4)
+	if r := doMultipartUpload(t, srv, "/api/v1/rooms/"+roomID+"/attachments", charlieTok, "file", "snoop.png", smallPNG); r.Code != http.StatusNotFound {
+		t.Fatalf("non-member upload = %d, want 404", r.Code)
+	}
+
+	// Empty file rejected with 400.
+	if r := doMultipartUpload(t, srv, "/api/v1/rooms/"+roomID+"/attachments", aliceTok, "file", "empty.txt", nil); r.Code != http.StatusBadRequest {
+		t.Fatalf("empty upload = %d, want 400", r.Code)
+	}
+
+	// Upload a >1 MiB PNG to verify ServeHTTP's generic 1 MiB JSON cap does not block attachments.
+	largePNG := makeTestPNG(t, 600, 600) // ~1.44 MiB uncompressed PNG
+	if len(largePNG) <= 1<<20 {
+		t.Fatalf("expected largePNG > 1 MiB, got %d bytes", len(largePNG))
+	}
+	upRec := doMultipartUpload(t, srv, "/api/v1/rooms/"+roomID+"/attachments", aliceTok, "file", "../../evil/design.png", largePNG)
+	if upRec.Code != http.StatusCreated {
+		t.Fatalf("upload large PNG = %d: %s", upRec.Code, upRec.Body.String())
+	}
+	var upResp struct {
+		Attachment store.Attachment `json:"attachment"`
+	}
+	if err := json.Unmarshal(upRec.Body.Bytes(), &upResp); err != nil {
+		t.Fatal(err)
+	}
+	att := upResp.Attachment
+	if att.Filename != "design.png" || att.MimeType != "image/png" || att.SizeBytes != int64(len(largePNG)) {
+		t.Fatalf("unexpected uploaded attachment metadata: %+v", att)
+	}
+
+	// Before linking to a message, uploader Alice can fetch it, but Bob gets 404.
+	reqAliceStaged := httptest.NewRequest(http.MethodGet, "/api/v1/attachments/"+att.ID+"?inline=1", nil)
+	reqAliceStaged.Header.Set("Authorization", "Bearer "+aliceTok)
+	recAliceStaged := httptest.NewRecorder()
+	srv.ServeHTTP(recAliceStaged, reqAliceStaged)
+	if recAliceStaged.Code != http.StatusOK {
+		t.Fatalf("uploader preview staged attachment = %d, want 200", recAliceStaged.Code)
+	}
+
+	reqBobStaged := httptest.NewRequest(http.MethodGet, "/api/v1/attachments/"+att.ID, nil)
+	reqBobStaged.Header.Set("Authorization", "Bearer "+bobTok)
+	recBobStaged := httptest.NewRecorder()
+	srv.ServeHTTP(recBobStaged, reqBobStaged)
+	if recBobStaged.Code != http.StatusNotFound {
+		t.Fatalf("other member fetching staged attachment = %d, want 404", recBobStaged.Code)
+	}
+
+	// Bob cannot hijack Alice's staged attachment into his message.
+	hijackRec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+roomID+"/messages", bobTok, map[string]any{
+		"body":           "mine",
+		"attachment_ids": []string{att.ID},
+	}, nil)
+	if hijackRec.Code != http.StatusBadRequest {
+		t.Fatalf("hijack attachment send = %d, want 400", hijackRec.Code)
+	}
+
+	// Alice sends an attachment-only message (empty body allowed when attachment_ids is non-empty).
+	sendRec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+roomID+"/messages", aliceTok, map[string]any{
+		"body":           "",
+		"attachment_ids": []string{att.ID},
+	}, nil)
+	if sendRec.Code != http.StatusCreated {
+		t.Fatalf("send attachment-only message = %d: %s", sendRec.Code, sendRec.Body.String())
+	}
+	var msgResp struct {
+		Message store.Message `json:"message"`
+	}
+	if err := json.Unmarshal(sendRec.Body.Bytes(), &msgResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(msgResp.Message.Attachments) != 1 || msgResp.Message.Attachments[0].ID != att.ID {
+		t.Fatalf("message missing linked attachment: %+v", msgResp.Message)
+	}
+
+	// Bob can now download it inline with strict security headers; Charlie still gets 404.
+	reqBobInline := httptest.NewRequest(http.MethodGet, "/api/v1/attachments/"+att.ID+"?inline=1", nil)
+	reqBobInline.Header.Set("Authorization", "Bearer "+bobTok)
+	recBobInline := httptest.NewRecorder()
+	srv.ServeHTTP(recBobInline, reqBobInline)
+	if recBobInline.Code != http.StatusOK {
+		t.Fatalf("bob download inline = %d", recBobInline.Code)
+	}
+	if got := recBobInline.Header().Get("Content-Type"); got != "image/png" {
+		t.Errorf("Content-Type = %q, want image/png", got)
+	}
+	if got := recBobInline.Header().Get("Content-Disposition"); !strings.HasPrefix(got, "inline;") {
+		t.Errorf("Content-Disposition = %q, want inline", got)
+	}
+	if got := recBobInline.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+	if got := recBobInline.Header().Get("Content-Security-Policy"); got != "default-src 'none'; sandbox" {
+		t.Errorf("CSP = %q, want sandbox", got)
+	}
+	if !bytes.Equal(recBobInline.Body.Bytes(), largePNG) {
+		t.Error("downloaded PNG bytes do not match uploaded bytes")
+	}
+
+	reqCharlie := httptest.NewRequest(http.MethodGet, "/api/v1/attachments/"+att.ID, nil)
+	reqCharlie.Header.Set("Authorization", "Bearer "+charlieTok)
+	recCharlie := httptest.NewRecorder()
+	srv.ServeHTTP(recCharlie, reqCharlie)
+	if recCharlie.Code != http.StatusNotFound {
+		t.Fatalf("non-member download = %d, want 404", recCharlie.Code)
+	}
+
+	// Deleting the message removes both metadata and blob file on disk.
+	blobPath := filepath.Join(cfg.Database.DataDir, "attachments", att.ID)
+	if _, err := os.Stat(blobPath); err != nil {
+		t.Fatalf("expected blob on disk before delete: %v", err)
+	}
+	delRec := doBearerJSON(t, srv, http.MethodDelete, "/api/v1/rooms/"+roomID+"/messages/"+msgResp.Message.ID, aliceTok, nil, nil)
+	if delRec.Code != http.StatusOK {
+		t.Fatalf("delete message = %d: %s", delRec.Code, delRec.Body.String())
+	}
+	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
+		t.Errorf("expected blob removed from disk after DeleteMessage, got err=%v", err)
+	}
+	reqBobAfterDel := httptest.NewRequest(http.MethodGet, "/api/v1/attachments/"+att.ID, nil)
+	reqBobAfterDel.Header.Set("Authorization", "Bearer "+bobTok)
+	recBobAfterDel := httptest.NewRecorder()
+	srv.ServeHTTP(recBobAfterDel, reqBobAfterDel)
+	if recBobAfterDel.Code != http.StatusNotFound {
+		t.Fatalf("download after message delete = %d, want 404", recBobAfterDel.Code)
+	}
+}
+
+func TestChatAttachmentsXSSDowngradeAndMaxUploadCap(t *testing.T) {
+	_, st, cfg := setupTestServer(t)
+	cfg.Attachments.MaxUploadBytes = 2048
+	srv := api.NewServer(cfg, st)
+	startChatBus(t, srv)
+	defer srv.CloseChat()
+
+	_, aliceTok := createChatTestUser(t, st, "u_sec_alice", "secalice", "user")
+
+	rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", aliceTok, map[string]any{
+		"kind": store.RoomKindChannel,
+		"name": "sec-room",
+	}, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create room = %d", rec.Code)
+	}
+	var roomResp struct {
+		Room store.Room `json:"room"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &roomResp)
+	roomID := roomResp.Room.ID
+
+	// Oversized file (> 2048 bytes) rejected with 413.
+	over := bytes.Repeat([]byte("A"), 3000)
+	if r := doMultipartUpload(t, srv, "/api/v1/rooms/"+roomID+"/attachments", aliceTok, "file", "big.txt", over); r.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized upload = %d, want 413", r.Code)
+	}
+
+	// SVG XSS payload must downgrade to application/octet-stream and NEVER serve inline even with ?inline=1.
+	svg := []byte(`<svg xmlns="http://www.w3.org/2000/svg" onload="alert(document.cookie)"></svg>`)
+	upSVG := doMultipartUpload(t, srv, "/api/v1/rooms/"+roomID+"/attachments", aliceTok, "file", "xss.svg", svg)
+	if upSVG.Code != http.StatusCreated {
+		t.Fatalf("upload svg = %d: %s", upSVG.Code, upSVG.Body.String())
+	}
+	var svgResp struct {
+		Attachment store.Attachment `json:"attachment"`
+	}
+	_ = json.Unmarshal(upSVG.Body.Bytes(), &svgResp)
+	if svgResp.Attachment.MimeType != "application/octet-stream" {
+		t.Fatalf("svg stored MimeType = %q, want application/octet-stream", svgResp.Attachment.MimeType)
+	}
+
+	reqInlineSVG := httptest.NewRequest(http.MethodGet, "/api/v1/attachments/"+svgResp.Attachment.ID+"?inline=1", nil)
+	reqInlineSVG.Header.Set("Authorization", "Bearer "+aliceTok)
+	recInlineSVG := httptest.NewRecorder()
+	srv.ServeHTTP(recInlineSVG, reqInlineSVG)
+	if recInlineSVG.Code != http.StatusOK {
+		t.Fatalf("download svg = %d", recInlineSVG.Code)
+	}
+	if got := recInlineSVG.Header().Get("Content-Type"); got != "application/octet-stream" {
+		t.Errorf("svg served Content-Type = %q, want application/octet-stream", got)
+	}
+	if got := recInlineSVG.Header().Get("Content-Disposition"); !strings.HasPrefix(got, "attachment;") {
+		t.Errorf("svg Content-Disposition = %q, want attachment (never inline)", got)
+	}
+}

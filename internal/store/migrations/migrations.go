@@ -254,7 +254,11 @@ ALTER TABLE mfa_challenges ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';`,
 	{Version: 23, Name: "native_chat", SQLite: nativeChatSchemaSQLite, Postgres: nativeChatSchemaPostgres},
 	// Native chat bot/agent accounts backed directly by users and hashed bearer tokens.
 	{Version: 24, Name: "native_agents", SQLite: nativeAgentsSchema("DATETIME"), Postgres: nativeAgentsSchema("TIMESTAMPTZ")},
+	// Index attachments by message_id for fast attachment hydration when listing messages.
+	{Version: 25, Name: "attachments_message_index", SQLite: attachmentsMessageIndex, Postgres: attachmentsMessageIndex},
 }
+
+const attachmentsMessageIndex = `CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);`
 
 func nativeAgentsSchema(timestamp string) string {
 	return `

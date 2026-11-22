@@ -13,12 +13,13 @@ var (
 	ErrNotFound      = errors.New("record not found")
 	ErrAlreadyExists = errors.New("record already exists")
 	// ErrUsernameTaken: another account holds the username (exact case, as the column is unique).
-	ErrUsernameTaken  = fmt.Errorf("username is taken: %w", ErrAlreadyExists)
-	ErrSessionExpired = errors.New("session expired")
-	ErrPairingExpired = errors.New("pairing session expired")
-	ErrRoomClosed     = errors.New("room is closed")
-	ErrReplyNotFound  = errors.New("reply target is not a message in this room")
-	ErrForbidden      = errors.New("forbidden")
+	ErrUsernameTaken     = fmt.Errorf("username is taken: %w", ErrAlreadyExists)
+	ErrSessionExpired    = errors.New("session expired")
+	ErrPairingExpired    = errors.New("pairing session expired")
+	ErrRoomClosed        = errors.New("room is closed")
+	ErrReplyNotFound     = errors.New("reply target is not a message in this room")
+	ErrAttachmentInvalid = errors.New("attachment not found, not owned by sender, or already attached")
+	ErrForbidden         = errors.New("forbidden")
 )
 
 // Store defines the unified storage contract implemented across SQLite, PostgreSQL, and MySQL.
@@ -211,6 +212,12 @@ type ChatStore interface {
 
 	AddReaction(ctx context.Context, tenantID, roomID, messageID, userID, emoji string) error
 	RemoveReaction(ctx context.Context, tenantID, roomID, messageID, userID, emoji string) error
+
+	// Attachments
+	CreateAttachment(ctx context.Context, a *Attachment) error
+	GetAttachment(ctx context.Context, tenantID, attachmentID string) (*Attachment, error)
+	ListMessageAttachments(ctx context.Context, tenantID, roomID, messageID string) ([]Attachment, error)
+	DeleteAttachment(ctx context.Context, tenantID, attachmentID string) error
 
 	// Webhooks
 	CreateRoomWebhook(ctx context.Context, w *RoomWebhook) error

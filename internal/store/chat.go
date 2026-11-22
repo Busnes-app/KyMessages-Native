@@ -583,6 +583,12 @@ func (c *chatStore) CreateMessage(ctx context.Context, p CreateMessageParams) (*
 			tenantID, p.RoomID, p.SenderID, p.IdempotencyKey,
 		))
 		if err == nil {
+			if err := c.attachReactions(ctx, tx, []*Message{existing}); err != nil {
+				return nil, false, err
+			}
+			if err := c.attachAttachments(ctx, tx, []*Message{existing}); err != nil {
+				return nil, false, err
+			}
 			return existing, false, nil
 		}
 		if !errorsIs(err, sql.ErrNoRows) {
@@ -604,6 +610,21 @@ func (c *chatStore) CreateMessage(ctx context.Context, p CreateMessageParams) (*
 		}
 	}
 
+	// Deduplicate requested attachment IDs while preserving order.
+	attIDs := make([]string, 0, len(p.AttachmentIDs))
+	seenAtt := make(map[string]struct{}, len(p.AttachmentIDs))
+	for _, rawID := range p.AttachmentIDs {
+		id := strings.TrimSpace(rawID)
+		if id == "" {
+			continue
+		}
+		if _, dup := seenAtt[id]; dup {
+			continue
+		}
+		seenAtt[id] = struct{}{}
+		attIDs = append(attIDs, id)
+	}
+
 	var seq int64
 	if err := tx.QueryRowContext(ctx,
 		c.store.rebind(`UPDATE rooms SET last_seq = last_seq + 1 WHERE tenant_id = ? AND id = ? RETURNING last_seq`),
@@ -621,6 +642,34 @@ func (c *chatStore) CreateMessage(ctx context.Context, p CreateMessageParams) (*
 		nullString(p.ReplyToID), encoding, p.Body, nullString(p.IdempotencyKey), createdAt,
 	); err != nil {
 		return nil, false, uniqueError(err)
+	}
+
+	var linkedAttachments []Attachment
+	if len(attIDs) > 0 {
+		qLink := c.store.rebind(`
+			UPDATE attachments
+			SET message_id = ?
+			WHERE tenant_id = ? AND room_id = ? AND uploader_id = ? AND message_id IS NULL AND id = ?`)
+		qFetch := c.store.rebind(`SELECT ` + attachmentColumns + ` FROM attachments WHERE tenant_id = ? AND id = ?`)
+		linkedAttachments = make([]Attachment, 0, len(attIDs))
+		for _, attID := range attIDs {
+			res, err := tx.ExecContext(ctx, qLink, msgID, tenantID, p.RoomID, p.SenderID, attID)
+			if err != nil {
+				return nil, false, err
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return nil, false, err
+			}
+			if n != 1 {
+				return nil, false, ErrAttachmentInvalid
+			}
+			att, err := scanAttachment(tx.QueryRowContext(ctx, qFetch, tenantID, attID))
+			if err != nil {
+				return nil, false, err
+			}
+			linkedAttachments = append(linkedAttachments, *att)
+		}
 	}
 
 	// Advance sender's own read cursor to the message they just sent.
@@ -647,6 +696,7 @@ func (c *chatStore) CreateMessage(ctx context.Context, p CreateMessageParams) (*
 		Body:           p.Body,
 		IdempotencyKey: p.IdempotencyKey,
 		CreatedAt:      createdAt,
+		Attachments:    linkedAttachments,
 	}, true, nil
 }
 
@@ -661,6 +711,9 @@ func (c *chatStore) GetMessage(ctx context.Context, tenantID, roomID, messageID 
 		return nil, err
 	}
 	if err := c.attachReactions(ctx, c.store.db, []*Message{m}); err != nil {
+		return nil, err
+	}
+	if err := c.attachAttachments(ctx, c.store.db, []*Message{m}); err != nil {
 		return nil, err
 	}
 	return m, nil
@@ -732,6 +785,9 @@ func (c *chatStore) ListMessages(ctx context.Context, q MessagePageQuery) ([]*Me
 	if err := c.attachReactions(ctx, db, msgs); err != nil {
 		return nil, false, err
 	}
+	if err := c.attachAttachments(ctx, db, msgs); err != nil {
+		return nil, false, err
+	}
 	return msgs, hasMore, nil
 }
 
@@ -765,6 +821,12 @@ func (c *chatStore) EditMessage(ctx context.Context, tenantID, roomID, messageID
 		c.store.rebind(`UPDATE messages SET body = ?, edited_at = ? WHERE tenant_id = ? AND room_id = ? AND id = ?`),
 		newBody, editedAt, tenantID, roomID, messageID,
 	); err != nil {
+		return nil, err
+	}
+	if err := c.attachReactions(ctx, tx, []*Message{m}); err != nil {
+		return nil, err
+	}
+	if err := c.attachAttachments(ctx, tx, []*Message{m}); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -808,6 +870,12 @@ func (c *chatStore) DeleteMessage(ctx context.Context, tenantID, roomID, message
 		); err != nil {
 			return nil, err
 		}
+		if _, err := tx.ExecContext(ctx,
+			c.store.rebind(`DELETE FROM attachments WHERE tenant_id = ? AND room_id = ? AND message_id = ?`),
+			tenantID, roomID, messageID,
+		); err != nil {
+			return nil, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
@@ -815,6 +883,7 @@ func (c *chatStore) DeleteMessage(ctx context.Context, tenantID, roomID, message
 
 	m.Body = ""
 	m.DeletedAt = &deletedAt
+	m.Attachments = nil
 	return m, nil
 }
 
@@ -874,7 +943,8 @@ func (c *chatStore) SearchMessages(ctx context.Context, tenantID, userID, roomID
 		args = append(args, "%"+escapeLike(query)+"%", limit)
 	}
 
-	rows, err := c.store.read().QueryContext(ctx, c.store.rebind(sqlText), args...)
+	readDB := c.store.read()
+	rows, err := readDB.QueryContext(ctx, c.store.rebind(sqlText), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -888,7 +958,13 @@ func (c *chatStore) SearchMessages(ctx context.Context, tenantID, userID, roomID
 		}
 		out = append(out, m)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := c.attachAttachments(ctx, readDB, out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *chatStore) AddReaction(ctx context.Context, tenantID, roomID, messageID, userID, emoji string) error {
@@ -933,7 +1009,11 @@ func (c *chatStore) RemoveReaction(ctx context.Context, tenantID, roomID, messag
 	return err
 }
 
-func (c *chatStore) attachReactions(ctx context.Context, db *sql.DB, msgs []*Message) error {
+type rowQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+func (c *chatStore) attachReactions(ctx context.Context, db rowQueryer, msgs []*Message) error {
 	if len(msgs) == 0 {
 		return nil
 	}
@@ -998,6 +1078,120 @@ func (c *chatStore) attachReactions(ctx context.Context, db *sql.DB, msgs []*Mes
 		}
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------
+// Attachments
+// ---------------------------------------------------------------------
+
+const attachmentColumns = `id, tenant_id, room_id, message_id, uploader_id, blob_key, filename, mime_type, size_bytes, sha256_hex, created_at`
+
+func scanAttachment(row interface{ Scan(...any) error }) (*Attachment, error) {
+	var (
+		a     Attachment
+		msgID sql.NullString
+	)
+	if err := row.Scan(
+		&a.ID, &a.TenantID, &a.RoomID, &msgID, &a.UploaderID,
+		&a.BlobKey, &a.Filename, &a.MimeType, &a.SizeBytes, &a.SHA256Hex, &a.CreatedAt,
+	); err != nil {
+		return nil, err
+	}
+	a.MessageID = msgID.String
+	return &a, nil
+}
+
+func (c *chatStore) CreateAttachment(ctx context.Context, a *Attachment) error {
+	a.TenantID = normalizeTenant(a.TenantID)
+	if a.ID == "" {
+		a.ID = "att_" + uuid.Must(uuid.NewV7()).String()
+	}
+	if a.BlobKey == "" {
+		a.BlobKey = a.ID
+	}
+	if a.CreatedAt == 0 {
+		a.CreatedAt = nowMilli()
+	}
+	q := c.store.rebind(`
+		INSERT INTO attachments (id, tenant_id, room_id, message_id, uploader_id, blob_key, filename, mime_type, size_bytes, sha256_hex, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	_, err := c.store.db.ExecContext(ctx, q,
+		a.ID, a.TenantID, a.RoomID, nullString(a.MessageID), a.UploaderID,
+		a.BlobKey, a.Filename, a.MimeType, a.SizeBytes, a.SHA256Hex, a.CreatedAt,
+	)
+	return uniqueError(err)
+}
+
+func (c *chatStore) GetAttachment(ctx context.Context, tenantID, attachmentID string) (*Attachment, error) {
+	tenantID = normalizeTenant(tenantID)
+	q := c.store.rebind(`SELECT ` + attachmentColumns + ` FROM attachments WHERE tenant_id = ? AND id = ?`)
+	a, err := scanAttachment(c.store.db.QueryRowContext(ctx, q, tenantID, attachmentID))
+	if errorsIs(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return a, err
+}
+
+func (c *chatStore) ListMessageAttachments(ctx context.Context, tenantID, roomID, messageID string) ([]Attachment, error) {
+	tenantID = normalizeTenant(tenantID)
+	q := c.store.rebind(`SELECT ` + attachmentColumns + ` FROM attachments WHERE tenant_id = ? AND room_id = ? AND message_id = ? ORDER BY created_at ASC, id ASC`)
+	rows, err := c.store.db.QueryContext(ctx, q, tenantID, roomID, messageID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]Attachment, 0)
+	for rows.Next() {
+		a, err := scanAttachment(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *a)
+	}
+	return out, rows.Err()
+}
+
+func (c *chatStore) DeleteAttachment(ctx context.Context, tenantID, attachmentID string) error {
+	tenantID = normalizeTenant(tenantID)
+	q := c.store.rebind(`DELETE FROM attachments WHERE tenant_id = ? AND id = ?`)
+	_, err := c.store.db.ExecContext(ctx, q, tenantID, attachmentID)
+	return err
+}
+
+func (c *chatStore) attachAttachments(ctx context.Context, db rowQueryer, msgs []*Message) error {
+	if len(msgs) == 0 {
+		return nil
+	}
+	byID := make(map[string]*Message, len(msgs))
+	placeholders := make([]string, len(msgs))
+	args := make([]any, len(msgs))
+	for i, m := range msgs {
+		byID[m.ID] = m
+		placeholders[i] = "?"
+		args[i] = m.ID
+	}
+
+	sqlText := fmt.Sprintf(
+		`SELECT `+attachmentColumns+` FROM attachments WHERE message_id IN (%s) ORDER BY created_at ASC, id ASC`,
+		strings.Join(placeholders, ","),
+	)
+	rows, err := db.QueryContext(ctx, c.store.rebind(sqlText), args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		a, err := scanAttachment(rows)
+		if err != nil {
+			return err
+		}
+		if m := byID[a.MessageID]; m != nil {
+			m.Attachments = append(m.Attachments, *a)
+		}
+	}
+	return rows.Err()
 }
 
 // ---------------------------------------------------------------------

@@ -21,15 +21,28 @@ import (
 
 // Config encapsulates all runtime configuration for KyMessages.
 type Config struct {
-	InstallerSSO *applysetup.SSO `json:"-"`
-	Server       ServerConfig    `json:"server"`
-	Database     DatabaseConfig  `json:"database"`
-	Security     SecurityConfig  `json:"security"`
-	SSO          SSOConfig       `json:"sso"`
-	SCIM         SCIMConfig      `json:"scim"`
-	Backup       BackupConfig    `json:"backup"`
-	Captcha      CaptchaConfig   `json:"captcha"`
-	RTC          RTCConfig       `json:"rtc"`
+	InstallerSSO *applysetup.SSO   `json:"-"`
+	Server       ServerConfig      `json:"server"`
+	Database     DatabaseConfig    `json:"database"`
+	Security     SecurityConfig    `json:"security"`
+	SSO          SSOConfig         `json:"sso"`
+	SCIM         SCIMConfig        `json:"scim"`
+	Backup       BackupConfig      `json:"backup"`
+	Captcha      CaptchaConfig     `json:"captcha"`
+	RTC          RTCConfig         `json:"rtc"`
+	Attachments  AttachmentsConfig `json:"attachments"`
+}
+
+// DefaultMaxUploadBytes is the default per-attachment upload size limit (25 MiB).
+const DefaultMaxUploadBytes int64 = 25 << 20
+
+// MaxAllowedUploadBytes caps KY_MAX_UPLOAD_BYTES at 100 MiB so single uploads stay bounded.
+const MaxAllowedUploadBytes int64 = 100 << 20
+
+// AttachmentsConfig configures local blob storage for chat file and image attachments.
+type AttachmentsConfig struct {
+	Dir            string `json:"dir"`
+	MaxUploadBytes int64  `json:"max_upload_bytes"`
 }
 
 // RTCConfig holds native hybrid P2P + LiveKit SFU calling and KyCalendar meeting settings.
@@ -268,6 +281,17 @@ func LoadFromEnv() (*Config, error) {
 			DifficultyPoW: getEnvInt("KY_CAPTCHA_POW_DIFFICULTY", 50000),
 		},
 		RTC: rtcCfg,
+		Attachments: AttachmentsConfig{
+			Dir:            getEnv("KY_ATTACHMENTS_DIR", filepath.Join(dataDir, "attachments")),
+			MaxUploadBytes: DefaultMaxUploadBytes,
+		},
+	}
+	if rawMax := strings.TrimSpace(os.Getenv("KY_MAX_UPLOAD_BYTES")); rawMax != "" {
+		n, err := strconv.ParseInt(rawMax, 10, 64)
+		if err != nil || n < 1024 || n > MaxAllowedUploadBytes {
+			return nil, fmt.Errorf("KY_MAX_UPLOAD_BYTES: must be between 1024 and %d bytes", MaxAllowedUploadBytes)
+		}
+		cfg.Attachments.MaxUploadBytes = n
 	}
 	// Login verifies only proof-of-work. Accepting another name would silently disable it.
 	if p := cfg.Captcha.Provider; p != "pow" && p != "none" {

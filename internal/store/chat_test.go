@@ -282,3 +282,128 @@ func TestChatStoreSearchAndWebhooks(t *testing.T) {
 		t.Fatalf("ListRoomWebhooks after revoke = (%d, %v), want 0", len(listAfter), err)
 	}
 }
+
+func TestChatStoreAttachments(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	chat := st.Chat()
+
+	roomA := &store.Room{Kind: store.RoomKindChannel, Name: "design", CreatedBy: "u_alice"}
+	if err := chat.CreateRoom(ctx, roomA, []string{"u_alice", "u_bob"}); err != nil {
+		t.Fatal(err)
+	}
+	roomB := &store.Room{Kind: store.RoomKindChannel, Name: "other", CreatedBy: "u_alice"}
+	if err := chat.CreateRoom(ctx, roomB, []string{"u_alice"}); err != nil {
+		t.Fatal(err)
+	}
+
+	attA := &store.Attachment{
+		RoomID:     roomA.ID,
+		UploaderID: "u_alice",
+		Filename:   "diagram.png",
+		MimeType:   "image/png",
+		SizeBytes:  1024,
+		SHA256Hex:  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	}
+	if err := chat.CreateAttachment(ctx, attA); err != nil {
+		t.Fatalf("CreateAttachment: %v", err)
+	}
+	if attA.ID == "" || attA.BlobKey == "" || attA.CreatedAt == 0 {
+		t.Fatalf("CreateAttachment did not populate defaults: %+v", attA)
+	}
+
+	// Bob cannot hijack Alice's staged attachment into his message.
+	if _, _, err := chat.CreateMessage(ctx, store.CreateMessageParams{
+		RoomID:        roomA.ID,
+		SenderID:      "u_bob",
+		Body:          "stealing file",
+		AttachmentIDs: []string{attA.ID},
+	}); !errors.Is(err, store.ErrAttachmentInvalid) {
+		t.Fatalf("cross-uploader CreateMessage = %v, want ErrAttachmentInvalid", err)
+	}
+
+	// Alice cannot attach roomA's upload to a message in roomB.
+	if _, _, err := chat.CreateMessage(ctx, store.CreateMessageParams{
+		RoomID:        roomB.ID,
+		SenderID:      "u_alice",
+		Body:          "wrong room",
+		AttachmentIDs: []string{attA.ID},
+	}); !errors.Is(err, store.ErrAttachmentInvalid) {
+		t.Fatalf("cross-room CreateMessage = %v, want ErrAttachmentInvalid", err)
+	}
+
+	// Rolled-back failures must not consume room sequence numbers.
+	roomSnapshot, err := chat.GetRoom(ctx, store.DefaultTenantID, roomA.ID)
+	if err != nil || roomSnapshot.LastSeq != 0 {
+		t.Fatalf("roomA LastSeq after rollback = (%+v, %v), want 0", roomSnapshot, err)
+	}
+
+	// Valid attachment-only message with idempotency key.
+	msg, created, err := chat.CreateMessage(ctx, store.CreateMessageParams{
+		RoomID:         roomA.ID,
+		SenderID:       "u_alice",
+		SenderName:     "Alice",
+		Body:           "architecture sketch",
+		IdempotencyKey: "att-idem-1",
+		AttachmentIDs:  []string{attA.ID, attA.ID}, // duplicates deduplicated
+	})
+	if err != nil || !created || len(msg.Attachments) != 1 || msg.Attachments[0].ID != attA.ID {
+		t.Fatalf("CreateMessage with attachment = (%+v, created=%v, err=%v)", msg, created, err)
+	}
+	if msg.Attachments[0].MessageID != msg.ID {
+		t.Errorf("linked attachment MessageID = %q, want %q", msg.Attachments[0].MessageID, msg.ID)
+	}
+
+	// Idempotency retry returns the same message with hydrated attachments.
+	dup, createdDup, err := chat.CreateMessage(ctx, store.CreateMessageParams{
+		RoomID:         roomA.ID,
+		SenderID:       "u_alice",
+		Body:           "architecture sketch",
+		IdempotencyKey: "att-idem-1",
+		AttachmentIDs:  []string{attA.ID},
+	})
+	if err != nil || createdDup || dup.ID != msg.ID || len(dup.Attachments) != 1 {
+		t.Fatalf("idempotency retry = (%+v, created=%v, err=%v)", dup, createdDup, err)
+	}
+
+	// Cannot re-attach an already linked attachment to a second message.
+	if _, _, err := chat.CreateMessage(ctx, store.CreateMessageParams{
+		RoomID:        roomA.ID,
+		SenderID:      "u_alice",
+		Body:          "reuse attempt",
+		AttachmentIDs: []string{attA.ID},
+	}); !errors.Is(err, store.ErrAttachmentInvalid) {
+		t.Fatalf("reuse attachment CreateMessage = %v, want ErrAttachmentInvalid", err)
+	}
+
+	// ListMessages, GetMessage, EditMessage, and SearchMessages all hydrate attachments.
+	listed, _, err := chat.ListMessages(ctx, store.MessagePageQuery{RoomID: roomA.ID, Limit: 10})
+	if err != nil || len(listed) != 1 || len(listed[0].Attachments) != 1 {
+		t.Fatalf("ListMessages = (%+v, %v)", listed, err)
+	}
+	fetched, err := chat.GetMessage(ctx, store.DefaultTenantID, roomA.ID, msg.ID)
+	if err != nil || len(fetched.Attachments) != 1 {
+		t.Fatalf("GetMessage = (%+v, %v)", fetched, err)
+	}
+	edited, err := chat.EditMessage(ctx, store.DefaultTenantID, roomA.ID, msg.ID, "u_alice", "updated sketch caption")
+	if err != nil || len(edited.Attachments) != 1 {
+		t.Fatalf("EditMessage = (%+v, %v)", edited, err)
+	}
+	hits, err := chat.SearchMessages(ctx, store.DefaultTenantID, "u_bob", roomA.ID, "sketch", 10)
+	if err != nil || len(hits) != 1 || len(hits[0].Attachments) != 1 {
+		t.Fatalf("SearchMessages = (%+v, %v)", hits, err)
+	}
+
+	// Deleting the message clears linked attachment rows.
+	linked, err := chat.ListMessageAttachments(ctx, store.DefaultTenantID, roomA.ID, msg.ID)
+	if err != nil || len(linked) != 1 {
+		t.Fatalf("ListMessageAttachments = (%+v, %v)", linked, err)
+	}
+	deleted, err := chat.DeleteMessage(ctx, store.DefaultTenantID, roomA.ID, msg.ID, "u_alice", false)
+	if err != nil || len(deleted.Attachments) != 0 {
+		t.Fatalf("DeleteMessage = (%+v, %v)", deleted, err)
+	}
+	if _, err := chat.GetAttachment(ctx, store.DefaultTenantID, attA.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("GetAttachment after DeleteMessage = %v, want ErrNotFound", err)
+	}
+}
