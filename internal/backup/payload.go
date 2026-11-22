@@ -14,7 +14,6 @@ import (
 	"github.com/Busnes-app/ky-primitives/applysetup"
 	"github.com/Busnes-app/ky-primitives/capsule"
 	"github.com/Busnes-app/ky-primitives/recoveryclient"
-	"github.com/Busnes-app/ky_server_base/internal/blobs"
 	"github.com/Busnes-app/ky_server_base/internal/config"
 	_ "modernc.org/sqlite"
 )
@@ -32,11 +31,13 @@ const recoveryPubPath = "data/recovery.pub"
 var ErrNoDatabaseSnapshot = errors.New("backup: no consistent database snapshot for this driver")
 
 // Collect assembles the payload every sealing caller uses: the local application files
-// (SQLite database containing native chat rooms, messages, calls, webhooks, bots/agents,
-// users, settings, and audit log; attachment blobs; plus server configuration) and the secrets
-// that may only ever travel inside a sealed capsule (the encryption key, the pinned recovery
-// public key, and managed installer credentials). Nothing returned from here may leave the
-// process except through a Sealer. A payload past the expanded limit returns *SizeError.
+// (SQLite database containing native chat rooms, messages, attachment references, calls,
+// webhooks, bots/agents, users, settings, and audit log; plus server configuration) and the
+// secrets that may only ever travel inside a sealed capsule (the encryption key, the pinned
+// recovery public key, the attachment mirror key when present, and managed installer
+// credentials). Attachment blobs are mirrored separately via MirrorAttachments so uploads
+// never consume the capsule budget. Nothing returned from here may leave the process except
+// through a Sealer. A payload past the expanded limit returns *SizeError.
 func Collect(ctx context.Context, cfg *config.Config, appVersion string) (recoveryclient.Payload, error) {
 	if strings.ToLower(cfg.Database.Driver) != "sqlite" {
 		return recoveryclient.Payload{}, fmt.Errorf("%w: %s", ErrNoDatabaseSnapshot, cfg.Database.Driver)
@@ -67,6 +68,17 @@ func Collect(ctx context.Context, cfg *config.Config, appVersion string) (recove
 	if pub, err := os.ReadFile(recoveryclient.RecoveryKeyPath(cfg.Database.DataDir)); err == nil {
 		files = append(files, recoveryclient.File{Path: recoveryPubPath, Data: pub, Mode: 0600})
 	}
+	if attachmentKeyNeeded(cfg) {
+		key, err := EnsureAttachmentKey(cfg.Database.DataDir)
+		if err != nil {
+			return recoveryclient.Payload{}, err
+		}
+		files = append(files, recoveryclient.File{
+			Path: AttachmentKeyPath,
+			Data: []byte(hex.EncodeToString(key) + "\n"),
+			Mode: 0600,
+		})
+	}
 	if managed := cfg.InstallerSSO; managed != nil {
 		paths := map[string]string{}
 		for name, path := range map[string]string{"installer/client.secret": managed.ClientSecretFile, "installer/directory.secret": managed.DirectorySecretFile} {
@@ -87,11 +99,6 @@ func Collect(ctx context.Context, cfg *config.Config, appVersion string) (recove
 	if err := b.err(); err != nil {
 		return recoveryclient.Payload{}, err
 	}
-	attFiles, err := collectAttachments(attachmentsDir(cfg), &b)
-	if err != nil {
-		return recoveryclient.Payload{}, err
-	}
-	files = append(files, attFiles...)
 	recipe := map[string]any{
 		"check_sqlite_integrity": true,
 		"sqlite_paths":           sqlitePaths,
@@ -186,69 +193,14 @@ func attachmentsDir(cfg *config.Config) string {
 	return filepath.Join(cfg.Database.DataDir, "attachments")
 }
 
-// collectAttachments packs regular, non-empty attachment blobs into data/attachments/<key>,
-// checking the capsule size budget before loading each blob into memory.
-func collectAttachments(dir string, b *budget) ([]recoveryclient.File, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("backup: read attachments directory: %w", err)
-	}
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("backup: open attachments root: %w", err)
-	}
-	defer root.Close()
-
-	out := make([]recoveryclient.File, 0, len(entries))
-	for _, entry := range entries {
-		name := entry.Name()
-		if !blobs.ValidKey(name) || !entry.Type().IsRegular() {
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 {
-			continue
-		}
-		rel := "data/attachments/" + name
-		b.add(rel, info.Size())
-		if err := b.err(); err != nil {
-			return nil, err
-		}
-		data, err := root.ReadFile(name)
-		if err != nil {
-			return nil, fmt.Errorf("backup: read attachment %s: %w", name, err)
-		}
-		if len(data) == 0 {
-			continue
-		}
-		out = append(out, recoveryclient.File{
-			Path: rel,
-			Data: data,
-			Mode: 0600,
-		})
-	}
-	return out, nil
-}
-
 // Members names what a capsule carries, for the screen; it is what Collect would seal now.
 func Members(cfg *config.Config) []string {
 	m := []string{"data/ky_server.db", "config/settings.json", encryptionKeyPath}
 	if _, err := os.Stat(recoveryclient.RecoveryKeyPath(cfg.Database.DataDir)); err == nil {
 		m = append(m, recoveryPubPath)
 	}
-	if entries, err := os.ReadDir(attachmentsDir(cfg)); err == nil {
-		for _, e := range entries {
-			if blobs.ValidKey(e.Name()) && e.Type().IsRegular() {
-				m = append(m, "data/attachments/")
-				break
-			}
-		}
+	if attachmentKeyNeeded(cfg) {
+		m = append(m, AttachmentKeyPath)
 	}
 	if cfg.InstallerSSO != nil {
 		m = append(m, "installer/client.secret", "installer/directory.secret", "installer/credential-paths.json")

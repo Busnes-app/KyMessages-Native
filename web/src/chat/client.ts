@@ -168,6 +168,16 @@ export async function uploadAttachment(roomId: string, file: File): Promise<Chat
   return parseAttachment(data.attachment);
 }
 
+export async function deleteAttachment(attachmentId: string): Promise<void> {
+  const res = await secureFetch(`/api/v1/attachments/${encodeURIComponent(attachmentId)}`, {
+    method: 'DELETE',
+    credentials: 'same-origin',
+  });
+  if (!res.ok && res.status !== 404) {
+    throw new Error(await errorMessage(res, 'Could not remove attachment'));
+  }
+}
+
 export async function sendMessage(params: {
   roomId: string;
   body: string;

@@ -42,6 +42,7 @@ import {
   leaveRoomCall,
   markRoomRead,
   newIdempotencyKey,
+  deleteAttachment,
   openDirectMessage,
   sendMessage,
   setReaction,
@@ -1000,6 +1001,12 @@ export const Chat: React.FC<ChatProps> = ({
 
   const removeStagedAttachment = useCallback(
     (roomId: string, localId: string) => {
+      const existing = (stagedByRoomRef.current[roomId] ?? []).find((item) => item.localId === localId);
+      if (existing && existing.kind === 'ready') {
+        void deleteAttachment(existing.attachment.id).catch(() => {
+          // Best-effort cleanup; orphan sweep also expires abandoned uploads.
+        });
+      }
       setStagedByRoom((prev) => {
         const current = prev[roomId] ?? [];
         const target = current.find((item) => item.localId === localId);

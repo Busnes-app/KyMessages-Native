@@ -353,6 +353,13 @@ func (s *Server) handleRunBackup(w http.ResponseWriter, r *http.Request) {
 		res, err = recoveryclient.Run(ctx, rc, settings, func() (recoveryclient.Payload, error) {
 			return backup.CollectForRun(ctx, s.config, settings, appVersion)
 		}, s.recovery)
+		if err == nil {
+			if mres, merr := backup.MirrorAttachments(ctx, s.config); merr != nil {
+				log.Printf("[BACKUP] attachment mirror sync warning: %s", recoveryclient.AuditSafe(merr.Error()))
+			} else if mres.Copied > 0 || mres.Pruned > 0 {
+				log.Printf("[BACKUP] attachment mirror synced: copied=%d skipped=%d pruned=%d", mres.Copied, mres.Skipped, mres.Pruned)
+			}
+		}
 		unlock()
 	}
 

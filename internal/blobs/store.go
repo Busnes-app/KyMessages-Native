@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -181,6 +182,35 @@ func (s *Store) Delete(key string) error {
 		return nil
 	}
 	return err
+}
+
+// SweepStaleTemps removes crashed .upload-* temp files older than olderThan inside the store.
+func (s *Store) SweepStaleTemps(olderThan time.Duration) int {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return 0
+	}
+	root, err := os.OpenRoot(s.dir)
+	if err != nil {
+		return 0
+	}
+	defer root.Close()
+	cutoff := time.Now().Add(-olderThan)
+	removed := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, ".upload-") || !entry.Type().IsRegular() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		if err := root.Remove(name); err == nil {
+			removed++
+		}
+	}
+	return removed
 }
 
 // IsInlineSafeImage reports whether mimeType is a verified raster image format safe to render

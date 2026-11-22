@@ -2,6 +2,7 @@ package api_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"image"
 	"image/color"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Busnes-app/ky_server_base/internal/api"
 	"github.com/Busnes-app/ky_server_base/internal/store"
@@ -285,5 +287,135 @@ func TestChatAttachmentsXSSDowngradeAndMaxUploadCap(t *testing.T) {
 	}
 	if got := recInlineSVG.Header().Get("Content-Disposition"); !strings.HasPrefix(got, "attachment;") {
 		t.Errorf("svg Content-Disposition = %q, want attachment (never inline)", got)
+	}
+}
+
+func TestChatAttachmentQuotasDeleteAndOrphanSweep(t *testing.T) {
+	_, st, cfg := setupTestServer(t)
+	cfg.Attachments.MaxUploadBytes = 2048
+	cfg.Attachments.MaxPendingUserBytes = 2500
+	cfg.Attachments.MaxTotalBytes = 3500
+	cfg.Attachments.PendingTTL = time.Hour
+	srv := api.NewServer(cfg, st)
+	startChatBus(t, srv)
+	defer srv.CloseChat()
+
+	_, aliceTok := createChatTestUser(t, st, "u_q_alice", "qalice", "user")
+	_, bobTok := createChatTestUser(t, st, "u_q_bob", "qbob", "user")
+
+	rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", aliceTok, map[string]any{
+		"kind": store.RoomKindChannel,
+		"name": "quota-room",
+	}, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create room = %d", rec.Code)
+	}
+	var roomResp struct {
+		Room store.Room `json:"room"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &roomResp)
+	roomID := roomResp.Room.ID
+
+	if r := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+roomID+"/members", aliceTok, map[string]any{
+		"user_id": "u_q_bob",
+	}, nil); r.Code != http.StatusCreated {
+		t.Fatalf("add bob = %d", r.Code)
+	}
+
+	// 1. Alice stages 1800 bytes (under 2500 pending quota).
+	up1 := doMultipartUpload(t, srv, "/api/v1/rooms/"+roomID+"/attachments", aliceTok, "file", "a.txt", bytes.Repeat([]byte("a"), 1800))
+	if up1.Code != http.StatusCreated {
+		t.Fatalf("upload 1 = %d: %s", up1.Code, up1.Body.String())
+	}
+	var att1Resp struct {
+		Attachment store.Attachment `json:"attachment"`
+	}
+	_ = json.Unmarshal(up1.Body.Bytes(), &att1Resp)
+
+	// 2. Alice attempting another 1000 bytes exceeds her 2500-byte pending quota (413).
+	upOverPending := doMultipartUpload(t, srv, "/api/v1/rooms/"+roomID+"/attachments", aliceTok, "file", "b.txt", bytes.Repeat([]byte("b"), 1000))
+	if upOverPending.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("over pending quota = %d, want 413: %s", upOverPending.Code, upOverPending.Body.String())
+	}
+
+	// 3. Bob cannot delete Alice's staged attachment (404).
+	reqBobDel := httptest.NewRequest(http.MethodDelete, "/api/v1/attachments/"+att1Resp.Attachment.ID, nil)
+	reqBobDel.Header.Set("Authorization", "Bearer "+bobTok)
+	recBobDel := httptest.NewRecorder()
+	srv.ServeHTTP(recBobDel, reqBobDel)
+	if recBobDel.Code != http.StatusNotFound {
+		t.Fatalf("bob delete alice staged = %d, want 404", recBobDel.Code)
+	}
+
+	// 4. Alice deletes her staged attachment (204), freeing both DB row and disk blob.
+	reqAliceDel := httptest.NewRequest(http.MethodDelete, "/api/v1/attachments/"+att1Resp.Attachment.ID, nil)
+	reqAliceDel.Header.Set("Authorization", "Bearer "+aliceTok)
+	recAliceDel := httptest.NewRecorder()
+	srv.ServeHTTP(recAliceDel, reqAliceDel)
+	if recAliceDel.Code != http.StatusNoContent {
+		t.Fatalf("alice delete staged = %d, want 204: %s", recAliceDel.Code, recAliceDel.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(cfg.Attachments.Dir, att1Resp.Attachment.ID)); !os.IsNotExist(err) {
+		t.Fatal("deleted staged blob still exists on disk")
+	}
+
+	// 5. Alice uploads 1800 bytes again and links it to a message; trying to DELETE a linked
+	// attachment must return 409 Conflict.
+	upLinked := doMultipartUpload(t, srv, "/api/v1/rooms/"+roomID+"/attachments", aliceTok, "file", "linked.txt", bytes.Repeat([]byte("c"), 1800))
+	if upLinked.Code != http.StatusCreated {
+		t.Fatalf("upload linked = %d", upLinked.Code)
+	}
+	var linkedResp struct {
+		Attachment store.Attachment `json:"attachment"`
+	}
+	_ = json.Unmarshal(upLinked.Body.Bytes(), &linkedResp)
+
+	sendRec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+roomID+"/messages", aliceTok, map[string]any{
+		"body":           "attached",
+		"attachment_ids": []string{linkedResp.Attachment.ID},
+	}, map[string]string{"Idempotency-Key": "idem-quota-1"})
+	if sendRec.Code != http.StatusCreated {
+		t.Fatalf("send linked message = %d: %s", sendRec.Code, sendRec.Body.String())
+	}
+
+	reqDelLinked := httptest.NewRequest(http.MethodDelete, "/api/v1/attachments/"+linkedResp.Attachment.ID, nil)
+	reqDelLinked.Header.Set("Authorization", "Bearer "+aliceTok)
+	recDelLinked := httptest.NewRecorder()
+	srv.ServeHTTP(recDelLinked, reqDelLinked)
+	if recDelLinked.Code != http.StatusConflict {
+		t.Fatalf("delete linked attachment = %d, want 409", recDelLinked.Code)
+	}
+
+	// 6. Total tenant storage is 1800/3500. Bob uploading 1800 bytes exceeds tenant total quota (413).
+	upOverTotal := doMultipartUpload(t, srv, "/api/v1/rooms/"+roomID+"/attachments", bobTok, "file", "overtotal.txt", bytes.Repeat([]byte("d"), 1800))
+	if upOverTotal.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("over tenant total quota = %d, want 413: %s", upOverTotal.Code, upOverTotal.Body.String())
+	}
+
+	// 7. Bob stages 1000 bytes (fits within remaining 1700 bytes). Sweeping with now + 2h
+	// expires Bob's abandoned staged upload (DB + disk) while keeping Alice's linked blob!
+	upOrphan := doMultipartUpload(t, srv, "/api/v1/rooms/"+roomID+"/attachments", bobTok, "file", "orphan.txt", bytes.Repeat([]byte("e"), 1000))
+	if upOrphan.Code != http.StatusCreated {
+		t.Fatalf("upload orphan = %d: %s", upOrphan.Code, upOrphan.Body.String())
+	}
+	var orphanResp struct {
+		Attachment store.Attachment `json:"attachment"`
+	}
+	_ = json.Unmarshal(upOrphan.Body.Bytes(), &orphanResp)
+
+	// Immediate sweep (now) must keep fresh staged upload.
+	if n, err := srv.SweepOrphanAttachments(context.Background(), time.Now()); err != nil || n != 0 {
+		t.Fatalf("immediate sweep = (%d, %v), want (0, nil)", n, err)
+	}
+
+	// Sweep 2 hours later purges the expired staged upload and removes its blob from disk.
+	if n, err := srv.SweepOrphanAttachments(context.Background(), time.Now().Add(2*time.Hour)); err != nil || n != 1 {
+		t.Fatalf("future sweep = (%d, %v), want (1, nil)", n, err)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.Attachments.Dir, orphanResp.Attachment.ID)); !os.IsNotExist(err) {
+		t.Fatal("expired orphan blob still exists on disk")
+	}
+	if _, err := os.Stat(filepath.Join(cfg.Attachments.Dir, linkedResp.Attachment.ID)); err != nil {
+		t.Fatalf("linked attachment blob should survive orphan sweep: %v", err)
 	}
 }

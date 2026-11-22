@@ -54,6 +54,9 @@ func main() {
 		case "restore":
 			runRestore(os.Args[2:])
 			return
+		case "restore-attachments":
+			runRestoreAttachments(os.Args[2:])
+			return
 		case "version":
 			fmt.Printf("kymessages %s\n", appVersion)
 			return
@@ -114,9 +117,12 @@ func runServer() {
 	go func() {
 		agentsDone := make(chan struct{})
 		go agentExpiryLoop(ctx, srv.ExpireIdleAgents, agentsDone)
+		attachmentsDone := make(chan struct{})
+		go attachmentSweepLoop(ctx, srv.SweepOrphanAttachments, attachmentsDone)
 		pairingsDone := make(chan struct{})
 		maintenanceLoop(ctx, st, pairingsDone)
 		<-agentsDone
+		<-attachmentsDone
 		close(maintenanceDone)
 	}()
 	backgroundDone := make(chan struct{})
@@ -276,6 +282,20 @@ func backupTick(ctx context.Context, cfg *config.Config, st store.Store, rc reco
 		return
 	}
 	recordRun(runCtx, st, "system", backupRunAction, res, err)
+	if err == nil {
+		mirrorAttachments(runCtx, cfg)
+	}
+}
+
+func mirrorAttachments(ctx context.Context, cfg *config.Config) {
+	mres, merr := backup.MirrorAttachments(ctx, cfg)
+	if merr != nil {
+		log.Printf("[BACKUP] attachment mirror sync warning: %s", recoveryclient.AuditSafe(merr.Error()))
+		return
+	}
+	if mres.Copied > 0 || mres.Pruned > 0 {
+		log.Printf("[BACKUP] attachment mirror synced: copied=%d skipped=%d pruned=%d", mres.Copied, mres.Skipped, mres.Pruned)
+	}
 }
 
 const (
@@ -340,6 +360,7 @@ func runDeposit(args []string) {
 	if err != nil {
 		log.Fatalf("Backup: %v", err)
 	}
+	mirrorAttachments(ctx, cfg)
 	if res.Receipt != nil {
 		log.Printf("✓ Capsule %s deposited at %s; digest %s", res.Manifest.CapsuleID, res.Receipt.DepositedAt.Format(time.RFC3339), res.Receipt.Digest)
 	}
@@ -660,4 +681,29 @@ func restoreCommand(args []string, run func(capsulePath, targetDir, expectServic
 	if err := run(*capsulePath, *target, *service, shares, os.Stdout); err != nil {
 		log.Fatalf("restore failed: %v", err)
 	}
+}
+
+func runRestoreAttachments(args []string) {
+	fs := flag.NewFlagSet("restore-attachments", flag.ExitOnError)
+	mirrorDir := fs.String("mirror", "", "path to the encrypted attachment mirror directory (<KY_BACKUP_DIR>/attachments)")
+	dataDir := fs.String("data-dir", "", "path to the restored data directory containing attachments.key")
+	targetDir := fs.String("to", "", "target attachments directory (KY_ATTACHMENTS_DIR)")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: kymessages restore-attachments -mirror <dir> -data-dir <restored-data-dir> -to <attachments-dir>\n\n")
+		fs.PrintDefaults()
+	}
+	_ = fs.Parse(args)
+	if *mirrorDir == "" || *dataDir == "" || *targetDir == "" {
+		fs.Usage()
+		os.Exit(2)
+	}
+	key, err := backup.LoadAttachmentKey(*dataDir)
+	if err != nil {
+		log.Fatalf("restore-attachments: load key: %v", err)
+	}
+	count, err := backup.RestoreAttachments(*mirrorDir, *targetDir, key)
+	if err != nil {
+		log.Fatalf("restore-attachments failed: %v", err)
+	}
+	log.Printf("✓ Restored %d attachment blob(s) to %s", count, *targetDir)
 }

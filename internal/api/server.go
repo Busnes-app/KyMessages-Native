@@ -409,6 +409,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/v1/rooms/{id}/messages", s.requireAuthenticated(s.handleChatSendMessage))
 	s.mux.HandleFunc("POST /api/v1/rooms/{id}/attachments", s.requireAuthenticated(s.handleChatUploadAttachment))
 	s.mux.HandleFunc("GET /api/v1/attachments/{id}", s.requireAuthenticated(s.handleChatDownloadAttachment))
+	s.mux.HandleFunc("DELETE /api/v1/attachments/{id}", s.requireAuthenticated(s.handleChatDeleteAttachment))
 	s.mux.HandleFunc("PATCH /api/v1/rooms/{id}/messages/{mid}", s.requireAuthenticated(s.handleChatEditMessage))
 	s.mux.HandleFunc("DELETE /api/v1/rooms/{id}/messages/{mid}", s.requireAuthenticated(s.handleChatDeleteMessage))
 	s.mux.HandleFunc("PUT /api/v1/rooms/{id}/messages/{mid}/reactions/{emoji}", s.requireAuthenticated(s.handleChatAddReaction))

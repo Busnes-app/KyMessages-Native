@@ -218,6 +218,10 @@ type ChatStore interface {
 	GetAttachment(ctx context.Context, tenantID, attachmentID string) (*Attachment, error)
 	ListMessageAttachments(ctx context.Context, tenantID, roomID, messageID string) ([]Attachment, error)
 	DeleteAttachment(ctx context.Context, tenantID, attachmentID string) error
+	DeleteStagedAttachment(ctx context.Context, tenantID, attachmentID, uploaderID string) (string, error)
+	SumAttachmentBytesByTenant(ctx context.Context, tenantID string) (int64, error)
+	SumPendingAttachmentBytesByUploader(ctx context.Context, tenantID, uploaderID string) (int64, error)
+	PurgeOrphanAttachments(ctx context.Context, olderThanMilli int64, limit int) ([]string, error)
 
 	// Webhooks
 	CreateRoomWebhook(ctx context.Context, w *RoomWebhook) error

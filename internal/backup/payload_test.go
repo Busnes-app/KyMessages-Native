@@ -1,6 +1,7 @@
 package backup_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -183,51 +184,119 @@ func TestCollectSweepsStaleSnapshots(t *testing.T) {
 	}
 }
 
-func TestCollectCarriesAttachmentBlobs(t *testing.T) {
+func TestCollectIsolatesAttachmentsFromCapsuleBudget(t *testing.T) {
 	cfg, _ := payloadConfig(t)
-	attDir := filepath.Join(cfg.Database.DataDir, "attachments")
+	// Use a custom KY_ATTACHMENTS_DIR outside <DataDir>/attachments and a separate backup dir.
+	attDir := filepath.Join(t.TempDir(), "custom-attachments")
+	cfg.Attachments.Dir = attDir
+	cfg.Backup.Dir = filepath.Join(t.TempDir(), "backups")
 	if err := os.MkdirAll(attDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	wantKey := "att_019a0000-0000-7000-8000-000000000001"
-	wantBytes := []byte("hello attachment backup payload")
-	if err := os.WriteFile(filepath.Join(attDir, wantKey), wantBytes, 0o600); err != nil {
+
+	// Baseline capsule size (SQLite DB + config + keys) without attachments.
+	baseline, err := backup.Collect(context.Background(), cfg, "1.0.0")
+	if err != nil {
+		t.Fatalf("baseline Collect: %v", err)
+	}
+	var baseBytes int64
+	for _, f := range baseline.Files {
+		baseBytes += int64(len(f.Data))
+	}
+
+	// Shrink capsule expand limit so it comfortably fits DB + config + 65-byte attachment key,
+	// while staged attachment blobs far exceed the reduced capsule budget.
+	reducedLimit := baseBytes + 16*1024
+	defer backup.SetExpandLimitForTest(reducedLimit)()
+
+	blob1Key := "att_019a0000-0000-7000-8000-000000000001"
+	blob2Key := "att_019a0000-0000-7000-8000-000000000002"
+	blob1 := bytes.Repeat([]byte("A"), int(reducedLimit))
+	blob2 := bytes.Repeat([]byte("B"), int(reducedLimit))
+	if err := os.WriteFile(filepath.Join(attDir, blob1Key), blob1, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// Temp and empty files must be skipped so restore drills never fail on zero-byte files.
+	if err := os.WriteFile(filepath.Join(attDir, blob2Key), blob2, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Temp and empty files must be ignored by both Collect and MirrorAttachments.
 	if err := os.WriteFile(filepath.Join(attDir, ".upload-inprogress"), []byte("tmp"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(attDir, "att_019a0000-0000-7000-8000-000000000002"), nil, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(attDir, "att_019a0000-0000-7000-8000-000000000003"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
+	// Server database/config backup MUST succeed even though staged blobs exceed reducedLimit.
 	payload, err := backup.Collect(context.Background(), cfg, "1.0.0")
 	if err != nil {
-		t.Fatalf("Collect: %v", err)
+		t.Fatalf("Collect failed despite attachment isolation: %v", err)
 	}
-	wantRel := "data/attachments/" + wantKey
-	f := findFile(payload.Files, wantRel)
-	if f == nil {
-		t.Fatalf("payload missing %s", wantRel)
+	if findFile(payload.Files, "data/ky_server.db") == nil {
+		t.Fatal("payload missing data/ky_server.db")
 	}
-	if string(f.Data) != string(wantBytes) {
-		t.Errorf("blob data mismatch: got %q, want %q", f.Data, wantBytes)
+	if findFile(payload.Files, "config/settings.json") == nil {
+		t.Fatal("payload missing config/settings.json")
 	}
-	if f.Mode != 0600 {
-		t.Errorf("blob mode = %o, want 600", f.Mode)
+	keyFile := findFile(payload.Files, backup.AttachmentKeyPath)
+	if keyFile == nil {
+		t.Fatalf("payload missing %s", backup.AttachmentKeyPath)
 	}
-	if findFile(payload.Files, "data/attachments/.upload-inprogress") != nil {
-		t.Error("temp upload file should not be packed into capsule")
+	if keyFile.Mode != 0600 {
+		t.Errorf("attachment key mode = %o, want 600", keyFile.Mode)
 	}
-	if findFile(payload.Files, "data/attachments/att_019a0000-0000-7000-8000-000000000002") != nil {
-		t.Error("empty file should not be packed into capsule")
+	for _, f := range payload.Files {
+		if strings.HasPrefix(f.Path, "data/attachments/") {
+			t.Errorf("attachment blob %s should not be packed into server capsule", f.Path)
+		}
 	}
-	req, _ := payload.VerificationRecipe["required_files"].([]string)
-	if !slices.Contains(req, wantRel) {
-		t.Errorf("required_files missing %s: %v", wantRel, req)
+	if !slices.Contains(backup.Members(cfg), backup.AttachmentKeyPath) {
+		t.Errorf("backup.Members missing %s: %v", backup.AttachmentKeyPath, backup.Members(cfg))
 	}
-	if !slices.Contains(backup.Members(cfg), "data/attachments/") {
-		t.Errorf("backup.Members missing data/attachments/: %v", backup.Members(cfg))
+
+	// Blobs are preserved separately in the encrypted mirror.
+	mres, err := backup.MirrorAttachments(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("MirrorAttachments: %v", err)
+	}
+	if mres.Copied != 2 || mres.Skipped != 0 || mres.Pruned != 0 {
+		t.Fatalf("unexpected mirror result: %+v", mres)
+	}
+	mirrorDir := backup.AttachmentMirrorDir(cfg)
+	encBytes, err := os.ReadFile(filepath.Join(mirrorDir, blob1Key+".enc"))
+	if err != nil {
+		t.Fatalf("read mirrored blob: %v", err)
+	}
+	if bytes.Contains(encBytes, bytes.Repeat([]byte("A"), 64)) {
+		t.Fatal("mirrored attachment blob must be encrypted on disk, not plaintext")
+	}
+	if _, err := os.Stat(filepath.Join(mirrorDir, ".upload-inprogress.enc")); !os.IsNotExist(err) {
+		t.Fatal("temp upload file must not be mirrored")
+	}
+
+	// Restore into a fresh custom target directory using the key recovered from the capsule.
+	restoredDataDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(restoredDataDir, "attachments.key"), keyFile.Data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restoredKey, err := backup.LoadAttachmentKey(restoredDataDir)
+	if err != nil {
+		t.Fatalf("LoadAttachmentKey: %v", err)
+	}
+	restoredAttDir := filepath.Join(t.TempDir(), "restored-attachments")
+	count, err := backup.RestoreAttachments(mirrorDir, restoredAttDir, restoredKey)
+	if err != nil {
+		t.Fatalf("RestoreAttachments: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("restored count = %d, want 2", count)
+	}
+	got1, err := os.ReadFile(filepath.Join(restoredAttDir, blob1Key))
+	if err != nil || !bytes.Equal(got1, blob1) {
+		t.Fatalf("restored blob1 mismatch: err=%v len=%d", err, len(got1))
+	}
+	got2, err := os.ReadFile(filepath.Join(restoredAttDir, blob2Key))
+	if err != nil || !bytes.Equal(got2, blob2) {
+		t.Fatalf("restored blob2 mismatch: err=%v len=%d", err, len(got2))
 	}
 }

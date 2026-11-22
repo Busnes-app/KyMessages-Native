@@ -1159,6 +1159,126 @@ func (c *chatStore) DeleteAttachment(ctx context.Context, tenantID, attachmentID
 	return err
 }
 
+func (c *chatStore) DeleteStagedAttachment(ctx context.Context, tenantID, attachmentID, uploaderID string) (string, error) {
+	tenantID = normalizeTenant(tenantID)
+	tx, err := c.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var msgID sql.NullString
+	var owner, blobKey string
+	selQ := c.store.rebind(`SELECT message_id, uploader_id, blob_key FROM attachments WHERE tenant_id = ? AND id = ?`)
+	if err := tx.QueryRowContext(ctx, selQ, tenantID, attachmentID).Scan(&msgID, &owner, &blobKey); err != nil {
+		if errorsIs(err, sql.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", err
+	}
+	if owner != uploaderID {
+		return "", ErrNotFound
+	}
+	if msgID.Valid && msgID.String != "" {
+		return "", ErrAttachmentInvalid
+	}
+
+	delQ := c.store.rebind(`DELETE FROM attachments WHERE tenant_id = ? AND id = ? AND uploader_id = ? AND message_id IS NULL`)
+	res, err := tx.ExecContext(ctx, delQ, tenantID, attachmentID, uploaderID)
+	if err != nil {
+		return "", err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return "", err
+	}
+	if n == 0 {
+		return "", ErrAttachmentInvalid
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return blobKey, nil
+}
+
+func (c *chatStore) SumAttachmentBytesByTenant(ctx context.Context, tenantID string) (int64, error) {
+	tenantID = normalizeTenant(tenantID)
+	q := c.store.rebind(`SELECT COALESCE(SUM(size_bytes), 0) FROM attachments WHERE tenant_id = ?`)
+	var total int64
+	if err := c.store.db.QueryRowContext(ctx, q, tenantID).Scan(&total); err != nil {
+		return 0, err
+	}
+	return total, nil
+}
+
+func (c *chatStore) SumPendingAttachmentBytesByUploader(ctx context.Context, tenantID, uploaderID string) (int64, error) {
+	tenantID = normalizeTenant(tenantID)
+	q := c.store.rebind(`SELECT COALESCE(SUM(size_bytes), 0) FROM attachments WHERE tenant_id = ? AND uploader_id = ? AND message_id IS NULL`)
+	var total int64
+	if err := c.store.db.QueryRowContext(ctx, q, tenantID, uploaderID).Scan(&total); err != nil {
+		return 0, err
+	}
+	return total, nil
+}
+
+func (c *chatStore) PurgeOrphanAttachments(ctx context.Context, olderThanMilli int64, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	tx, err := c.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	selQ := c.store.rebind(`
+		SELECT id, blob_key FROM attachments
+		WHERE message_id IS NULL AND created_at < ?
+		ORDER BY created_at ASC, id ASC
+		LIMIT ?`)
+	rows, err := tx.QueryContext(ctx, selQ, olderThanMilli, limit)
+	if err != nil {
+		return nil, err
+	}
+	type candidate struct {
+		id      string
+		blobKey string
+	}
+	var candidates []candidate
+	for rows.Next() {
+		var item candidate
+		if err := rows.Scan(&item.id, &item.blobKey); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		candidates = append(candidates, item)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	_ = rows.Close()
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	delQ := c.store.rebind(`DELETE FROM attachments WHERE id = ? AND message_id IS NULL`)
+	deletedKeys := make([]string, 0, len(candidates))
+	for _, item := range candidates {
+		res, err := tx.ExecContext(ctx, delQ, item.id)
+		if err != nil {
+			return nil, err
+		}
+		if n, err := res.RowsAffected(); err == nil && n == 1 {
+			deletedKeys = append(deletedKeys, item.blobKey)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return deletedKeys, nil
+}
+
 func (c *chatStore) attachAttachments(ctx context.Context, db rowQueryer, msgs []*Message) error {
 	if len(msgs) == 0 {
 		return nil
