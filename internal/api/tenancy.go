@@ -12,7 +12,9 @@ import (
 )
 
 // EnsureTenancyMode locks the database's tenancy mode on first start and refuses to boot if an
-// existing database was initialized in a different mode (single vs. multi).
+// existing database was initialized in a different mode (single vs. multi). A database from
+// before the lock that has served chat is single-tenant: its accounts have no org, so locking
+// it to multi would shut every one of them out for good.
 func EnsureTenancyMode(ctx context.Context, st store.Store, cfg config.TenancyConfig) error {
 	if st == nil {
 		return nil
@@ -20,6 +22,15 @@ func EnsureTenancyMode(ctx context.Context, st store.Store, cfg config.TenancyCo
 	want := cfg.EffectiveMode()
 	stored, err := st.Settings().GetSetting(ctx, store.TenancyModeSettingKey)
 	if errors.Is(err, store.ErrNotFound) {
+		if want == config.TenancyMulti {
+			used, err := st.Chat().HasRooms(ctx)
+			if err != nil {
+				return fmt.Errorf("check for existing chat data: %w", err)
+			}
+			if used {
+				return fmt.Errorf("this database already holds single-tenant chat; refusing to lock it to KY_TENANCY_MODE=multi (start it with single, or use a fresh database)")
+			}
+		}
 		return st.Settings().SetSetting(ctx, store.TenancyModeSettingKey, want)
 	}
 	if err != nil {

@@ -96,14 +96,16 @@ func (c *chatStore) UpsertPushSubscription(ctx context.Context, sessionHash stri
 
 	switch {
 	case err == nil && existingTenant == tenantID && existingUser == sub.UserID:
+		// Re-registration refreshes created_at, so the per-user cap evicts abandoned browsers
+		// before one that keeps coming back.
 		out.ID = existingID
-		out.CreatedAt = existingCreated
+		out.CreatedAt = now
 		out.LastUsedAt = existingUsed
 		if _, err := tx.ExecContext(ctx, c.store.rebind(`
 			UPDATE push_subscriptions
-			SET p256dh = ?, auth_secret = ?, user_agent = ?
+			SET p256dh = ?, auth_secret = ?, user_agent = ?, created_at = ?
 			WHERE id = ?
-		`), out.P256DH, out.AuthSecret, out.UserAgent, out.ID); err != nil {
+		`), out.P256DH, out.AuthSecret, out.UserAgent, out.CreatedAt, out.ID); err != nil {
 			return nil, err
 		}
 	case err == nil || errors.Is(err, sql.ErrNoRows):

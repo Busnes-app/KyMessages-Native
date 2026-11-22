@@ -736,3 +736,28 @@ func TestMultiTenantStaleOrgLifecycleIsIgnored(t *testing.T) {
 		t.Fatalf("unsuspend after delete = %d, status %q, want deleted", code, status())
 	}
 }
+
+// Upgrading a used single-tenant database with KY_TENANCY_MODE=multi is refused without locking it.
+func TestEnsureTenancyModeRefusesMultiOnAUsedDatabase(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, testdb.Config(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if err := st.Users().CreateUser(ctx, &store.User{ID: "u_old", Username: "old", Role: "user", Status: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Chat().CreateRoom(ctx, &store.Room{Kind: store.RoomKindChannel, Name: "general", CreatedBy: "u_old"}, []string{"u_old"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := api.EnsureTenancyMode(ctx, st, config.TenancyConfig{Mode: config.TenancyMulti}); err == nil {
+		t.Fatal("a database that served single-tenant chat was locked to multi")
+	}
+	if _, err := st.Settings().GetSetting(ctx, store.TenancyModeSettingKey); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("refused multi boot still stored a mode: %v", err)
+	}
+	if err := api.EnsureTenancyMode(ctx, st, config.TenancyConfig{Mode: config.TenancySingle}); err != nil {
+		t.Fatalf("single boot after the refusal: %v", err)
+	}
+}

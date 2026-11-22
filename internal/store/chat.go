@@ -148,6 +148,16 @@ func (c *chatStore) SetTenantStatus(ctx context.Context, tenantID, status string
 	return oneRow(c.store.db.ExecContext(ctx, q, status, tenantID))
 }
 
+// HasRooms reports whether any room exists, in any tenant: a database that has served chat.
+func (c *chatStore) HasRooms(ctx context.Context) (bool, error) {
+	var one int
+	err := c.store.db.QueryRowContext(ctx, `SELECT 1 FROM rooms LIMIT 1`).Scan(&one)
+	if errorsIs(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 // ApplyTenantLifecycle sets an org's status from a KyIdentity lifecycle event carrying the org's
 // revision. Only a revision above the last applied one changes status, so a delayed event never
 // undoes a newer one; deletion applies whatever its revision and is never undone. It reports

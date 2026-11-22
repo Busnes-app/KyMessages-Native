@@ -39,6 +39,21 @@ export const App: React.FC = () => {
   const [settings, setSettings] = useState<SiteSettings | null>(null);
   const [activeCallSummary, setActiveCallSummary] = useState<ActiveCallSummary | null>(null);
 
+  // A notification click names a room: show Chat on it from any page. A mounted Chat also
+  // switches rooms itself; one still loading picks the room up from the hash.
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return;
+    const onSwMessage = (ev: MessageEvent) => {
+      const data: unknown = ev.data;
+      if (!data || typeof data !== 'object' || !('type' in data) || data.type !== 'kymessages.navigate') return;
+      if (!('roomId' in data) || typeof data.roomId !== 'string' || !data.roomId) return;
+      window.location.hash = `#room=${encodeURIComponent(data.roomId)}`;
+      setActiveTab('chat');
+    };
+    navigator.serviceWorker.addEventListener('message', onSwMessage);
+    return () => navigator.serviceWorker.removeEventListener('message', onSwMessage);
+  }, []);
+
   useEffect(() => {
     if (meetToken) {
       void fetch('/api/settings')

@@ -177,3 +177,38 @@ func TestUpdateRoomNotifyMode(t *testing.T) {
 		t.Fatalf("expected error for invalid notify mode")
 	}
 }
+
+// A browser that re-registers is the newest for the per-user cap, so an abandoned one goes first.
+func TestPushCapEvictsTheLeastRecentlyRegistered(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	u := &store.User{ID: "usr_push_cap", Username: "pushcap", Role: "user", Status: "active", CreatedAt: time.Now()}
+	if err := st.Users().CreateUser(ctx, u); err != nil {
+		t.Fatal(err)
+	}
+	sess := liveSession(t, st, u.ID)
+	register := func(ep string) {
+		t.Helper()
+		if _, err := st.Chat().UpsertPushSubscription(ctx, sess, &store.PushSubscription{
+			TenantID: store.DefaultTenantID, UserID: u.ID, Endpoint: "https://fcm.googleapis.com/fcm/send/" + ep, P256DH: "k", AuthSecret: "a",
+		}, 2); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	register("active")
+	register("abandoned")
+	register("active") // the active browser syncs on every load
+	register("new")
+	subs, err := st.Chat().ListPushSubscriptions(ctx, store.DefaultTenantID, u.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, s := range subs {
+		got[s.Endpoint[len("https://fcm.googleapis.com/fcm/send/"):]] = true
+	}
+	if len(subs) != 2 || !got["active"] || !got["new"] {
+		t.Fatalf("kept %v, want active and new", got)
+	}
+}

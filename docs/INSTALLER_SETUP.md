@@ -20,7 +20,8 @@ stored setup, so a conflicting environment override added later stops the server
 - `KY_BACKUP_DIR` is `/app/backups`, the container's writable backup location; a setup
   `backup.directory` must be `/app/backups` or omitted.
 - `KY_TENANCY_MODE` defaults to `single` for self-hosted installer deployments. If set to `multi`,
-  the database locks to multi-tenant mode on first boot, inbound SCIM is permanently disabled
+  the database locks to multi-tenant mode on first boot (a database that already holds
+  single-tenant chat is refused, so start it with `single`), inbound SCIM is permanently disabled
   (`/scim/v2/*` returns JSON 404), and every OIDC sign-in and directory webhook must carry a
   verified `org_id`. Set `KY_STAFF_ORG_ID` to KyIdentity's staff org: only its accounts may be
   administrators, and customer orgs have none.

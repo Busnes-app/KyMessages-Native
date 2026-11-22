@@ -109,3 +109,21 @@ it('keeps push on when the server refuses sign-out', async () => {
   await screen.findByRole('alert');
   expect(unsubscribeBrowserPush).not.toHaveBeenCalled();
 });
+
+it('opens Chat on the room a notification click names, from another page', async () => {
+  const listeners: Array<(ev: MessageEvent) => void> = [];
+  vi.stubGlobal('navigator', Object.assign(Object.create(navigator), {
+    serviceWorker: {
+      addEventListener: (_: string, fn: (ev: MessageEvent) => void) => listeners.push(fn),
+      removeEventListener: () => {},
+    },
+  }));
+  stubServer(async () => json({ logged_out: true }));
+  render(<App />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
+  await screen.findByRole('heading', { name: 'Preferences' });
+  for (const fn of listeners) fn(new MessageEvent('message', { data: { type: 'kymessages.navigate', roomId: 'rm 1' } }));
+  expect(await screen.findByRole('button', { name: 'Settings' })).toBeTruthy();
+  expect(screen.queryByRole('heading', { name: 'Preferences' })).toBeNull();
+  expect(window.location.hash).toBe('#room=rm%201');
+});
