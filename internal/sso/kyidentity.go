@@ -23,10 +23,10 @@ import (
 
 // KyIdentityClient manages interactions with the suite KyIdentity identity provider.
 type KyIdentityClient struct {
-	config      config.SSOConfig
-	store       store.Store
-	flow        *oauthFlow
-	multiTenant bool
+	config  config.SSOConfig
+	store   store.Store
+	flow    *oauthFlow
+	tenancy config.TenancyConfig
 
 	// syncMu applies directory updates one at a time, so a read and its conditional write
 	// see the same row. Ordering itself is persisted per subject (directory_sync_state).
@@ -35,6 +35,8 @@ type KyIdentityClient struct {
 	rejects rejectCounter
 	// onUserRevoked fires after a user's sessions are revoked (deactivation, role change, deletion).
 	onUserRevoked func(ctx context.Context, userID string)
+	// onTenantRevoked fires when an org is suspended or deleted, before its members are revoked.
+	onTenantRevoked func(ctx context.Context, orgID string)
 }
 
 func NewKyIdentityClient(cfg config.SSOConfig, st store.Store) *KyIdentityClient {
@@ -45,9 +47,15 @@ func NewKyIdentityClient(cfg config.SSOConfig, st store.Store) *KyIdentityClient
 	}
 }
 
-// SetMultiTenant enables or disables strict org_id binding on directory webhooks.
-func (k *KyIdentityClient) SetMultiTenant(enabled bool) {
-	k.multiTenant = enabled
+// SetTenancy enables strict org_id binding on directory webhooks in multi-tenant mode, and
+// limits the admin role to the staff org.
+func (k *KyIdentityClient) SetTenancy(t config.TenancyConfig) {
+	k.tenancy = t
+}
+
+// OnTenantRevoked registers a callback invoked when an org is suspended or deleted.
+func (k *KyIdentityClient) OnTenantRevoked(fn func(ctx context.Context, orgID string)) {
+	k.onTenantRevoked = fn
 }
 
 // OnUserRevoked registers a callback invoked immediately when directory sync revokes or deletes a user.
@@ -241,7 +249,7 @@ func (k *KyIdentityClient) applySyncWebhook(ctx context.Context, headers syncaut
 }
 
 func (k *KyIdentityClient) applyOrgLifecycle(ctx context.Context, eventType string, body []byte) error {
-	if !k.multiTenant {
+	if !k.tenancy.IsMultiTenant() {
 		return nil
 	}
 	var payload struct {
@@ -283,6 +291,9 @@ func (k *KyIdentityClient) applyOrgLifecycle(ctx context.Context, eventType stri
 		return err
 	}
 	if nextStatus != store.TenantStatusActive {
+		if k.onTenantRevoked != nil {
+			k.onTenantRevoked(ctx, orgID)
+		}
 		const pageSize = 1000
 		for offset := 0; ; offset += pageSize {
 			users, total, err := k.store.Users().ListUsers(ctx, offset, pageSize, store.UserFilter{OrgID: orgID})
@@ -305,8 +316,9 @@ func (k *KyIdentityClient) applyOrgLifecycle(ctx context.Context, eventType stri
 
 func (k *KyIdentityClient) upsertDirectoryUser(ctx context.Context, in DirectoryUser, ev store.DirectoryEvent) error {
 	// KyIdentity sends this app's roles when it defines any, else the user's global role.
+	orgID := strings.TrimSpace(in.OrgID)
 	role := "user"
-	if primaryValue(in.Roles) == "admin" {
+	if primaryValue(in.Roles) == "admin" && k.tenancy.MayAdminister(orgID) {
 		role = "admin"
 	}
 	status := "inactive"
@@ -318,8 +330,7 @@ func (k *KyIdentityClient) upsertDirectoryUser(ctx context.Context, in Directory
 	if displayName == "" && in.Name != nil {
 		displayName = in.Name.Formatted
 	}
-	orgID := strings.TrimSpace(in.OrgID)
-	if k.multiTenant {
+	if k.tenancy.IsMultiTenant() {
 		if orgID == "" {
 			return ErrSyncMalformed
 		}
@@ -334,7 +345,7 @@ func (k *KyIdentityClient) upsertDirectoryUser(ctx context.Context, in Directory
 			ID: fmt.Sprintf("usr_%s", crypto.RandomHex(12)), Username: in.UserName, Email: email,
 			DisplayName: displayName, Role: role, Status: status, SSOProvider: "kyidentity", SSOSubject: in.ID,
 		}
-		if k.multiTenant {
+		if k.tenancy.IsMultiTenant() {
 			newUser.OrgID = orgID
 		}
 		_, err = k.store.Users().CreateDirectoryUser(ctx, newUser, ev)
@@ -347,7 +358,7 @@ func (k *KyIdentityClient) upsertDirectoryUser(ctx context.Context, in Directory
 	if err != nil {
 		return err
 	}
-	if k.multiTenant && existing.OrgID != orgID {
+	if k.tenancy.IsMultiTenant() && existing.OrgID != orgID {
 		k.auditOrgMismatch(ctx, in.ID, existing.OrgID, orgID)
 		return fmt.Errorf("%w: subject %q", ErrSyncOrgMismatch, in.ID)
 	}

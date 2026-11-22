@@ -22,7 +22,8 @@ stored setup, so a conflicting environment override added later stops the server
 - `KY_TENANCY_MODE` defaults to `single` for self-hosted installer deployments. If set to `multi`,
   the database locks to multi-tenant mode on first boot, inbound SCIM is permanently disabled
   (`/scim/v2/*` returns JSON 404), and every OIDC sign-in and directory webhook must carry a
-  verified `org_id`.
+  verified `org_id`. Set `KY_STAFF_ORG_ID` to KyIdentity's staff org: only its accounts may be
+  administrators, and customer orgs have none.
 
 ## Setup bundle contract (`ky.product-setup/1`)
 

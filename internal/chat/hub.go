@@ -37,6 +37,7 @@ type Hub struct {
 	sessionValid   func(ctx context.Context, userID, sessionHash string) (bool, error)
 	callFrameHook  CallFrameHandler
 	disconnectHook DisconnectHandler
+	tenantRevoked  func(tenantID string)
 	pingInterval   time.Duration
 
 	// roomSource, when set, rebuilds each socket's rooms from the store after it registers
@@ -106,6 +107,11 @@ func (h *Hub) SetDisconnectHandler(fn DisconnectHandler) {
 	h.disconnectHook = fn
 }
 
+// SetTenantRevokeHandler registers what each pod does when a tenant's access is revoked.
+func (h *Hub) SetTenantRevokeHandler(fn func(tenantID string)) {
+	h.tenantRevoked = fn
+}
+
 // SetRoomSource registers the store lookup resync uses. Call it before serving connections.
 func (h *Hub) SetRoomSource(fn func(ctx context.Context, tenantID, userID string) ([]string, error)) {
 	h.roomSource = fn
@@ -150,6 +156,21 @@ func (h *Hub) RevokeUser(ctx context.Context, userID string) error {
 		Type:   EventAuthRevoked,
 		UserID: userID,
 	})
+}
+
+// RevokeTenant tells every pod that tenantID lost access, so each drops its guests.
+func (h *Hub) RevokeTenant(ctx context.Context, tenantID string) error {
+	if tenantID == "" {
+		return nil
+	}
+	return h.bus.PublishUser(ctx, "", Event{
+		Type: EventTenantRevoked,
+		Data: MustMarshalData(tenantRevoke{TenantID: tenantID}),
+	})
+}
+
+type tenantRevoke struct {
+	TenantID string `json:"tenant_id"`
 }
 
 // RevokeSession disconnects the user's WebSockets bound to sessionHash across all pods.
@@ -198,6 +219,13 @@ func (h *Hub) Dispatch(ev Event) {
 	}
 
 	switch ev.Type {
+	case EventTenantRevoked:
+		var t tenantRevoke
+		if json.Unmarshal(ev.Data, &t) == nil && t.TenantID != "" && h.tenantRevoked != nil {
+			h.tenantRevoked(t.TenantID)
+		}
+		return
+
 	case EventAuthRevoked:
 		if ev.UserID == "" {
 			return

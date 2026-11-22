@@ -16,8 +16,11 @@ import (
 	"github.com/Busnes-app/ky_server_base/internal/crypto"
 	"github.com/Busnes-app/ky_server_base/internal/store"
 	"github.com/Busnes-app/ky_server_base/internal/testdb"
+	"github.com/coder/websocket"
 	"github.com/google/uuid"
 )
+
+const testStaffOrg = "org-staff"
 
 const testMultiTenantHMAC = "4f1c2a9e8b7d6c5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e"
 
@@ -47,7 +50,8 @@ func newMultiTenantTestServer(t *testing.T) (*api.Server, store.Store, *config.C
 			MeetingSyncSecret: testMultiTenantHMAC,
 		},
 		Tenancy: config.TenancyConfig{
-			Mode: config.TenancyMulti,
+			Mode:       config.TenancyMulti,
+			StaffOrgID: testStaffOrg,
 		},
 		SCIM: config.SCIMConfig{
 			// Even if left on in config, multi-tenant mode must never expose /scim/v2/*.
@@ -138,7 +142,7 @@ func TestEnsureTenancyModeLocksDatabase(t *testing.T) {
 
 func TestMultiTenantSCIMDisabled(t *testing.T) {
 	srv, st, _ := newMultiTenantTestServer(t)
-	_, adminTok := createOrgUser(t, st, "usr_mt_admin", "mtadmin", "admin", "org-alpha")
+	_, adminTok := createOrgUser(t, st, "usr_mt_admin", "mtadmin", "admin", testStaffOrg)
 
 	// /scim/v2/* must return JSON 404, never SPA 200 or SCIM 401.
 	req := httptest.NewRequest(http.MethodGet, "/scim/v2/Users", nil)
@@ -285,63 +289,78 @@ func TestMultiTenantCrossOrgIsolation(t *testing.T) {
 		t.Fatalf("cross-org instant meeting = %d, want 400: %s", rec.Code, rec.Body.String())
 	}
 
-	// 5. Cross-org admin agent isolation.
-	rec = doBearerJSON(t, srv, http.MethodPost, "/api/admin/agents", aliceTok, map[string]any{
-		"name":  "agent-alpha-bot",
+	// 5. Customer orgs have no administrators: a stored admin role outside the staff org is refused.
+	for _, tok := range []string{aliceTok, carolTok} {
+		if rec := doBearerJSON(t, srv, http.MethodGet, "/api/admin/agents", tok, nil, nil); rec.Code != http.StatusForbidden {
+			t.Fatalf("customer-org admin list agents = %d, want 403: %s", rec.Code, rec.Body.String())
+		}
+	}
+
+	// Staff administer from their own org and cannot hand a bot to a customer's member.
+	_, staffTok := createOrgUser(t, st, "usr_s_sam", "sam", "admin", testStaffOrg)
+	rec = doBearerJSON(t, srv, http.MethodPost, "/api/admin/agents", staffTok, map[string]any{
+		"name":  "agent-hijack",
 		"owner": bob.ID,
 	}, nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("alice create agent = %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("staff create agent for org-alpha owner = %d, want 400: %s", rec.Code, rec.Body.String())
 	}
-	var agentCreate struct {
-		Agent struct {
-			ID     string `json:"id"`
-			UserID string `json:"user_id"`
-		} `json:"agent"`
-	}
-	_ = json.Unmarshal(rec.Body.Bytes(), &agentCreate)
-
-	// Backing bot user must inherit org-alpha.
-	botUser, err := st.Users().GetUserByID(context.Background(), agentCreate.Agent.UserID)
-	if err != nil {
-		t.Fatalf("load bot user: %v", err)
-	}
-	if botUser.OrgID != "org-alpha" {
-		t.Fatalf("bot org_id = %q, want org-alpha", botUser.OrgID)
-	}
-
-	// Carol (org-beta admin) must not see alice's agent or org-alpha owners.
-	rec = doBearerJSON(t, srv, http.MethodGet, "/api/admin/agents", carolTok, nil, nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("carol list agents = %d: %s", rec.Code, rec.Body.String())
-	}
+	rec = doBearerJSON(t, srv, http.MethodGet, "/api/admin/agents", staffTok, nil, nil)
 	var listAgents struct {
-		Agents []any `json:"agents"`
 		Owners []struct {
 			ID string `json:"id"`
 		} `json:"owners"`
 	}
 	_ = json.Unmarshal(rec.Body.Bytes(), &listAgents)
-	if len(listAgents.Agents) != 0 {
-		t.Fatalf("carol saw %d cross-org agents", len(listAgents.Agents))
-	}
 	for _, o := range listAgents.Owners {
 		if o.ID == alice.ID || o.ID == bob.ID {
-			t.Fatalf("carol saw cross-org owner %s", o.ID)
+			t.Fatalf("staff agent owners leaked customer member %s", o.ID)
 		}
 	}
+}
 
-	// Carol cannot create an agent owned by bob or revoke alice's agent.
-	rec = doBearerJSON(t, srv, http.MethodPost, "/api/admin/agents", carolTok, map[string]any{
-		"name":  "agent-hijack",
-		"owner": bob.ID,
-	}, nil)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("carol create agent for org-alpha owner = %d, want 400", rec.Code)
+// A customer org's administrator from KyIdentity is a member here; only the staff org operates
+// the install.
+func TestMultiTenantDirectoryAdminsOnlyFromStaffOrg(t *testing.T) {
+	srv, st, _ := newMultiTenantTestServer(t)
+	ctx := context.Background()
+	sync := func(id, org string) *store.User {
+		body := []byte(`{"schemas":["urn:ietf:params:scim:schemas:core:2.0:User"],"id":"` + id + `","userName":"` + id + `","org_id":"` + org + `","roles":[{"value":"admin"}],"active":true,"meta":{"resourceType":"User","version":"W/\"1\""}}`)
+		req := httptest.NewRequest(http.MethodPost, "/api/sso/kyidentity/sync", bytes.NewReader(body))
+		h, err := syncauth.Sign([]byte(testMultiTenantHMAC), time.Now(), "user.created", uuid.NewString(), body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.Apply(req)
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("sync %s = %d: %s", id, rec.Code, rec.Body.String())
+		}
+		u, err := st.Users().GetUserBySSO(ctx, "kyidentity", id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return u
 	}
-	rec = doBearerJSON(t, srv, http.MethodPost, "/api/admin/agents/"+agentCreate.Agent.ID+"/revoke", carolTok, nil, nil)
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("carol revoke org-alpha agent = %d, want 404", rec.Code)
+	if u := sync("kid-tenant-admin", "org-alpha"); u.Role != "user" {
+		t.Fatalf("customer-org admin stored as %q, want user", u.Role)
+	}
+	if u := sync("kid-staff-admin", testStaffOrg); u.Role != "admin" {
+		t.Fatalf("staff-org admin stored as %q, want admin", u.Role)
+	}
+
+	// Even with an admin row, a customer-org account cannot change backups or read the audit log.
+	_, tenantTok := createOrgUser(t, st, "usr_a_admin", "alphaadmin", "admin", "org-alpha")
+	if rec := doBearerJSON(t, srv, http.MethodPut, "/api/backup/schedule", tenantTok, map[string]any{"interval": "24h"}, nil); rec.Code != http.StatusForbidden {
+		t.Fatalf("customer-org admin backup schedule = %d, want 403: %s", rec.Code, rec.Body.String())
+	}
+	if rec := doBearerJSON(t, srv, http.MethodGet, "/api/admin/audit", tenantTok, nil, nil); rec.Code != http.StatusForbidden {
+		t.Fatalf("customer-org admin audit = %d, want 403: %s", rec.Code, rec.Body.String())
+	}
+	_, staffTok := createOrgUser(t, st, "usr_s_admin", "staffadmin", "admin", testStaffOrg)
+	if rec := doBearerJSON(t, srv, http.MethodGet, "/api/admin/audit", staffTok, nil, nil); rec.Code != http.StatusOK {
+		t.Fatalf("staff admin audit = %d, want 200: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -368,10 +387,12 @@ func TestMultiTenantKyCalendarMeetingSync(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	// Missing org_id must be rejected in multi-tenant mode.
 	rec := signedReq(http.MethodPut, "/api/meetings/ext-1", map[string]any{
-		"title":        "Missing Org",
-		"organizer_id": alice.SSOSubject,
-		"starts_at":    now.Format(time.RFC3339),
-		"ends_at":      now.Add(time.Hour).Format(time.RFC3339),
+		"title":         "Missing Org",
+		"organizer_sub": alice.SSOSubject,
+		"windows": []map[string]string{{
+			"start": now.Format(time.RFC3339),
+			"end":   now.Add(time.Hour).Format(time.RFC3339),
+		}},
 	})
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("PUT meeting without org_id = %d, want 400: %s", rec.Code, rec.Body.String())
@@ -379,12 +400,14 @@ func TestMultiTenantKyCalendarMeetingSync(t *testing.T) {
 
 	// Valid org_id creates meeting scoped to org-alpha and ignores cross-org attendees.
 	rec = signedReq(http.MethodPut, "/api/meetings/ext-1", map[string]any{
-		"org_id":       "org-alpha",
-		"title":        "Alpha Standup",
-		"organizer_id": alice.SSOSubject,
-		"attendee_ids": []string{alice.SSOSubject, carol.SSOSubject},
-		"starts_at":    now.Format(time.RFC3339),
-		"ends_at":      now.Add(time.Hour).Format(time.RFC3339),
+		"org_id":        "org-alpha",
+		"title":         "Alpha Standup",
+		"organizer_sub": alice.SSOSubject,
+		"member_subs":   []string{alice.SSOSubject, carol.SSOSubject},
+		"windows": []map[string]string{{
+			"start": now.Format(time.RFC3339),
+			"end":   now.Add(time.Hour).Format(time.RFC3339),
+		}},
 	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("PUT meeting with org_id = %d: %s", rec.Code, rec.Body.String())
@@ -397,10 +420,15 @@ func TestMultiTenantKyCalendarMeetingSync(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListRoomMembers: %v", err)
 	}
+	aliceIn := false
 	for _, m := range members {
 		if m.UserID == carol.ID {
 			t.Fatalf("cross-org attendee %s was added to org-alpha meeting room", carol.ID)
 		}
+		aliceIn = aliceIn || m.UserID == alice.ID
+	}
+	if !aliceIn {
+		t.Fatalf("organizer %s was not resolved into the meeting room: %+v", alice.ID, members)
 	}
 
 	// DELETE without org_id fails (400); DELETE with wrong org_id is an idempotent no-op that
@@ -515,14 +543,64 @@ func TestMultiTenantDirectoryWebhookAndOrgLifecycle(t *testing.T) {
 		t.Fatalf("create guest link = %d: %s", rec.Code, rec.Body.String())
 	}
 	var guestCreated struct {
-		GuestToken string `json:"guest_token"`
+		GuestURL   string `json:"guest_url"`
+		GuestToken string
 	}
 	_ = json.Unmarshal(rec.Body.Bytes(), &guestCreated)
+	_, guestCreated.GuestToken, _ = strings.Cut(guestCreated.GuestURL, "/meet/")
+	if guestCreated.GuestToken == "" {
+		t.Fatalf("guest link response has no /meet/ token: %s", rec.Body.String())
+	}
+
+	// An admitted guest holds a live socket into the meeting.
+	knockReq := httptest.NewRequest(http.MethodPost, "/api/meet/"+guestCreated.GuestToken+"/knock", strings.NewReader(`{"display_name":"Visitor"}`))
+	knockReq.Header.Set("Content-Type", "application/json")
+	knockRec := httptest.NewRecorder()
+	srv.ServeHTTP(knockRec, knockReq)
+	var knocked struct {
+		GuestID string `json:"guest_id"`
+		RoomID  string `json:"room_id"`
+	}
+	_ = json.Unmarshal(knockRec.Body.Bytes(), &knocked)
+	var guestSecret string
+	for _, c := range knockRec.Result().Cookies() {
+		if c.Name == "ky_guest_session" {
+			guestSecret = c.Value
+		}
+	}
+	if knockRec.Code != http.StatusOK || knocked.GuestID == "" || guestSecret == "" {
+		t.Fatalf("guest knock = %d: %s", knockRec.Code, knockRec.Body.String())
+	}
+	if rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+knocked.RoomID+"/lobby/"+knocked.GuestID+"/admit", evaTok, nil, nil); rec.Code != http.StatusOK {
+		t.Fatalf("admit guest = %d: %s", rec.Code, rec.Body.String())
+	}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	wsCtx, wsCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer wsCancel()
+	guestWS, _, err := websocket.Dial(wsCtx, "ws"+strings.TrimPrefix(ts.URL, "http")+"/api/meet/"+guestCreated.GuestToken+"/ws", &websocket.DialOptions{
+		HTTPHeader: http.Header{"X-Guest-Session": []string{guestSecret}},
+	})
+	if err != nil {
+		t.Fatalf("guest websocket: %v", err)
+	}
+	defer guestWS.CloseNow()
+	if _, _, err := guestWS.Read(wsCtx); err != nil {
+		t.Fatalf("guest hello: %v", err)
+	}
 
 	// 5. org.suspended revokes sessions and blocks API, incoming webhook, and guest link for org-alpha.
 	suspendBody := []byte(`{"org_id":"org-alpha"}`)
 	if rec := postSync("org.suspended", suspendBody); rec.Code != http.StatusOK {
 		t.Fatalf("org.suspended = %d: %s", rec.Code, rec.Body.String())
+	}
+	for {
+		if _, _, err := guestWS.Read(wsCtx); err != nil {
+			if websocket.CloseStatus(err) != websocket.StatusPolicyViolation {
+				t.Fatalf("admitted guest socket after org.suspended ended with %v, want policy violation", err)
+			}
+			break
+		}
 	}
 
 	// Eva's old session was revoked (401). Even a freshly minted session gets 403 because tenant is suspended.

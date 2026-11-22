@@ -375,6 +375,26 @@ func TestTenancyModeFromEnv(t *testing.T) {
 		if cfg.SCIM.Enabled {
 			t.Fatal("expected KY_TENANCY_MODE=multi to force SCIM.Enabled=false")
 		}
+		if cfg.Tenancy.MayAdminister("org-a") {
+			t.Fatal("with KY_STAFF_ORG_ID unset, no org may administer in multi-tenant mode")
+		}
+	})
+
+	t.Run("staff_org_administers", func(t *testing.T) {
+		t.Setenv("KY_DATA_DIR", t.TempDir())
+		t.Setenv("KY_TENANCY_MODE", "multi")
+		t.Setenv("KY_STAFF_ORG_ID", " org-staff ")
+		cfg, err := config.LoadFromEnv()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !cfg.Tenancy.MayAdminister("org-staff") || cfg.Tenancy.MayAdminister("org-a") || cfg.Tenancy.MayAdminister("") {
+			t.Fatalf("MayAdminister wrong for staff org %q", cfg.Tenancy.StaffOrgID)
+		}
+		single := config.TenancyConfig{Mode: config.TenancySingle}
+		if !single.MayAdminister("org-a") {
+			t.Fatal("single-tenant mode must keep every org's admins")
+		}
 	})
 
 	t.Run("invalid_mode_fails", func(t *testing.T) {

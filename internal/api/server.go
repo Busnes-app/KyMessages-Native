@@ -174,7 +174,7 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 	sessions := auth.NewSessionManager(st, cfg.Security)
 	pairing := devices.NewPairingService(st, cfg.Server.AppName, cfg.Server.AppURL)
 	kyidentity := sso.NewKyIdentityClient(cfg.SSO, st)
-	kyidentity.SetMultiTenant(cfg.Tenancy.IsMultiTenant())
+	kyidentity.SetTenancy(cfg.Tenancy)
 	scimSrv := scim.NewServer(st, cfg.SCIM, cfg.Server.AppURL)
 	recovery := recoveryclient.NewClient(recoveryclient.Options{AllowPrivate: cfg.Backup.AllowPrivateRecovery})
 
@@ -249,6 +249,8 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 		s.revokeAgentsForOwner(ctx, userID)
 	}
 	kyidentity.OnUserRevoked(revokeUser)
+	chatHub.SetTenantRevokeHandler(func(tenantID string) { lobbyMgr.RevokeTenant(context.Background(), tenantID) })
+	kyidentity.OnTenantRevoked(func(ctx context.Context, orgID string) { _ = chatHub.RevokeTenant(ctx, orgID) })
 	scimSrv.OnUserRevoked(revokeUser)
 
 	s.routes()
@@ -514,7 +516,8 @@ func (s *Server) admin(h http.HandlerFunc, fresh bool) http.HandlerFunc {
 			}
 			return
 		}
-		if user.Role != "admin" {
+		// A customer org's account never administers the install, whatever its stored role.
+		if user.Role != "admin" || (user.OrgID != "" && !s.config.Tenancy.MayAdminister(user.OrgID)) {
 			s.writeError(w, http.StatusForbidden, "Administrator role required")
 			return
 		}

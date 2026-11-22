@@ -46,6 +46,14 @@ const (
 // isolates multiple KyIdentity organizations by org_id.
 type TenancyConfig struct {
 	Mode string `json:"mode"` // "single" (default) or "multi"
+	// StaffOrgID is KyIdentity's staff org (KY_STAFF_ORG_ID). In multi-tenant mode only its
+	// accounts may be administrators; customer orgs have none.
+	StaffOrgID string `json:"staff_org_id"`
+}
+
+// MayAdminister reports whether an account bound to orgID may hold the install-wide admin role.
+func (t TenancyConfig) MayAdminister(orgID string) bool {
+	return !t.IsMultiTenant() || (t.StaffOrgID != "" && orgID == t.StaffOrgID)
 }
 
 // EffectiveMode returns the normalized tenancy mode, defaulting to single-tenant.
@@ -288,7 +296,8 @@ func LoadFromEnv() (*Config, error) {
 
 	cfg := &Config{
 		Tenancy: TenancyConfig{
-			Mode: tenancyMode,
+			Mode:       tenancyMode,
+			StaffOrgID: strings.TrimSpace(os.Getenv("KY_STAFF_ORG_ID")),
 		},
 		Server: ServerConfig{
 			Host:         host,

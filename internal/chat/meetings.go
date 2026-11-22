@@ -380,6 +380,24 @@ func (l *LobbyManager) RevokeMeeting(ctx context.Context, roomID string) {
 	}
 }
 
+// RevokeTenant evicts every guest of tenantID this pod holds, waiting or admitted, and takes
+// them out of their calls.
+func (l *LobbyManager) RevokeTenant(ctx context.Context, tenantID string) {
+	type gone struct{ roomID, guestID string }
+	var evict []gone
+	l.mu.Lock()
+	for _, s := range l.byGuestID {
+		if s.TenantID == tenantID {
+			evict = append(evict, gone{s.RoomID, s.GuestID})
+			l.deleteSessionLocked(s)
+		}
+	}
+	l.mu.Unlock()
+	for _, g := range evict {
+		l.evictLiveGuest(ctx, g.roomID, g.guestID)
+	}
+}
+
 // RevokeGuestKey evicts the live session for one revoked guest_key in meetingID.
 func (l *LobbyManager) RevokeGuestKey(ctx context.Context, meetingID, guestKey string) {
 	mk := meetingID + "|" + guestKey

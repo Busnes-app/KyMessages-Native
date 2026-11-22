@@ -16,6 +16,8 @@ const (
 	EventTyping        = "typing"
 	EventReadSync      = "read.sync"
 	EventAuthRevoked   = "auth.revoked"
+	// EventTenantRevoked travels only on the bus: every pod drops that tenant's guests.
+	EventTenantRevoked = "tenant.revoked"
 
 	// Phase 3: Hybrid P2P + LiveKit SFU calling & external guest waiting room events.
 	EventCallState     = "call.state"

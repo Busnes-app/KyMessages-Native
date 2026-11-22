@@ -66,9 +66,15 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
   lifecycle events (`org.suspended`, `org.unsuspended`, `org.deleted`).
 - Deactivation, deletion, or org suspension immediately revokes sessions, push subscriptions, and
   active WebSocket connections, and blocks API calls, incoming webhooks, and guest meeting links.
+  Org suspension or deletion also ejects that org's meeting guests, waiting or admitted, from the
+  lobby, their sockets and their calls on every server instance.
 - In `KY_TENANCY_MODE=multi`, every user account is bound immutably to `(sub, org_id)`, tokens or
   webhooks without `org_id` are refused, cross-org `org_id` reassignment is rejected with HTTP 409
   and audited (`sso.org_mismatch`), and inbound SCIM (`/scim/v2/*`) is forced off (404).
+- In `KY_TENANCY_MODE=multi`, customer orgs have no administrators. An `admin` role from KyIdentity
+  is honoured only for the staff org named by `KY_STAFF_ORG_ID` (unset: no directory
+  administrators), and the console refuses any account bound to another org. Local operator
+  accounts, which belong to no org, keep console access.
 - Local operator login remains available for single-tenant recovery/console access, with mandatory
   initial password replacement and optional TOTP MFA with recovery codes.
 
