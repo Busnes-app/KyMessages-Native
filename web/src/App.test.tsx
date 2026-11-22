@@ -127,3 +127,13 @@ it('opens Chat on the room a notification click names, from another page', async
   expect(screen.queryByRole('heading', { name: 'Preferences' })).toBeNull();
   expect(window.location.hash).toBe('#room=rm%201');
 });
+
+it('clears the room hash when Chat gives way to Settings', async () => {
+  stubServer(async () => json({ logged_out: true }));
+  render(<App />);
+  const gear = await screen.findByRole('button', { name: 'Settings' });
+  window.history.replaceState(null, '', '/#room=rm_seen');
+  fireEvent.click(gear);
+  await screen.findByRole('heading', { name: 'Preferences' });
+  expect(window.location.hash).toBe('');
+});

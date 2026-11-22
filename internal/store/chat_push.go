@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -54,8 +55,12 @@ func (c *chatStore) UpsertPushSubscription(ctx context.Context, sessionHash stri
 	tenantID := normalizeTenant(sub.TenantID)
 	now := nowMilli()
 	ua := sub.UserAgent
-	if len(ua) > 255 {
-		ua = ua[:255]
+	if len(ua) > 255 { // cut on a character boundary: PostgreSQL refuses invalid UTF-8
+		n := 255
+		for n > 0 && !utf8.RuneStart(ua[n]) {
+			n--
+		}
+		ua = ua[:n]
 	}
 
 	tx, err := c.store.db.BeginTx(ctx, nil)

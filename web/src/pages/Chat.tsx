@@ -1646,13 +1646,21 @@ export const Chat: React.FC<ChatProps> = ({
   const activeRoomLobby = activeRoomId ? lobbyByRoom[activeRoomId] ?? [] : [];
   const otherLobbyCount = activeRoomLobby.length - 1;
 
+  // The hash names the room on screen, and the service worker skips that room's notifications,
+  // so it is cleared while Chat is hidden behind Settings or a console page.
   useEffect(() => {
-    if (!activeRoomId || typeof window === 'undefined') return;
+    if (typeof window === 'undefined') return;
+    const base = `${window.location.pathname}${window.location.search}`;
+    if (!isActive) {
+      if (window.location.hash.startsWith('#room=')) window.history.replaceState(null, '', base);
+      return;
+    }
+    if (!activeRoomId) return;
     const nextHash = `#room=${encodeURIComponent(activeRoomId)}`;
     if (window.location.hash !== nextHash) {
-      window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}${nextHash}`);
+      window.history.replaceState(null, '', `${base}${nextHash}`);
     }
-  }, [activeRoomId]);
+  }, [activeRoomId, isActive]);
 
   useEffect(() => {
     if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return;

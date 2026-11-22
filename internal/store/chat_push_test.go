@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Busnes-app/ky_server_base/internal/store"
 )
@@ -210,5 +212,28 @@ func TestPushCapEvictsTheLeastRecentlyRegistered(t *testing.T) {
 	}
 	if len(subs) != 2 || !got["active"] || !got["new"] {
 		t.Fatalf("kept %v, want active and new", got)
+	}
+}
+
+// A long non-ASCII User-Agent is cut on a character boundary, so PostgreSQL accepts it.
+func TestPushUserAgentTruncatesOnARuneBoundary(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	u := &store.User{ID: "usr_push_ua", Username: "pushua", Role: "user", Status: "active", CreatedAt: time.Now()}
+	if err := st.Users().CreateUser(ctx, u); err != nil {
+		t.Fatal(err)
+	}
+	ua := strings.Repeat("a", 254) + strings.Repeat("é", 10)
+	if _, err := st.Chat().UpsertPushSubscription(ctx, liveSession(t, st, u.ID), &store.PushSubscription{
+		TenantID: store.DefaultTenantID, UserID: u.ID, Endpoint: "https://fcm.googleapis.com/fcm/send/ua", P256DH: "k", AuthSecret: "a", UserAgent: ua,
+	}, 20); err != nil {
+		t.Fatal(err)
+	}
+	subs, err := st.Chat().ListPushSubscriptions(ctx, store.DefaultTenantID, u.ID)
+	if err != nil || len(subs) != 1 {
+		t.Fatalf("list = %v, %v", subs, err)
+	}
+	if got := subs[0].UserAgent; !utf8.ValidString(got) || len(got) > 255 || got != strings.Repeat("a", 254) {
+		t.Fatalf("stored user agent %q (%d bytes), want the 254 ASCII bytes", got, len(got))
 	}
 }
