@@ -319,6 +319,34 @@ func (s *Server) handleChatDownloadAttachment(w http.ResponseWriter, r *http.Req
 	http.ServeContent(w, r, blobs.SanitizeFilename(att.Filename), modTime, f)
 }
 
+// GET /api/v1/rooms/{id}/attachments
+// Lists the caller's own staged uploads in a room they belong to, so a reloaded composer can
+// show, send or remove what still counts against their pending quota.
+func (s *Server) handleChatListStagedAttachments(w http.ResponseWriter, r *http.Request) {
+	user, _, ok := s.currentUser(r)
+	if !ok {
+		s.writeError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+	roomID := strings.TrimSpace(r.PathValue("id"))
+	tenantID := store.DefaultTenantID
+	if _, err := s.store.Chat().GetRoomMember(r.Context(), tenantID, roomID, user.ID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			s.writeError(w, http.StatusNotFound, "Room not found")
+			return
+		}
+		s.writeError(w, http.StatusInternalServerError, "Failed to verify room membership")
+		return
+	}
+	list, err := s.store.Chat().ListStagedAttachments(r.Context(), tenantID, roomID, user.ID)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "Failed to list attachments")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	s.writeJSON(w, http.StatusOK, map[string]any{"attachments": list})
+}
+
 // DELETE /api/v1/attachments/{id}
 // Allows an uploader to discard an unposted (staged) attachment before sending a message,
 // freeing both the database row and disk blob immediately.

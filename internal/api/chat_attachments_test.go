@@ -295,6 +295,24 @@ func TestChatAttachmentsXSSDowngradeAndMaxUploadCap(t *testing.T) {
 	}
 }
 
+func listStaged(t *testing.T, srv http.Handler, roomID, tok string) []store.Attachment {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/rooms/"+roomID+"/attachments", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list staged = %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Attachments []store.Attachment `json:"attachments"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	return resp.Attachments
+}
+
 func TestChatAttachmentQuotasDeleteAndOrphanSweep(t *testing.T) {
 	_, st, cfg := setupTestServer(t)
 	cfg.Attachments.MaxUploadBytes = 2048
@@ -343,6 +361,22 @@ func TestChatAttachmentQuotasDeleteAndOrphanSweep(t *testing.T) {
 		t.Fatalf("over pending quota = %d, want 413: %s", upOverPending.Code, upOverPending.Body.String())
 	}
 
+	// A reloaded composer lists only its own staged uploads.
+	if got := listStaged(t, srv, roomID, aliceTok); len(got) != 1 || got[0].ID != att1Resp.Attachment.ID {
+		t.Fatalf("alice staged list = %+v, want only her upload", got)
+	}
+	if got := listStaged(t, srv, roomID, bobTok); len(got) != 0 {
+		t.Fatalf("bob sees alice's staged uploads: %+v", got)
+	}
+	_, carolTok := createChatTestUser(t, st, "u_q_carol", "qcarol", "user")
+	reqCarol := httptest.NewRequest(http.MethodGet, "/api/v1/rooms/"+roomID+"/attachments", nil)
+	reqCarol.Header.Set("Authorization", "Bearer "+carolTok)
+	recCarol := httptest.NewRecorder()
+	srv.ServeHTTP(recCarol, reqCarol)
+	if recCarol.Code != http.StatusNotFound {
+		t.Fatalf("non-member staged list = %d, want 404", recCarol.Code)
+	}
+
 	// 3. Bob cannot delete Alice's staged attachment (404).
 	reqBobDel := httptest.NewRequest(http.MethodDelete, "/api/v1/attachments/"+att1Resp.Attachment.ID, nil)
 	reqBobDel.Header.Set("Authorization", "Bearer "+bobTok)
@@ -381,6 +415,10 @@ func TestChatAttachmentQuotasDeleteAndOrphanSweep(t *testing.T) {
 	}, map[string]string{"Idempotency-Key": "idem-quota-1"})
 	if sendRec.Code != http.StatusCreated {
 		t.Fatalf("send linked message = %d: %s", sendRec.Code, sendRec.Body.String())
+	}
+
+	if got := listStaged(t, srv, roomID, aliceTok); len(got) != 0 {
+		t.Fatalf("posted attachment still listed as staged: %+v", got)
 	}
 
 	reqDelLinked := httptest.NewRequest(http.MethodDelete, "/api/v1/attachments/"+linkedResp.Attachment.ID, nil)

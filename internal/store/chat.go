@@ -1133,9 +1133,17 @@ func (c *chatStore) GetAttachment(ctx context.Context, tenantID, attachmentID st
 }
 
 func (c *chatStore) ListMessageAttachments(ctx context.Context, tenantID, roomID, messageID string) ([]Attachment, error) {
-	tenantID = normalizeTenant(tenantID)
-	q := c.store.rebind(`SELECT ` + attachmentColumns + ` FROM attachments WHERE tenant_id = ? AND room_id = ? AND message_id = ? ORDER BY created_at ASC, id ASC`)
-	rows, err := c.store.db.QueryContext(ctx, q, tenantID, roomID, messageID)
+	return c.listAttachments(ctx, `message_id = ?`, normalizeTenant(tenantID), roomID, messageID)
+}
+
+// ListStagedAttachments lists uploaderID's unposted uploads in roomID, oldest first.
+func (c *chatStore) ListStagedAttachments(ctx context.Context, tenantID, roomID, uploaderID string) ([]Attachment, error) {
+	return c.listAttachments(ctx, `message_id IS NULL AND uploader_id = ?`, normalizeTenant(tenantID), roomID, uploaderID)
+}
+
+func (c *chatStore) listAttachments(ctx context.Context, where, tenantID, roomID, arg string) ([]Attachment, error) {
+	q := c.store.rebind(`SELECT ` + attachmentColumns + ` FROM attachments WHERE tenant_id = ? AND room_id = ? AND ` + where + ` ORDER BY created_at ASC, id ASC`)
+	rows, err := c.store.db.QueryContext(ctx, q, tenantID, roomID, arg)
 	if err != nil {
 		return nil, err
 	}

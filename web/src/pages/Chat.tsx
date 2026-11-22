@@ -43,6 +43,7 @@ import {
   markRoomRead,
   newIdempotencyKey,
   deleteAttachment,
+  listStagedAttachments,
   openDirectMessage,
   sendMessage,
   setReaction,
@@ -224,6 +225,31 @@ export const Chat: React.FC<ChatProps> = ({
       urls.clear();
     };
   }, []);
+
+  // Rebuild the tray from the server once per room: a reload or another tab may have left
+  // staged uploads that still count against the pending quota.
+  const stagedFetchedRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!activeRoomId || stagedFetchedRef.current.has(activeRoomId)) return;
+    const roomId = activeRoomId;
+    stagedFetchedRef.current.add(roomId);
+    listStagedAttachments(roomId)
+      .then((list) => {
+        setStagedByRoom((prev) => {
+          const current = prev[roomId] ?? [];
+          const known = new Set(
+            current.flatMap((item) => (item.kind === 'ready' ? [item.attachment.id] : [])),
+          );
+          const restored: StagedAttachment[] = list
+            .filter((a) => !known.has(a.id))
+            .map((a) => ({ kind: 'ready', localId: a.id, attachment: a }));
+          return restored.length ? { ...prev, [roomId]: [...restored, ...current] } : prev;
+        });
+      })
+      .catch(() => {
+        stagedFetchedRef.current.delete(roomId);
+      });
+  }, [activeRoomId]);
 
   useEffect(() => {
     if (!lightboxAttachment) return;
@@ -2070,6 +2096,15 @@ export const Chat: React.FC<ChatProps> = ({
                             }
                           }}
                           onDismissFailed={(key) => {
+                            // A dismissed send's uploads are never posted: free their quota now.
+                            const dismissed = bucketsRef.current[activeRoom.id]?.messages.find(
+                              (m) => m.delivery.kind === 'failed' && m.delivery.idempotencyKey === key,
+                            );
+                            for (const a of dismissed?.attachments ?? []) {
+                              void deleteAttachment(a.id).catch(() => {
+                                // Best-effort; the orphan sweep expires it otherwise.
+                              });
+                            }
                             setBuckets((prevBuckets) => {
                               const current = prevBuckets[activeRoom.id];
                               if (!current) return prevBuckets;

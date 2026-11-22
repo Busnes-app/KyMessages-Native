@@ -222,6 +222,7 @@ type ChatStore interface {
 	CommitAttachmentWithQuota(ctx context.Context, reservationID string, a *Attachment, limits AttachmentQuotaLimits) error
 	GetAttachment(ctx context.Context, tenantID, attachmentID string) (*Attachment, error)
 	ListMessageAttachments(ctx context.Context, tenantID, roomID, messageID string) ([]Attachment, error)
+	ListStagedAttachments(ctx context.Context, tenantID, roomID, uploaderID string) ([]Attachment, error)
 	DeleteAttachment(ctx context.Context, tenantID, attachmentID string) error
 	DeleteStagedAttachment(ctx context.Context, tenantID, attachmentID, uploaderID string) (string, error)
 	SumAttachmentBytesByTenant(ctx context.Context, tenantID string) (int64, error)

@@ -363,6 +363,76 @@ describe('Native Chat page', () => {
     });
   });
 
+  it('restores staged uploads after a reload so they can be removed', async () => {
+    const deletedUrls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? 'GET';
+        if (url === '/api/v1/bootstrap') {
+          return Promise.resolve(
+            json({
+              user: { id: 'u_alice', username: 'alice', display_name: 'Alice', role: 'user' },
+              tenant: { id: 'default', slug: 'default', display_name: 'Busnes HQ', plan: 'self_hosted' },
+              rooms: [
+                {
+                  id: 'rm_gen',
+                  tenant_id: 'default',
+                  kind: 'channel',
+                  name: 'general',
+                  topic: '',
+                  is_private: false,
+                  last_seq: 0,
+                  created_by: 'u_alice',
+                  created_at: Date.now(),
+                  role: 'owner',
+                  last_read_seq: 0,
+                  unread_count: 0,
+                  notify_mode: 'all',
+                },
+              ],
+              attachments: { max_upload_bytes: 10 * 1024 * 1024, max_per_message: 10 },
+            }),
+          );
+        }
+        if (url.startsWith('/api/v1/rooms/rm_gen/messages')) {
+          return Promise.resolve(json({ messages: [], has_more: false }));
+        }
+        if (url === '/api/v1/rooms/rm_gen/attachments' && method === 'GET') {
+          return Promise.resolve(
+            json({
+              attachments: [
+                {
+                  id: 'att_left_staged',
+                  tenant_id: 'default',
+                  room_id: 'rm_gen',
+                  uploader_id: 'u_alice',
+                  filename: 'notes.txt',
+                  mime_type: 'text/plain',
+                  size_bytes: 5,
+                  sha256_hex: 'b'.repeat(64),
+                  created_at: Date.now(),
+                },
+              ],
+            }),
+          );
+        }
+        if (url.startsWith('/api/v1/attachments/') && method === 'DELETE') {
+          deletedUrls.push(url);
+          return Promise.resolve(new Response(null, { status: 204 }));
+        }
+        return Promise.resolve(json({ error: 'not found' }, 404));
+      }),
+    );
+
+    render(<Chat />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Remove notes.txt' }));
+    await waitFor(() => {
+      expect(deletedUrls).toEqual(['/api/v1/attachments/att_left_staged']);
+    });
+  });
+
   it('hides the attachment button when bootstrap reports attachments.available=false', async () => {
     vi.stubGlobal(
       'fetch',

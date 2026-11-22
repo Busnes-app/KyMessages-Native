@@ -173,6 +173,14 @@ export async function uploadAttachment(
   return parseAttachment(data.attachment);
 }
 
+// The caller's staged (unposted) uploads in a room, which still count against their quota.
+export async function listStagedAttachments(roomId: string): Promise<ChatAttachment[]> {
+  const data = obj(
+    await apiJSON(`/api/v1/rooms/${encodeURIComponent(roomId)}/attachments`, {}, 'Could not load staged files'),
+  );
+  return arr(data.attachments).map(parseAttachment);
+}
+
 export async function deleteAttachment(attachmentId: string): Promise<void> {
   const res = await secureFetch(`/api/v1/attachments/${encodeURIComponent(attachmentId)}`, {
     method: 'DELETE',
