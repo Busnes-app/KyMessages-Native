@@ -31,6 +31,7 @@ Owns environment variable parsing, configuration validation, default fallbacks, 
 
 - `KY_ADMIN_USERNAME` (default `admin`) is `Security.AdminUsername`: the local admin `cmd/server` creates on an empty database and `init-admin`'s `-username` default. It must pass `ValidUsername` (3-64 of `[A-Za-z0-9._-]`, the rule `auth.ValidateUsername` shares), else startup fails.
 - `KY_SCIM_TOKEN` is `SCIM.BearerToken`; unset, it is random per start and `SCIM.TokenSet` (`json:"-"`) is false, which the console reports without the token. The installer clears both.
+- Web Push fills `Config.Push`: `KY_PUSH_ENABLED` (default true; false means no dispatcher and bootstrap reports push unavailable), `KY_VAPID_PRIVATE_KEY` (overrides `<KY_DATA_DIR>/vapid.key`) and `KY_VAPID_SUBJECT` (else derived from `KY_APP_URL`). `Push.AllowPrivate` is tests only.
 - `KY_CAPTCHA_PROVIDER` is `pow` (default) or `none`; anything else fails startup, because login verifies nothing else. `KY_CAPTCHA_POW_DIFFICULTY` defaults to 50000.
 - `KY_MATRIX_ELEMENT_RESTART_HINT` (default `DefaultElementRestartHint`, `docker compose restart element`) is `Config.Matrix.ElementRestartHint`, read only with Matrix enabled: the command Settings shows for restarting Element. One line, at most 256 bytes, else startup fails. Displayed, never run.
 - `KY_MATRIX_SYNAPSE_RESTART_HINT` (default `DefaultSynapseRestartHint`, `docker compose restart synapse`) is `Config.Matrix.SynapseRestartHint`, the same way: the command Settings > Federation shows, since Synapse reads its config only at start.
