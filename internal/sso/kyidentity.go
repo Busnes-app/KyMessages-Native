@@ -253,10 +253,11 @@ func (k *KyIdentityClient) applyOrgLifecycle(ctx context.Context, eventType stri
 		return nil
 	}
 	var payload struct {
-		ID    string `json:"id"`
-		OrgID string `json:"org_id"`
+		ID       string `json:"id"`
+		OrgID    string `json:"org_id"`
+		Revision int64  `json:"revision"` // KyIdentity's per-org lifecycle counter
 	}
-	if err := json.Unmarshal(body, &payload); err != nil {
+	if err := json.Unmarshal(body, &payload); err != nil || payload.Revision <= 0 {
 		return ErrSyncMalformed
 	}
 	orgID := strings.TrimSpace(payload.OrgID)
@@ -266,31 +267,30 @@ func (k *KyIdentityClient) applyOrgLifecycle(ctx context.Context, eventType stri
 	if orgID == "" {
 		return ErrSyncMalformed
 	}
-	tenant, err := k.store.Chat().EnsureTenant(ctx, orgID)
-	if err != nil {
+	if _, err := k.store.Chat().EnsureTenant(ctx, orgID); err != nil {
 		return err
 	}
 	var nextStatus string
 	switch eventType {
 	case "org.suspended":
-		if tenant.Status == store.TenantStatusDeleted {
-			return nil
-		}
 		nextStatus = store.TenantStatusSuspended
 	case "org.unsuspended":
-		if tenant.Status == store.TenantStatusDeleted {
-			return nil
-		}
 		nextStatus = store.TenantStatusActive
 	case "org.deleted":
 		nextStatus = store.TenantStatusDeleted
 	default:
 		return nil
 	}
-	if err := k.store.Chat().SetTenantStatus(ctx, orgID, nextStatus); err != nil {
+	if _, err := k.store.Chat().ApplyTenantLifecycle(ctx, orgID, nextStatus, payload.Revision); err != nil {
 		return err
 	}
-	if nextStatus != store.TenantStatusActive {
+	// Revoke from the resulting state, so a retry of a delivery that died mid-revocation, or a
+	// stale event, still leaves an inactive org with no grants.
+	tenant, err := k.store.Chat().GetTenant(ctx, orgID)
+	if err != nil {
+		return err
+	}
+	if tenant.Status != store.TenantStatusActive {
 		if k.onTenantRevoked != nil {
 			k.onTenantRevoked(ctx, orgID)
 		}

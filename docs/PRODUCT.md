@@ -63,7 +63,10 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
   for privileged console actions.
 - Signed KyIdentity directory webhooks (`POST /api/sso/kyidentity/sync`) synchronize user creation,
   profile updates, deactivation, deletion, MFA resets, and — in `KY_TENANCY_MODE=multi` — org
-  lifecycle events (`org.suspended`, `org.unsuspended`, `org.deleted`).
+  lifecycle events (`org.suspended`, `org.unsuspended`, `org.deleted`). Each carries KyIdentity's
+  per-org `revision`; one at or below the last applied revision changes nothing, so a delayed
+  event never undoes a newer one, and deletion is never undone. Tenant status is read from the
+  primary database, never a read replica.
 - Deactivation, deletion, or org suspension immediately revokes sessions, push subscriptions, and
   active WebSocket connections, and blocks API calls, incoming webhooks, and guest meeting links.
   No new session, MFA challenge or pairing is issued to an inactive org, including one in flight

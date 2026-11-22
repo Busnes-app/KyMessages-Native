@@ -60,7 +60,7 @@ the server back up. KyQuickStart verifies the activated snapshot before reportin
   replacement rules in single-tenant deployments.
 - `POST /api/installer/directory` (and `/api/sso/kyidentity/sync`) accepts signed SCIM User
   desired-state events (plus `org.suspended`, `org.unsuspended`, and `org.deleted` lifecycle
-  webhooks in multi-tenant mode). Canonical positive `meta.version` revisions and body/event
+  webhooks in multi-tenant mode, each with KyIdentity's per-org `revision`; a stale one is ignored). Canonical positive `meta.version` revisions and body/event
   digests are stored transactionally so exact retries are idempotent and stale/conflicting
   revisions fail cleanly.
 - Offboarding (`active: false` / deletion), `user.mfa_reset`, and org suspension immediately

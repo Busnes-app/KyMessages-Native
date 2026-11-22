@@ -599,7 +599,7 @@ func TestMultiTenantDirectoryWebhookAndOrgLifecycle(t *testing.T) {
 	}
 
 	// 5. org.suspended revokes sessions and blocks API, incoming webhook, and guest link for org-alpha.
-	suspendBody := []byte(`{"org_id":"org-alpha"}`)
+	suspendBody := []byte(`{"org_id":"org-alpha","revision":1}`)
 	if rec := postSync("org.suspended", suspendBody); rec.Code != http.StatusOK {
 		t.Fatalf("org.suspended = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -649,7 +649,7 @@ func TestMultiTenantDirectoryWebhookAndOrgLifecycle(t *testing.T) {
 	}
 
 	// 6. org.unsuspended restores org-alpha.
-	if rec := postSync("org.unsuspended", []byte(`{"org_id":"org-alpha"}`)); rec.Code != http.StatusOK {
+	if rec := postSync("org.unsuspended", []byte(`{"org_id":"org-alpha","revision":2}`)); rec.Code != http.StatusOK {
 		t.Fatalf("org.unsuspended = %d: %s", rec.Code, rec.Body.String())
 	}
 	if err := mint(); err != nil {
@@ -663,7 +663,7 @@ func TestMultiTenantDirectoryWebhookAndOrgLifecycle(t *testing.T) {
 	}
 
 	// 7. org.deleted permanently blocks org-alpha.
-	if rec := postSync("org.deleted", []byte(`{"org_id":"org-alpha"}`)); rec.Code != http.StatusOK {
+	if rec := postSync("org.deleted", []byte(`{"org_id":"org-alpha","revision":3}`)); rec.Code != http.StatusOK {
 		t.Fatalf("org.deleted = %d: %s", rec.Code, rec.Body.String())
 	}
 	tenant, err := st.Chat().GetTenant(context.Background(), "org-alpha")
@@ -687,5 +687,52 @@ func TestMultiTenantLogoutDropsPushSubscription(t *testing.T) {
 	}
 	if subs, _ := st.Chat().ListPushSubscriptions(ctx, "org-alpha", u.ID); len(subs) != 0 {
 		t.Fatalf("org-alpha push subscription survived sign-out: %d", len(subs))
+	}
+}
+
+// A delayed org.unsuspended older than the suspension never re-enables the org, across a restart.
+func TestMultiTenantStaleOrgLifecycleIsIgnored(t *testing.T) {
+	srv, st, cfg := newMultiTenantTestServer(t)
+	ctx := context.Background()
+	post := func(h http.Handler, event string, body string) int {
+		req := httptest.NewRequest(http.MethodPost, "/api/sso/kyidentity/sync", strings.NewReader(body))
+		hdr, err := syncauth.Sign([]byte(testMultiTenantHMAC), time.Now(), event, uuid.NewString(), []byte(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		hdr.Apply(req)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	status := func() string {
+		tenant, err := st.Chat().GetTenant(ctx, "org-gamma")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tenant.Status
+	}
+	if code := post(srv, "org.suspended", `{"org_id":"org-gamma"}`); code != http.StatusBadRequest {
+		t.Fatalf("lifecycle event without a revision = %d, want 400", code)
+	}
+	if code := post(srv, "org.suspended", `{"org_id":"org-gamma","revision":5}`); code != http.StatusOK || status() != store.TenantStatusSuspended {
+		t.Fatalf("suspend rev 5 = %d, status %q", code, status())
+	}
+	if code := post(srv, "org.unsuspended", `{"org_id":"org-gamma","revision":4}`); code != http.StatusOK || status() != store.TenantStatusSuspended {
+		t.Fatalf("stale unsuspend rev 4 = %d, status %q, want suspended", code, status())
+	}
+	restarted := api.NewServer(cfg, st)
+	t.Cleanup(restarted.WaitDetached)
+	if code := post(restarted, "org.unsuspended", `{"org_id":"org-gamma","revision":5}`); code != http.StatusOK || status() != store.TenantStatusSuspended {
+		t.Fatalf("replayed rev 5 after restart = %d, status %q, want suspended", code, status())
+	}
+	if code := post(restarted, "org.unsuspended", `{"org_id":"org-gamma","revision":6}`); code != http.StatusOK || status() != store.TenantStatusActive {
+		t.Fatalf("newer unsuspend rev 6 = %d, status %q, want active", code, status())
+	}
+	if code := post(restarted, "org.deleted", `{"org_id":"org-gamma","revision":2}`); code != http.StatusOK || status() != store.TenantStatusDeleted {
+		t.Fatalf("delete = %d, status %q, want deleted", code, status())
+	}
+	if code := post(restarted, "org.unsuspended", `{"org_id":"org-gamma","revision":99}`); code != http.StatusOK || status() != store.TenantStatusDeleted {
+		t.Fatalf("unsuspend after delete = %d, status %q, want deleted", code, status())
 	}
 }

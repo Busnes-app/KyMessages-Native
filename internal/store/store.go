@@ -192,6 +192,7 @@ type ChatStore interface {
 	EnsureTenant(ctx context.Context, tenantID string) (*Tenant, error)
 	GetTenant(ctx context.Context, tenantID string) (*Tenant, error)
 	SetTenantStatus(ctx context.Context, tenantID, status string) error
+	ApplyTenantLifecycle(ctx context.Context, tenantID, status string, revision int64) (bool, error)
 	UpdateTenantMediaPolicy(ctx context.Context, tenantID, policy string, maxVideo, maxAudio int, guestForceSFU bool) (*Tenant, error)
 
 	// Rooms & Membership

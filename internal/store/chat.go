@@ -119,7 +119,8 @@ func (c *chatStore) GetTenant(ctx context.Context, tenantID string) (*Tenant, er
 		FROM tenants WHERE id = ?`)
 	var t Tenant
 	var guestForce int
-	err := c.store.read().QueryRowContext(ctx, q, tenantID).Scan(
+	// Tenant status gates access, so it is read from the primary, never a lagging replica.
+	err := c.store.db.QueryRowContext(ctx, q, tenantID).Scan(
 		&t.ID, &t.Slug, &t.DisplayName, &t.Plan, &t.Status, &t.P2PPolicy,
 		&t.P2PMaxVideo, &t.P2PMaxAudio, &guestForce, &t.CreatedAt,
 	)
@@ -145,6 +146,31 @@ func (c *chatStore) SetTenantStatus(ctx context.Context, tenantID, status string
 	}
 	q := c.store.rebind(`UPDATE tenants SET status = ? WHERE id = ?`)
 	return oneRow(c.store.db.ExecContext(ctx, q, status, tenantID))
+}
+
+// ApplyTenantLifecycle sets an org's status from a KyIdentity lifecycle event carrying the org's
+// revision. Only a revision above the last applied one changes status, so a delayed event never
+// undoes a newer one; deletion applies whatever its revision and is never undone. It reports
+// whether the status changed.
+func (c *chatStore) ApplyTenantLifecycle(ctx context.Context, tenantID, status string, revision int64) (bool, error) {
+	var q string
+	var args []any
+	switch status {
+	case TenantStatusActive, TenantStatusSuspended:
+		q = `UPDATE tenants SET status = ?, lifecycle_revision = ? WHERE id = ? AND lifecycle_revision < ? AND status <> ?`
+		args = []any{status, revision, strings.TrimSpace(tenantID), revision, TenantStatusDeleted}
+	case TenantStatusDeleted:
+		q = `UPDATE tenants SET status = ?, lifecycle_revision = CASE WHEN lifecycle_revision < ? THEN ? ELSE lifecycle_revision END WHERE id = ? AND status <> ?`
+		args = []any{status, revision, revision, strings.TrimSpace(tenantID), TenantStatusDeleted}
+	default:
+		return false, fmt.Errorf("invalid tenant status %q", status)
+	}
+	res, err := c.store.db.ExecContext(ctx, c.store.rebind(q), args...)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
 }
 
 // ---------------------------------------------------------------------
