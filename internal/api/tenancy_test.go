@@ -657,3 +657,21 @@ func TestMultiTenantDirectoryWebhookAndOrgLifecycle(t *testing.T) {
 		t.Fatalf("tenant after org.deleted = %+v err=%v, want deleted", tenant, err)
 	}
 }
+
+// Sign-out drops the named push subscription under the user's own org.
+func TestMultiTenantLogoutDropsPushSubscription(t *testing.T) {
+	srv, st, _ := newMultiTenantTestServer(t)
+	ctx := context.Background()
+	u, tok := createOrgUser(t, st, "usr_lo_mt", "lomt", "user", "org-alpha")
+	if _, err := st.Chat().UpsertPushSubscription(ctx, crypto.SHA256Hex([]byte(tok)), &store.PushSubscription{
+		TenantID: "org-alpha", UserID: u.ID, Endpoint: "https://push.example/mt", P256DH: "k", AuthSecret: "a",
+	}, 10); err != nil {
+		t.Fatal(err)
+	}
+	if rec := doBearerJSON(t, srv, http.MethodPost, "/api/auth/logout", tok, map[string]any{"push_endpoint": "https://push.example/mt"}, nil); rec.Code != http.StatusOK {
+		t.Fatalf("logout = %d: %s", rec.Code, rec.Body.String())
+	}
+	if subs, _ := st.Chat().ListPushSubscriptions(ctx, "org-alpha", u.ID); len(subs) != 0 {
+		t.Fatalf("org-alpha push subscription survived sign-out: %d", len(subs))
+	}
+}

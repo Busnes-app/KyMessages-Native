@@ -13,6 +13,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net/http"
@@ -343,5 +344,46 @@ func TestSenderEndToEndAndRedirectRefused(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatalf("timed out waiting for onGone callback")
+	}
+}
+
+// Close delivers what is already queued instead of discarding it.
+func TestDispatcherCloseDeliversQueuedJobs(t *testing.T) {
+	vapid, err := GenerateVAPIDKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	uaPriv, _ := ecdh.P256().GenerateKey(rand.Reader)
+	authSecret := make([]byte, 16)
+	_, _ = rand.Read(authSecret)
+	var delivered atomic.Int32
+	release := make(chan struct{})
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		delivered.Add(1)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+	disp := NewDispatcher(NewSender(SenderOptions{
+		VAPID: vapid, Subject: "mailto:ops@example.com", AllowPrivate: true,
+		TLSConfig: srv.Client().Transport.(*http.Transport).TLSClientConfig,
+	}), nil, nil)
+
+	const jobs = 3 * defaultWorkers
+	for i := range jobs {
+		if !disp.Enqueue(Job{Subscription: Subscription{
+			ID:         fmt.Sprintf("ps_%d", i),
+			Endpoint:   srv.URL + "/ok",
+			P256DH:     base64.RawURLEncoding.EncodeToString(uaPriv.PublicKey().Bytes()),
+			AuthSecret: base64.RawURLEncoding.EncodeToString(authSecret),
+		}, Payload: Payload{Kind: "message"}}) {
+			t.Fatalf("Enqueue %d refused", i)
+		}
+	}
+	// Every worker is busy and the rest are queued when shutdown starts.
+	time.AfterFunc(100*time.Millisecond, func() { close(release) })
+	disp.Close()
+	if got := delivered.Load(); got != jobs {
+		t.Fatalf("delivered %d of %d queued pushes before Close returned", got, jobs)
 	}
 }

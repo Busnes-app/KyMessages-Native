@@ -45,8 +45,10 @@ func (c *chatStore) UpdateRoomNotifyMode(ctx context.Context, tenantID, roomID, 
 
 // UpsertPushSubscription stores or updates a Web Push subscription owned by (sub.TenantID, sub.UserID),
 // enforcing maxPerUser by evicting the oldest subscriptions for that user when the cap is exceeded.
-func (c *chatStore) UpsertPushSubscription(ctx context.Context, sub *PushSubscription, maxPerUser int) (*PushSubscription, error) {
-	if sub == nil || sub.UserID == "" || sub.Endpoint == "" || sub.P256DH == "" || sub.AuthSecret == "" {
+// It first locks the caller's session row (sessionHash), so it serializes with grant revocation:
+// a session revoked first gets ErrNotFound, and a revocation that comes after deletes the row.
+func (c *chatStore) UpsertPushSubscription(ctx context.Context, sessionHash string, sub *PushSubscription, maxPerUser int) (*PushSubscription, error) {
+	if sub == nil || sessionHash == "" || sub.UserID == "" || sub.Endpoint == "" || sub.P256DH == "" || sub.AuthSecret == "" {
 		return nil, ErrInvalidInput
 	}
 	tenantID := normalizeTenant(sub.TenantID)
@@ -61,6 +63,19 @@ func (c *chatStore) UpsertPushSubscription(ctx context.Context, sub *PushSubscri
 		return nil, err
 	}
 	defer tx.Rollback()
+
+	live, err := tx.ExecContext(ctx, c.store.rebind(`
+		UPDATE sessions SET token_hash = token_hash
+		WHERE token_hash = ? AND user_id = ?
+	`), sessionHash, sub.UserID)
+	if err != nil {
+		return nil, err
+	}
+	if n, err := live.RowsAffected(); err != nil {
+		return nil, err
+	} else if n != 1 {
+		return nil, ErrNotFound
+	}
 
 	var existingID, existingTenant, existingUser string
 	var existingCreated, existingUsed int64

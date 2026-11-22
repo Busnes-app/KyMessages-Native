@@ -73,7 +73,7 @@ func restore(capsulePath, targetDir, expectService string, shares []string, stdo
 	if _, err := io.Copy(stdout, &manifest); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintln(stdout, "Restored sessions, challenges, pairings, active bot tokens and open calls invalidated. Sign in freshly.")
+	_, err = fmt.Fprintln(stdout, "Restored sessions, challenges, pairings, push subscriptions, active bot tokens and open calls invalidated. Sign in freshly.")
 	return err
 }
 

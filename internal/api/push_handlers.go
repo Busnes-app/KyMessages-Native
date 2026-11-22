@@ -84,7 +84,7 @@ func (s *Server) handleListPushSubscriptions(w http.ResponseWriter, r *http.Requ
 // POST /api/v1/push/subscriptions
 func (s *Server) handleRegisterPushSubscription(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	user, _, ok := s.currentUser(r)
+	user, sess, ok := s.currentUser(r)
 	if !ok {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
@@ -123,7 +123,7 @@ func (s *Server) handleRegisterPushSubscription(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	sub, err := s.store.Chat().UpsertPushSubscription(r.Context(), &store.PushSubscription{
+	sub, err := s.store.Chat().UpsertPushSubscription(r.Context(), sess.TokenHash, &store.PushSubscription{
 		TenantID:   tenantID,
 		UserID:     user.ID,
 		Endpoint:   endpoint,
@@ -131,6 +131,10 @@ func (s *Server) handleRegisterPushSubscription(w http.ResponseWriter, r *http.R
 		AuthSecret: authSecret,
 		UserAgent:  strings.TrimSpace(r.UserAgent()),
 	}, maxPushSubsPerUser)
+	if errors.Is(err, store.ErrNotFound) {
+		s.writeError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to save push subscription")
 		return
@@ -311,8 +315,9 @@ func (s *Server) dispatchMessagePush(ctx context.Context, tenantID, roomID strin
 		URL:        "/#room=" + roomID,
 	}
 
+	dropped := 0
 	for _, sub := range subs {
-		s.push.Enqueue(push.Job{
+		if !s.push.Enqueue(push.Job{
 			Subscription: push.Subscription{
 				ID:         sub.ID,
 				Endpoint:   sub.Endpoint,
@@ -323,7 +328,12 @@ func (s *Server) dispatchMessagePush(ctx context.Context, tenantID, roomID strin
 			Options: push.SendOptions{
 				Urgency: "normal",
 			},
-		})
+		}) {
+			dropped++
+		}
+	}
+	if dropped > 0 {
+		log.Printf("[PUSH] queue full: dropped %d of %d message notifications in room %s", dropped, len(subs), roomID)
 	}
 }
 
@@ -380,8 +390,9 @@ func (s *Server) dispatchCallPush(ctx context.Context, tenantID, roomID, starter
 		URL:        "/#room=" + roomID,
 	}
 
+	dropped := 0
 	for _, sub := range subs {
-		s.push.Enqueue(push.Job{
+		if !s.push.Enqueue(push.Job{
 			Subscription: push.Subscription{
 				ID:         sub.ID,
 				Endpoint:   sub.Endpoint,
@@ -393,7 +404,12 @@ func (s *Server) dispatchCallPush(ctx context.Context, tenantID, roomID, starter
 				TTL:     push.CallTTL(),
 				Urgency: "high",
 			},
-		})
+		}) {
+			dropped++
+		}
+	}
+	if dropped > 0 {
+		log.Printf("[PUSH] queue full: dropped %d of %d call notifications in room %s", dropped, len(subs), roomID)
 	}
 }
 
