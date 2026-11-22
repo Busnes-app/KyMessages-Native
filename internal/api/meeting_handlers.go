@@ -723,6 +723,10 @@ func (s *Server) handleGuestCallJoin(w http.ResponseWriter, r *http.Request) {
 		ProtectIP:   body.ProtectIP,
 		ECDHPubJWK:  body.ECDHPubJWK,
 	})
+	if errors.Is(err, chat.ErrTenantInactive) {
+		s.writeError(w, http.StatusForbidden, "Meeting is not available")
+		return
+	}
 	if errors.Is(err, chat.ErrSFUUnavailable) {
 		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 			"error": "External guest calls require LiveKit SFU when Guest Force SFU policy is enabled",

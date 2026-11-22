@@ -24,6 +24,8 @@ var (
 	// ErrSFUUnavailable is returned when policy or privacy requires SFU mode (sfu_only,
 	// protect_ip, or guest_force_sfu) but LiveKit is not configured on this server.
 	ErrSFUUnavailable = errors.New("livekit sfu is not configured on this server")
+	// ErrTenantInactive is returned when the call's organization is suspended or deleted.
+	ErrTenantInactive = errors.New("organization is suspended or inactive")
 	// ErrCallNotActive is returned when operating on a room without an active call.
 	ErrCallNotActive = errors.New("no active call in this room")
 )
@@ -177,6 +179,9 @@ func (m *CallManager) Join(ctx context.Context, req JoinCallRequest) (*JoinCallR
 		req.TenantID = store.DefaultTenantID
 	}
 	tenant, err := m.chatStore.GetTenant(ctx, req.TenantID)
+	if err == nil && tenant.Status != store.TenantStatusActive {
+		return nil, ErrTenantInactive
+	}
 	if err != nil {
 		// Fall back to safe defaults if tenant row is missing in unit tests.
 		tenant = &store.Tenant{
@@ -302,6 +307,14 @@ func (m *CallManager) Join(ctx context.Context, req JoinCallRequest) (*JoinCallR
 	stickyNow := c.session.SFUSticky
 	m.mu.Unlock()
 
+	// Check the org again now the peer is registered, before any token exists. A suspension that
+	// committed first is seen here and the join takes itself back out; one that commits later
+	// finds the peer and its revocation removes it.
+	if !m.tenantStillActive(ctx, req.TenantID) {
+		m.Leave(ctx, req.RoomID, req.UserID)
+		return nil, ErrTenantInactive
+	}
+
 	// Persist call session row.
 	if created {
 		if err := m.chatStore.CreateCallSession(ctx, &sessionCopy); err != nil {
@@ -344,6 +357,14 @@ func (m *CallManager) Join(ctx context.Context, req JoinCallRequest) (*JoinCallR
 		Peers:        statePayload.Peers,
 		Started:      created,
 	}, nil
+}
+
+func (m *CallManager) tenantStillActive(ctx context.Context, tenantID string) bool {
+	tenant, err := m.chatStore.GetTenant(ctx, tenantID)
+	if errors.Is(err, store.ErrNotFound) {
+		return true // unit tests without a tenant row, as above
+	}
+	return err == nil && tenant.Status == store.TenantStatusActive
 }
 
 // Leave removes userID from the active call in roomID, ending the call if empty or

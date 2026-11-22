@@ -96,6 +96,10 @@ func (s *Server) handleCallJoin(w http.ResponseWriter, r *http.Request) {
 		ProtectIP:   body.ProtectIP,
 		ECDHPubJWK:  body.ECDHPubJWK,
 	})
+	if errors.Is(err, chat.ErrTenantInactive) {
+		s.writeError(w, http.StatusForbidden, "Organization is suspended or inactive")
+		return
+	}
 	if errors.Is(err, chat.ErrSFUUnavailable) {
 		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 			"error": "LiveKit SFU is required for this call policy or IP privacy setting, but LiveKit is not configured on this server",
