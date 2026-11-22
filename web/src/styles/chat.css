@@ -1382,6 +1382,17 @@
   overflow: hidden;
 }
 
+/* Base UI's Dialog portals the card beside its backdrop (.modal-backdrop) rather than inside
+   it, so the card centres itself; later in the DOM, it paints over the backdrop. */
+.chat-dialog {
+  position: fixed;
+  inset: 0;
+  margin: auto;
+  height: fit-content;
+  z-index: 1000;
+  outline: 0;
+}
+
 .chat-modal-head {
   display: flex;
   align-items: center;
@@ -1464,9 +1475,78 @@
 }
 
 .chat-picker-item:hover,
-.chat-picker-item.is-active {
+.chat-picker-item[data-highlighted] {
   background: var(--panel-hover);
   opacity: 1;
+}
+
+/* Base UI options are divs, not buttons: they take from the global button rule what the
+   buttons they replace had, so rows keep their size and feel. */
+.chat-picker-item,
+.chat-search-hit {
+  display: flex;
+  gap: 8px;
+  font-family: var(--font-sans);
+  line-height: normal;
+  cursor: pointer;
+  transition: box-shadow 0.15s ease, transform 0.1s ease;
+}
+
+.chat-picker-item {
+  align-items: center;
+}
+
+.chat-search-hit {
+  font-size: 14px;
+}
+
+.chat-picker-item:hover,
+.chat-search-hit:hover {
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.22), 0 1px 4px rgba(0, 0, 0, 0.16);
+}
+
+.chat-picker-item:active,
+.chat-search-hit:active {
+  transform: scale(0.98);
+}
+
+.chat-picker-item[data-disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-picker-item,
+  .chat-search-hit {
+    transition: none;
+  }
+  .chat-picker-item:active,
+  .chat-search-hit:active {
+    transform: none;
+  }
+}
+
+/* Create channel's teammates: Combobox options laid out as the checkbox rows they were,
+   including the type those rows took as labels inside .chat-field. */
+.chat-member-option {
+  padding: 0.32rem 0.45rem;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.chat-member-option[data-highlighted] {
+  background: var(--panel-hover);
+}
+
+.chat-member-option[data-disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* The box only shows the option's state; a press lands on the option. */
+.chat-member-option input[type="checkbox"] {
+  pointer-events: none;
 }
 
 .chat-search-hit {
@@ -1484,7 +1564,7 @@
 }
 
 .chat-search-hit:hover,
-.chat-search-hit.is-active {
+.chat-search-hit[data-highlighted] {
   border-color: var(--accent);
   background: var(--panel-hover);
   opacity: 1;
