@@ -14,6 +14,7 @@ function makeMsg(overrides: Partial<ChatMessage> = {}): ChatMessage {
     body: 'hello',
     created_at: 1_700_000_000_000,
     reactions: [],
+    attachments: [],
     delivery: { kind: 'synced' },
     ...overrides,
   };
@@ -51,6 +52,41 @@ describe('chat state helpers', () => {
     const afterRest = upsertMessage(afterWs, wsCopy, 'k2');
     expect(afterRest).toHaveLength(1);
     expect(afterRest[0].id).toBe('msg_99');
+  });
+
+  it('does not collide distinct attachment-only pending messages when WS arrives', () => {
+    const attA = {
+      id: 'att_a',
+      tenant_id: 'default',
+      room_id: 'rm_1',
+      uploader_id: 'u_alice',
+      filename: 'a.png',
+      mime_type: 'image/png',
+      size_bytes: 120,
+      sha256_hex: 'aa',
+      created_at: 1_700_000_000_000,
+    };
+    const attB = { ...attA, id: 'att_b', filename: 'b.png' };
+    const pendingA = makeMsg({
+      id: 'pending_a',
+      seq: Number.MAX_SAFE_INTEGER,
+      body: '',
+      attachments: [attA],
+      delivery: { kind: 'sending', idempotencyKey: 'ka' },
+    });
+    const pendingB = makeMsg({
+      id: 'pending_b',
+      seq: Number.MAX_SAFE_INTEGER,
+      body: '',
+      attachments: [attB],
+      delivery: { kind: 'sending', idempotencyKey: 'kb' },
+    });
+    const wsB = makeMsg({ id: 'msg_101', seq: 101, body: '', attachments: [attB] });
+
+    const next = upsertMessage([pendingA, pendingB], wsB);
+    expect(next).toHaveLength(2);
+    expect(next[0].id).toBe('msg_101');
+    expect(next[1].id).toBe('pending_a');
   });
 
   it('applies reaction add/remove idempotently and removes empty buckets', () => {

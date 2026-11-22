@@ -61,6 +61,58 @@ test('production CSP, worker, themes, keyboard, dialog and responsive shell', as
   await expect(dialog).toHaveCount(0);
   await page.reload();
 
+  // Upload a real PNG image + text file, send them in chat, preview the image in the lightbox,
+  // verify attachment download headers, and confirm both survive reload with zero CSP violations.
+  await expect(page.getByRole('region', { name: 'Conversation' })).toBeVisible();
+  const createGeneral = page.getByRole('button', { name: 'Create #general' });
+  if (await createGeneral.isVisible().catch(() => false)) {
+    await createGeneral.click();
+  }
+  const uploadInput = page.getByLabel('Upload files');
+  await expect(uploadInput).toBeAttached();
+  const suffix = testInfo.project.name;
+  const pngName = `pixel-${suffix}.png`;
+  const txtName = `report-${suffix}.txt`;
+  const pngBytes = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+    'base64',
+  );
+  const txtBody = `attachment-e2e-${suffix}`;
+  await uploadInput.setInputFiles([
+    { name: pngName, mimeType: 'image/png', buffer: pngBytes },
+    { name: txtName, mimeType: 'text/plain', buffer: Buffer.from(txtBody) },
+  ]);
+  const stagedTray = page.getByRole('list', { name: 'Pending attachments' });
+  await expect(stagedTray.getByText(pngName)).toBeVisible();
+  await expect(stagedTray.getByText(txtName)).toBeVisible();
+  const sendBtn = page.getByRole('button', { name: 'Send message' });
+  await expect(sendBtn).toBeEnabled();
+  await sendBtn.click();
+
+  const inlineImg = page.getByRole('img', { name: pngName }).last();
+  await expect(inlineImg).toBeVisible();
+  await expect.poll(() => inlineImg.evaluate((el) => el.complete && el.naturalWidth > 0)).toBe(true);
+  await page.getByRole('button', { name: `Preview ${pngName}` }).last().click();
+  const lightbox = page.getByRole('dialog', { name: `Image preview: ${pngName}` });
+  await expect(lightbox).toBeVisible();
+  await fits(page);
+  await page.keyboard.press('Escape');
+  await expect(lightbox).toHaveCount(0);
+
+  const fileLink = page.getByRole('link', { name: new RegExp(txtName) }).last();
+  await expect(fileLink).toBeVisible();
+  const fileHref = await fileLink.getAttribute('href');
+  expect(fileHref).toMatch(/^\/api\/v1\/attachments\//);
+  const dlResp = await page.request.get(fileHref);
+  expect(dlResp.status()).toBe(200);
+  expect(dlResp.headers()['content-disposition']).toContain('attachment');
+  expect(dlResp.headers()['x-content-type-options']).toBe('nosniff');
+  expect(await dlResp.text()).toBe(txtBody);
+
+  await page.reload();
+  await expect(page.getByRole('img', { name: pngName }).last()).toBeVisible();
+  await expect(page.getByRole('link', { name: new RegExp(txtName) }).last()).toBeVisible();
+
   await openSettings(page);
   const nav = page.getByRole('navigation', { name: 'Settings and administration' });
   await expect(nav.getByRole('button', { name: 'Settings & DB' })).toHaveAttribute('aria-current', 'page');

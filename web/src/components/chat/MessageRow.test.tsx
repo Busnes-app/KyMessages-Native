@@ -16,6 +16,7 @@ const baseMsg: ChatMessage = {
   body: 'See https://example.com/docs and `code`',
   created_at: 1_700_000_000_000,
   reactions: [],
+  attachments: [],
   delivery: { kind: 'synced' },
 };
 
@@ -178,5 +179,59 @@ describe('MessageRow', () => {
 
     const alert = await screen.findByRole('alert');
     expect(alert.textContent).toContain('Network offline');
+  });
+
+  it('renders inline raster images with preview trigger and non-image files as download links', () => {
+    const onPreview = vi.fn();
+    const imgAtt = {
+      id: 'att_img1',
+      tenant_id: 't1',
+      room_id: 'r1',
+      message_id: 'm1',
+      uploader_id: 'u1',
+      filename: 'diagram.png',
+      mime_type: 'image/png',
+      size_bytes: 2048,
+      sha256_hex: 'deadbeef',
+      created_at: 1_700_000_000_000,
+    };
+    const fileAtt = {
+      id: 'att_file1',
+      tenant_id: 't1',
+      room_id: 'r1',
+      message_id: 'm1',
+      uploader_id: 'u1',
+      filename: 'notes.txt',
+      mime_type: 'application/octet-stream',
+      size_bytes: 512,
+      sha256_hex: 'cafebabe',
+      created_at: 1_700_000_000_000,
+    };
+
+    render(
+      <MessageRow
+        message={{ ...baseMsg, body: '', attachments: [imgAtt, fileAtt] }}
+        grouped={false}
+        currentUserId="u1"
+        canModerate={false}
+        onReply={vi.fn()}
+        onPreviewImage={onPreview}
+        onToggleReaction={vi.fn()}
+        onEdit={vi.fn().mockResolvedValue(undefined)}
+        onDelete={vi.fn().mockResolvedValue(undefined)}
+        onRetryFailed={vi.fn()}
+        onDismissFailed={vi.fn()}
+      />,
+    );
+
+    const img = screen.getByRole('img', { name: 'diagram.png' });
+    expect(img.getAttribute('src')).toBe('/api/v1/attachments/att_img1?inline=1');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Preview diagram.png' }));
+    expect(onPreview).toHaveBeenCalledWith(imgAtt);
+
+    const fileLink = screen.getByRole('link', { name: /notes\.txt/i });
+    expect(fileLink.getAttribute('href')).toBe('/api/v1/attachments/att_file1');
+    expect(fileLink.getAttribute('download')).toBe('notes.txt');
   });
 });

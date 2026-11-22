@@ -1,7 +1,20 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { CornerUpLeft, MoreHorizontal, Pencil, RefreshCw, Trash2, X } from 'lucide-react';
-import type { ChatMessage } from '../../chat/types';
+import { CornerUpLeft, Download, FileText, MoreHorizontal, Pencil, RefreshCw, Trash2, X } from 'lucide-react';
+import {
+  attachmentUrl,
+  formatBytes,
+  isInlineImageAttachment,
+  type ChatAttachment,
+  type ChatMessage,
+} from '../../chat/types';
 import { formatTime, initialsFor, isBotSender, isWebhookSender } from '../../chat/state';
+
+function messagePreviewText(msg: ChatMessage): string {
+  if (msg.body) return msg.body;
+  if (msg.attachments.length === 1) return `Attachment: ${msg.attachments[0].filename}`;
+  if (msg.attachments.length > 1) return `${msg.attachments.length} attachments`;
+  return '';
+}
 
 const QUICK_REACTIONS = ['👍', '❤️', '🎉', '👀'] as const;
 
@@ -71,6 +84,7 @@ interface MessageRowProps {
   onEditEnd?: () => void;
   onReply: (message: ChatMessage) => void;
   onJumpToMessage?: (seq: number) => void;
+  onPreviewImage?: (attachment: ChatAttachment) => void;
   onToggleReaction: (messageId: string, emoji: string, currentlyReacted: boolean) => void;
   onEdit: (messageId: string, newBody: string) => Promise<void>;
   onDelete: (messageId: string) => Promise<void>;
@@ -90,6 +104,7 @@ export const MessageRow: React.FC<MessageRowProps> = ({
   onEditEnd,
   onReply,
   onJumpToMessage,
+  onPreviewImage,
   onToggleReaction,
   onEdit,
   onDelete,
@@ -196,7 +211,7 @@ export const MessageRow: React.FC<MessageRowProps> = ({
                 {isWebhookSender(replyTarget.sender_id) && ' (webhook)'}
                 {isBotSender(replyTarget.sender_id) && ' (bot)'}
               </strong>
-              <span>{replyTarget.deleted_at ? 'Original message deleted' : replyTarget.body}</span>
+              <span>{replyTarget.deleted_at ? 'Original message deleted' : messagePreviewText(replyTarget)}</span>
             </button>
           ) : (
             <div className="chat-reply-quote">
@@ -210,7 +225,7 @@ export const MessageRow: React.FC<MessageRowProps> = ({
                 {replyTarget
                   ? replyTarget.deleted_at
                     ? 'Original message deleted'
-                    : replyTarget.body
+                    : messagePreviewText(replyTarget)
                   : 'Referenced earlier message'}
               </span>
             </div>
@@ -262,10 +277,71 @@ export const MessageRow: React.FC<MessageRowProps> = ({
             </div>
           </form>
         ) : (
-          <div className="chat-msg-body">
-            {renderFormattedBody(message.body)}
-            {grouped && message.edited_at && <span className="chat-msg-edited"> (edited)</span>}
-          </div>
+          <>
+            {(message.body || message.attachments.length === 0) && (
+              <div className="chat-msg-body">
+                {renderFormattedBody(message.body)}
+                {grouped && message.edited_at && <span className="chat-msg-edited"> (edited)</span>}
+              </div>
+            )}
+
+            {message.attachments.length > 0 && (
+              <div className="chat-attachments" aria-label="Attachments">
+                {message.attachments.map((att) =>
+                  isInlineImageAttachment(att) ? (
+                    <div key={att.id} className="chat-att-image-card">
+                      <button
+                        type="button"
+                        className="chat-att-image-btn"
+                        aria-label={`Preview ${att.filename}`}
+                        onClick={() => onPreviewImage?.(att)}
+                      >
+                        <img
+                          src={attachmentUrl(att.id, true)}
+                          alt={att.filename}
+                          className="chat-att-image"
+                          loading="lazy"
+                        />
+                      </button>
+                      <div className="chat-att-image-bar">
+                        <span className="chat-att-name" title={att.filename}>
+                          {att.filename}
+                        </span>
+                        <span className="chat-att-size">{formatBytes(att.size_bytes)}</span>
+                        <a
+                          href={attachmentUrl(att.id)}
+                          download={att.filename}
+                          className="chat-att-dl-icon"
+                          title={`Download ${att.filename}`}
+                          aria-label={`Download ${att.filename}`}
+                        >
+                          <Download size={13} aria-hidden="true" />
+                        </a>
+                      </div>
+                    </div>
+                  ) : (
+                    <a
+                      key={att.id}
+                      href={attachmentUrl(att.id)}
+                      download={att.filename}
+                      className="chat-att-file"
+                    >
+                      <span className="chat-att-file-icon" aria-hidden="true">
+                        <FileText size={16} />
+                      </span>
+                      <span className="chat-att-file-meta">
+                        <span className="chat-att-name" title={att.filename}>
+                          {att.filename}
+                        </span>
+                        <span className="chat-att-size">{formatBytes(att.size_bytes)}</span>
+                      </span>
+                      <Download size={14} className="chat-att-file-dl" aria-hidden="true" />
+                    </a>
+                  ),
+                )}
+              </div>
+            )}
+          </>
         )}
 
         {actionError && (
