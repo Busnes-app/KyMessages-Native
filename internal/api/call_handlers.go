@@ -98,6 +98,9 @@ func (s *Server) handleCallJoin(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusInternalServerError, "Failed to join call")
 		return
 	}
+	if resp.Started {
+		s.dispatchCallPush(r.Context(), store.DefaultTenantID, roomID, user.ID, displayNameFor(user))
+	}
 	s.writeJSON(w, http.StatusOK, resp)
 }
 

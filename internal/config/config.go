@@ -31,6 +31,7 @@ type Config struct {
 	Captcha      CaptchaConfig     `json:"captcha"`
 	RTC          RTCConfig         `json:"rtc"`
 	Attachments  AttachmentsConfig `json:"attachments"`
+	Push         PushConfig        `json:"push"`
 }
 
 // DefaultMaxUploadBytes is the default per-attachment upload size limit (25 MiB).
@@ -55,6 +56,14 @@ type AttachmentsConfig struct {
 	MaxTotalBytes       int64         `json:"max_total_bytes"`
 	MaxPendingUserBytes int64         `json:"max_pending_user_bytes"`
 	PendingTTL          time.Duration `json:"pending_ttl"`
+}
+
+// PushConfig configures RFC 8291/8292 Web Push notifications (VAPID).
+type PushConfig struct {
+	Disabled        bool   `json:"disabled"`
+	VAPIDPrivateKey string `json:"-"` // Optional base64url 32-byte P-256 scalar; defaults to <DataDir>/vapid.key
+	VAPIDSubject    string `json:"vapid_subject"`
+	AllowPrivate    bool   `json:"-"` // Tests only
 }
 
 // RTCConfig holds native hybrid P2P + LiveKit SFU calling and KyCalendar meeting settings.
@@ -299,6 +308,11 @@ func LoadFromEnv() (*Config, error) {
 			MaxTotalBytes:       DefaultMaxTotalAttachmentBytes,
 			MaxPendingUserBytes: DefaultMaxPendingUserBytes,
 			PendingTTL:          DefaultPendingAttachmentTTL,
+		},
+		Push: PushConfig{
+			Disabled:        !getEnvBool("KY_PUSH_ENABLED", true),
+			VAPIDPrivateKey: strings.TrimSpace(os.Getenv("KY_VAPID_PRIVATE_KEY")),
+			VAPIDSubject:    strings.TrimSpace(os.Getenv("KY_VAPID_SUBJECT")),
 		},
 	}
 	if rawMax := strings.TrimSpace(os.Getenv("KY_MAX_UPLOAD_BYTES")); rawMax != "" {

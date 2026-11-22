@@ -99,6 +99,37 @@ func TestCollectCarriesTheRecoveryPublicKeyWhenPaired(t *testing.T) {
 	}
 }
 
+func TestCollectCarriesVAPIDKeyWhenPresent(t *testing.T) {
+	cfg, _ := payloadConfig(t)
+	ctx := context.Background()
+
+	withoutKey, err := backup.Collect(ctx, cfg, "1.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f := findFile(withoutKey.Files, "data/vapid.key"); f != nil {
+		t.Error("expected no data/vapid.key before key exists")
+	}
+
+	vapidPath := filepath.Join(cfg.Database.DataDir, "vapid.key")
+	want := []byte("vapid-test-key-material\n")
+	if err := os.WriteFile(vapidPath, want, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	withKey, err := backup.Collect(ctx, cfg, "1.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := findFile(withKey.Files, "data/vapid.key")
+	if f == nil {
+		t.Fatal("payload missing data/vapid.key")
+	}
+	if string(f.Data) != string(want) || f.Mode != 0600 {
+		t.Fatalf("unexpected vapid.key entry: mode=%o len=%d", f.Mode, len(f.Data))
+	}
+}
+
 func findFile(files []recoveryclient.File, path string) *recoveryclient.File {
 	for i := range files {
 		if files[i].Path == path {

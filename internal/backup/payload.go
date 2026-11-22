@@ -68,6 +68,9 @@ func Collect(ctx context.Context, cfg *config.Config, appVersion string) (recove
 	if pub, err := os.ReadFile(recoveryclient.RecoveryKeyPath(cfg.Database.DataDir)); err == nil {
 		files = append(files, recoveryclient.File{Path: recoveryPubPath, Data: pub, Mode: 0600})
 	}
+	if vapidKey, err := os.ReadFile(filepath.Join(cfg.Database.DataDir, "vapid.key")); err == nil && len(vapidKey) > 0 {
+		files = append(files, recoveryclient.File{Path: "data/vapid.key", Data: vapidKey, Mode: 0600})
+	}
 	if attachmentKeyNeeded(cfg) {
 		key, err := EnsureAttachmentKey(cfg.Database.DataDir)
 		if err != nil {

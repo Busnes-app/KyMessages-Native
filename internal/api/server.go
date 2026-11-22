@@ -23,6 +23,7 @@ import (
 	"github.com/Busnes-app/ky_server_base/internal/config"
 	"github.com/Busnes-app/ky_server_base/internal/devices"
 	"github.com/Busnes-app/ky_server_base/internal/health"
+	"github.com/Busnes-app/ky_server_base/internal/push"
 	"github.com/Busnes-app/ky_server_base/internal/rtc"
 	"github.com/Busnes-app/ky_server_base/internal/scim"
 	"github.com/Busnes-app/ky_server_base/internal/sso"
@@ -42,6 +43,7 @@ type Server struct {
 	store            store.Store
 	blobs            *blobs.Store
 	blobsErr         error
+	push             *push.Dispatcher
 	sessions         *auth.SessionManager
 	pairing          *devices.PairingService
 	kyidentity       *sso.KyIdentityClient
@@ -127,9 +129,12 @@ func (s *Server) tracked(h http.HandlerFunc) http.HandlerFunc {
 func (s *Server) WaitDetached() {
 	c := s.detached.signal()
 	c.L.Lock()
-	defer c.L.Unlock()
 	for s.detached.n > 0 {
 		c.Wait()
+	}
+	c.L.Unlock()
+	if s.push != nil {
+		s.push.Close()
 	}
 }
 
@@ -221,6 +226,7 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 		store:           st,
 		blobs:           blobStore,
 		blobsErr:        blobsErr,
+		push:            initPushDispatcher(cfg, st),
 		sessions:        sessions,
 		pairing:         pairing,
 		kyidentity:      kyidentity,
@@ -429,6 +435,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("PUT /api/v1/rooms/{id}/messages/{mid}/reactions/{emoji}", s.requireAuthenticated(s.handleChatAddReaction))
 	s.mux.HandleFunc("DELETE /api/v1/rooms/{id}/messages/{mid}/reactions/{emoji}", s.requireAuthenticated(s.handleChatRemoveReaction))
 	s.mux.HandleFunc("POST /api/v1/rooms/{id}/read", s.requireAuthenticated(s.handleChatMarkRead))
+	s.mux.HandleFunc("PUT /api/v1/rooms/{id}/notifications", s.requireAuthenticated(s.handleUpdateRoomNotifications))
+	s.mux.HandleFunc("GET /api/v1/push/subscriptions", s.requireAuthenticated(s.handleListPushSubscriptions))
+	s.mux.HandleFunc("POST /api/v1/push/subscriptions", s.requireAuthenticated(s.handleRegisterPushSubscription))
+	s.mux.HandleFunc("DELETE /api/v1/push/subscriptions", s.requireAuthenticated(s.handleDeletePushSubscription))
 	s.mux.HandleFunc("GET /api/v1/search", s.requireAuthenticated(s.handleChatSearch))
 	s.mux.HandleFunc("GET /api/v1/rooms/{id}/webhooks", s.requireAuthenticated(s.handleChatListWebhooks))
 	s.mux.HandleFunc("POST /api/v1/rooms/{id}/webhooks", s.requireAuthenticated(s.handleChatCreateWebhook))

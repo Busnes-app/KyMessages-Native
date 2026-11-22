@@ -686,7 +686,7 @@ func (s *sessionStore) DeleteUserSessions(ctx context.Context, userID string) er
 }
 
 func deleteGrants(ctx context.Context, st *SQLStore, tx *sql.Tx, userID string) error {
-	for _, table := range []string{"sessions", "mfa_challenges", "device_pairings"} {
+	for _, table := range []string{"sessions", "mfa_challenges", "device_pairings", "push_subscriptions"} {
 		if _, err := tx.ExecContext(ctx, st.rebind("DELETE FROM "+table+" WHERE user_id = ?"), userID); err != nil {
 			return err
 		}

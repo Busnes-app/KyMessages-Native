@@ -31,6 +31,7 @@ import {
   type GuestMeetInfo,
   type LobbyGuest,
   type MediaPolicyConfig,
+  type NotifyMode,
   type WsServerEvent,
   type WsStatus,
 } from './types';
@@ -263,6 +264,53 @@ export async function markRoomRead(roomId: string, seq: number): Promise<number>
     ),
   );
   return count(data.last_read_seq);
+}
+
+export async function updateRoomNotifyMode(roomId: string, notifyMode: NotifyMode): Promise<NotifyMode> {
+  const data = obj(
+    await apiJSON(
+      `/api/v1/rooms/${encodeURIComponent(roomId)}/notifications`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({ notify_mode: notifyMode }),
+      },
+      'Could not update notification preference',
+    ),
+  );
+  const mode = str(data.notify_mode, 16);
+  if (mode === 'all' || mode === 'mentions' || mode === 'mute') {
+    return mode;
+  }
+  return notifyMode;
+}
+
+export async function registerPushSubscription(params: {
+  endpoint: string;
+  p256dh: string;
+  auth: string;
+}): Promise<void> {
+  await apiJSON(
+    '/api/v1/push/subscriptions',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        endpoint: params.endpoint,
+        keys: { p256dh: params.p256dh, auth: params.auth },
+      }),
+    },
+    'Could not register push notifications',
+  );
+}
+
+export async function deletePushSubscription(endpoint: string): Promise<void> {
+  await apiJSON(
+    '/api/v1/push/subscriptions',
+    {
+      method: 'DELETE',
+      body: JSON.stringify({ endpoint }),
+    },
+    'Could not disable push notifications',
+  );
 }
 
 export async function searchMessages(query: string, roomId?: string): Promise<ChatMessage[]> {
