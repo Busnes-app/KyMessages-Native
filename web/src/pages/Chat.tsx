@@ -1695,11 +1695,6 @@ export const Chat: React.FC<ChatProps> = ({
     }
   }, [pushBusy, pushConfig.vapid_public_key, pushState.kind]);
 
-  const handleLogoutWithPushCleanup = useCallback(() => {
-    void disableBrowserPush();
-    onLogout?.();
-  }, [onLogout]);
-
   const handleNotifyModeChanged = useCallback((roomId: string, mode: NotifyMode) => {
     setRooms((prev) => prev.map((r) => (r.id === roomId ? { ...r, notify_mode: mode } : r)));
     setRoomDetail((prev) =>
@@ -1774,7 +1769,7 @@ export const Chat: React.FC<ChatProps> = ({
         onOpenSearch={() => setModal('search')}
         onStartInstantMeeting={() => void handleStartInstantMeeting()}
         onOpenSettings={onOpenSettings}
-        onLogout={onLogout ? handleLogoutWithPushCleanup : undefined}
+        onLogout={onLogout}
       />
 
       <section

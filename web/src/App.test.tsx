@@ -2,6 +2,12 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { App } from './App';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import { disableBrowserPush } from './chat/push';
+
+vi.mock('./chat/push', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./chat/push')>()),
+  disableBrowserPush: vi.fn(async () => ({ kind: 'disabled' })),
+}));
 
 const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { 'Content-Type': 'application/json' } });
 const member = { username: 'bob', display_name: 'Bob', role: 'user', must_change_password: false };
@@ -25,7 +31,7 @@ function stubServer(logout: () => Promise<Response>, me: unknown = { authenticat
   }));
 }
 
-afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.mocked(disableBrowserPush).mockClear(); });
 
 it('stays signed in and says so when the server refuses sign-out', async () => {
   stubServer(async () => json({ error: 'Invalid CSRF token' }, 403));
@@ -75,4 +81,16 @@ it('opens preferences via the bottom settings gear and omits Pair Device', async
   expect(await screen.findByRole('heading', { name: 'Preferences' })).toBeTruthy();
   fireEvent.click(screen.getByRole('button', { name: /back to chat/i }));
   expect(await screen.findByRole('button', { name: 'Settings' })).toBeTruthy();
+});
+
+it('removes the browser push subscription before signing out from Settings', async () => {
+  const order: string[] = [];
+  vi.mocked(disableBrowserPush).mockImplementationOnce(async () => { order.push('push'); return { kind: 'disabled' }; });
+  stubServer(async () => { order.push('logout'); return json({ logged_out: true }); });
+  render(<App />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
+  await screen.findByRole('heading', { name: 'Preferences' });
+  fireEvent.click(screen.getAllByRole('button', { name: 'Sign out' })[0]);
+  expect(await screen.findByLabelText('Username')).toBeTruthy();
+  expect(order).toEqual(['push', 'logout']);
 });

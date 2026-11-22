@@ -781,7 +781,7 @@ func (s *Server) handleChatSendMessage(w http.ResponseWriter, r *http.Request) {
 			Seq:    msg.Seq,
 			Data:   chat.MustMarshalData(msg),
 		})
-		s.dispatchMessagePush(r.Context(), tenantID, roomID, msg)
+		s.pushAsync(r.Context(), func(ctx context.Context) { s.dispatchMessagePush(ctx, tenantID, roomID, msg) })
 	}
 	status := http.StatusOK
 	if created {
@@ -1284,7 +1284,7 @@ func (s *Server) handleChatIncomingWebhook(w http.ResponseWriter, r *http.Reques
 			Seq:    msg.Seq,
 			Data:   chat.MustMarshalData(msg),
 		})
-		s.dispatchMessagePush(r.Context(), wh.TenantID, wh.RoomID, msg)
+		s.pushAsync(r.Context(), func(ctx context.Context) { s.dispatchMessagePush(ctx, wh.TenantID, wh.RoomID, msg) })
 	}
 	status := http.StatusOK
 	if created {

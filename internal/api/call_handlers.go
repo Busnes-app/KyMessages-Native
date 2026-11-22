@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -107,7 +108,10 @@ func (s *Server) handleCallJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if resp.Started {
-		s.dispatchCallPush(r.Context(), tenantID, roomID, user.ID, displayNameFor(user))
+		starter := displayNameFor(user)
+		s.pushAsync(r.Context(), func(ctx context.Context) {
+			s.dispatchCallPush(ctx, tenantID, roomID, user.ID, starter)
+		})
 	}
 	s.writeJSON(w, http.StatusOK, resp)
 }
