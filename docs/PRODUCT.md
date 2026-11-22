@@ -125,6 +125,13 @@ publishes an attested image, `ghcr.io/busnes-app/kymessage-server` (README, "Con
 - Capsule limit 256 MiB expanded; the run fails loudly past it and the screen warns from 75%.
 - `restore` then `restore-matrix` rebuild a lost host; proven end to end in acceptance.
 
+**Notifications.** Browser Web Push for new messages and incoming calls, opt-in per browser.
+Each member picks a room mode: all messages, mentions only, or mute (DMs always notify outside
+mute). Only current room members with active human accounts get a push. A plaintext message's
+sender, room and a short preview pass through the browser vendor's push service, encrypted to the
+browser (RFC 8291); end-to-end encrypted messages are never previewed. Signing out, offboarding
+and a restore remove subscriptions.
+
 **Console.** Changes need a sign-in from the last 10 minutes and are audited.
 - Overview: chat health, users, backups, KyIdentity sync cards.
 - Users: Matrix users with their KyIdentity link and sessions; end one or all sessions. No

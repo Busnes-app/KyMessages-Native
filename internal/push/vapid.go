@@ -194,7 +194,12 @@ func (k *VAPIDKey) AuthorizationHeader(endpoint *url.URL, subject string, ttl ti
 		ttl = 12 * time.Hour
 	}
 
-	aud := endpoint.Scheme + "://" + endpoint.Host
+	// The audience is the push service's origin, which omits the scheme's default port.
+	host := endpoint.Host
+	if endpoint.Scheme == "https" {
+		host = strings.TrimSuffix(host, ":443")
+	}
+	aud := endpoint.Scheme + "://" + host
 	headerJSON := `{"typ":"JWT","alg":"ES256"}`
 	claimsBytes, err := json.Marshal(struct {
 		Aud string `json:"aud"`
