@@ -45,7 +45,8 @@ type Store struct {
 	dir string
 }
 
-// NewStore creates a Store rooted at dir, creating the directory (0700) if needed.
+// NewStore creates a Store rooted at dir, creating the directory (0700) if needed
+// and verifying that it is writable.
 func NewStore(dir string) (*Store, error) {
 	if strings.TrimSpace(dir) == "" {
 		return nil, errors.New("blobs: directory is required")
@@ -57,6 +58,13 @@ func NewStore(dir string) (*Store, error) {
 	if err := os.MkdirAll(abs, 0o700); err != nil {
 		return nil, fmt.Errorf("blobs: create directory: %w", err)
 	}
+	probe, err := os.CreateTemp(abs, ".probe-*")
+	if err != nil {
+		return nil, fmt.Errorf("blobs: directory %q is not writable: %w", abs, err)
+	}
+	probePath := probe.Name()
+	_ = probe.Close()
+	_ = os.Remove(probePath)
 	return &Store{dir: abs}, nil
 }
 

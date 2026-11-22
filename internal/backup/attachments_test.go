@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/Busnes-app/ky_server_base/internal/backup"
 )
@@ -28,8 +29,10 @@ func TestMirrorAttachmentsIdempotentPrunesAndAuthenticates(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	t0 := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+
 	// First run copies both blobs.
-	res1, err := backup.MirrorAttachments(context.Background(), cfg)
+	res1, err := backup.MirrorAttachmentsAt(context.Background(), cfg, t0, backup.DefaultMirrorPruneRetention)
 	if err != nil {
 		t.Fatalf("first MirrorAttachments: %v", err)
 	}
@@ -38,7 +41,7 @@ func TestMirrorAttachmentsIdempotentPrunesAndAuthenticates(t *testing.T) {
 	}
 
 	// Second run skips both already-mirrored blobs.
-	res2, err := backup.MirrorAttachments(context.Background(), cfg)
+	res2, err := backup.MirrorAttachmentsAt(context.Background(), cfg, t0.Add(time.Minute), backup.DefaultMirrorPruneRetention)
 	if err != nil {
 		t.Fatalf("second MirrorAttachments: %v", err)
 	}
@@ -46,25 +49,52 @@ func TestMirrorAttachmentsIdempotentPrunesAndAuthenticates(t *testing.T) {
 		t.Fatalf("second run = %+v, want copied=0 skipped=2 pruned=0", res2)
 	}
 
-	// Deleting k2 from live storage prunes k2.enc on the next mirror sync.
+	// Deleting k2 from live storage moves k2.enc into .pruned/ for the retention window.
 	if err := os.Remove(filepath.Join(attDir, k2)); err != nil {
 		t.Fatal(err)
 	}
-	res3, err := backup.MirrorAttachments(context.Background(), cfg)
+	res3, err := backup.MirrorAttachmentsAt(context.Background(), cfg, t0.Add(2*time.Minute), backup.DefaultMirrorPruneRetention)
 	if err != nil {
 		t.Fatalf("third MirrorAttachments: %v", err)
 	}
-	if res3.Copied != 0 || res3.Skipped != 1 || res3.Pruned != 1 {
-		t.Fatalf("third run = %+v, want copied=0 skipped=1 pruned=1", res3)
+	if res3.Copied != 0 || res3.Skipped != 1 || res3.Pruned != 1 || res3.Expired != 0 {
+		t.Fatalf("third run = %+v, want copied=0 skipped=1 pruned=1 expired=0", res3)
 	}
 	mirrorDir := backup.AttachmentMirrorDir(cfg)
 	if _, err := os.Stat(filepath.Join(mirrorDir, k2+".enc")); !os.IsNotExist(err) {
-		t.Fatal("deleted blob should be pruned from mirror")
+		t.Fatal("deleted blob should move out of active mirror directory")
+	}
+	prunedPath := filepath.Join(mirrorDir, backup.AttachmentMirrorPrunedDirName, k2+".enc")
+	if _, err := os.Stat(prunedPath); err != nil {
+		t.Fatalf("soft-pruned blob should remain in %s during retention window: %v", backup.AttachmentMirrorPrunedDirName, err)
 	}
 
 	key, err := backup.LoadAttachmentKey(cfg.Database.DataDir)
 	if err != nil {
 		t.Fatalf("LoadAttachmentKey: %v", err)
+	}
+
+	// Within the retention window, soft-pruned blobs are still restorable.
+	restoredPruned := t.TempDir()
+	n, err := backup.RestoreAttachments(filepath.Join(mirrorDir, backup.AttachmentMirrorPrunedDirName), restoredPruned, key)
+	if err != nil || n != 1 {
+		t.Fatalf("RestoreAttachments(.pruned) = (%d, %v), want (1, nil)", n, err)
+	}
+	gotK2, err := os.ReadFile(filepath.Join(restoredPruned, k2))
+	if err != nil || string(gotK2) != "second payload" {
+		t.Fatalf("restored pruned blob = %q (%v), want %q", string(gotK2), err, "second payload")
+	}
+
+	// After the retention window elapses, k2.enc is permanently expired.
+	res4, err := backup.MirrorAttachmentsAt(context.Background(), cfg, t0.Add(2*time.Minute+backup.DefaultMirrorPruneRetention), backup.DefaultMirrorPruneRetention)
+	if err != nil {
+		t.Fatalf("fourth MirrorAttachments: %v", err)
+	}
+	if res4.Expired != 1 {
+		t.Fatalf("fourth run = %+v, want expired=1", res4)
+	}
+	if _, err := os.Stat(prunedPath); !os.IsNotExist(err) {
+		t.Fatal("expired soft-pruned blob should be removed after retention window")
 	}
 
 	// Wrong key must fail restore.
@@ -95,5 +125,76 @@ func TestMirrorAttachmentsIdempotentPrunesAndAuthenticates(t *testing.T) {
 	}
 	if _, err := backup.RestoreAttachments(tamperedDir, t.TempDir(), key); err == nil {
 		t.Fatal("RestoreAttachments succeeded on tampered ciphertext")
+	}
+}
+
+func TestMirrorAttachmentsRefusesWipeWhenSourceEmptyAndRetainsPruned(t *testing.T) {
+	cfg, _ := payloadConfig(t)
+	attDir := filepath.Join(t.TempDir(), "att")
+	cfg.Attachments.Dir = attDir
+	cfg.Backup.Dir = filepath.Join(t.TempDir(), "bak")
+	if err := os.MkdirAll(attDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	k1 := "att_019a0000-0000-7000-8000-000000000201"
+	k2 := "att_019a0000-0000-7000-8000-000000000202"
+	if err := os.WriteFile(filepath.Join(attDir, k1), []byte("alpha"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(attDir, k2), []byte("beta"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t0 := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+	if _, err := backup.MirrorAttachmentsAt(context.Background(), cfg, t0, backup.DefaultMirrorPruneRetention); err != nil {
+		t.Fatalf("initial mirror: %v", err)
+	}
+
+	// Simulate starting the server after a DB restore before running restore-attachments:
+	// the live attachments directory exists, is empty, and a scheduled backup runs.
+	if err := os.Remove(filepath.Join(attDir, k1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(attDir, k2)); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := backup.MirrorAttachmentsAt(context.Background(), cfg, t0.Add(time.Hour), backup.DefaultMirrorPruneRetention)
+	if err != nil {
+		t.Fatalf("empty-source mirror: %v", err)
+	}
+	if !res.PruneSkipped || res.MirrorBlobs != 2 || res.Pruned != 0 {
+		t.Fatalf("empty-source mirror = %+v, want PruneSkipped=true MirrorBlobs=2 Pruned=0", res)
+	}
+
+	mirrorDir := backup.AttachmentMirrorDir(cfg)
+	key, err := backup.LoadAttachmentKey(cfg.Database.DataDir)
+	if err != nil {
+		t.Fatalf("LoadAttachmentKey: %v", err)
+	}
+	restoredDir := t.TempDir()
+	n, err := backup.RestoreAttachments(mirrorDir, restoredDir, key)
+	if err != nil || n != 2 {
+		t.Fatalf("RestoreAttachments after empty-source backup = (%d, %v), want (2, nil)", n, err)
+	}
+
+	// Even if one new blob is uploaded before restore-attachments runs, existing blobs are
+	// soft-pruned into .pruned/ (not destroyed) and stay restorable for the retention window.
+	k3 := "att_019a0000-0000-7000-8000-000000000203"
+	if err := os.WriteFile(filepath.Join(attDir, k3), []byte("gamma"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res2, err := backup.MirrorAttachmentsAt(context.Background(), cfg, t0.Add(2*time.Hour), backup.DefaultMirrorPruneRetention)
+	if err != nil {
+		t.Fatalf("mirror after single upload: %v", err)
+	}
+	if res2.Copied != 1 || res2.Pruned != 2 || res2.Expired != 0 {
+		t.Fatalf("mirror after single upload = %+v, want copied=1 pruned=2 expired=0", res2)
+	}
+	recovered := t.TempDir()
+	n, err = backup.RestoreAttachments(filepath.Join(mirrorDir, backup.AttachmentMirrorPrunedDirName), recovered, key)
+	if err != nil || n != 2 {
+		t.Fatalf("RestoreAttachments(.pruned) = (%d, %v), want (2, nil)", n, err)
 	}
 }

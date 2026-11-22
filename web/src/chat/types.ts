@@ -80,11 +80,13 @@ export interface ChatAttachment {
 }
 
 export interface ChatAttachmentLimits {
+  available: boolean;
   max_upload_bytes: number;
   max_per_message: number;
 }
 
 export const DEFAULT_ATTACHMENT_LIMITS: ChatAttachmentLimits = {
+  available: true,
   max_upload_bytes: 25 * 1024 * 1024,
   max_per_message: 10,
 };
@@ -610,6 +612,7 @@ export function parseBootstrap(v: unknown): ChatBootstrap {
       ice_servers: parseICEServers(rtcObj.ice_servers),
     },
     attachments: {
+      available: opt(attObj.available, bool) ?? DEFAULT_ATTACHMENT_LIMITS.available,
       max_upload_bytes: opt(attObj.max_upload_bytes, count) ?? DEFAULT_ATTACHMENT_LIMITS.max_upload_bytes,
       max_per_message: opt(attObj.max_per_message, count) ?? DEFAULT_ATTACHMENT_LIMITS.max_per_message,
     },

@@ -161,6 +161,7 @@ func (s *Server) handleChatBootstrap(w http.ResponseWriter, r *http.Request) {
 			"ice_servers":   s.calls.ICEServers(),
 		},
 		"attachments": map[string]any{
+			"available":        s.blobs != nil,
 			"max_upload_bytes": s.maxUploadBytes(),
 			"max_per_message":  maxAttachmentsPerMessage,
 		},

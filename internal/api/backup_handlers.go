@@ -356,8 +356,10 @@ func (s *Server) handleRunBackup(w http.ResponseWriter, r *http.Request) {
 		if err == nil {
 			if mres, merr := backup.MirrorAttachments(ctx, s.config); merr != nil {
 				log.Printf("[BACKUP] attachment mirror sync warning: %s", recoveryclient.AuditSafe(merr.Error()))
-			} else if mres.Copied > 0 || mres.Pruned > 0 {
-				log.Printf("[BACKUP] attachment mirror synced: copied=%d skipped=%d pruned=%d", mres.Copied, mres.Skipped, mres.Pruned)
+			} else if mres.PruneSkipped {
+				log.Printf("[BACKUP] attachment mirror prune skipped: live attachments directory is empty while mirror holds %d encrypted blob(s) (run restore-attachments if restoring)", mres.MirrorBlobs)
+			} else if mres.Copied > 0 || mres.Pruned > 0 || mres.Expired > 0 {
+				log.Printf("[BACKUP] attachment mirror synced: copied=%d skipped=%d pruned=%d expired=%d", mres.Copied, mres.Skipped, mres.Pruned, mres.Expired)
 			}
 		}
 		unlock()

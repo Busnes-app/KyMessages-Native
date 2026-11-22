@@ -362,4 +362,47 @@ describe('Native Chat page', () => {
       expect(deletedUrls).toEqual(['/api/v1/attachments/att_late_orphan']);
     });
   });
+
+  it('hides the attachment button when bootstrap reports attachments.available=false', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === '/api/v1/bootstrap') {
+          return Promise.resolve(
+            json({
+              user: { id: 'u_alice', username: 'alice', display_name: 'Alice', role: 'user' },
+              tenant: { id: 'default', slug: 'default', display_name: 'Busnes HQ', plan: 'self_hosted' },
+              rooms: [
+                {
+                  id: 'rm_gen',
+                  tenant_id: 'default',
+                  kind: 'channel',
+                  name: 'general',
+                  topic: '',
+                  is_private: false,
+                  last_seq: 0,
+                  created_by: 'u_alice',
+                  created_at: Date.now(),
+                  role: 'owner',
+                  last_read_seq: 0,
+                  unread_count: 0,
+                  notify_mode: 'all',
+                },
+              ],
+              attachments: { available: false, max_upload_bytes: 10 * 1024 * 1024, max_per_message: 10 },
+            }),
+          );
+        }
+        if (url.startsWith('/api/v1/rooms/rm_gen/messages')) {
+          return Promise.resolve(json({ messages: [], has_more: false }));
+        }
+        return Promise.resolve(json({ error: 'not found' }, 404));
+      }),
+    );
+
+    render(<Chat />);
+    await screen.findByRole('heading', { name: 'Welcome to #general' });
+    expect(screen.queryByRole('button', { name: 'Attach files' })).toBeNull();
+  });
 });

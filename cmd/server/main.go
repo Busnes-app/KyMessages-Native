@@ -106,6 +106,9 @@ func runServer() {
 	}
 
 	srv := api.NewServer(cfg, st)
+	if err := srv.BlobsError(); err != nil {
+		log.Fatalf("Failed to initialize attachment storage: %v", err)
+	}
 	chatBusDone := make(chan struct{})
 	go func() {
 		defer close(chatBusDone)
@@ -293,8 +296,12 @@ func mirrorAttachments(ctx context.Context, cfg *config.Config) {
 		log.Printf("[BACKUP] attachment mirror sync warning: %s", recoveryclient.AuditSafe(merr.Error()))
 		return
 	}
-	if mres.Copied > 0 || mres.Pruned > 0 {
-		log.Printf("[BACKUP] attachment mirror synced: copied=%d skipped=%d pruned=%d", mres.Copied, mres.Skipped, mres.Pruned)
+	if mres.PruneSkipped {
+		log.Printf("[BACKUP] attachment mirror prune skipped: live attachments directory is empty while mirror holds %d encrypted blob(s) (run restore-attachments if restoring)", mres.MirrorBlobs)
+		return
+	}
+	if mres.Copied > 0 || mres.Pruned > 0 || mres.Expired > 0 {
+		log.Printf("[BACKUP] attachment mirror synced: copied=%d skipped=%d pruned=%d expired=%d", mres.Copied, mres.Skipped, mres.Pruned, mres.Expired)
 	}
 }
 

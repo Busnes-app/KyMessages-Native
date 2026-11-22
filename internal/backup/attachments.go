@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/Busnes-app/ky_server_base/internal/blobs"
 	"github.com/Busnes-app/ky_server_base/internal/config"
@@ -21,6 +22,14 @@ import (
 // attachment mirror key is stored, matching <DataDir>/attachments.key on disk.
 const AttachmentKeyPath = "data/attachments.key"
 
+// AttachmentMirrorPrunedDirName holds soft-pruned encrypted blobs inside the mirror directory
+// for DefaultMirrorPruneRetention so an accidental wipe or out-of-order restore remains recoverable.
+const AttachmentMirrorPrunedDirName = ".pruned"
+
+// DefaultMirrorPruneRetention is how long unreferenced encrypted blobs stay in .pruned
+// before being permanently deleted.
+const DefaultMirrorPruneRetention = 7 * 24 * time.Hour
+
 const (
 	attachmentMirrorAADPrefix = "kymessages-attachments/v1\x00"
 	attachmentNonceSize       = 12
@@ -29,9 +38,12 @@ const (
 
 // AttachmentMirrorResult summarizes a MirrorAttachments sync run.
 type AttachmentMirrorResult struct {
-	Copied  int
-	Skipped int
-	Pruned  int
+	Copied       int
+	Skipped      int
+	Pruned       int
+	Expired      int
+	PruneSkipped bool
+	MirrorBlobs  int
 }
 
 // EnsureAttachmentKey loads the 32-byte attachment mirror key from <dataDir>/attachments.key,
@@ -104,7 +116,17 @@ func AttachmentMirrorDir(cfg *config.Config) string {
 // MirrorAttachments synchronizes regular attachment blobs from cfg.Attachments.Dir into an
 // AES-256-GCM encrypted mirror at <KY_BACKUP_DIR>/attachments. Blobs are encrypted one at a
 // time with the write-once attachment key and never consume the server capsule budget.
+//
+// Pruning refuses to run when the live directory is empty while the mirror still holds
+// encrypted blobs (protecting against out-of-order restores or an unmounted volume), and
+// unreferenced mirror blobs are moved to .pruned/ for DefaultMirrorPruneRetention before
+// permanent deletion.
 func MirrorAttachments(ctx context.Context, cfg *config.Config) (AttachmentMirrorResult, error) {
+	return MirrorAttachmentsAt(ctx, cfg, time.Now(), DefaultMirrorPruneRetention)
+}
+
+// MirrorAttachmentsAt is the time- and retention-parameterized implementation of MirrorAttachments.
+func MirrorAttachmentsAt(ctx context.Context, cfg *config.Config, now time.Time, retention time.Duration) (AttachmentMirrorResult, error) {
 	var res AttachmentMirrorResult
 	mirrorDir := AttachmentMirrorDir(cfg)
 	if mirrorDir == "" {
@@ -134,10 +156,40 @@ func MirrorAttachments(ctx context.Context, cfg *config.Config) (AttachmentMirro
 	}
 
 	if len(srcBlobs) == 0 {
-		// Nothing to mirror; if mirror directory exists, prune deleted blobs.
-		if _, err := os.Stat(mirrorDir); errors.Is(err, os.ErrNotExist) {
+		existing, err := os.ReadDir(mirrorDir)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return res, nil
+			}
+			return res, fmt.Errorf("backup: read attachment mirror directory: %w", err)
+		}
+		mirrorRoot, err := os.OpenRoot(mirrorDir)
+		if err != nil {
+			return res, fmt.Errorf("backup: open attachment mirror root: %w", err)
+		}
+		defer mirrorRoot.Close()
+
+		mirrorCount := 0
+		for _, e := range existing {
+			name := e.Name()
+			if strings.HasPrefix(name, ".tmp-") && e.Type().IsRegular() {
+				_ = mirrorRoot.Remove(name)
+				continue
+			}
+			if strings.HasSuffix(name, ".enc") && e.Type().IsRegular() && blobs.ValidKey(strings.TrimSuffix(name, ".enc")) {
+				mirrorCount++
+			}
+		}
+		if mirrorCount > 0 {
+			// Guard against catastrophic mirror wipe when the live attachments directory is empty
+			// (for example, starting the server after a DB restore before running restore-attachments,
+			// or a mis-mounted volume). Never prune or expire in this state.
+			res.PruneSkipped = true
+			res.MirrorBlobs = mirrorCount
 			return res, nil
 		}
+		res.Expired = expirePrunedAttachments(ctx, mirrorDir, mirrorRoot, now, retention)
+		return res, nil
 	}
 
 	if err := os.MkdirAll(mirrorDir, 0o700); err != nil {
@@ -158,58 +210,61 @@ func MirrorAttachments(ctx context.Context, cfg *config.Config) (AttachmentMirro
 		}
 	}
 
-	if len(srcBlobs) > 0 {
-		key, err := EnsureAttachmentKey(cfg.Database.DataDir)
-		if err != nil {
+	key, err := EnsureAttachmentKey(cfg.Database.DataDir)
+	if err != nil {
+		return res, err
+	}
+	gcm, err := newAttachmentGCM(key)
+	if err != nil {
+		return res, err
+	}
+	srcRoot, err := os.OpenRoot(srcDir)
+	if err != nil {
+		return res, fmt.Errorf("backup: open attachments root: %w", err)
+	}
+	defer srcRoot.Close()
+
+	for name, srcSize := range srcBlobs {
+		if err := ctx.Err(); err != nil {
 			return res, err
 		}
-		gcm, err := newAttachmentGCM(key)
-		if err != nil {
-			return res, err
-		}
-		srcRoot, err := os.OpenRoot(srcDir)
-		if err != nil {
-			return res, fmt.Errorf("backup: open attachments root: %w", err)
-		}
-		defer srcRoot.Close()
+		encName := name + ".enc"
+		// If this blob was previously soft-pruned and later reappeared (e.g. after restore),
+		// remove the stale duplicate from .pruned/.
+		_ = mirrorRoot.Remove(filepath.Join(AttachmentMirrorPrunedDirName, encName))
 
-		for name, srcSize := range srcBlobs {
-			if err := ctx.Err(); err != nil {
-				return res, err
-			}
-			encName := name + ".enc"
-			expectedSize := srcSize + attachmentNonceSize + attachmentTagSize
-			if info, err := mirrorRoot.Stat(encName); err == nil && info.Mode().IsRegular() && info.Size() == expectedSize {
-				res.Skipped++
+		expectedSize := srcSize + attachmentNonceSize + attachmentTagSize
+		if info, err := mirrorRoot.Stat(encName); err == nil && info.Mode().IsRegular() && info.Size() == expectedSize {
+			res.Skipped++
+			continue
+		}
+
+		plain, err := srcRoot.ReadFile(name)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				// Deleted concurrently between ReadDir and ReadFile.
 				continue
 			}
-
-			plain, err := srcRoot.ReadFile(name)
-			if err != nil {
-				if errors.Is(err, os.ErrNotExist) {
-					// Deleted concurrently between ReadDir and ReadFile.
-					continue
-				}
-				return res, fmt.Errorf("backup: read attachment %s: %w", name, err)
-			}
-			if len(plain) == 0 {
-				continue
-			}
-			sealed, err := sealAttachmentBlob(gcm, name, plain)
-			if err != nil {
-				return res, fmt.Errorf("backup: encrypt attachment %s: %w", name, err)
-			}
-			if err := writeFileAtomicRoot(mirrorRoot, encName, sealed); err != nil {
-				return res, fmt.Errorf("backup: write mirrored attachment %s: %w", name, err)
-			}
-			res.Copied++
+			return res, fmt.Errorf("backup: read attachment %s: %w", name, err)
 		}
+		if len(plain) == 0 {
+			continue
+		}
+		sealed, err := sealAttachmentBlob(gcm, name, plain)
+		if err != nil {
+			return res, fmt.Errorf("backup: encrypt attachment %s: %w", name, err)
+		}
+		if err := writeFileAtomicRoot(mirrorRoot, encName, sealed); err != nil {
+			return res, fmt.Errorf("backup: write mirrored attachment %s: %w", name, err)
+		}
+		res.Copied++
 	}
 
 	if err := ctx.Err(); err != nil {
 		return res, err
 	}
 	if existing, err := os.ReadDir(mirrorDir); err == nil {
+		prunedDirReady := false
 		for _, e := range existing {
 			name := e.Name()
 			if !strings.HasSuffix(name, ".enc") || !e.Type().IsRegular() {
@@ -219,14 +274,62 @@ func MirrorAttachments(ctx context.Context, cfg *config.Config) (AttachmentMirro
 			if !blobs.ValidKey(keyName) {
 				continue
 			}
-			if _, ok := srcBlobs[keyName]; !ok {
-				if err := mirrorRoot.Remove(name); err == nil {
+			if _, ok := srcBlobs[keyName]; ok {
+				continue
+			}
+			if retention > 0 {
+				if !prunedDirReady {
+					if err := mirrorRoot.Mkdir(AttachmentMirrorPrunedDirName, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+						return res, fmt.Errorf("backup: create pruned mirror directory: %w", err)
+					}
+					prunedDirReady = true
+				}
+				prunedRel := filepath.Join(AttachmentMirrorPrunedDirName, name)
+				if err := mirrorRoot.Rename(name, prunedRel); err == nil {
+					_ = mirrorRoot.Chtimes(prunedRel, now, now)
 					res.Pruned++
 				}
+			} else if err := mirrorRoot.Remove(name); err == nil {
+				res.Pruned++
 			}
 		}
 	}
+	res.Expired = expirePrunedAttachments(ctx, mirrorDir, mirrorRoot, now, retention)
 	return res, nil
+}
+
+func expirePrunedAttachments(ctx context.Context, mirrorDir string, mirrorRoot *os.Root, now time.Time, retention time.Duration) int {
+	if retention <= 0 {
+		return 0
+	}
+	prunedPath := filepath.Join(mirrorDir, AttachmentMirrorPrunedDirName)
+	entries, err := os.ReadDir(prunedPath)
+	if err != nil {
+		return 0
+	}
+	expired := 0
+	for _, e := range entries {
+		if ctx.Err() != nil {
+			break
+		}
+		name := e.Name()
+		if !strings.HasSuffix(name, ".enc") || !e.Type().IsRegular() {
+			continue
+		}
+		if !blobs.ValidKey(strings.TrimSuffix(name, ".enc")) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		if now.Sub(info.ModTime()) >= retention {
+			if err := mirrorRoot.Remove(filepath.Join(AttachmentMirrorPrunedDirName, name)); err == nil {
+				expired++
+			}
+		}
+	}
+	return expired
 }
 
 // RestoreAttachments decrypts all mirrored attachment blobs from mirrorDir using the 32-byte

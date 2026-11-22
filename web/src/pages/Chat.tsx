@@ -1040,7 +1040,7 @@ export const Chat: React.FC<ChatProps> = ({
 
   const uploadFilesForRoom = useCallback(
     (roomId: string, files: File[]) => {
-      if (files.length === 0) return;
+      if (files.length === 0 || !attachmentLimits.available) return;
       const room = roomsRef.current.find((r) => r.id === roomId);
       if (room?.closed_at) return;
 
@@ -1673,27 +1673,27 @@ export const Chat: React.FC<ChatProps> = ({
         className={`chat-stage${dragActive ? ' is-drag-over' : ''}`}
         aria-label="Conversation"
         onDragEnter={(e) => {
-          if (!activeRoom || activeRoom.closed_at) return;
+          if (!activeRoom || activeRoom.closed_at || !attachmentLimits.available) return;
           if (!Array.from(e.dataTransfer.types).includes('Files')) return;
           e.preventDefault();
           dragDepthRef.current += 1;
           setDragActive(true);
         }}
         onDragOver={(e) => {
-          if (!activeRoom || activeRoom.closed_at) return;
+          if (!activeRoom || activeRoom.closed_at || !attachmentLimits.available) return;
           if (!Array.from(e.dataTransfer.types).includes('Files')) return;
           e.preventDefault();
           e.dataTransfer.dropEffect = 'copy';
         }}
         onDragLeave={(e) => {
-          if (!activeRoom) return;
+          if (!activeRoom || !attachmentLimits.available) return;
           if (!Array.from(e.dataTransfer.types).includes('Files')) return;
           e.preventDefault();
           dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
           if (dragDepthRef.current === 0) setDragActive(false);
         }}
         onDrop={(e) => {
-          if (!activeRoom || activeRoom.closed_at) return;
+          if (!activeRoom || activeRoom.closed_at || !attachmentLimits.available) return;
           e.preventDefault();
           dragDepthRef.current = 0;
           setDragActive(false);
@@ -1703,7 +1703,7 @@ export const Chat: React.FC<ChatProps> = ({
           }
         }}
       >
-        {dragActive && activeRoom && !activeRoom.closed_at && (
+        {dragActive && activeRoom && !activeRoom.closed_at && attachmentLimits.available && (
           <div className="chat-drop-overlay" aria-hidden="true">
             <div className="chat-drop-card">
               <Paperclip size={24} />
@@ -2214,16 +2214,18 @@ export const Chat: React.FC<ChatProps> = ({
                 className={replyTo || activeStaged.length > 0 ? 'chat-composer has-reply' : 'chat-composer'}
                 onSubmit={handleComposerSubmit}
               >
-                <button
-                  type="button"
-                  className="chat-attach-btn"
-                  disabled={Boolean(activeRoom.closed_at)}
-                  title={`Attach files (max ${formatBytes(attachmentLimits.max_upload_bytes)} each)`}
-                  aria-label="Attach files"
-                  onClick={() => fileInputRef.current?.click()}
-                >
-                  <Paperclip size={16} aria-hidden="true" />
-                </button>
+                {attachmentLimits.available && (
+                  <button
+                    type="button"
+                    className="chat-attach-btn"
+                    disabled={Boolean(activeRoom.closed_at)}
+                    title={`Attach files (max ${formatBytes(attachmentLimits.max_upload_bytes)} each)`}
+                    aria-label="Attach files"
+                    onClick={() => fileInputRef.current?.click()}
+                  >
+                    <Paperclip size={16} aria-hidden="true" />
+                  </button>
+                )}
                 <textarea
                   ref={composerRef}
                   rows={1}

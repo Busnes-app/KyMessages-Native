@@ -21,7 +21,9 @@ import (
 	"time"
 
 	"github.com/Busnes-app/ky_server_base/internal/api"
+	"github.com/Busnes-app/ky_server_base/internal/config"
 	"github.com/Busnes-app/ky_server_base/internal/store"
+	"github.com/Busnes-app/ky_server_base/internal/testdb"
 )
 
 func makeTestPNG(t *testing.T, width, height int) []byte {
@@ -612,4 +614,48 @@ func TestChatAttachmentConcurrentUploadsRespectPendingAndTenantQuotas(t *testing
 			}
 		}
 	})
+}
+
+func TestChatAttachmentStorageInitErrorExposedAndReflectedInBootstrap(t *testing.T) {
+	ctx := context.Background()
+	dbCfg := testdb.Config(t)
+	st, err := store.Open(ctx, dbCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	// Point Attachments.Dir at an existing regular file so blobs.NewStore fails even under root.
+	badPath := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(badPath, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		Server:      config.ServerConfig{AppName: "TestApp", AppURL: "http://localhost:8080"},
+		Security:    config.SecurityConfig{SessionSecret: "test-secret-key-at-least-32-chars!!", SessionTTL: time.Hour},
+		Database:    dbCfg,
+		Attachments: config.AttachmentsConfig{Dir: badPath},
+	}
+	srv := api.NewServer(cfg, st)
+	if srv.BlobsError() == nil {
+		t.Fatal("expected non-nil BlobsError() when attachment directory cannot be initialized")
+	}
+
+	_, aliceTok := createChatTestUser(t, st, "u_att_unavail", "alice_unavail", "user")
+	rec := doBearerJSON(t, srv, http.MethodGet, "/api/v1/bootstrap", aliceTok, nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bootstrap = %d: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Attachments struct {
+			Available bool `json:"available"`
+		} `json:"attachments"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Attachments.Available {
+		t.Fatal("expected bootstrap attachments.available=false when blob store failed to initialize")
+	}
 }

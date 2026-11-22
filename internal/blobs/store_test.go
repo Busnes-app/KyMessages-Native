@@ -12,6 +12,7 @@ import (
 	"image/png"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -195,5 +196,28 @@ func TestSanitizeFilename(t *testing.T) {
 	sanitized := blobs.SanitizeFilename(longName)
 	if len(sanitized) > 200 || !strings.HasSuffix(sanitized, ".png") {
 		t.Errorf("long filename sanitized to len=%d %q", len(sanitized), sanitized)
+	}
+}
+
+func TestNewStoreFailsOnUnwritablePath(t *testing.T) {
+	// A regular file path cannot be used as a directory.
+	filePath := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(filePath, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := blobs.NewStore(filePath); err == nil {
+		t.Fatal("NewStore succeeded on regular file path")
+	}
+
+	// An existing read-only directory must fail the writability probe when not running as root.
+	if os.Geteuid() != 0 {
+		roDir := filepath.Join(t.TempDir(), "readonly")
+		if err := os.Mkdir(roDir, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(roDir, 0o700) })
+		if _, err := blobs.NewStore(roDir); err == nil {
+			t.Fatal("NewStore succeeded on read-only directory")
+		}
 	}
 }
