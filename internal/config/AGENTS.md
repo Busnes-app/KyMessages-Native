@@ -27,6 +27,8 @@ Owns environment variable parsing, configuration validation, default fallbacks, 
 
 - Server backups add `KY_MATRIX_DIR` and `KY_MATRIX_MEDIA_DIR` (absolute paths of the read-only `./matrix` and media mounts), `KY_MATRIX_DB_HOST` (default `postgres`, plain host name because it becomes `--host=`) and `KY_MATRIX_BACKUP_DB_PASSWORD_FILE` (the read-only `kybackup` role's password; trimmed, non-empty, `json:"-"`, a bad file fails startup) to `Config.Matrix`. `KY_BACKUP_MEDIA_FULL_KEEP` (default 3, below 1 fails startup) is `Backup.MediaFullKeep`, the monthly media archives kept.
 
+- Attachments fill `Config.Attachments`: `KY_ATTACHMENTS_DIR` (default `<KY_DATA_DIR>/attachments`), `KY_MAX_UPLOAD_BYTES` (per file, default 25 MiB, 1024 to 100 MiB), `KY_ATTACHMENTS_MAX_TOTAL_BYTES` (per tenant, default 1 GiB), `KY_ATTACHMENTS_MAX_PENDING_USER_BYTES` (one uploader's staged bytes, default 50 MiB) and `KY_ATTACHMENTS_PENDING_TTL` (staged lifetime, default 24h, 1m to 720h). The byte limits must be at least 1024; a value out of range fails startup.
+
 - `KY_ADMIN_USERNAME` (default `admin`) is `Security.AdminUsername`: the local admin `cmd/server` creates on an empty database and `init-admin`'s `-username` default. It must pass `ValidUsername` (3-64 of `[A-Za-z0-9._-]`, the rule `auth.ValidateUsername` shares), else startup fails.
 - `KY_SCIM_TOKEN` is `SCIM.BearerToken`; unset, it is random per start and `SCIM.TokenSet` (`json:"-"`) is false, which the console reports without the token. The installer clears both.
 - `KY_CAPTCHA_PROVIDER` is `pow` (default) or `none`; anything else fails startup, because login verifies nothing else. `KY_CAPTCHA_POW_DIFFICULTY` defaults to 50000.
