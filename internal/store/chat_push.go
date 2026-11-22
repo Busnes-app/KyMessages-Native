@@ -169,7 +169,7 @@ func (c *chatStore) ListPushSubscriptions(ctx context.Context, tenantID, userID 
 	return scanPushSubscriptions(rows)
 }
 
-// ListPushSubscriptionsForUsers batch-loads active-account push subscriptions for userIDs in tenantID.
+// ListPushSubscriptionsForUsers batch-loads active human-account push subscriptions for userIDs in tenantID.
 func (c *chatStore) ListPushSubscriptionsForUsers(ctx context.Context, tenantID string, userIDs []string) ([]*PushSubscription, error) {
 	if len(userIDs) == 0 {
 		return nil, nil
@@ -186,7 +186,7 @@ func (c *chatStore) ListPushSubscriptionsForUsers(ctx context.Context, tenantID 
 		SELECT ps.id, ps.tenant_id, ps.user_id, ps.endpoint, ps.p256dh, ps.auth_secret, ps.user_agent, ps.created_at, ps.last_used_at
 		FROM push_subscriptions ps
 		INNER JOIN users u ON u.id = ps.user_id
-		WHERE ps.tenant_id = ? AND ps.user_id IN (` + placeholders + `) AND u.status = 'active'
+		WHERE ps.tenant_id = ? AND ps.user_id IN (` + placeholders + `) AND u.status = 'active' AND u.role <> 'bot'
 		ORDER BY ps.created_at DESC
 	`)
 	rows, err := c.store.readDB.QueryContext(ctx, q, args...)

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/Busnes-app/ky_server_base/internal/config"
 	"github.com/Busnes-app/ky_server_base/internal/push"
@@ -82,6 +83,10 @@ func (s *Server) handleRegisterPushSubscription(w http.ResponseWriter, r *http.R
 	user, _, ok := s.currentUser(r)
 	if !ok {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+	if user.Role == "bot" {
+		s.writeError(w, http.StatusForbidden, "Bot accounts cannot receive push notifications")
 		return
 	}
 	if !s.allowChatAction(w, user.ID, chatLimitRooms) {
@@ -196,6 +201,21 @@ func (s *Server) handleUpdateRoomNotifications(w http.ResponseWriter, r *http.Re
 		"room_id":     roomID,
 		"notify_mode": mode,
 	})
+}
+
+// pushAsync runs a push fan-out off the request path. It is counted as detached so shutdown
+// waits for it before closing the dispatcher.
+func (s *Server) pushAsync(ctx context.Context, fan func(context.Context)) {
+	if s.push == nil {
+		return
+	}
+	s.detached.add()
+	go func() {
+		defer s.detached.done()
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		fan(ctx)
+	}()
 }
 
 // dispatchMessagePush fans out encrypted Web Push alerts for a newly created message,
@@ -400,10 +420,8 @@ func bodyHasMention(body, handle string) bool {
 			return false
 		}
 		pos := offset + idx
-		beforeOK := pos == 0 || !isHandleChar(rune(lower[pos-1]))
-		end := pos + len(needle)
-		afterOK := end >= len(lower) || !isHandleChar(rune(lower[end]))
-		if beforeOK && afterOK {
+		prev, _ := utf8.DecodeLastRuneInString(lower[:pos])
+		if (pos == 0 || !isHandleChar(prev)) && mentionEnds(lower[pos+len(needle):]) {
 			return true
 		}
 		offset = pos + len(needle)
@@ -411,6 +429,13 @@ func bodyHasMention(body, handle string) bool {
 			return false
 		}
 	}
+}
+
+// mentionEnds reports whether a handle ends where rest begins. A trailing '.' or '-' is
+// punctuation ("@bob.") unless more handle characters follow ("@bob.smith").
+func mentionEnds(rest string) bool {
+	r, n := utf8.DecodeRuneInString(strings.TrimLeft(rest, ".-"))
+	return n == 0 || !isHandleChar(r)
 }
 
 func isHandleChar(r rune) bool {

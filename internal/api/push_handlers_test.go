@@ -358,6 +358,7 @@ func TestPushExcludedForRevokedAndInstallerDeactivatedUsers(t *testing.T) {
 	alice, aliceTok := createChatTestUser(t, st, "usr_rev_alice", "alice-rev", "user")
 	inactiveUser, _ := createChatTestUser(t, st, "usr_rev_bob", "bob-rev", "user")
 	activeUser, _ := createChatTestUser(t, st, "usr_rev_carol", "carol-rev", "user")
+	botUser, botTok := createChatTestUser(t, st, "usr_rev_bot", "bot-rev", "bot")
 
 	rm := &store.Room{
 		TenantID:  store.DefaultTenantID,
@@ -365,7 +366,7 @@ func TestPushExcludedForRevokedAndInstallerDeactivatedUsers(t *testing.T) {
 		Name:      "revocation-room",
 		CreatedBy: alice.ID,
 	}
-	if err := st.Chat().CreateRoom(ctx, rm, []string{alice.ID, managedUser.ID, inactiveUser.ID, activeUser.ID}); err != nil {
+	if err := st.Chat().CreateRoom(ctx, rm, []string{alice.ID, managedUser.ID, inactiveUser.ID, activeUser.ID, botUser.ID}); err != nil {
 		t.Fatalf("CreateRoom: %v", err)
 	}
 
@@ -384,6 +385,16 @@ func TestPushExcludedForRevokedAndInstallerDeactivatedUsers(t *testing.T) {
 	register(managedUser.ID, "managed")
 	register(inactiveUser.ID, "inactive")
 	register(activeUser.ID, "active")
+	// A bot holding an ordinary member role and a subscription stored before bots were refused.
+	register(botUser.ID, "bot")
+	p256dh, auth := newTestPushKeys(t)
+	rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/push/subscriptions", botTok, map[string]any{
+		"endpoint": fakePush.URL + "/push/bot-new",
+		"keys":     map[string]string{"p256dh": p256dh, "auth": auth},
+	}, nil)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("bot push registration: expected 403, got %d (%s)", rec.Code, rec.Body.String())
+	}
 
 	// 1. Deactivate installer-managed user via ApplyInstallerDirectory -> must delete push_subscriptions.
 	revokedID, err := st.ApplyInstallerDirectory(ctx, bundle.SSO.IssuerURL, "daily", "user.deactivated", "1", "digest-deact", false, false)
@@ -405,7 +416,7 @@ func TestPushExcludedForRevokedAndInstallerDeactivatedUsers(t *testing.T) {
 	}
 
 	// 3. Send a message: ONLY activeUser should receive a push.
-	rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+rm.ID+"/messages", aliceTok, map[string]any{
+	rec = doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+rm.ID+"/messages", aliceTok, map[string]any{
 		"body": "Secret message after revocation",
 	}, nil)
 	if rec.Code != http.StatusCreated {
