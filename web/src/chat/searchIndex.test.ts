@@ -129,4 +129,16 @@ describe('on-device search index', () => {
     // If the server cannot be asked, nothing unverified is shown.
     await expect(freshHits(index, await index.search('quarterly'), async () => { throw new Error('offline'); })).rejects.toThrow('offline');
   });
+
+  it('drops an earlier copy when a message stops being indexable without being deleted', async () => {
+    const index = await searchIndexFor('u-alice');
+    await index.put([msg('m1', 'r1', 'readable secret', 1), msg('m2', 'r1', 'another secret', 2), msg('m3', 'r1', 'third secret', 3)]);
+    expect((await index.search('secret')).map((h) => h.id)).toEqual(['m3', 'm2', 'm1']);
+    await index.put([
+      msg('m1', 'r1', '', 1), // emptied, e.g. a decrypt that now fails
+      msg('m2', 'r1', 'another secret', 2, { encoding: 'system_v1' }),
+      msg('m3', 'r1', 'third secret', 3, { delivery: { kind: 'sending' } as ChatMessage['delivery'] }),
+    ]);
+    expect(await index.search('secret')).toEqual([]);
+  });
 });

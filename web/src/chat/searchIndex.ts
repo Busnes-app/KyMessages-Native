@@ -108,14 +108,16 @@ export class SearchIndex {
     if (this.closed) throw new DOMException('The search index was closed', 'InvalidStateError');
   }
 
-  /** Indexes readable messages and drops deleted or empty ones. */
+  /** Indexes readable messages and drops the entry of any message that is no longer indexable. */
   async put(messages: ChatMessage[]): Promise<void> {
     this.live();
     const keep: Entry[] = [];
     const drop: string[] = [];
     for (const m of messages) {
+      // Anything no longer indexable (deleted, emptied, unreadable, not yet stored) also loses an
+      // earlier copy, so the device never keeps old text it would not index now.
       if (m.deleted_at || !m.body.trim() || m.encoding === 'system_v1' || m.delivery.kind !== 'synced') {
-        if (m.deleted_at) drop.push(m.id);
+        drop.push(m.id);
         continue;
       }
       const plain: SearchHit = { id: m.id, room_id: m.room_id, seq: m.seq, sender_id: m.sender_id, sender_name: m.sender_name, body: m.body, created_at: m.created_at, edited_at: m.edited_at };
