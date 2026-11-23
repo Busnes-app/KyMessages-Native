@@ -277,6 +277,13 @@ func (h *Hub) Dispatch(ev Event) {
 	// A user-targeted event (call signal, call migration, lobby decision) may also name its
 	// room; it still goes only to that user, never to everyone in the room.
 	if ev.UserID != "" {
+		// An admission decided on another replica subscribes the guest's sockets here.
+		if ev.Type == EventLobbyDecision && ev.RoomID != "" {
+			var d LobbyDecisionPayload
+			if json.Unmarshal(ev.Data, &d) == nil && d.Decision == "admitted" && d.GuestID == ev.UserID {
+				h.subscribeUserToRoom(ev.UserID, ev.RoomID)
+			}
+		}
 		h.broadcastUser(ev.UserID, raw)
 		return
 	}

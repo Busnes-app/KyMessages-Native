@@ -1,0 +1,165 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+
+	"github.com/Busnes-app/ky_server_base/internal/crypto"
+)
+
+// GuestSession is one meeting guest's lobby session as every replica sees it (multi mode).
+// The secret the guest presents is stored only as its SHA-256.
+type GuestSession struct {
+	GuestID     string
+	TenantID    string
+	MeetingID   string
+	RoomID      string
+	GuestKey    string
+	DisplayName string
+	Status      string // "waiting" or "admitted"
+	KnockedAt   int64
+	DecidedBy   string
+	SeenAt      int64
+	ExpiresAt   int64
+}
+
+// GuestSessionStore holds lobby sessions in the shared database.
+type GuestSessionStore struct{ s *SQLStore }
+
+// GuestSessions returns the shared lobby session store.
+func (s *SQLStore) GuestSessions() *GuestSessionStore { return &GuestSessionStore{s: s} }
+
+const guestSessionCols = `guest_id, tenant_id, meeting_id, room_id, guest_key, display_name, status, knocked_at, decided_by, seen_at, expires_at`
+
+func scanGuestSession(row interface{ Scan(...any) error }) (*GuestSession, error) {
+	var g GuestSession
+	err := row.Scan(&g.GuestID, &g.TenantID, &g.MeetingID, &g.RoomID, &g.GuestKey, &g.DisplayName, &g.Status, &g.KnockedAt, &g.DecidedBy, &g.SeenAt, &g.ExpiresAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return &g, err
+}
+
+func (g *GuestSessionStore) list(ctx context.Context, q string, args ...any) ([]GuestSession, error) {
+	rows, err := g.s.db.QueryContext(ctx, g.s.rebind(q), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []GuestSession
+	for rows.Next() {
+		s, err := scanGuestSession(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *s)
+	}
+	return out, rows.Err()
+}
+
+// Create stores sess under secret, replacing the live session of the same invite (tenant,
+// meeting, guest key), whose rows it returns so the caller can evict them.
+func (g *GuestSessionStore) Create(ctx context.Context, secret string, sess GuestSession) ([]GuestSession, error) {
+	var lastErr error
+	// Two replicas knocking with one invite at once: the loser meets the unique key and retries,
+	// replacing the winner's session.
+	for range 3 {
+		replaced, err := g.create(ctx, secret, sess)
+		if err == nil {
+			return replaced, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+func (g *GuestSessionStore) create(ctx context.Context, secret string, sess GuestSession) ([]GuestSession, error) {
+	tx, err := g.s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.QueryContext(ctx, g.s.rebind(`DELETE FROM meeting_guest_sessions WHERE tenant_id = ? AND meeting_id = ? AND guest_key = ? RETURNING `+guestSessionCols),
+		sess.TenantID, sess.MeetingID, sess.GuestKey)
+	if err != nil {
+		return nil, err
+	}
+	var replaced []GuestSession
+	for rows.Next() {
+		r, err := scanGuestSession(rows)
+		if err != nil {
+			rows.Close()
+			return nil, err
+		}
+		replaced = append(replaced, *r)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, g.s.rebind(`INSERT INTO meeting_guest_sessions (secret_hash, `+guestSessionCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+		crypto.SHA256Hex([]byte(secret)), sess.GuestID, sess.TenantID, sess.MeetingID, sess.RoomID, sess.GuestKey, sess.DisplayName,
+		sess.Status, sess.KnockedAt, sess.DecidedBy, sess.SeenAt, sess.ExpiresAt); err != nil {
+		return nil, fmt.Errorf("guest session insert: %w", err)
+	}
+	return replaced, tx.Commit()
+}
+
+// BySecret resolves the unexpired session a guest's secret names.
+func (g *GuestSessionStore) BySecret(ctx context.Context, secret string, nowMs int64) (*GuestSession, error) {
+	return scanGuestSession(g.s.db.QueryRowContext(ctx, g.s.rebind(`SELECT `+guestSessionCols+` FROM meeting_guest_sessions WHERE secret_hash = ? AND expires_at > ?`),
+		crypto.SHA256Hex([]byte(secret)), nowMs))
+}
+
+// ByID resolves an unexpired session by guest ID.
+func (g *GuestSessionStore) ByID(ctx context.Context, guestID string, nowMs int64) (*GuestSession, error) {
+	return scanGuestSession(g.s.db.QueryRowContext(ctx, g.s.rebind(`SELECT `+guestSessionCols+` FROM meeting_guest_sessions WHERE guest_id = ? AND expires_at > ?`),
+		guestID, nowMs))
+}
+
+// InRoom lists the unexpired sessions of roomID.
+func (g *GuestSessionStore) InRoom(ctx context.Context, roomID string, nowMs int64) ([]GuestSession, error) {
+	return g.list(ctx, `SELECT `+guestSessionCols+` FROM meeting_guest_sessions WHERE room_id = ? AND expires_at > ? ORDER BY knocked_at ASC`, roomID, nowMs)
+}
+
+// Admit marks guestID in roomID admitted by actorID.
+func (g *GuestSessionStore) Admit(ctx context.Context, roomID, guestID, actorID string, nowMs int64) (*GuestSession, error) {
+	return scanGuestSession(g.s.db.QueryRowContext(ctx, g.s.rebind(`UPDATE meeting_guest_sessions SET status = 'admitted', decided_by = ?
+WHERE guest_id = ? AND room_id = ? AND expires_at > ? RETURNING `+guestSessionCols), actorID, guestID, roomID, nowMs))
+}
+
+// Touch records that guestID has a live socket now, so a leave timer started earlier on any
+// replica does not end its session.
+func (g *GuestSessionStore) Touch(ctx context.Context, guestID string, nowMs int64) error {
+	_, err := g.s.db.ExecContext(ctx, g.s.rebind(`UPDATE meeting_guest_sessions SET seen_at = ? WHERE guest_id = ?`), nowMs, guestID)
+	return err
+}
+
+// Delete removes guestID's session (in roomID when roomID is set) and returns it.
+func (g *GuestSessionStore) Delete(ctx context.Context, roomID, guestID string) ([]GuestSession, error) {
+	if roomID == "" {
+		return g.list(ctx, `DELETE FROM meeting_guest_sessions WHERE guest_id = ? RETURNING `+guestSessionCols, guestID)
+	}
+	return g.list(ctx, `DELETE FROM meeting_guest_sessions WHERE guest_id = ? AND room_id = ? RETURNING `+guestSessionCols, guestID, roomID)
+}
+
+// DeleteIfUnseen removes guestID's session only if no socket touched it after seenBefore.
+func (g *GuestSessionStore) DeleteIfUnseen(ctx context.Context, guestID string, seenBefore int64) ([]GuestSession, error) {
+	return g.list(ctx, `DELETE FROM meeting_guest_sessions WHERE guest_id = ? AND seen_at <= ? RETURNING `+guestSessionCols, guestID, seenBefore)
+}
+
+// DeleteRoom removes every session in roomID.
+func (g *GuestSessionStore) DeleteRoom(ctx context.Context, roomID string) ([]GuestSession, error) {
+	return g.list(ctx, `DELETE FROM meeting_guest_sessions WHERE room_id = ? RETURNING `+guestSessionCols, roomID)
+}
+
+// DeleteTenant removes every session of tenantID.
+func (g *GuestSessionStore) DeleteTenant(ctx context.Context, tenantID string) ([]GuestSession, error) {
+	return g.list(ctx, `DELETE FROM meeting_guest_sessions WHERE tenant_id = ? RETURNING `+guestSessionCols, tenantID)
+}
+
+// DeleteKey removes the session of one invite.
+func (g *GuestSessionStore) DeleteKey(ctx context.Context, tenantID, meetingID, guestKey string) ([]GuestSession, error) {
+	return g.list(ctx, `DELETE FROM meeting_guest_sessions WHERE tenant_id = ? AND meeting_id = ? AND guest_key = ? RETURNING `+guestSessionCols, tenantID, meetingID, guestKey)
+}

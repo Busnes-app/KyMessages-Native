@@ -74,8 +74,11 @@ func GeneratePoWChallenge(difficulty int, signingSecret string) (*PoWChallenge, 
 // PoWSpender accepts each solved challenge once. Without it one solution buys unlimited
 // logins until the challenge expires.
 type PoWSpender struct {
-	mu    sync.Mutex
-	spent map[string]int64 // challenge signature -> expiry
+	// Shared, set in multi mode, records spent signatures where every replica sees them.
+	// Its error refuses the solution.
+	Shared func(signature string, expiresAt int64) (bool, error)
+	mu     sync.Mutex
+	spent  map[string]int64 // challenge signature -> expiry
 }
 
 // Spend verifies a solution and consumes its challenge.
@@ -83,6 +86,10 @@ func (p *PoWSpender) Spend(solutionBase64, signingSecret string) bool {
 	sol, ok := verifyPoWSolution(solutionBase64, signingSecret)
 	if !ok {
 		return false
+	}
+	if p.Shared != nil {
+		fresh, err := p.Shared(sol.Signature, sol.ExpiresAt)
+		return err == nil && fresh
 	}
 	now := time.Now().Unix()
 	p.mu.Lock()

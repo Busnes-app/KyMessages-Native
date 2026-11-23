@@ -54,6 +54,13 @@ type Store interface {
 	InvalidateRestoredGrants(context.Context) error
 	// AcquireLease takes or renews a background job's lease (multi mode); see leases.go.
 	AcquireLease(ctx context.Context, name, holder string, ttl time.Duration) (bool, error)
+	// Multi mode's shared limits, spent proof-of-work and lobby sessions (shared_limits.go,
+	// guest_sessions.go). Single mode keeps them in process memory.
+	BumpAttempt(ctx context.Context, key string, window time.Duration) (int64, error)
+	AttemptState(ctx context.Context, key string) (int64, time.Duration, error)
+	SpendPoW(ctx context.Context, signature string, expiresAtUnix int64) (bool, error)
+	PruneShared(ctx context.Context) error
+	GuestSessions() *GuestSessionStore
 	Driver() string
 	Ping(ctx context.Context) error
 	Close() error

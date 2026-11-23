@@ -157,7 +157,8 @@ When the user requests a durable behavior change, record it here or in the relev
 - The shared multi-server install (every paid plan is an org), replica safety, attachments in
   S3-compatible storage and the per-org storage pool are designed in
   `docs/superpowers/specs/2026-11-23-tenancy-design.md`. Its PR 2 (migration lock, job leases,
-  shared secrets, capsule scheduler off) is built; the rest is not. It extends the 2026-11-22
+  shared secrets, capsule scheduler off) and PR 3 (shared sign-in limits and proof-of-work,
+  per-org meeting IDs, guest sessions in PostgreSQL) are built; the rest is not. It extends the 2026-11-22
   spec, whose §4 wire contract stays authoritative.
 - Single mode must not change: `TestSingleTenantGolden` replays a fixed single-mode script and
   compares it with `internal/api/testdata/single-tenant-golden.txt`, recorded before the tenancy
@@ -230,7 +231,7 @@ The loop closes its `done` channel
 only where it returns, between runs, and `runServer` cancels and waits on that channel after
 `httpServer.Shutdown` and before the store closes, then waits on `api.Server.WaitDetached()` for
 the pair, pin-key, unpair, deposit, export and drill handlers, which detach or run long and can outlive
-`Shutdown`. In `KY_TENANCY_MODE=multi` (refused at startup in this release; `internal/config`) the capsule scheduler returns at once (`backup.MultiTenantOff`, which backup status reports as `scheduler_error`; no audit row), and each other loop runs a tick only while it holds that job's `job_leases` row (`leasedJobs`: jobs `maintenance`, `agent_expiry`, `attachment_sweep`; lease three ticks, renewed each tick). Single mode passes `everyReplica` and runs every tick as before. `kymessages invalidate-grants` runs `InvalidateRestoredGrants` on the configured database, for a PostgreSQL restore (docs/RESTORE.md, multi section).
+`Shutdown`. In `KY_TENANCY_MODE=multi` (refused at startup in this release; `internal/config`) the capsule scheduler returns at once (`backup.MultiTenantOff`, which backup status reports as `scheduler_error`; no audit row), and each other loop runs a tick only while it holds that job's `job_leases` row (`leasedJobs`: jobs `maintenance`, `agent_expiry`, `attachment_sweep`; lease three ticks, renewed each tick; `maintenance` also runs `PruneShared` in multi mode). Single mode passes `everyReplica` and runs every tick as before. `kymessages invalidate-grants` runs `InvalidateRestoredGrants` on the configured database, for a PostgreSQL restore (docs/RESTORE.md, multi section).
 `maintenanceLoop` sweeps expired device pairings, expired suite replay IDs
 (`suite_replay_events`) and to-device mail older than `api.E2EEMailboxTTL` (30 days) every
 minute, each with a 30-second deadline; `agentExpiryLoop` revokes idle or inactive-owner bot tokens every hour; `attachmentSweepLoop` expires staged attachments older than `KY_ATTACHMENTS_PENDING_TTL` at start and every 15 minutes. All background loops join the backup scheduler's wait before the same shutdown drain finishes. Nothing writes

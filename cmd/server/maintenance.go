@@ -32,7 +32,8 @@ func leasedJobs(st store.Store) jobGate {
 // maintenanceLoop deletes expired QR pairings, suite replay IDs and stale end-to-end encryption
 // mail once a minute. done closes between ticks,
 // so shutdown can wait for it before the store closes.
-func maintenanceLoop(ctx context.Context, st store.Store, gate jobGate, done chan<- struct{}) {
+// In multi mode (shared) it also prunes the shared limits, spent challenges and lobby sessions.
+func maintenanceLoop(ctx context.Context, st store.Store, gate jobGate, shared bool, done chan<- struct{}) {
 	defer close(done)
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
@@ -45,6 +46,9 @@ func maintenanceLoop(ctx context.Context, st store.Store, gate jobGate, done cha
 				sweepPairings(ctx, st)
 				sweepSuiteReplay(ctx, st)
 				sweepE2EEMailbox(ctx, st)
+				if shared {
+					sweepShared(ctx, st)
+				}
 			}
 		}
 	}
@@ -55,6 +59,14 @@ func sweepPairings(ctx context.Context, st store.Store) {
 	defer cancel()
 	if err := st.Devices().CleanExpiredPairings(run); err != nil && ctx.Err() == nil {
 		log.Printf("[DEVICES] expired pairing sweep failed: %v", err)
+	}
+}
+
+func sweepShared(ctx context.Context, st store.Store) {
+	run, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := st.PruneShared(run); err != nil && ctx.Err() == nil {
+		log.Printf("[JOBS] shared limit sweep failed: %v", err)
 	}
 }
 

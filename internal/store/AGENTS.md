@@ -80,6 +80,15 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   Migration 55 adds `job_leases (name, holder, expires_at)`. `AcquireLease(name, holder, ttl)`
   is one conditional upsert that wins only when the lease is free, expired or already the
   holder's; it reads the database clock (Unix ms), never a replica's (`TestJobLeaseHandover`).
+- Migration 56 rekeys `meetings` by `(tenant_id, id)`; `meeting_windows` and `meeting_guests`
+  gain `tenant_id` and reference `meetings (tenant_id, id)`. It rebuilds and renames the three
+  tables, one SQL for both engines (`TestMeetingsPerTenantKeyKeepsData`). Every meeting query
+  matches `tenant_id`, and `UpsertMeeting` takes `pg_advisory_xact_lock` on the pair first.
+- Migrations 42-43 add multi mode's shared state: `attempt_counters` (`BumpAttempt`,
+  `AttemptState`), `pow_spent` (`SpendPoW`) and `meeting_guest_sessions`
+  (`GuestSessions()`: keyed by the secret's SHA-256, one live session per tenant, meeting and
+  guest key, 4 h expiry, `seen_at` for cross-replica leave timers). `PruneShared` deletes
+  expired rows; the leased maintenance loop runs it in multi mode only.
   `migrations.Run` refuses with `ErrNewerSchema` a database whose `schema_migrations` holds a
   version above this build's newest (image rollback, or a capsule from a newer build), before
   running anything. It takes only `sqlite` or `postgres`/`postgresql` and picks its placeholder
