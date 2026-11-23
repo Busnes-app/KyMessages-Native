@@ -145,8 +145,10 @@ func (h *Hub) WaitReady(ctx context.Context) error {
 	}
 }
 
-// PublishRoom emits a room-scoped event onto the bus (all pods).
+// PublishRoom emits a room-scoped event onto the bus (all pods). It clears UserID, which
+// names a recipient (see Event), so a room event always reaches the whole room.
 func (h *Hub) PublishRoom(ctx context.Context, roomID string, ev Event) error {
+	ev.UserID = ""
 	return h.bus.PublishRoom(ctx, roomID, ev)
 }
 
@@ -272,12 +274,14 @@ func (h *Hub) Dispatch(ev Event) {
 		}
 	}
 
-	if ev.RoomID != "" {
-		h.broadcastRoom(ev.RoomID, raw)
-		return
-	}
+	// A user-targeted event (call signal, call migration, lobby decision) may also name its
+	// room; it still goes only to that user, never to everyone in the room.
 	if ev.UserID != "" {
 		h.broadcastUser(ev.UserID, raw)
+		return
+	}
+	if ev.RoomID != "" {
+		h.broadcastRoom(ev.RoomID, raw)
 	}
 }
 

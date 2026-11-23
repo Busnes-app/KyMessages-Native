@@ -13,6 +13,7 @@ import (
 
 	"github.com/Busnes-app/ky-primitives/syncauth"
 	"github.com/Busnes-app/ky_server_base/internal/api"
+	"github.com/Busnes-app/ky_server_base/internal/chat"
 	"github.com/Busnes-app/ky_server_base/internal/config"
 	"github.com/Busnes-app/ky_server_base/internal/crypto"
 	"github.com/Busnes-app/ky_server_base/internal/store"
@@ -287,7 +288,7 @@ func TestMultiTenantCrossOrgIsolation(t *testing.T) {
 		{http.MethodGet, "/api/v1/rooms/" + roomID + "/messages", nil},
 		{http.MethodPost, "/api/v1/rooms/" + roomID + "/messages", map[string]any{"body": "hijack"}},
 		{http.MethodPost, "/api/v1/rooms/" + roomID + "/members", map[string]any{"user_id": carol.ID}},
-		{http.MethodPost, "/api/v1/rooms/" + roomID + "/call/join", nil},
+		{http.MethodPost, "/api/v1/rooms/" + roomID + "/calls/join", nil},
 	} {
 		rec = doBearerJSON(t, srv, tc.method, tc.path, carolTok, tc.body, nil)
 		if rec.Code != http.StatusNotFound {
@@ -714,6 +715,154 @@ func TestMultiTenantLogoutDropsPushSubscription(t *testing.T) {
 	}
 	if subs, _ := st.Chat().ListPushSubscriptions(ctx, "00000000-0000-4000-8000-00000000000a", u.ID); len(subs) != 0 {
 		t.Fatalf("org-alpha push subscription survived sign-out: %d", len(subs))
+	}
+}
+
+// Every route that names a user or a room answers a caller from another org exactly as it
+// answers an unknown ID, and live events never reach a socket in another org.
+func TestMultiTenantCrossOrgUserPaths(t *testing.T) {
+	srv, st, _ := newMultiTenantTestServer(t)
+	startChatBus(t, srv)
+	const orgA, orgB = "00000000-0000-4000-8000-00000000000a", "00000000-0000-4000-8000-00000000000b"
+	_, aliceTok := createOrgUser(t, st, "usr_a_alice", "alice", "user", orgA)
+	bob, _ := createOrgUser(t, st, "usr_a_bob", "bob", "user", orgA)
+	carol, carolTok := createOrgUser(t, st, "usr_b_carol", "carol", "user", orgB)
+	_, daveTok := createOrgUser(t, st, "usr_b_dave", "dave", "user", orgB)
+
+	roomOf := func(tok string, body map[string]any) string {
+		t.Helper()
+		rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", tok, body, nil)
+		if rec.Code != http.StatusCreated && rec.Code != http.StatusOK {
+			t.Fatalf("create room %v = %d: %s", body, rec.Code, rec.Body.String())
+		}
+		var resp struct {
+			Room struct {
+				ID string `json:"id"`
+			} `json:"room"`
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+		return resp.Room.ID
+	}
+	alphaRoom := roomOf(aliceTok, map[string]any{"kind": "channel", "name": "alpha", "member_ids": []string{bob.ID}})
+	alphaDM := roomOf(aliceTok, map[string]any{"kind": "dm", "dm_user_id": bob.ID})
+	betaRoom := roomOf(daveTok, map[string]any{"kind": "channel", "name": "beta", "member_ids": []string{carol.ID}})
+
+	// Alice owns her channel and still cannot pull org-beta's carol into it, or a ghost ID.
+	for _, uid := range []string{carol.ID, "usr_nobody"} {
+		rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+alphaRoom+"/members", aliceTok, map[string]any{"user_id": uid}, nil)
+		if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "Target user not found") {
+			t.Fatalf("add %s to alpha room = %d %s, want the unknown-user 404", uid, rec.Code, rec.Body.String())
+		}
+	}
+
+	// Carol gets the non-member 404 on every org-alpha room route.
+	for _, rm := range []string{alphaRoom, alphaDM} {
+		for _, tc := range []struct{ method, path string }{
+			{http.MethodPatch, "/api/v1/rooms/" + rm},
+			{http.MethodDelete, "/api/v1/rooms/" + rm + "/members/" + bob.ID},
+			{http.MethodPost, "/api/v1/rooms/" + rm + "/read"},
+			{http.MethodPut, "/api/v1/rooms/" + rm + "/notifications"},
+			{http.MethodGet, "/api/v1/rooms/" + rm + "/attachments"},
+			{http.MethodGet, "/api/v1/rooms/" + rm + "/webhooks"},
+			{http.MethodPost, "/api/v1/rooms/" + rm + "/webhooks"},
+			{http.MethodGet, "/api/v1/rooms/" + rm + "/calls/state"},
+			{http.MethodPost, "/api/v1/rooms/" + rm + "/calls/join"},
+			{http.MethodPost, "/api/v1/rooms/" + rm + "/calls/escalate"},
+			{http.MethodGet, "/api/v1/rooms/" + rm + "/lobby"},
+			{http.MethodPost, "/api/v1/rooms/" + rm + "/lobby/guest_x/admit"},
+			{http.MethodPost, "/api/v1/rooms/" + rm + "/meeting/guest-link"},
+		} {
+			body := map[string]any{"name": "x", "topic": "", "mode": "all", "seq": 1, "audio": true}
+			rec := doBearerJSON(t, srv, tc.method, tc.path, carolTok, body, nil)
+			if rec.Code != http.StatusNotFound || strings.Contains(rec.Body.String(), "Unknown API endpoint") {
+				t.Fatalf("cross-org %s %s = %d %s, want the room 404", tc.method, tc.path, rec.Code, rec.Body.String())
+			}
+		}
+	}
+
+	// The DM peer's name never resolves across orgs, and org-alpha rooms never list for carol.
+	for _, path := range []string{"/api/v1/rooms", "/api/v1/bootstrap"} {
+		rec := doBearerJSON(t, srv, http.MethodGet, path, carolTok, nil, nil)
+		if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), alphaRoom) || strings.Contains(rec.Body.String(), alphaDM) || strings.Contains(rec.Body.String(), "usr_a_") {
+			t.Fatalf("carol %s = %d, leaks org-alpha: %s", path, rec.Code, rec.Body.String())
+		}
+	}
+
+	// Live fan-out: carol's socket sees nothing from org-alpha, including a mention of her name.
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	carolWS, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.URL, "http")+"/api/v1/ws", &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + carolTok}, "Origin": []string{"https://chat.example.com"}},
+	})
+	if err != nil {
+		t.Fatalf("carol ws: %v", err)
+	}
+	defer carolWS.CloseNow()
+	if ev := readWSEvent(t, carolWS); ev.Type != chat.EventHello {
+		t.Fatalf("carol first frame = %+v, want hello", ev)
+	}
+	for _, rm := range []string{alphaRoom, alphaDM} {
+		if rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+rm+"/messages", aliceTok, map[string]any{"body": "@carol @all secret"}, nil); rec.Code != http.StatusCreated {
+			t.Fatalf("alice post = %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+	if rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+betaRoom+"/messages", daveTok, map[string]any{"body": "beta"}, nil); rec.Code != http.StatusCreated {
+		t.Fatalf("dave post = %d: %s", rec.Code, rec.Body.String())
+	}
+	if ev := readWSEvent(t, carolWS); ev.RoomID != betaRoom || ev.Type != chat.EventMessageNew {
+		t.Fatalf("carol's next frame = %+v, want only her org's message in %s", ev, betaRoom)
+	}
+}
+
+// KyIdentity names the resume event org.resumed; org.unsuspended stays accepted until it confirms.
+func TestMultiTenantOrgResumed(t *testing.T) {
+	srv, st, _ := newMultiTenantTestServer(t)
+	const org = "00000000-0000-4000-8000-00000000000d"
+	_, tok := createOrgUser(t, st, "usr_d_erin", "erin", "user", org)
+	post := func(event, body string) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/api/sso/kyidentity/sync", strings.NewReader(body))
+		hdr, err := syncauth.Sign([]byte(testMultiTenantHMAC), time.Now(), event, uuid.NewString(), []byte(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		hdr.Apply(req)
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s = %d: %s", event, rec.Code, rec.Body.String())
+		}
+	}
+	status := func() string {
+		tenant, err := st.Chat().GetTenant(context.Background(), org)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tenant.Status
+	}
+	post("org.suspended", `{"org_id":"`+org+`","revision":1}`)
+	if rec := doBearerJSON(t, srv, http.MethodGet, "/api/v1/rooms", tok, nil, nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("rooms while suspended = %d, want 401 (sessions revoked)", rec.Code)
+	}
+	post("org.resumed", `{"org_id":"`+org+`","revision":1}`)
+	if status() != store.TenantStatusSuspended {
+		t.Fatalf("org.resumed at the suspension's revision applied: %q", status())
+	}
+	post("org.resumed", `{"org_id":"`+org+`","revision":2}`)
+	if status() != store.TenantStatusActive {
+		t.Fatalf("org.resumed rev 2 left status %q, want active", status())
+	}
+	post("org.suspended", `{"org_id":"`+org+`","revision":3}`)
+	post("org.unsuspended", `{"org_id":"`+org+`","revision":4}`)
+	if status() != store.TenantStatusActive {
+		t.Fatalf("legacy org.unsuspended left status %q, want active", status())
+	}
+	post("org.deleted", `{"org_id":"`+org+`","revision":5}`)
+	post("org.resumed", `{"org_id":"`+org+`","revision":6}`)
+	if status() != store.TenantStatusDeleted {
+		t.Fatalf("org.resumed after deletion = %q, want deleted", status())
 	}
 }
 
