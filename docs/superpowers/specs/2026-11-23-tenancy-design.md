@@ -549,7 +549,8 @@ Tests each PR must add, beyond its own:
 - A user's own deleted attachment stays as an old object version for 30 days.
 - Staff see every org's usernames in the install-wide audit (open question 6).
 - An org that KyIdentity stops listing without a `deleted` status is held offline and kept, not
-  purged, until staff resolve it. Its data costs storage until then.
+  purged, until a later full read lists it again or staff resolve it. Its data costs storage
+  until then.
 - A restore to a point less than a day old, made while KyIdentity is unreachable, can serve an
   erased person's or a deleted org's restored data until KyIdentity answers again. Then the
   incremental re-read replays the erasures (§7.4).
