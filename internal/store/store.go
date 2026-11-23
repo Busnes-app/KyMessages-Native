@@ -399,6 +399,8 @@ type ChatStore interface {
 	ErasureTarget(ctx context.Context, provider, subject string) (*User, error)
 	DeactivateForErasure(ctx context.Context, userID string) error
 	EraseUser(ctx context.Context, tenantID string, user *User) ([]BlobRef, error)
+	PendingBlobDeletes(ctx context.Context, limit int) ([]BlobRef, error)
+	ClearPendingBlobDeletes(ctx context.Context, refs []BlobRef) error
 	// AttachmentTenant returns the org of the attachment stored under blobKey.
 	AttachmentTenant(ctx context.Context, blobKey string) (string, error)
 

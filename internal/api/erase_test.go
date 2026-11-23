@@ -257,3 +257,81 @@ func TestUserErasedAfterUserDeleted(t *testing.T) {
 		t.Fatal("blob kept")
 	}
 }
+
+// erasingStore runs hook once when a call join loads its room: the join is authenticated, and
+// the erasure completes before the peer registers.
+type erasingStore struct {
+	store.Store
+	hook func()
+	once sync.Once
+}
+
+type erasingChat struct {
+	store.ChatStore
+	s *erasingStore
+}
+
+func (e *erasingStore) Chat() store.ChatStore { return erasingChat{e.Store.Chat(), e} }
+
+func (c erasingChat) GetRoom(ctx context.Context, tenantID, roomID string) (*store.Room, error) {
+	c.s.once.Do(c.s.hook)
+	return c.ChatStore.GetRoom(ctx, tenantID, roomID)
+}
+
+// A call join already past authentication when the erasure completes gets no seat and no
+// credentials.
+func TestCallJoinOverlappingErasureIsRefused(t *testing.T) {
+	srv, _, st, _ := newReplicas(t, withPool(t, &fakePool{headroom: 1 << 20}))
+	alice, aliceTok := createOrgUser(t, st, "usr_cj_alice", "cjalice", "user", replicaOrgA)
+	bob, bobTok := createOrgUser(t, st, "usr_cj_bob", "cjbob", "user", replicaOrgA)
+	room := roomOf(t, doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", aliceTok, map[string]any{"kind": store.RoomKindChannel, "name": "c", "member_ids": []string{bob.ID}}, nil))
+	api.SetStoreForTest(srv, &erasingStore{Store: st, hook: func() {
+		if rec := postErased(t, srv, alice.SSOSubject, replicaOrgA); rec.Code != http.StatusOK {
+			t.Errorf("user.erased = %d", rec.Code)
+		}
+	}})
+	rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room+"/calls/join", aliceTok, map[string]any{"audio": true}, nil)
+	if rec.Code != http.StatusUnauthorized || bytes.Contains(rec.Body.Bytes(), []byte("token")) {
+		t.Fatalf("join overlapping erasure = %d %s", rec.Code, rec.Body.String())
+	}
+	state := doBearerJSON(t, srv, http.MethodGet, "/api/v1/rooms/"+room+"/calls/state", bobTok, nil, nil)
+	if bytes.Contains(state.Body.Bytes(), []byte(alice.ID)) {
+		t.Fatalf("an erased person kept a call seat: %s", state.Body.String())
+	}
+}
+
+// Blobs of rows an erasure deleted are queued with the delete; if removing them fails then, the
+// attachment sweep finishes the job.
+func TestErasureQueuesStragglerBlobs(t *testing.T) {
+	ctx := context.Background()
+	srv, _, st, cfg := newReplicas(t, withPool(t, &fakePool{headroom: 1 << 20}))
+	alice, aliceTok := createOrgUser(t, st, "usr_q_alice", "qalice", "user", replicaOrgA)
+	room := roomOf(t, doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", aliceTok, map[string]any{"kind": store.RoomKindChannel, "name": "c"}, nil))
+	up := doMultipartUpload(t, srv, "/api/v1/rooms/"+room+"/attachments", aliceTok, "file", "a.txt", []byte("late"))
+	var a struct {
+		Attachment store.Attachment `json:"attachment"`
+	}
+	_ = json.Unmarshal(up.Body.Bytes(), &a)
+	// The rows go without the blob, as when an upload committed after ErasureBlobs and the
+	// blob delete then failed.
+	late, err := st.Chat().EraseUser(ctx, replicaOrgA, alice)
+	if err != nil || len(late) != 1 {
+		t.Fatalf("EraseUser: %v %v", late, err)
+	}
+	if q, _ := st.Chat().PendingBlobDeletes(ctx, 10); len(q) != 1 || q[0].Key != a.Attachment.ID {
+		t.Fatalf("queue: %v", q)
+	}
+	blob := filepath.Join(cfg.Database.DataDir, "attachments", "orgs", replicaOrgA, "att", a.Attachment.ID)
+	if _, err := os.Stat(blob); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.SweepOrphanAttachments(ctx, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(blob); !os.IsNotExist(err) {
+		t.Fatal("queued blob kept after the sweep")
+	}
+	if q, _ := st.Chat().PendingBlobDeletes(ctx, 10); len(q) != 0 {
+		t.Fatalf("queue after sweep: %v", q)
+	}
+}

@@ -62,7 +62,10 @@ Owns HTTP routing, request parsing, session cookie validation, CORS headers, and
   serving and loses its grants first, then it is disconnected, then blobs, then
   `store.EraseUser` (and the blobs it returns), then a last disconnect
   (`TestUserErasedDeletesThePersonsData`, `TestUserErasedRevokesAccessFirst`,
-  `TestUserErasedAfterUserDeleted`). Multi-mode uploads commit only for an active uploader.
+  `TestUserErasedAfterUserDeleted`). Multi-mode uploads commit only for an active uploader, and a
+  multi-mode call join re-checks the account after its peer registers, leaving the call and
+  answering 401 when it no longer serves (`TestCallJoinOverlappingErasureIsRefused`). The
+  attachment sweep drains `pending_blob_deletes` (`TestErasureQueuesStragglerBlobs`).
 - The org storage pool (`pool.go`, multi mode, customer orgs only; the staff org and org-less
   operators are exempt). Uploads check KyIdentity's grant (`AttachmentQuotaLimits.Pool`), and
   `KY_ATTACHMENTS_MAX_TOTAL_BYTES` does not apply (startup warns when it is set). An upload with

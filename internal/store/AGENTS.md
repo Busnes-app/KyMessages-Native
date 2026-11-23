@@ -119,9 +119,11 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   emptied, `deleted_at` set, row kept). The caller first runs `DeactivateForErasure` (status
   `deleted`) and drops every grant, deletes the blobs `ErasureBlobs` lists, then `EraseUser`
   removes the rows and returns the blobs of attachment rows it deleted (an upload that committed
-  meanwhile) for the caller to delete. Both are idempotent and need no account row. The audit row
+  meanwhile) for the caller to delete; it queues them in `pending_blob_deletes` in the same
+  transaction, so a delete that fails after commit is retried (`PendingBlobDeletes`,
+  `ClearPendingBlobDeletes`; the multi-mode attachment sweep drains the queue). Both are idempotent and need no account row. The audit row
   `sso.user_erased` names only `user:<id>`.
-- Migration 60 adds `user_subjects (provider, subject, user_id, org_id)`: `DeleteDirectoryUser`
+- Migration 60 (`erasure_state`) adds `pending_blob_deletes` and `user_subjects (provider, subject, user_id, org_id)`: `DeleteDirectoryUser`
   and `EraseUser` record an org-bound account's mapping before its row goes, so an erasure after
   `user.deleted`, or a repeat, still finds the person's data (`ErasureTarget`). Single-mode
   accounts (no org) are never recorded.

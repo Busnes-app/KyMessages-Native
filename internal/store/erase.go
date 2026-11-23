@@ -97,6 +97,13 @@ func (c *chatStore) EraseUser(ctx context.Context, tenantID string, user *User) 
 			return nil, err
 		}
 	}
+	// Blobs of rows deleted here are queued in the same transaction, so a failed delete after
+	// commit is retried (PendingBlobDeletes) instead of lost with its row.
+	for _, r := range late {
+		if _, err := tx.ExecContext(ctx, c.store.rebind(`INSERT INTO pending_blob_deletes (tenant_id, blob_key) VALUES (?, ?) ON CONFLICT (tenant_id, blob_key) DO NOTHING`), r.TenantID, r.Key); err != nil {
+			return nil, err
+		}
+	}
 	now := time.Now().UnixMilli()
 	steps := []struct {
 		q    string
@@ -125,4 +132,32 @@ func (c *chatStore) EraseUser(ctx context.Context, tenantID string, user *User) 
 		}
 	}
 	return late, tx.Commit()
+}
+
+// PendingBlobDeletes lists up to limit queued blob deletes.
+func (c *chatStore) PendingBlobDeletes(ctx context.Context, limit int) ([]BlobRef, error) {
+	rows, err := c.store.db.QueryContext(ctx, c.store.rebind(`SELECT tenant_id, blob_key FROM pending_blob_deletes ORDER BY tenant_id, blob_key LIMIT ?`), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []BlobRef
+	for rows.Next() {
+		var r BlobRef
+		if err := rows.Scan(&r.TenantID, &r.Key); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ClearPendingBlobDeletes drops queued deletes whose blobs are gone.
+func (c *chatStore) ClearPendingBlobDeletes(ctx context.Context, refs []BlobRef) error {
+	for _, r := range refs {
+		if _, err := c.store.db.ExecContext(ctx, c.store.rebind(`DELETE FROM pending_blob_deletes WHERE tenant_id = ? AND blob_key = ?`), r.TenantID, r.Key); err != nil {
+			return err
+		}
+	}
+	return nil
 }

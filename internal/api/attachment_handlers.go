@@ -440,6 +440,11 @@ func (s *Server) SweepOrphanAttachments(ctx context.Context, now time.Time) (int
 	if err := s.relocateFlatBlobs(ctx); err != nil && ctx.Err() == nil {
 		log.Printf("[ATTACHMENTS] flat blob relocation incomplete (retrying next sweep): %v", err)
 	}
+	if s.config.Tenancy.IsMultiTenant() {
+		if err := s.drainPendingBlobDeletes(ctx); err != nil && ctx.Err() == nil {
+			log.Printf("[ATTACHMENTS] queued blob deletes incomplete (retrying next sweep): %v", err)
+		}
+	}
 	cutoff := now.Add(-s.pendingAttachmentTTL()).UnixMilli()
 	deleted := 0
 	for {
@@ -523,11 +528,24 @@ func (s *Server) eraseUser(ctx context.Context, user *store.User, revoke func(co
 	if err != nil {
 		return err
 	}
+	revoke(ctx, user.ID)
+	// EraseUser queued these; a failure here leaves them for the attachment sweep.
 	if err := s.deleteBlobs(late); err != nil {
 		return err
 	}
-	revoke(ctx, user.ID)
-	return nil
+	return s.store.Chat().ClearPendingBlobDeletes(ctx, late)
+}
+
+// drainPendingBlobDeletes finishes blob deletes an erasure committed but could not complete.
+func (s *Server) drainPendingBlobDeletes(ctx context.Context) error {
+	refs, err := s.store.Chat().PendingBlobDeletes(ctx, 500)
+	if err != nil || len(refs) == 0 {
+		return err
+	}
+	if err := s.deleteBlobs(refs); err != nil {
+		return err
+	}
+	return s.store.Chat().ClearPendingBlobDeletes(ctx, refs)
 }
 
 func (s *Server) deleteBlobs(refs []store.BlobRef) error {

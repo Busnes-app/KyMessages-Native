@@ -115,6 +115,16 @@ func (s *Server) handleCallJoin(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusInternalServerError, "Failed to join call")
 		return
 	}
+	// Multi mode: an erasure (or any deactivation) that landed while this join was in flight
+	// gets no seat and no credentials. Erasure deactivates before its final disconnect, so a
+	// join either sees the deactivation here or registered early enough for that disconnect.
+	if s.config.Tenancy.IsMultiTenant() {
+		if fresh, err := s.store.Users().GetUserByID(r.Context(), user.ID); err != nil || fresh.Status != "active" {
+			s.calls.Leave(context.WithoutCancel(r.Context()), roomID, user.ID)
+			s.writeError(w, http.StatusUnauthorized, "Authentication required")
+			return
+		}
+	}
 	if resp.Started {
 		starter := displayNameFor(user)
 		s.pushAsync(r.Context(), func(ctx context.Context) {
