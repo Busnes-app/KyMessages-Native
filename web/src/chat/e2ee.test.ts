@@ -1,7 +1,7 @@
 import 'fake-indexeddb/auto';
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { abandonDevice, forgetCryptoStore, httpKeyServer, keyGeneration, NOT_YET, onRoomKeys, openMessage, replaceDevice, RETIRE_MS, retireDevice, retryable, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
+import { abandonDevice, forgetCryptoStore, keyGeneration, NOT_YET, onRoomKeys, openMessage, replaceDevice, RETIRE_MS, retireDevice, retryable, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
 import { openCryptoStore } from '../crypto/store';
 import { parseMessage } from './types';
 
@@ -19,6 +19,7 @@ vi.mock('../crypto/index', async (importOriginal) => {
 });
 
 const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { 'Content-Type': 'application/json' } });
+const ownRoom = { room: { id: 'r1', kind: 'channel' }, member: { room_id: 'r1', user_id: 'u_alice' }, members: [{ room_id: 'r1', user_id: 'u_alice' }] };
 
 afterEach(async () => {
   deviceRead.replace = undefined;
@@ -41,6 +42,8 @@ describe('the signed-in device', () => {
         if (!known.has(req.device_id)) return json({ error: 'Unknown device' }, 404);
         return json({ one_time_key_count: req.one_time_keys.length });
       }
+      if (url === '/api/v1/rooms/r1') return json(ownRoom);
+      if (url === '/api/v1/keys/query') return json({ devices: {} });
       if (url.startsWith('/api/v1/to-device')) return json({ messages: [] });
       return json({ error: `unexpected ${url}` }, 404);
     }));
@@ -50,8 +53,6 @@ describe('the signed-in device', () => {
     expect(uploads[0].device_keys).toBeTruthy();
     expect(uploads.reduce((n, u) => n + u.one_time_keys.length, 0)).toBe(50);
 
-    vi.spyOn(httpKeyServer, 'roomMembers').mockResolvedValue(['u_alice']);
-    vi.spyOn(httpKeyServer, 'query').mockResolvedValue({});
     const message = parseMessage({ id: 'old-message', room_id: 'r1', sender_id: 'u_alice', encoding: 'e2ee_room_v1', body: await first.encrypt('r1', { type: 'text', body: 'historical secret' }) });
     expect((await openMessage(message)).body).toBe('historical secret');
     const before = await openCryptoStore('u_alice');
@@ -80,16 +81,17 @@ describe('the signed-in device', () => {
     let unavailable = true;
     const uploads: string[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      if (String(input) === '/api/v1/keys/upload') {
+      const url = String(input);
+      if (url === '/api/v1/keys/upload') {
         const req = JSON.parse(String(init?.body)) as { device_id: string; one_time_keys: unknown[] };
         uploads.push(req.device_id);
         if (unavailable) return json({ error: 'Try later' }, 503);
         return json({ one_time_key_count: req.one_time_keys.length });
       }
+      if (url === '/api/v1/rooms/r1') return json(ownRoom);
+      if (url === '/api/v1/keys/query') return json({ devices: {} });
       return json({ messages: [] });
     }));
-    vi.spyOn(httpKeyServer, 'roomMembers').mockResolvedValue(['u_alice']);
-    vi.spyOn(httpKeyServer, 'query').mockResolvedValue({});
     await expect(startE2EE('u_alice')).rejects.toThrow('Try later');
     unavailable = false; // the socket never reconnects; the next sends must restart startup
     const envelopes = await Promise.all(['one', 'two', 'three'].map((body) => sealRoomMessage('r1', { type: 'text', body })));
@@ -166,6 +168,44 @@ describe('the signed-in device', () => {
     deviceRead.replace = read;
     await forgetCryptoStore();
     expect((await indexedDB.databases()).filter((d) => d.name?.startsWith('kymessages-crypto-'))).toEqual([]);
+  });
+
+  it.each(['upload', 'mailbox'])('signs back in as the same user while the old %s remains stalled', async (stalledPath) => {
+    let stalledSignal: AbortSignal | null | undefined;
+    let release = () => {};
+    let first = true;
+    let stalled = false;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const uploading = url === '/api/v1/keys/upload';
+      const response = uploading
+        ? json({ one_time_key_count: (JSON.parse(String(init?.body)) as { one_time_keys: unknown[] }).one_time_keys.length })
+        : json({ messages: [] });
+      if (first && (stalledPath === 'upload' ? uploading : url.startsWith('/api/v1/to-device?'))) {
+        first = false;
+        stalled = true;
+        stalledSignal = init?.signal;
+        return new Promise<Response>((resolve, reject) => {
+          release = () => resolve(response);
+          stalledSignal?.addEventListener('abort', () => reject(new DOMException('Stopped', 'AbortError')), { once: true });
+        });
+      }
+      return response;
+    }));
+    const oldStart = startE2EE('u_alice').catch(() => undefined);
+    await vi.waitFor(() => expect(stalled).toBe(true));
+    await abandonDevice();
+    let restartedId: string | undefined;
+    const restarting = startE2EE('u_alice').then((e) => { restartedId = e.deviceId; });
+    try {
+      // Do not release the old response: stopping its entry must release the per-user lock.
+      await vi.waitFor(() => expect(restartedId).toBeDefined());
+      expect(stalledSignal?.aborted).toBe(true);
+    } finally {
+      release();
+      await oldStart;
+      await restarting;
+    }
   });
 
   it('deletes local keys on revocation without waiting for a start-up stuck on the network', async () => {

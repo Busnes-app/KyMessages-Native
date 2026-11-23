@@ -14,9 +14,10 @@ export class KeyServerError extends Error {
   }
 }
 
-async function call(path: string, method: string, body?: unknown): Promise<unknown> {
+async function call(path: string, method: string, body?: unknown, signal?: AbortSignal): Promise<unknown> {
   const res = await secureFetch(path, {
     method,
+    signal,
     credentials: 'same-origin',
     headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -30,14 +31,14 @@ const device = (v: unknown): DeviceKeys => {
   return { device_id: str(o.device_id, 64), curve25519: str(o.curve25519, 64), ed25519: str(o.ed25519, 64), signature: str(o.signature, 128) };
 };
 
-export const httpKeyServer: KeyServer = {
+const keyServer = (signal: AbortSignal): KeyServer => ({
   async upload(req) {
-    const o = obj(await call('/api/v1/keys/upload', 'POST', req));
+    const o = obj(await call('/api/v1/keys/upload', 'POST', req, signal));
     // Only an explicit false asks for a new fallback key.
     return { count: typeof o.one_time_key_count === 'number' ? o.one_time_key_count : 0, fallback: o.has_fallback_key !== false };
   },
   async query(userIds) {
-    const devices = obj(obj(await call('/api/v1/keys/query', 'POST', { user_ids: userIds })).devices);
+    const devices = obj(obj(await call('/api/v1/keys/query', 'POST', { user_ids: userIds }, signal)).devices);
     const out: Record<string, DeviceKeys[]> = {};
     for (const id of userIds) out[id] = arr(devices[id] ?? []).flatMap((d) => {
       try {
@@ -49,7 +50,7 @@ export const httpKeyServer: KeyServer = {
     return out;
   },
   async claim(devices) {
-    return arr(obj(await call('/api/v1/keys/claim', 'POST', { devices })).keys).flatMap((v): ClaimedKey[] => {
+    return arr(obj(await call('/api/v1/keys/claim', 'POST', { devices }, signal)).keys).flatMap((v): ClaimedKey[] => {
       try {
         const o = obj(v);
         return [{
@@ -62,10 +63,10 @@ export const httpKeyServer: KeyServer = {
     });
   },
   async sendToDevice(deviceId, messages) {
-    await call('/api/v1/to-device', 'PUT', { device_id: deviceId, messages });
+    await call('/api/v1/to-device', 'PUT', { device_id: deviceId, messages }, signal);
   },
   async mailbox(deviceId) {
-    const page = obj(await call(`/api/v1/to-device?device_id=${encodeURIComponent(deviceId)}`, 'GET'));
+    const page = obj(await call(`/api/v1/to-device?device_id=${encodeURIComponent(deviceId)}`, 'GET', undefined, signal));
     return arr(page.messages).flatMap((v): Mail[] => {
       const o = typeof v === 'object' && v !== null ? (v as Record<string, unknown>) : {};
       if (typeof o.id !== 'number') return [];
@@ -81,22 +82,23 @@ export const httpKeyServer: KeyServer = {
     });
   },
   async ack(deviceId, ids) {
-    await call('/api/v1/to-device/ack', 'POST', { device_id: deviceId, ids });
+    await call('/api/v1/to-device/ack', 'POST', { device_id: deviceId, ids }, signal);
   },
   async roomMembers(roomId) {
-    return parseRoomDetail(await call(`/api/v1/rooms/${encodeURIComponent(roomId)}`, 'GET')).members.map((m) => m.user_id);
+    return parseRoomDetail(await call(`/api/v1/rooms/${encodeURIComponent(roomId)}`, 'GET', undefined, signal)).members.map((m) => m.user_id);
   },
-};
+});
 
-// One device start-up. Stopping it (sign-out, revocation, another user) is immediate: it closes
-// the store connection now and marks the start-up cancelled, so a pending network step can never
-// hold local keys alive or reopen a store after it was deleted.
+// One device start-up. Stopping it (sign-out, revocation, another user) aborts its requests,
+// releasing any per-user lock held over the network, closes the store and cancels start-up.
+// A pending start-up can never keep keys alive or reopen a deleted store.
 interface Entry {
   userId: string;
   engine: Promise<CryptoEngine>;
   ready?: CryptoEngine;
   cancelled: boolean;
   failed: boolean;
+  controller: AbortController;
   store?: CryptoStore;
 }
 
@@ -125,7 +127,8 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
   if (current?.userId === userId && !current.failed) return current.engine;
   if (deletedElsewhere) return Promise.reject(new Error('Encryption was reset in another tab; reload this tab to continue.'));
   stopE2EE();
-  const entry = { userId, cancelled: false, failed: false } as Entry;
+  const entry = { userId, cancelled: false, failed: false, controller: new AbortController() } as Entry;
+  const server = keyServer(entry.controller.signal);
   const live = () => {
     if (entry.cancelled) throw new Cancelled('Device start-up was cancelled');
   };
@@ -140,6 +143,7 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
     // Another tab deleted the store on sign-out: drop this engine, so the next use
     // starts afresh instead of writing to a closed or deleted store.
     s.onClosed(() => {
+      entry.controller.abort();
       if (current === entry) current = undefined;
       deletedElsewhere = true;
     });
@@ -150,7 +154,7 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
     let e: CryptoEngine;
     const store = await openStore();
     try {
-      e = await CryptoEngine.open(userId, httpKeyServer, store);
+      e = await CryptoEngine.open(userId, server, store);
     } catch (err) {
       store.close();
       // The server no longer knows this device (removed from another session): never revive it,
@@ -159,13 +163,13 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
       const replacementStore = await openStore();
       await resetDevice(replacementStore);
       live();
-      e = await CryptoEngine.open(userId, httpKeyServer, replacementStore);
+      e = await CryptoEngine.open(userId, server, replacementStore);
     }
     if (entry.cancelled) {
       e.close();
       live();
     }
-    void retireAbandoned(userId).catch(() => undefined);
+    void retireAbandoned(userId, entry.controller.signal).catch(() => undefined);
     e.onKeys(() => keysArrived(true));
     return e;
   })();
@@ -180,6 +184,7 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
   // Attach failure handling directly: it runs before a caller resumes from the rejected start.
   void entry.engine.then((e) => void e.receive().catch(() => undefined), () => {
     entry.failed = true;
+    entry.controller.abort();
     entry.store?.close();
   });
   return entry.engine;
@@ -191,6 +196,7 @@ function stopE2EE(): void {
   current = undefined;
   if (!old) return;
   old.cancelled = true;
+  old.controller.abort();
   old.store?.close();
   void old.engine.then((e) => e.close(), () => undefined);
 }
@@ -287,7 +293,7 @@ export function retireDevice() {
     const e = await entry?.engine.catch(() => undefined);
     if (!e) return false;
     try {
-      await call(`/api/v1/keys/devices/${encodeURIComponent(e.deviceId)}`, 'DELETE');
+      await call(`/api/v1/keys/devices/${encodeURIComponent(e.deviceId)}`, 'DELETE', undefined, entry?.controller.signal);
       return true;
     } catch (err) {
       return err instanceof KeyServerError && err.status === 404;
@@ -330,7 +336,7 @@ function saveAbandoned(list: Abandoned[]): void {
   }
 }
 
-async function retireAbandoned(userId: string): Promise<void> {
+async function retireAbandoned(userId: string, signal: AbortSignal): Promise<void> {
   const left: Abandoned[] = [];
   for (const d of abandoned()) {
     if (d.user_id !== userId) {
@@ -338,7 +344,7 @@ async function retireAbandoned(userId: string): Promise<void> {
       continue;
     }
     try {
-      await call(`/api/v1/keys/devices/${encodeURIComponent(d.device_id)}`, 'DELETE');
+      await call(`/api/v1/keys/devices/${encodeURIComponent(d.device_id)}`, 'DELETE', undefined, signal);
     } catch (e) {
       if (!(e instanceof KeyServerError && e.status === 404)) left.push(d);
     }
