@@ -1,17 +1,24 @@
 package api_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Busnes-app/ky-primitives/syncauth"
 	"github.com/Busnes-app/ky_server_base/internal/chat"
 	"github.com/Busnes-app/ky_server_base/internal/config"
+	"github.com/Busnes-app/ky_server_base/internal/store"
 	"github.com/coder/websocket"
+	"github.com/google/uuid"
 )
 
 func TestRoomCallHTTPAndSocketChooseOneAuthorizedReplica(t *testing.T) {
@@ -125,5 +132,108 @@ func TestGuestRoomCallAliasRequiresExactMeetingAndAdmission(t *testing.T) {
 	}
 	if r := guestPost(a, "/api/meet/"+meeting.token+"/call/join"); r.Code != http.StatusNotFound {
 		t.Fatalf("token-only route bypassed affinity:%d %s", r.Code, r.Body.String())
+	}
+}
+
+func TestHostedMeetingCloseRetainsMediaCleanupAndRevokesAdmissions(t *testing.T) {
+	var fail atomic.Bool
+	var mu sync.Mutex
+	var deleted []string
+	sfu := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/DeleteRoom") {
+			var in struct {
+				Room string `json:"room"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&in)
+			mu.Lock()
+			deleted = append(deleted, in.Room)
+			mu.Unlock()
+			if fail.Swap(false) {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer sfu.Close()
+	a, _, st, _ := newReplicas(t, func(c *config.Config) {
+		c.RTC.LiveKitURL = sfu.URL
+		c.RTC.LiveKitAPIKey = "test"
+		c.RTC.LiveKitAPISecret = "test-secret"
+	})
+	host, token := createOrgUser(t, st, "close-host", "closehost", "user", replicaOrgA)
+	other, otherToken := createOrgUser(t, st, "close-other", "closeother", "user", replicaOrgB)
+	meeting := putMeeting(t, a, "closing", replicaOrgA, host.SSOSubject)
+	otherMeeting := putMeeting(t, a, "closing", replicaOrgB, other.SSOSubject)
+	gid, _ := guestKnock(t, a, meeting.token)
+	if r := doBearerJSON(t, a, http.MethodPost, "/api/v1/rooms/"+meeting.roomID+"/lobby/"+gid+"/admit", token, nil, nil); r.Code != http.StatusOK {
+		t.Fatal(r.Code)
+	}
+	for _, entry := range []struct{ room, token string }{{meeting.roomID, token}, {otherMeeting.roomID, otherToken}} {
+		r := doBearerJSON(t, a, http.MethodPost, "/api/v1/rooms/"+entry.room+"/calls/join", entry.token, map[string]bool{"audio": true, "protect_ip": true}, nil)
+		if r.Code != http.StatusOK {
+			t.Fatalf("join:%d %s", r.Code, r.Body.String())
+		}
+	}
+	ctx := context.Background()
+	old, err := st.Chat().GetActiveCallSession(ctx, replicaOrgA, meeting.roomID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherBefore, err := st.Chat().GetActiveCallSession(ctx, replicaOrgB, otherMeeting.roomID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := uuid.NewString()
+	closeMeeting := func() *httptest.ResponseRecorder {
+		raw := []byte(`{"org_id":"` + replicaOrgA + `"}`)
+		request := httptest.NewRequest(http.MethodDelete, "/api/meetings/closing", bytes.NewReader(raw))
+		request.Header.Set("Content-Type", "application/json")
+		headers, err := syncauth.Sign([]byte(testMultiTenantHMAC), time.Now(), "meeting.close", event, raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		headers.Apply(request)
+		response := httptest.NewRecorder()
+		a.ServeHTTP(response, request)
+		return response
+	}
+	fail.Store(true)
+	if r := closeMeeting(); r.Code != http.StatusServiceUnavailable {
+		t.Fatalf("incomplete close acknowledged:%d %s", r.Code, r.Body.String())
+	}
+	if exists, err := st.GuestSessions().Exists(ctx, gid); err != nil || exists {
+		t.Fatalf("closed admission can revive:%v %v", exists, err)
+	}
+	if seats, err := st.Chat().CallSeats(ctx, replicaOrgA, meeting.roomID); err != nil || len(seats) != 0 {
+		t.Fatalf("closed seats remain:%+v %v", seats, err)
+	}
+	if _, err := st.Chat().GetActiveCallSession(ctx, replicaOrgA, meeting.roomID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("closed call remains active:%v", err)
+	}
+	if r := doBearerJSON(t, a, http.MethodGet, "/api/v1/rooms/"+meeting.roomID+"/calls/state", token, nil, nil); r.Code != http.StatusOK || !strings.Contains(r.Body.String(), `"call":null`) {
+		t.Fatalf("closed state:%d %s", r.Code, r.Body.String())
+	}
+	for range 2 {
+		if r := closeMeeting(); r.Code != http.StatusOK {
+			t.Fatalf("close retry/replay:%d %s", r.Code, r.Body.String())
+		}
+	}
+	otherAfter, err := st.Chat().GetActiveCallSession(ctx, replicaOrgB, otherMeeting.roomID)
+	if err != nil || otherAfter.Epoch != otherBefore.Epoch || otherAfter.LiveKitRoom != otherBefore.LiveKitRoom {
+		t.Fatalf("other org's call changed:%+v %v", otherAfter, err)
+	}
+	if pending, err := st.Chat().PendingCallEvictions(ctx, replicaOrgA, "", 200); err != nil || len(pending) != 0 {
+		t.Fatalf("close cleanup remains:%+v %v", pending, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(deleted) < 2 {
+		t.Fatal("cleanup not retried")
+	}
+	for _, target := range deleted {
+		if target != old.LiveKitRoom {
+			t.Fatalf("close retired another media target:%v", deleted)
+		}
 	}
 }

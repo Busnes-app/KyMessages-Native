@@ -83,6 +83,10 @@ func (g *GuestSessionStore) create(ctx context.Context, secret string, sess Gues
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	// Serialize the admitted/waiting principal with room closure before touching guest rows.
+	if err := oneRow(tx.ExecContext(ctx, g.s.rebind(`UPDATE rooms SET topic=topic WHERE tenant_id=? AND id=? AND closed_at IS NULL`), sess.TenantID, sess.RoomID)); err != nil {
+		return nil, err
+	}
 	rows, err := tx.QueryContext(ctx, g.s.rebind(`DELETE FROM meeting_guest_sessions WHERE tenant_id = ? AND meeting_id = ? AND guest_key = ? RETURNING `+guestSessionCols),
 		sess.TenantID, sess.MeetingID, sess.GuestKey)
 	if err != nil {
@@ -135,8 +139,19 @@ func (g *GuestSessionStore) InRoom(ctx context.Context, roomID string, nowMs int
 
 // Admit marks guestID in roomID admitted by actorID.
 func (g *GuestSessionStore) Admit(ctx context.Context, roomID, guestID, actorID string, nowMs int64, live time.Duration) (*GuestSession, error) {
-	return scanGuestSession(g.s.db.QueryRowContext(ctx, g.s.rebind(`UPDATE meeting_guest_sessions SET status = 'admitted', decided_by = ?
-WHERE guest_id = ? AND room_id = ? AND expires_at > ?`+g.present()+` RETURNING `+guestSessionCols), actorID, guestID, roomID, nowMs, live.Milliseconds()))
+	tx, err := g.s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if err := oneRow(tx.ExecContext(ctx, g.s.rebind(`UPDATE rooms SET topic=topic WHERE id=? AND closed_at IS NULL AND tenant_id=(SELECT tenant_id FROM meeting_guest_sessions WHERE guest_id=? AND room_id=?)`), roomID, guestID, roomID)); err != nil {
+		return nil, err
+	}
+	session, err := scanGuestSession(tx.QueryRowContext(ctx, g.s.rebind(`UPDATE meeting_guest_sessions SET status='admitted',decided_by=? WHERE guest_id=? AND room_id=? AND expires_at>?`+g.present()+` RETURNING `+guestSessionCols), actorID, guestID, roomID, nowMs, live.Milliseconds()))
+	if err != nil {
+		return nil, err
+	}
+	return session, tx.Commit()
 }
 
 // Touch records, on the database clock, that each guest has a live socket on the caller's

@@ -291,16 +291,6 @@ func (h *Hub) Dispatch(ev Event) {
 			case "added":
 				h.subscribeUserToRoom(delta.UserID, ev.RoomID)
 				h.broadcastRoom(ev.RoomID, raw)
-				if h.roomCalls && ev.Type == EventCallState {
-					h.mu.RLock()
-					targets := copyClients(h.byRoom[ev.RoomID])
-					h.mu.RUnlock()
-					for _, c := range targets {
-						if c.callRoomID == ev.RoomID {
-							c.enqueue(raw)
-						}
-					}
-				}
 				return
 			case "removed":
 				h.broadcastRoom(ev.RoomID, raw)
@@ -325,6 +315,16 @@ func (h *Hub) Dispatch(ev Event) {
 	}
 	if ev.RoomID != "" {
 		h.broadcastRoom(ev.RoomID, raw)
+		if h.roomCalls && (ev.Type == EventCallState || ev.Type == EventRoomClosed) {
+			h.mu.RLock()
+			targets := copyClients(h.byRoom[ev.RoomID])
+			h.mu.RUnlock()
+			for _, c := range targets {
+				if c.callRoomID == ev.RoomID {
+					c.enqueue(raw)
+				}
+			}
+		}
 	}
 }
 

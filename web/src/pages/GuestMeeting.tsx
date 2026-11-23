@@ -319,6 +319,7 @@ export const GuestMeeting: React.FC<GuestMeetingProps> = ({ token, appName }) =>
         isGuest: true,
         socket: () => socketRef.current,
         rejoin: (media) => joinGuestCall(token,media,info?.call_room_id),
+        onEnded: () => { callCtrlRef.current = null; setCallSnap(null); },
         onChange: setCallSnap,
       });
       callCtrlRef.current = ctrl;

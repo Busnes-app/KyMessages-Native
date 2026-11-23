@@ -275,9 +275,10 @@ describe('HybridCallController SFU/P2P handoff', () => {
     };
     const rejoin = vi.fn().mockResolvedValue(response);
     const globalMedia = vi.fn();
+    const onEnded = vi.fn();
     const global = { sendCallMedia: globalMedia } as unknown as ChatSocket;
     const controller = new HybridCallController({ localUserId: 'alice', localDisplayName: 'Alice', isGuest: false,
-      socket: () => global, rejoin, onChange: () => undefined });
+      socket: () => global, rejoin, onEnded, onChange: () => undefined });
     const started = controller.start(response, { audio: true, video: false, protectIp: true });
     const wire = WireSocket.instances[0];
     expect(wire.url).toContain(response.call_ws_path);
@@ -305,6 +306,9 @@ describe('HybridCallController SFU/P2P handoff', () => {
     expect(rejoin).toHaveBeenLastCalledWith({ audio: false, video: false, screenShare: false, protectIp: true });
     expect(mockConnect).toHaveBeenLastCalledWith(response.livekit_url, 'recovered');
     expect(audio.readyState).toBe('live');
+    recovered.emit({ t: 'room.closed', room: 'room_owned', d: {} });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(onEnded).toHaveBeenCalledTimes(1);
     controller.dispose();
     expect(recovered.readyState).toBe(3);
     expect(audio.readyState).toBe('ended');

@@ -28,6 +28,17 @@ func (s *Server) handleCallState(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireRoomMember(w, r, tenantID, roomID, user.ID); !ok {
 		return
 	}
+	if s.config.Tenancy.IsMultiTenant() {
+		room, err := s.store.Chat().GetRoom(r.Context(), tenantID, roomID)
+		if err != nil {
+			s.writeError(w, http.StatusServiceUnavailable, "Call state is temporarily unavailable")
+			return
+		}
+		if room.ClosedAt != nil {
+			s.writeJSON(w, http.StatusOK, map[string]any{"call": nil, "sfu_available": s.calls.SFUAvailable(), "ice_servers": s.calls.ICEServers()})
+			return
+		}
+	}
 	if !s.requireCallOwner(w, r, tenantID, roomID) {
 		return
 	}

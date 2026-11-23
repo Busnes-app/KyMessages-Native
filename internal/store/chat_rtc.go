@@ -509,6 +509,12 @@ func (c *chatStore) CloseMeeting(ctx context.Context, tenantID, meetingID string
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if tenantID != DefaultTenantID {
+		// Acquire SQLite's writer before the binding read; serialize repeat closures on PG.
+		if _, err := tx.ExecContext(ctx, c.store.rebind(`UPDATE meetings SET updated_at=updated_at WHERE tenant_id=? AND id=?`), tenantID, meetingID); err != nil {
+			return nil, err
+		}
+	}
 
 	var m Meeting
 	var closedAt sql.NullInt64
@@ -541,6 +547,41 @@ func (c *chatStore) CloseMeeting(ctx context.Context, tenantID, meetingID string
 		now, tenantID, meetingID,
 	); err != nil {
 		return nil, err
+	}
+
+	if tenantID != DefaultTenantID {
+		// Closure is an authoritative revocation: retain every old media target before removing
+		// seats/admissions and fencing the owner. Single mode retains its existing close path.
+		rows, err := tx.QueryContext(ctx, c.store.rebind(`DELETE FROM meeting_guest_sessions WHERE tenant_id=? AND room_id=? RETURNING guest_id`), tenantID, m.RoomID)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			m.RevokedGuestIDs = append(m.RevokedGuestIDs, id)
+		}
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, c.store.rebind(`UPDATE call_room_owners SET expires_at=0,generation=generation+1 WHERE tenant_id=? AND room_id=?`), tenantID, m.RoomID); err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, c.store.rebind(`INSERT INTO pending_call_evictions(tenant_id,livekit_room,peer_id,user_id)
+   SELECT tenant_id,livekit_room,'','' FROM call_sessions WHERE tenant_id=? AND room_id=? AND ended_at IS NULL AND livekit_room IS NOT NULL AND livekit_room<>'' ON CONFLICT DO NOTHING`), tenantID, m.RoomID); err != nil {
+			return nil, err
+		}
+		if err := queueCallSeatsTx(ctx, c.store, tx, `call_seats.tenant_id=? AND call_seats.room_id=?`, tenantID, m.RoomID); err != nil {
+			return nil, err
+		}
+
+		if _, err := tx.ExecContext(ctx, c.store.rebind(`UPDATE call_sessions SET ended_at=COALESCE(ended_at,?) WHERE tenant_id=? AND room_id=?`), now, tenantID, m.RoomID); err != nil {
+			return nil, err
+		}
+
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err

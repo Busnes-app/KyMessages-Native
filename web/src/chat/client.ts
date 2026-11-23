@@ -49,7 +49,40 @@ async function apiJSON(input: string, init: RequestInit = {}, fallback = 'Reques
 }
 
 export async function fetchBootstrap(): Promise<ChatBootstrap> {
-  return parseBootstrap(await apiJSON('/api/v1/bootstrap', {}, 'Could not load chat'));
+  const boot = parseBootstrap(await apiJSON('/api/v1/bootstrap', {}, 'Could not load chat'));
+  if (boot.tenant.id === 'default') return boot;
+  // The global chat socket/HTTP may reach any pod. Only the room route can supply its
+  // current call roster. Bound fanout and time so an unavailable owner cannot stall chat.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2_000);
+  const rooms = boot.rooms.values();
+  const calls = { ...boot.active_calls };
+  const readRooms = async () => {
+    for (const room of rooms) {
+      if (controller.signal.aborted) return;
+      try {
+        const reply = obj(await apiJSON(
+          `/api/v1/rooms/${encodeURIComponent(room.id)}/calls/state`,
+          { signal: controller.signal }, 'Could not load call state',
+        ));
+        if (reply.call === null) {
+          delete calls[room.id];
+        } else {
+          const state = parseCallState(reply.call);
+          if (state.room_id !== room.id) throw new Error('Unexpected call room');
+          calls[room.id] = state;
+        }
+      } catch {
+        // Retain the last known snapshot on an owner/database outage.
+      }
+    }
+  };
+  try {
+    await Promise.all(Array.from({ length: 4 }, readRooms));
+    return { ...boot, active_calls: calls };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function fetchDirectoryUsers(): Promise<ChatDirectoryUser[]> {

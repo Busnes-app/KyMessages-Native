@@ -59,6 +59,7 @@ export interface HybridCallControllerOptions {
   socket: () => ChatSocket | null;
   rejoin?: (media: { audio: boolean; video: boolean; screenShare: boolean; protectIp: boolean }) => Promise<CallJoinResponse>;
   onChange: (snapshot: HybridCallSnapshot) => void;
+ onEnded?: () => void;
 }
 
 const PROTECT_IP_TIMEOUT_MS = 10_000;
@@ -143,7 +144,7 @@ export class HybridCallController {
           if (event.kind === 'call.state') this.handleCallState(event.state);
           if (event.kind === 'call.signal') void this.handleSignal(event.signal);
           if (event.kind === 'call.migrate') void this.handleMigrate(event.migrate);
-          if (event.kind === 'auth.revoked' || event.kind === 'room.closed') this.dispose();
+          if (event.kind === 'auth.revoked' || event.kind === 'room.closed') { this.dispose(); this.opts.onEnded?.(); }
         },
         onReconnect: () => { reconnect = true; },
       }, path);
@@ -246,6 +247,7 @@ export class HybridCallController {
     if (this.disposed || state.room_id !== this.roomId || (this.roomSocket && state.epoch !== undefined && state.epoch < this.epoch)) return;
     if (state.ended || state.active === false) {
       this.dispose();
+      this.opts.onEnded?.();
       return;
     }
     this.callId = state.call_id;

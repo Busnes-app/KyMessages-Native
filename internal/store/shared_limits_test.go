@@ -3,6 +3,8 @@ package store_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -128,5 +130,45 @@ func TestGuestSessionStore(t *testing.T) {
 	}
 	if r, _ := gs.DeleteTenant(ctx, "org-b"); len(r) != 1 {
 		t.Fatalf("org b sessions: %v", r)
+	}
+}
+
+func TestGuestAdmissionCannotRacePastHostedMeetingClosure(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	if _, err := st.Chat().EnsureTenant(ctx, "closing-org"); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 8 {
+		meeting, err := st.Chat().UpsertMeeting(ctx, store.UpsertMeetingParams{ID: "closing", TenantID: "closing-org", OrganizerSub: "host", Title: "T"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UnixMilli()
+		session := store.GuestSession{GuestID: fmt.Sprintf("closing-guest-%d", i), TenantID: "closing-org", MeetingID: "closing", RoomID: meeting.Meeting.RoomID, GuestKey: "key", DisplayName: "Guest", Status: "waiting", KnockedAt: now, ExpiresAt: now + 3600000}
+		start := make(chan struct{})
+		var createErr, closeErr error
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, createErr = st.GuestSessions().Create(ctx, "closing-secret", session)
+		}()
+		go func() { defer wg.Done(); <-start; _, closeErr = st.Chat().CloseMeeting(ctx, "closing-org", "closing") }()
+		close(start)
+		wg.Wait()
+		if closeErr != nil || createErr != nil && !errors.Is(createErr, store.ErrNotFound) {
+			t.Fatalf("concurrent close/knock:%v %v", closeErr, createErr)
+		}
+		if exists, err := st.GuestSessions().Exists(ctx, session.GuestID); err != nil || exists {
+			t.Fatalf("closed meeting kept admission:%v %v", exists, err)
+		}
+		if _, err := st.GuestSessions().Create(ctx, "stale-secret", session); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("stale meeting model created a principal:%v", err)
+		}
+		if _, err := st.GuestSessions().Admit(ctx, session.RoomID, session.GuestID, "host", now, time.Hour); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("closed principal admitted:%v", err)
+		}
 	}
 }

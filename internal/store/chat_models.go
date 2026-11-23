@@ -237,13 +237,15 @@ type CallSession struct {
 
 // Meeting represents a KyCalendar-backed or standalone native meeting room.
 type Meeting struct {
-	ID           string `json:"id"`
-	TenantID     string `json:"tenant_id"`
-	RoomID       string `json:"room_id"`
-	OrganizerSub string `json:"organizer_sub"`
-	Title        string `json:"title"`
-	ClosedAt     *int64 `json:"closed_at,omitempty"`
-	UpdatedAt    int64  `json:"updated_at"`
+	// IDs removed transactionally during hosted closure, for immediate post-commit WS revocation.
+	RevokedGuestIDs []string `json:"-"`
+	ID              string   `json:"id"`
+	TenantID        string   `json:"tenant_id"`
+	RoomID          string   `json:"room_id"`
+	OrganizerSub    string   `json:"organizer_sub"`
+	Title           string   `json:"title"`
+	ClosedAt        *int64   `json:"closed_at,omitempty"`
+	UpdatedAt       int64    `json:"updated_at"`
 }
 
 // MeetingWindow is one active time window [StartsAt, EndsAt] in Unix milliseconds.

@@ -304,12 +304,22 @@ func (s *Server) handleKyCalendarCloseMeeting(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	for _, id := range closed.RevokedGuestIDs {
+		_ = s.chatHub.RevokeUser(r.Context(), id)
+	}
 	s.lobby.RevokeMeeting(r.Context(), closed.RoomID)
 	_ = s.chatHub.PublishRoom(r.Context(), closed.RoomID, chat.Event{
 		Type:   chat.EventRoomClosed,
 		RoomID: closed.RoomID,
 		Data:   chat.MustMarshalData(map[string]any{"room_id": closed.RoomID, "meeting_id": closed.ID}),
 	})
+	if s.config.Tenancy.IsMultiTenant() {
+		if err := s.calls.DrainCleanup(r.Context(), tenantID, ""); err != nil {
+			s.forgetSuiteEvent(ev)
+			s.writeError(w, http.StatusServiceUnavailable, "Meeting media cleanup is pending; retry")
+			return
+		}
+	}
 	s.writeJSON(w, http.StatusOK, map[string]bool{"closed": true})
 }
 

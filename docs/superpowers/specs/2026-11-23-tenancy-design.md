@@ -647,6 +647,12 @@ credentials. Browser call sockets reconnect through the room route and rejoin by
 fresh peers/credentials; they do not reconstruct SDP or private media keys from the database.
 Primary session/seat checks fence outbound signaling, migration grants and missed revocations.
 Late disconnect callbacks recheck connected replacement sockets after room serialization.
+Cold/reconnected multi-mode bootstrap also refreshes rosters through the room HTTP routes,
+with four reads in flight and a two-second deadline, retaining the last known snapshot on
+read failure. A global pod snapshot is not the call authority. Existing signed meeting close
+atomically fences ownership, ends calls, retains SFU cleanup and removes guest admissions;
+failed cleanup remains retryable before the close is acknowledged. This preserves the
+current close permission boundary and does not choose the future host/moderator model.
 
 This is not a seamless-live-media promise: recovery can interrupt media, and a dead owner
 can retain its lease for up to 90 seconds. Keep the eligible call replica pool stable during

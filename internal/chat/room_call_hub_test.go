@@ -121,6 +121,16 @@ func TestRoomCallSocketConfinesRoomAndVerifiedSession(t *testing.T) {
 	}
 	ping(one)
 	ping(other)
+
+	if err := hub.PublishRoom(context.Background(), "r1", Event{Type: EventRoomClosed}); err != nil {
+		t.Fatal(err)
+	}
+	for _, conn := range []*websocket.Conn{global, one, other} {
+		if ev := readEvent(t, conn); ev.Type != EventRoomClosed {
+			t.Fatalf("room closure not delivered:%+v", ev)
+		}
+	}
+	ping(two)
 	// Closing a room call socket is independent of an ordinary chat socket or another room.
 	_ = one.CloseNow()
 	_ = other.CloseNow()

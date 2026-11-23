@@ -1642,6 +1642,7 @@ export const Chat: React.FC<ChatProps> = ({
         isGuest: false,
         socket: () => socketRef.current,
         rejoin: (media) => joinRoomCall(roomId,media),
+        onEnded: () => { callCtrlRef.current = null; setCallSnap(null); setCallExpanded(false); },
         onChange: setCallSnap,
       });
       callCtrlRef.current = ctrl;
