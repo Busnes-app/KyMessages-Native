@@ -7,6 +7,16 @@ Exposes HTTP REST routes, authentication endpoints, Single Sign-On callbacks, SC
 Owns HTTP routing, request parsing, session cookie validation, CORS headers, and error response formatting.
 
 ## Local Contracts
+- `POST /api/sso/kyidentity/logout` is public and CSRF-exempt: its credential is the verified
+  logout_token form field (64 KiB maximum, exactly one). Refused tokens/replays return 400;
+  unavailable storage returns 503. Accepted logout publishes session-specific WS revocations
+  across pods. Verified logouts for an unprovisioned subject retain an identity fence for
+  the first callback; they do not create an account. Register this URI on the KyIdentity OAuth client.
+- The SSO callback reads the database revocation generation before exchange and carries the
+  verified IdP issuer/sid/iat into session issuance. Both device pairing steps inherit that binding.
+- Installer directory events narrow canonical org_id in multi mode before calling the store;
+  its transaction compares the subject/account binding before revision or authority changes.
+
 - `GET /api/admin/network-check` (`requireAdmin`, `no-store`) reports how the request arrived: `peer_ip`, `client_ip`, `forwarded_trusted`, `forwarded_proto`, `app_url_https`, `host_matches`, `trusted_proxies_narrow` (true only when every `KY_TRUSTED_PROXIES` prefix is a single address, /32 or /128; false when empty). Admin-only because it describes the deployment's wiring. `forwarded_proto` is reported only when the direct peer is in `KY_TRUSTED_PROXIES`; otherwise forwarded headers are ignored and it is empty.
 - POST `/api/auth/change-password` accepts a restricted local session, current password and a different policy-valid new password. Browser CSRF and per-IP/account limits apply. Success revokes all sessions and requires sign-in again; flagged sessions get `password_change_required` on protected routes and public-only settings.
 - All JSON API endpoints return structured errors `{"error": "message"}` upon failure.

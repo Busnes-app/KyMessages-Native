@@ -38,7 +38,7 @@ type InitPairingResult struct {
 // accepts only the 24-byte secret: a short typed code could be guessed within the window.
 // authenticatedAt is the initiating session's credential time; the paired session inherits it.
 // The pairing is refused if user's credential snapshot was revoked since it was read.
-func (s *PairingService) InitPairing(ctx context.Context, user *store.User, authenticatedAt time.Time) (*InitPairingResult, error) {
+func (s *PairingService) InitPairing(ctx context.Context, user *store.User, authenticatedAt time.Time, binding ...store.SSOSession) (*InitPairingResult, error) {
 	secret := crypto.RandomHex(24)
 	now := time.Now().UTC()
 	expiresAt := now.Add(90 * time.Second)
@@ -52,6 +52,9 @@ func (s *PairingService) InitPairing(ctx context.Context, user *store.User, auth
 		AuthenticatedAt: authenticatedAt,
 	}
 
+	if len(binding) > 0 {
+		pairing.SSOSession = binding[0]
+	}
 	if err := s.store.Devices().CreatePairing(ctx, pairing, user.PasswordHash); err != nil {
 		return nil, err
 	}

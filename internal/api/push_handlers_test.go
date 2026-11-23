@@ -407,7 +407,7 @@ func TestPushExcludedForRevokedAndInstallerDeactivatedUsers(t *testing.T) {
 	}
 
 	// 1. Deactivate installer-managed user via ApplyInstallerDirectory -> must delete push_subscriptions.
-	revokedID, err := st.ApplyInstallerDirectory(ctx, bundle.SSO.IssuerURL, "daily", "user.deactivated", "1", "digest-deact", false, false)
+	revokedID, err := st.ApplyInstallerDirectory(ctx, bundle.SSO.IssuerURL, "daily", "user.deactivated", "1", "digest-deact", false, false, "")
 	if err != nil || revokedID != managedUser.ID {
 		t.Fatalf("ApplyInstallerDirectory deactivation = (%q, %v), want (%q, nil)", revokedID, err, managedUser.ID)
 	}

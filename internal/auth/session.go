@@ -52,7 +52,7 @@ func (sm *SessionManager) IssueSession(ctx context.Context, w http.ResponseWrite
 
 // IssueDerivedSession issues a session whose credentials were verified at authenticatedAt,
 // for a session minted from another one (device pairing) without a fresh sign-in.
-func (sm *SessionManager) IssueDerivedSession(ctx context.Context, w http.ResponseWriter, r *http.Request, user *store.User, authenticatedAt time.Time) (*store.Session, string, error) {
+func (sm *SessionManager) IssueDerivedSession(ctx context.Context, w http.ResponseWriter, r *http.Request, user *store.User, authenticatedAt time.Time, binding ...store.SSOSession) (*store.Session, string, error) {
 	rawToken := crypto.RandomHex(32)
 	tokenHash := crypto.SHA256Hex([]byte(rawToken))
 
@@ -70,6 +70,9 @@ func (sm *SessionManager) IssueDerivedSession(ctx context.Context, w http.Respon
 		ExpiresAt: time.Now().UTC().Add(ttl),
 	}
 
+	if len(binding) > 0 {
+		sess.SSOSession = binding[0]
+	}
 	if err := sm.store.Sessions().CreateSession(ctx, sess, user.PasswordHash); err != nil {
 		return nil, "", err
 	}

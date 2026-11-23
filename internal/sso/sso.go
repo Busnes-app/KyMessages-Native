@@ -13,6 +13,8 @@ var (
 
 // IdentityClaims holds the unified identity extracted from any SSO provider.
 type IdentityClaims struct {
+	SessionID         string
+	IssuedAt          int64
 	Issuer            string `json:"-"`
 	Subject           string `json:"sub"`
 	OrgID             string `json:"org_id,omitempty"`

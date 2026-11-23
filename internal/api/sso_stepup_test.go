@@ -89,6 +89,7 @@ type fakeIdP struct {
 	key        *rsa.PrivateKey
 	mu         sync.Mutex
 	tokens     map[string]string
+	onToken    func()
 }
 
 // newFakeIdP starts the issuer and points cfg's KyIdentity settings at it.
@@ -111,7 +112,11 @@ func makeFakeIdP(t *testing.T, cfg *config.Config, tls bool) *fakeIdP {
 			_ = r.ParseForm()
 			f.mu.Lock()
 			token := f.tokens[r.Form.Get("code")]
+			hook := f.onToken
 			f.mu.Unlock()
+			if hook != nil {
+				hook()
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "unused", "token_type": "Bearer", "id_token": token})
 		default:
 			http.NotFound(w, r)
@@ -141,7 +146,7 @@ func (f *fakeIdP) signIn(srv *api.Server, claims map[string]any) *httptest.Respo
 	}
 	srv.ServeHTTP(login, loginRequest)
 	authorize, _ := url.Parse(login.Header().Get("Location"))
-	full := map[string]any{"iss": f.issuer, "aud": "client", "exp": time.Now().Add(time.Hour).Unix(), "iat": time.Now().Unix(), "nonce": authorize.Query().Get("nonce")}
+	full := map[string]any{"sid": crypto.RandomHex(16), "iss": f.issuer, "aud": "client", "exp": time.Now().Add(time.Hour).Unix(), "iat": time.Now().Unix(), "nonce": authorize.Query().Get("nonce")}
 	maps.Copy(full, claims)
 	body, _ := json.Marshal(full)
 	input := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","kid":"k"}`)) + "." + base64.RawURLEncoding.EncodeToString(body)

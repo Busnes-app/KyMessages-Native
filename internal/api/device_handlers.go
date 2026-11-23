@@ -37,7 +37,7 @@ func (s *Server) handlePairInit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := s.pairing.InitPairing(r.Context(), user, sess.CreatedAt)
+	res, err := s.pairing.InitPairing(r.Context(), user, sess.CreatedAt, sess.SSOSession)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to initialize pairing")
 		return
@@ -87,7 +87,7 @@ func (s *Server) handlePairVerify(w http.ResponseWriter, r *http.Request) {
 	var sessionToken string
 	if pairing.UserID != "" {
 		// Pairing verifies no credentials, so the new session is only as fresh as its parent.
-		_, rawToken, err := s.sessions.IssueDerivedSession(r.Context(), w, r, user, pairing.AuthenticatedAt)
+		_, rawToken, err := s.sessions.IssueDerivedSession(r.Context(), w, r, user, pairing.AuthenticatedAt, pairing.SSOSession)
 		if err == nil {
 			sessionToken = rawToken
 		}

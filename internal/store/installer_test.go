@@ -43,18 +43,18 @@ func TestInstallerAtomicOwnershipAndDirectoryFence(t *testing.T) {
 	}
 	// The first delivery and its replay both name the revoked user.
 	for range 2 {
-		revoked, err := st.ApplyInstallerDirectory(ctx, b.SSO.IssuerURL, "owner", "user.deactivated", "2", "digest-off", false, false)
+		revoked, err := st.ApplyInstallerDirectory(ctx, b.SSO.IssuerURL, "owner", "user.deactivated", "2", "digest-off", false, false, "")
 		if err != nil || revoked != u.ID {
 			t.Fatalf("deactivation revoked %q, want %q: %v", revoked, u.ID, err)
 		}
 	}
-	if _, err = st.ApplyInstallerDirectory(ctx, b.SSO.IssuerURL, "owner", "user.updated", "1", "digest-on", true, true); err == nil {
+	if _, err = st.ApplyInstallerDirectory(ctx, b.SSO.IssuerURL, "owner", "user.updated", "1", "digest-on", true, true, ""); err == nil {
 		t.Fatal("stale activation accepted")
 	}
-	if _, err = st.ApplyInstallerDirectory(ctx, b.SSO.IssuerURL, "owner", "user.updated", "2", "digest-other", true, true); err == nil {
+	if _, err = st.ApplyInstallerDirectory(ctx, b.SSO.IssuerURL, "owner", "user.updated", "2", "digest-other", true, true, ""); err == nil {
 		t.Fatal("conflicting revision accepted")
 	}
-	if _, err = st.ApplyInstallerDirectory(ctx, "https://foreign.example", "owner", "user.updated", "3", "digest-on", true, true); err == nil {
+	if _, err = st.ApplyInstallerDirectory(ctx, "https://foreign.example", "owner", "user.updated", "3", "digest-on", true, true, ""); err == nil {
 		t.Fatal("foreign issuer accepted")
 	}
 	if _, err = st.ApplyInstaller(ctx, b, false); err == nil {
@@ -129,14 +129,14 @@ func TestInstallerDirectoryPreservesMatrixDelete(t *testing.T) {
 	if _, err := st.ApplyInstaller(ctx, b, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ApplyInstallerDirectory(ctx, b.SSO.IssuerURL, "daily", "user.deleted", "1", "deleted", false, false); err != nil {
+	if _, err := st.ApplyInstallerDirectory(ctx, b.SSO.IssuerURL, "daily", "user.deleted", "1", "deleted", false, false, ""); err != nil {
 		t.Fatal(err)
 	}
 	statuses, err := st.Users().DirectoryStatuses(ctx, "kyidentity")
 	if err != nil || statuses["daily"] != "deleted" {
 		t.Fatal(statuses, err)
 	}
-	if _, err = st.ApplyInstallerDirectory(ctx, b.SSO.IssuerURL, "daily", "user.created", "2", "recreate", true, false); err == nil {
+	if _, err = st.ApplyInstallerDirectory(ctx, b.SSO.IssuerURL, "daily", "user.created", "2", "recreate", true, false, ""); err == nil {
 		t.Fatal("deleted Matrix account reactivated")
 	}
 }
@@ -164,10 +164,13 @@ func TestInstallerMFAResetFencesInFlightPairing(t *testing.T) {
 	if err = st.Devices().ConsumePairing(ctx, "in-flight", "phone", "android", ""); err != nil {
 		t.Fatal(err)
 	}
-	if revoked, err := st.ApplyInstallerDirectory(ctx, b.SSO.IssuerURL, "daily", "user.mfa_reset", "1", "reset", true, false); err != nil || revoked != u.ID {
+	if _, err := st.ApplyInstallerDirectory(ctx, b.SSO.IssuerURL, "daily", "user.updated", "2", "profile-newer", true, false, ""); err != nil {
+		t.Fatal(err)
+	}
+	if revoked, err := st.ApplyInstallerDirectory(ctx, b.SSO.IssuerURL, "daily", "user.mfa_reset", "1", "reset", true, false, ""); err != nil || revoked != u.ID {
 		t.Fatalf("MFA reset revoked %q, want %q: %v", revoked, u.ID, err)
 	}
-	if revoked, err := st.ApplyInstallerDirectory(ctx, b.SSO.IssuerURL, "daily", "user.mfa_reset", "1", "reset", true, false); err != nil || revoked != "" {
+	if revoked, err := st.ApplyInstallerDirectory(ctx, b.SSO.IssuerURL, "daily", "user.mfa_reset", "1", "reset", true, false, ""); err != nil || revoked != "" {
 		t.Fatalf("replayed MFA reset revoked %q: %v", revoked, err)
 	}
 	sess := &store.Session{TokenHash: "derived", UserID: u.ID, CreatedAt: now, ExpiresAt: now.Add(time.Hour)}

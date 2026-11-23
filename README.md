@@ -451,7 +451,7 @@ instance; the current operator-console preview is not a chat release (see `docs/
 | `KY_ENV=production` | Requires a durable `KY_SESSION_SECRET` and an `https` `KY_APP_URL` (unless `KY_COOKIE_SECURE=false`) |
 | `KY_COOKIE_SECURE` | Defaults to true for production or any `https` `KY_APP_URL`; also turns on HSTS for the `KY_APP_URL` host. With it on and `KY_COOKIE_DOMAIN` unset, auth cookies carry the `__Host-` prefix |
 | `KY_SSO_ENABLED` | Default true; `false` turns KyIdentity sign-in off (its routes answer 404) |
-| `KY_KYIDENTITY_ISSUER`, `KY_KYIDENTITY_CLIENT_ID`, `KY_KYIDENTITY_SECRET` | Suite KyIdentity OIDC client; register `https://<host>/api/sso/kyidentity/callback` as its redirect URI. The former `KY_KYSIGNON_*` names stop startup |
+| `KY_KYIDENTITY_ISSUER`, `KY_KYIDENTITY_CLIENT_ID`, `KY_KYIDENTITY_SECRET` | Suite KyIdentity OIDC client; register `https://<host>/api/sso/kyidentity/callback` as its redirect URI and `https://<host>/api/sso/kyidentity/logout` as its back-channel logout URI. The former `KY_KYSIGNON_*` names stop startup |
 | `KY_MATRIX_RTC_HOST`, `KY_MATRIX_MEDIA_IP` | LiveKit HTTPS signalling origin and directly reachable media IPv4; required by `matrix-init`; set the host in `.env` too |
 | `KY_MATRIX_TURN_HOST`, `KY_MATRIX_TURN_CERT_FILE`, `KY_MATRIX_TURN_KEY_FILE` | Optional complete TURN/TLS setup block for `matrix-init`; DNS-only hostname and trusted PEM files; enable the TURN overlay |
 | `KY_MATRIX_MEDIA_BIND_IP` | Host interface for direct TCP 7881/UDP 7882, default `0.0.0.0`; does not change the advertised media IP |

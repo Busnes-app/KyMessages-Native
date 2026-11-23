@@ -76,6 +76,11 @@ func (s *Server) handleKyIdentityCallback(w http.ResponseWriter, r *http.Request
 	s.ssoCookie(w, "ky_pkce_"+state, "", -1)
 	s.ssoCookie(w, "ky_nonce_"+state, "", -1)
 
+	generation, err := s.store.Sessions().SSOGeneration(r.Context())
+	if err != nil {
+		s.writeError(w, 503, "Suite sign-in is unavailable")
+		return
+	}
 	redirectURI := fmt.Sprintf("%s/api/sso/kyidentity/callback", s.config.Server.AppURL)
 	claims, err := s.kyidentity.ExchangeCode(r.Context(), code, verifier, redirectURI, nonceCookie.Value)
 	if err != nil {
@@ -154,7 +159,7 @@ func (s *Server) handleKyIdentityCallback(w http.ResponseWriter, r *http.Request
 	}
 
 	// The session is as fresh as the IdP's signed auth_time; a missing one never passes step-up.
-	_, _, err = s.sessions.IssueDerivedSession(r.Context(), w, r, user, claims.AuthenticatedAt)
+	_, _, err = s.sessions.IssueDerivedSession(r.Context(), w, r, user, claims.AuthenticatedAt, store.SSOSession{Issuer: claims.Issuer, SID: claims.SessionID, IssuedAt: claims.IssuedAt, Generation: generation})
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Session creation failed")
 		return

@@ -104,6 +104,7 @@ func (f *oauthFlow) exchangeIDToken(ctx context.Context, code, verifier, redirec
 func claimsFromIDToken(idToken *oidc.IDToken) (*IdentityClaims, error) {
 	var raw struct {
 		Sub               string `json:"sub"`
+		SID               string `json:"sid"`
 		OrgID             string `json:"org_id"`
 		Email             string `json:"email"`
 		Name              string `json:"name"`
@@ -111,7 +112,7 @@ func claimsFromIDToken(idToken *oidc.IDToken) (*IdentityClaims, error) {
 		Role              string `json:"role"`
 		AuthTime          int64  `json:"auth_time"`
 	}
-	if err := idToken.Claims(&raw); err != nil || raw.Sub == "" {
+	if err := idToken.Claims(&raw); err != nil || raw.Sub == "" || raw.SID == "" || len(raw.SID) > 256 || idToken.IssuedAt.IsZero() {
 		return nil, ErrInvalidIDToken
 	}
 	username := raw.PreferredUsername
@@ -123,6 +124,8 @@ func claimsFromIDToken(idToken *oidc.IDToken) (*IdentityClaims, error) {
 	}
 	claims := &IdentityClaims{
 		Issuer:            idToken.Issuer,
+		SessionID:         raw.SID,
+		IssuedAt:          idToken.IssuedAt.Unix(),
 		Subject:           raw.Sub,
 		OrgID:             strings.TrimSpace(raw.OrgID),
 		Email:             raw.Email,

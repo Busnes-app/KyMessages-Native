@@ -383,6 +383,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/sso/kyidentity/login", s.handleKyIdentityLogin)
 	s.mux.HandleFunc("/api/sso/kyidentity/callback", s.handleKyIdentityCallback)
 	s.mux.HandleFunc("/api/sso/kyidentity/sync", s.handleKyIdentitySyncWebhook)
+	s.mux.HandleFunc("POST /api/sso/kyidentity/logout", s.handleKyIdentityLogout)
 
 	// Devices & Ephemeral QR Pairing
 	s.mux.HandleFunc("/api/devices/pair/init", s.requireAuthenticated(s.handlePairInit))
@@ -657,6 +658,7 @@ func csrfExempt(path string) bool {
 	return path == "/api/auth/login" ||
 		strings.HasPrefix(path, "/api/auth/mfa/") ||
 		path == "/api/sso/kyidentity/sync" ||
+		path == "/api/sso/kyidentity/logout" ||
 		strings.HasPrefix(path, "/api/v1/webhooks/in/") ||
 		strings.HasPrefix(path, "/api/meetings/") ||
 		strings.HasPrefix(path, "/api/suite/") ||

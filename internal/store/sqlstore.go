@@ -372,9 +372,14 @@ func (u *userStore) directoryWrite(ctx context.Context, user *User, ev Directory
 	if rows, err := res.RowsAffected(); err != nil || rows == 0 {
 		return false, err
 	}
-	res, err = tx.ExecContext(ctx, u.store.rebind(`INSERT INTO directory_sync_state (provider, subject, revision) VALUES (?, ?, ?)
-ON CONFLICT (provider, subject) DO UPDATE SET revision = excluded.revision
-WHERE directory_sync_state.revision < excluded.revision OR excluded.revision = -1`), user.SSOProvider, user.SSOSubject, ev.Revision)
+	var restoreBump int64
+	if ev.Revision == -1 {
+		restoreBump = 1
+	}
+	res, err = tx.ExecContext(ctx, u.store.rebind(`INSERT INTO directory_sync_state (provider, subject, revision, restore_generation) VALUES (?, ?, ?, ?)
+ON CONFLICT (provider, subject) DO UPDATE SET revision = excluded.revision,
+    restore_generation = directory_sync_state.restore_generation + excluded.restore_generation
+WHERE directory_sync_state.revision < excluded.revision OR excluded.revision = -1`), user.SSOProvider, user.SSOSubject, ev.Revision, restoreBump)
 	if err != nil {
 		return false, err
 	}
@@ -400,12 +405,68 @@ func (u *userStore) ApplyDirectoryProfile(ctx context.Context, user *User, ev Di
 	})
 }
 
+// ResetDirectoryMFA deduplicates resets independently of profile ordering. An unseen reset
+// still revokes grants after a newer profile delivery, without rewriting that profile.
+func (u *userStore) ResetDirectoryMFA(ctx context.Context, user *User, ev DirectoryEvent) (bool, error) {
+	tx, err := u.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var managed int
+	if err := tx.QueryRowContext(ctx, u.store.rebind("SELECT COUNT(*) FROM server_settings z WHERE z.key LIKE 'installer.user.%' AND 'usr_' || substr(z.key,16,24) = ?"), user.ID).Scan(&managed); err != nil {
+		return false, err
+	}
+	if managed != 0 {
+		return false, errors.New("managed directory requires installer authority")
+	}
+	if user.ID == "" {
+		var deleted int
+		if err := tx.QueryRowContext(ctx, u.store.rebind(`SELECT COUNT(*) FROM directory_sync_state WHERE provider = ? AND subject = ? AND NOT EXISTS (SELECT 1 FROM users WHERE sso_provider = ? AND sso_subject = ?)`), user.SSOProvider, user.SSOSubject, user.SSOProvider, user.SSOSubject).Scan(&deleted); err != nil {
+			return false, err
+		}
+		if deleted != 1 {
+			return false, ErrNotFound
+		}
+	}
+	res, err := tx.ExecContext(ctx, u.store.rebind(`INSERT INTO directory_sync_events (provider, event_id) VALUES (?, ?) ON CONFLICT (provider, event_id) DO NOTHING`), user.SSOProvider, ev.ID)
+	if err != nil {
+		return false, err
+	}
+	if n, err := res.RowsAffected(); err != nil || n == 0 {
+		return false, err
+	}
+	key := fmt.Sprintf("revision:%d", ev.Revision)
+	if ev.Revision == -1 {
+		key = "restore:" + ev.ID
+	}
+	fresh, err := recordMFAReset(ctx, u.store, tx, user.SSOProvider, user.SSOSubject, key)
+	if err != nil {
+		return false, err
+	}
+	if !fresh || user.ID == "" {
+		// A known deletion is terminal for this delivery; acknowledge without recreation.
+		return false, tx.Commit()
+	}
+	if err := revokeSSOGrants(ctx, u.store, tx, user.ID); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
 func (u *userStore) CreateDirectoryUser(ctx context.Context, user *User, ev DirectoryEvent) (bool, error) {
 	return u.directoryWrite(ctx, user, ev, func(tx *sql.Tx) error { return u.insertUser(ctx, tx, user) })
 }
 
 func (u *userStore) DeleteDirectoryUser(ctx context.Context, user *User, ev DirectoryEvent) (bool, error) {
 	return u.directoryWrite(ctx, user, ev, func(tx *sql.Tx) error {
+		// Pairing creation locks this row too; it cannot land behind the grant sweep.
+		if _, err := tx.ExecContext(ctx, u.store.rebind("UPDATE users SET id = id WHERE id = ?"), user.ID); err != nil {
+			return err
+		}
+		if err := deleteGrants(ctx, u.store, tx, user.ID); err != nil {
+			return err
+		}
 		_, err := tx.ExecContext(ctx, u.store.rebind(`DELETE FROM users WHERE id = ?`), user.ID)
 		return err
 	})
@@ -579,6 +640,25 @@ func (s *SQLStore) withPassword(ctx context.Context, userID, expectedHash string
 		return err
 	}
 	defer tx.Rollback()
+	if s.driver == "sqlite" {
+		// Reserve SQLite's single writer before reading identity state; a deferred
+		// read transaction cannot upgrade after a competing logout commits.
+		if _, err := tx.ExecContext(ctx, "UPDATE sso_generation SET generation=generation WHERE id=1"); err != nil {
+			return err
+		}
+	}
+	var provider, subject, orgID string
+	if err := tx.QueryRowContext(ctx, s.rebind("SELECT sso_provider, sso_subject, org_id FROM users WHERE id = ?"), userID).Scan(&provider, &subject, &orgID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if provider == "kyidentity" {
+		if err := lockSSOIdentity(ctx, s, tx, subject, orgID); err != nil {
+			return err
+		}
+	}
 	result, err := tx.ExecContext(ctx, s.rebind("UPDATE users SET id = id WHERE id = ? AND password_hash = ? AND status = 'active'"), userID, expectedHash)
 	if err != nil {
 		return err
@@ -593,10 +673,6 @@ func (s *SQLStore) withPassword(ctx context.Context, userID, expectedHash string
 	// An org-bound account gets a grant only while its org is active. Locking the org row
 	// orders this against a suspension: one that committed first refuses the grant, and one
 	// that waits for it then deletes it with the org's other grants.
-	var orgID string
-	if err := tx.QueryRowContext(ctx, s.rebind("SELECT org_id FROM users WHERE id = ?"), userID).Scan(&orgID); err != nil {
-		return err
-	}
 	if orgID != "" {
 		org, err := tx.ExecContext(ctx, s.rebind("UPDATE tenants SET id = id WHERE id = ? AND status = ?"), orgID, TenantStatusActive)
 		if err != nil {
@@ -616,7 +692,10 @@ func (s *SQLStore) withPassword(ctx context.Context, userID, expectedHash string
 
 func (s *sessionStore) CreateSession(ctx context.Context, sess *Session, expectedPasswordHash string) error {
 	return s.store.withPassword(ctx, sess.UserID, expectedPasswordHash, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, s.store.rebind(`INSERT INTO sessions (token_hash, user_id, user_agent, ip_address, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)`), sess.TokenHash, sess.UserID, sess.UserAgent, sess.IPAddress, sess.CreatedAt, sess.ExpiresAt)
+		if err := checkSSOFence(ctx, s.store, tx, sess.UserID, sess.SSOSession); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, s.store.rebind(`INSERT INTO sessions (token_hash, user_id, user_agent, ip_address, created_at, expires_at, sso_sid, sso_issued_at, sso_generation, sso_issuer) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`), sess.TokenHash, sess.UserID, sess.UserAgent, sess.IPAddress, sess.CreatedAt, sess.ExpiresAt, sess.SID, sess.IssuedAt, sess.Generation, sess.Issuer)
 		return err
 	})
 }
@@ -674,13 +753,13 @@ func (u *userStore) revokePasswordGrants(ctx context.Context, tx *sql.Tx, userID
 
 func (s *sessionStore) GetSession(ctx context.Context, tokenHash string) (*Session, error) {
 	q := s.store.rebind(`
-SELECT token_hash, user_id, user_agent, ip_address, created_at, expires_at
+SELECT token_hash, user_id, user_agent, ip_address, created_at, expires_at, sso_sid, sso_issued_at, sso_generation, sso_issuer
 FROM sessions WHERE token_hash = ?
 `)
 	var sess Session
 	err := s.store.db.QueryRowContext(ctx, q, tokenHash).Scan(
 		&sess.TokenHash, &sess.UserID, &sess.UserAgent, &sess.IPAddress,
-		&sess.CreatedAt, &sess.ExpiresAt,
+		&sess.CreatedAt, &sess.ExpiresAt, &sess.SID, &sess.IssuedAt, &sess.Generation, &sess.Issuer,
 	)
 	if err != nil {
 		if errorsIs(err, sql.ErrNoRows) {
@@ -788,13 +867,16 @@ func (d *deviceStore) CreatePairing(ctx context.Context, p *DevicePairing, expec
 	}
 
 	q := d.store.rebind(`
-INSERT INTO device_pairings (secret, user_id, device_name, platform, push_token, status, created_at, expires_at, authenticated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO device_pairings (secret, user_id, device_name, platform, push_token, status, created_at, expires_at, authenticated_at, sso_sid, sso_issued_at, sso_generation, sso_issuer)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `)
 	return d.store.withPassword(ctx, p.UserID, expectedPasswordHash, func(tx *sql.Tx) error {
+		if err := checkSSOFence(ctx, d.store, tx, p.UserID, p.SSOSession); err != nil {
+			return err
+		}
 		_, err := tx.ExecContext(ctx, q,
 			p.Secret, p.UserID, p.DeviceName, p.Platform, p.PushToken,
-			p.Status, p.CreatedAt, p.ExpiresAt, p.AuthenticatedAt,
+			p.Status, p.CreatedAt, p.ExpiresAt, p.AuthenticatedAt, p.SID, p.IssuedAt, p.Generation, p.Issuer,
 		)
 		return err
 	})
@@ -802,7 +884,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 
 func (d *deviceStore) GetPairingBySecret(ctx context.Context, secret string) (*DevicePairing, error) {
 	q := d.store.rebind(`
-SELECT secret, user_id, device_name, platform, push_token, status, created_at, expires_at, authenticated_at
+SELECT secret, user_id, device_name, platform, push_token, status, created_at, expires_at, authenticated_at, sso_sid, sso_issued_at, sso_generation, sso_issuer
 FROM device_pairings WHERE secret = ?
 `)
 	return d.scanPairing(d.store.db.QueryRowContext(ctx, q, secret))
@@ -812,7 +894,7 @@ func (d *deviceStore) scanPairing(row interface{ Scan(...any) error }) (*DeviceP
 	var p DevicePairing
 	err := row.Scan(
 		&p.Secret, &p.UserID, &p.DeviceName, &p.Platform,
-		&p.PushToken, &p.Status, &p.CreatedAt, &p.ExpiresAt, &p.AuthenticatedAt,
+		&p.PushToken, &p.Status, &p.CreatedAt, &p.ExpiresAt, &p.AuthenticatedAt, &p.SID, &p.IssuedAt, &p.Generation, &p.Issuer,
 	)
 	if err != nil {
 		if errorsIs(err, sql.ErrNoRows) {
