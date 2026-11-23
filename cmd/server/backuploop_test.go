@@ -261,3 +261,20 @@ func TestWriteNewRefusesAnExistingPath(t *testing.T) {
 		t.Fatalf("temporary left behind: %v", entries)
 	}
 }
+
+// Multi mode backs up PostgreSQL with its own tooling: the capsule scheduler returns at once,
+// writes no audit row and never ticks.
+func TestBackupLoopIsOffInMultiTenantMode(t *testing.T) {
+	st, cfg := tickFixture(t, time.Hour)
+	cfg.Tenancy = config.TenancyConfig{Mode: config.TenancyMulti}
+	done := make(chan struct{})
+	go backupLoop(context.Background(), cfg, st, done)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("backupLoop ran in multi-tenant mode")
+	}
+	if recs, _, err := st.Audit().ListAuditRecords(context.Background(), 0, 10); err != nil || len(recs) != 0 {
+		t.Fatalf("audit rows: %+v %v", recs, err)
+	}
+}

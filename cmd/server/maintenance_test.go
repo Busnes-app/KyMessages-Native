@@ -42,7 +42,7 @@ func TestMaintenanceLoopClosesDoneOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	done := make(chan struct{})
-	go maintenanceLoop(ctx, nil, done)
+	go maintenanceLoop(ctx, nil, everyReplica, done)
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
@@ -61,7 +61,7 @@ func TestAgentExpiryLoopRunsAtStartAndStops(t *testing.T) {
 		}
 		called <- struct{}{}
 		return errors.New("store unavailable")
-	}, done)
+	}, everyReplica, done)
 	select {
 	case <-called:
 	case <-time.After(5 * time.Second):
@@ -85,7 +85,7 @@ func TestAttachmentSweepLoopRunsAtStartAndStops(t *testing.T) {
 		}
 		called <- struct{}{}
 		return 1, nil
-	}, done)
+	}, everyReplica, done)
 	select {
 	case <-called:
 	case <-time.After(5 * time.Second):
@@ -97,4 +97,37 @@ func TestAttachmentSweepLoopRunsAtStartAndStops(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("attachmentSweepLoop did not close done after cancel")
 	}
+}
+
+// Two replicas on one database: only the lease holder runs a tick, per job.
+func TestLeasedJobsRunOnOneReplica(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, config.DatabaseConfig{Driver: "sqlite", DSN: filepath.Join(t.TempDir(), "t.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	a, b := leasedJobs(st), leasedJobs(st)
+	if !a(ctx, "agent_expiry", time.Hour) || b(ctx, "agent_expiry", time.Hour) {
+		t.Fatal("agent_expiry must run on exactly one replica")
+	}
+	if !a(ctx, "agent_expiry", time.Hour) {
+		t.Fatal("the holder must keep its lease from tick to tick")
+	}
+	if !b(ctx, "maintenance", time.Minute) || a(ctx, "maintenance", time.Minute) {
+		t.Fatal("each job has its own lease")
+	}
+}
+
+// A replica without the lease skips the work and still stops cleanly.
+func TestLoopsSkipWithoutTheLease(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	never := func(context.Context, string, time.Duration) bool { return false }
+	done1, done2 := make(chan struct{}), make(chan struct{})
+	go agentExpiryLoop(ctx, func(context.Context, time.Time) error { t.Error("expiry ran without the lease"); return nil }, never, done1)
+	go attachmentSweepLoop(ctx, func(context.Context, time.Time) (int, error) { t.Error("sweep ran without the lease"); return 0, nil }, never, done2)
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done1
+	<-done2
 }

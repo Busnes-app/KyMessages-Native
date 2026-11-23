@@ -398,3 +398,34 @@ func TestRemoveRoomWebhooks(t *testing.T) {
 		t.Fatalf("audit rows = %d (%s, %s) %v, want one for the live webhook", n, who, which, err)
 	}
 }
+
+// Replicas start together. On PostgreSQL the migration lock makes every runner wait for the
+// first, then find nothing left to apply; without it one of them fails on schema_migrations.
+func TestConcurrentRunsAllSucceed(t *testing.T) {
+	ctx := context.Background()
+	cfg := testdb.Config(t)
+	driver := "sqlite"
+	if cfg.Driver == "postgres" {
+		driver = "pgx"
+	} else {
+		t.Skip("one SQLite file has one writer; the lock is PostgreSQL only")
+	}
+	const n = 4
+	errs := make(chan error, n)
+	for range n {
+		go func() {
+			db, err := sql.Open(driver, cfg.DSN)
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer db.Close()
+			errs <- migrations.Run(ctx, db, cfg.Driver)
+		}()
+	}
+	for range n {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent migration run: %v", err)
+		}
+	}
+}

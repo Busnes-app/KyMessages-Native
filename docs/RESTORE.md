@@ -32,7 +32,7 @@ database during snapshot creation.
 Only SQLite capsule backup/restore is supported by `kymessages restore`. For PostgreSQL
 deployments (`KY_DB_DRIVER=postgres`), use standard PostgreSQL backup/PITR tooling (`pg_dump` /
 WAL archiving) alongside off-host copies of `data/encryption.key`, `data/attachments.key`,
-`data/vapid.key`, and the attachment directory.
+`data/vapid.key`, and the attachment directory. Multi-tenant installs follow [Multi-tenant](#multi-tenant-ky_tenancy_modemulti).
 
 ## Restore offline
 
@@ -109,6 +109,33 @@ attachment downloads return 404.
 - Review changes after the capsule timestamp using surviving audit logs and KyIdentity records:
   offboarded accounts, suspended orgs, passwords, or MFA enrollments may be newer than the
   snapshot. Resolve stale access before reopening traffic, then create a fresh sealed backup.
+
+## Multi-tenant (`KY_TENANCY_MODE=multi`)
+
+Multi mode runs several replicas on one PostgreSQL database. The capsule scheduler is off there
+(backup status says so), and `kymessages restore` does not apply.
+
+- **Database.** Back it up with PostgreSQL tooling: continuous WAL archiving plus base backups,
+  copied off-host. Restore with the same tooling (point-in-time recovery), into a database no
+  replica is using.
+- **Shared secrets.** `KY_SESSION_SECRET`, `KY_ENCRYPTION_KEY` (or the shared
+  `data/encryption.key`) and `KY_VAPID_PRIVATE_KEY` (or the shared `data/vapid.key`) live in the
+  operator's secret store, never next to the database backup. A restored database needs the same
+  encryption key, or stored TOTP secrets cannot be read. Multi mode never mints these at start.
+- **Attachments.** `KY_ATTACHMENTS_DIR` is a volume every replica mounts; back it up with the
+  volume's own snapshots or copies. The capsule's attachment mirror is not used in multi mode.
+- **Return to service.** Stop every replica before the restore, then start them all. Migrations
+  take a PostgreSQL advisory lock, so replicas starting together apply each migration once.
+  Restart every replica after any restore, including one made underneath running replicas: the
+  server cannot detect a PostgreSQL restore, and the tenancy spec's restart re-read of
+  KyIdentity's erased and org lists (not built yet) runs at start.
+- **Restored grants.** A restored database still holds sessions, pairings and bot tokens that
+  were revoked after its restore point. Before starting any replica, run
+  `kymessages invalidate-grants` once with the same environment. It does what `restore` does for
+  a capsule: deletes sessions, MFA challenges, device pairings and push subscriptions, ends
+  active calls, revokes bot tokens, and audits `restore.grants_invalidated`. Users sign in again.
+  Then review the audit trail and KyIdentity for offboarding and org changes after the restore
+  point, as above.
 
 ## Installer-managed console
 

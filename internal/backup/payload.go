@@ -30,6 +30,9 @@ const recoveryPubPath = "data/recovery.pub"
 // database, so a capsule without one is never sealed as if it were a backup.
 var ErrNoDatabaseSnapshot = errors.New("backup: no consistent database snapshot for this driver")
 
+// MultiTenantOff is why the capsule scheduler never runs in multi-tenant mode.
+const MultiTenantOff = "multi-tenant mode backs up PostgreSQL with its own tooling (WAL archive and base backups); see docs/RESTORE.md"
+
 // Collect assembles the payload every sealing caller uses: the local application files
 // (SQLite database containing native chat rooms, messages, attachment references, calls,
 // webhooks, bots/agents, users, settings, and audit log; plus server configuration) and the

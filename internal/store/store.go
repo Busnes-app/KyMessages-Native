@@ -52,6 +52,8 @@ type Store interface {
 	Notify(ctx context.Context, channel, payload string) error
 
 	InvalidateRestoredGrants(context.Context) error
+	// AcquireLease takes or renews a background job's lease (multi mode); see leases.go.
+	AcquireLease(ctx context.Context, name, holder string, ttl time.Duration) (bool, error)
 	Driver() string
 	Ping(ctx context.Context) error
 	Close() error

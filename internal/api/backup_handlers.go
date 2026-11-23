@@ -585,7 +585,9 @@ func (s *Server) handleBackupStatus(w http.ResponseWriter, r *http.Request) {
 	s.scheduleStatus(ctx, out)
 	// The scheduler builds the same RunConfig from the same immutable config at start and, if
 	// it fails, stops for the life of the process (cmd/server backupLoop).
-	if _, err := backup.RunConfig(s.config, appVersion); err != nil {
+	if s.config.Tenancy.IsMultiTenant() {
+		out["scheduler_error"] = backup.MultiTenantOff
+	} else if _, err := backup.RunConfig(s.config, appVersion); err != nil {
 		out["scheduler_error"] = "Scheduled backups are off until the configuration is fixed and the server restarted: " + recoveryclient.AuditSafe(err.Error())
 	}
 	if s.config.Backup.Dir != "" {

@@ -268,12 +268,24 @@ ALTER TABLE mfa_challenges ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';`,
 	{Version: 30, Name: "suite_presence", SQLite: presenceSchema, Postgres: presenceSchema},
 	// End-to-end encryption key server: public device keys, one-time keys, to-device mailbox.
 	{Version: 31, Name: "e2ee_keys", SQLite: e2eeSchema + e2eeToDeviceSQLite, Postgres: e2eeSchema + e2eeToDevicePostgres},
+
 	{Version: 51, Name: "sso_session_lifecycle", SQLite: ssoLifecycleSchema, Postgres: ssoLifecycleSchema},
 	// Incoming webhooks are removed for end-to-end encryption; each live one leaves an audit row.
 	{Version: 52, Name: "remove_room_webhooks", SQLite: removeRoomWebhooksSchema, Postgres: removeRoomWebhooksSchema},
 	// Search runs on the device; the server's full-text index has no reader left.
 	{Version: 53, Name: "drop_message_search_index", SQLite: `SELECT 1;`, Postgres: `DROP INDEX IF EXISTS idx_messages_body_fts;`},
+
+	// Tenancy migrations follow the merged webhook removal and E2EE slots 53–54.
+	{Version: 55, Name: "job_leases", SQLite: jobLeasesSchema, Postgres: jobLeasesSchema},
 }
+
+const jobLeasesSchema = `
+CREATE TABLE IF NOT EXISTS job_leases (
+	name TEXT PRIMARY KEY,
+	holder TEXT NOT NULL,
+	expires_at BIGINT NOT NULL
+);
+`
 
 const multiTenancySchemaSQLite = `
 ALTER TABLE users ADD COLUMN org_id TEXT NOT NULL DEFAULT '';
@@ -515,14 +527,36 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );`
 	}
 
-	if _, err := db.ExecContext(ctx, initTableQuery); err != nil {
+	// On PostgreSQL every replica may start at once: one session-level advisory lock, held on
+	// one connection for the whole run, makes the others wait and then re-read the applied set.
+	var q interface {
+		ExecContext(context.Context, string, ...any) (sql.Result, error)
+		QueryRowContext(context.Context, string, ...any) *sql.Row
+		BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error)
+	} = db
+	if driver == "postgres" {
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			return fmt.Errorf("migration connection: %w", err)
+		}
+		defer conn.Close()
+		if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock(hashtext('kymessages:migrate'))`); err != nil {
+			return fmt.Errorf("migration lock: %w", err)
+		}
+		defer func() {
+			_, _ = conn.ExecContext(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock(hashtext('kymessages:migrate'))`)
+		}()
+		q = conn
+	}
+
+	if _, err := q.ExecContext(ctx, initTableQuery); err != nil {
 		return fmt.Errorf("failed to init schema_migrations: %w", err)
 	}
 
 	// A database migrated by a newer build (an image rollback, or a restored capsule from one)
 	// has a schema this binary does not know; running against it would corrupt it quietly.
 	var applied, known int
-	if err := db.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations").Scan(&applied); err != nil {
+	if err := q.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations").Scan(&applied); err != nil {
 		return fmt.Errorf("failed to read schema version: %w", err)
 	}
 	for _, m := range registry {
@@ -538,7 +572,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 	}
 	for _, m := range registry {
 		var exists int
-		if err := db.QueryRowContext(ctx, checkQuery, m.Version).Scan(&exists); err != nil {
+		if err := q.QueryRowContext(ctx, checkQuery, m.Version).Scan(&exists); err != nil {
 			return fmt.Errorf("failed to check migration version %d: %w", m.Version, err)
 		}
 
@@ -551,7 +585,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 			ddl = m.Postgres
 		}
 
-		tx, err := db.BeginTx(ctx, nil)
+		tx, err := q.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("failed to begin migration tx for v%d: %w", m.Version, err)
 		}
