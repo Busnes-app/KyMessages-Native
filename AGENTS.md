@@ -148,6 +148,10 @@ When the user requests a durable behavior change, record it here or in the relev
 - Every route that names a user or room answers another org's ID exactly like an unknown one,
   and no live event crosses orgs (`TestMultiTenantCrossOrgUserPaths`). The resume event is
   `org.resumed`; `org.unsuspended` stays accepted until KyIdentity confirms the name.
+- The shared multi-server install (every paid plan is an org), replica safety, attachments in
+  S3-compatible storage and the per-org storage pool are designed in
+  `docs/superpowers/specs/2026-11-23-tenancy-design.md` (not built). It extends the 2026-11-22
+  spec, whose §4 wire contract stays authoritative.
 
 ## Installer setup
 
