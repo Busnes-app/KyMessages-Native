@@ -197,7 +197,7 @@ Multi mode, `origin/main` plus PR #27. Every row has a cross-org test in
    (§8.1) deletes the org's rows in batches, child tables first, then deletes its blobs (prefix
    `orgs/<org_id>/` in S3, or the listed keys on disk). The `tenants` row stays as a tombstone, so
    a late event cannot revive it.
-5. **A restore must not bring back a deleted org or an erased person.** A backup taken before
+4. **A restore must not bring back a deleted org or an erased person.** A backup taken before
    the deletion has no tombstone, so the restored database cannot be the authority. KyIdentity
    is: after any restore, and before serving, multi mode re-reads `GET /api/suite/erased` from
    `since=0` and the org list `GET /api/suite/orgs`, as T requires of every app (T,
@@ -207,7 +207,7 @@ Multi mode, `origin/main` plus PR #27. Every row has a cross-org test in
    (its only suite-API call is `dir.Peer`, `internal/api/suite.go:173-180`), so this adds two reads to the existing `suitedir` client (`internal/sso/kyidentity.go:418-424`).
    Whether `/api/suite/orgs` lists a deleted org as a tombstone or drops it is unverified, so
    both mean "deleted".
-6. **Mail-style 550s do not apply.** KyMessages has no inbound mail.
+5. **Mail-style 550s do not apply.** KyMessages has no inbound mail.
 
 ## 8. Replica safety
 
@@ -255,7 +255,7 @@ is off, and its status says why. The database is backed up by PostgreSQL tooling
 and base backups, off-host), and attachments by the bucket's versioning or replica copy (§9.4).
 The shared secrets (§5: VAPID key, encryption key, session secret, and the S3 seal key) live
 in the operator's secret store, never in the bucket. `RESTORE.md`
-gets a multi-mode section. After any restore it must re-read KyIdentity's erased and org lists before serving (§7.5).
+gets a multi-mode section. After any restore it must re-read KyIdentity's erased and org lists before serving (§7.4).
 
 ## 9. Attachments in S3-compatible storage (decision 8)
 
@@ -374,7 +374,7 @@ test proves the answers are byte for byte the same.
 | Org A lists, resolves, invites or messages org B's users | §6. Every path is tenant-scoped, and cross-org answers match unknown ones. |
 | A user-targeted event reaches room members | PR #27: `Dispatch` sends `user_id` events to that user only. |
 | A member signs in with full access during `deletion_scheduled` | M9: refuse `export_only` tokens. |
-| An erased person's or deleted org's data stays, or a restore brings it back | §7.2, §7.3, §7.5: purge every object version, tombstone, and re-read KyIdentity's erased and org lists after a restore. |
+| An erased person's or deleted org's data stays, or a restore brings it back | §7.2, §7.3, §7.4: purge every object version, tombstone, and re-read KyIdentity's erased and org lists after a restore. |
 | N replicas give an attacker N sign-in budgets, or N uses of one PoW | §8.2: shared counters and a shared spent table. |
 | Two replicas migrate at once and one stops | §8.1: advisory lock. |
 | A guest is lost, or let in twice, across replicas | §8.3: guest sessions in PostgreSQL, keyed by a hash of the secret. |
@@ -394,7 +394,7 @@ replay or stale revision where it applies, oversize input), and runs CI on SQLit
 | PR | Scope | Blocks launch | Depends on |
 |---|---|---|---|
 | 0 | **#27 (open):** the hub fix and the cross-org tests | Yes | — |
-| 1 | Lifecycle (§7): refuse `export_only`, handle `user.erased`, purge on `org.deleted`, re-read KyIdentity's erased and org lists after a restore (§7.5) | Yes | — |
+| 1 | Lifecycle (§7): refuse `export_only`, handle `user.erased`, purge on `org.deleted`, re-read KyIdentity's erased and org lists after a restore (§7.4) | Yes | — |
 | 2 | Replica safety I (§8.1, §8.4, §5): migration lock, `job_leases`, the capsule scheduler off in multi mode, `RESTORE.md` multi section, multi mode requires the shared VAPID key, encryption key and session secret (§5) | Yes | — |
 | 3 | Replica safety II (§8.2, §8.3): shared limiters, the PoW table, meeting upsert lock and 409, guest sessions in PostgreSQL | Yes | 2 |
 | 4 | Calls across replicas (§8.3), as open question 5 decides | Yes | 3 |
