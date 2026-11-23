@@ -25,6 +25,9 @@ func TestSuiteDirectoryPrefersInstaller(t *testing.T) {
 	if err != nil || c == nil || c.Issuer != "https://identity.example" || c.ClientID != "message" || c.ClientSecret != "installer-secret" {
 		t.Fatalf("installer directory = %+v, %v", c, err)
 	}
+	if got := k.EffectiveIssuer(); got != c.Issuer {
+		t.Fatalf("EffectiveIssuer = %q, want the directory's issuer %q", got, c.Issuer)
+	}
 	if c, err := sso.NewKyIdentityClient(config.SSOConfig{}, nil).SuiteDirectory(); c != nil || err != nil {
 		t.Fatalf("unconfigured = %+v, %v", c, err)
 	}

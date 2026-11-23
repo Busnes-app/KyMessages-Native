@@ -433,13 +433,14 @@ func (k *KyIdentityClient) SuiteDirectory() (*suitedir.Client, error) {
 	}, nil
 }
 
-// EffectiveIssuer returns the canonical KyIdentity issuer URL configured for this server.
+// EffectiveIssuer returns the canonical KyIdentity issuer URL configured for this server, by the
+// same installer-first rule as SuiteDirectory.
 func (k *KyIdentityClient) EffectiveIssuer() string {
-	if !k.config.Enabled {
-		return ""
-	}
 	if m := k.config.Installer; m != nil && m.IssuerURL != "" {
 		return strings.TrimRight(strings.TrimSpace(m.IssuerURL), "/")
+	}
+	if !k.config.Enabled {
+		return ""
 	}
 	return strings.TrimRight(strings.TrimSpace(k.config.KyIdentityIssuer), "/")
 }
