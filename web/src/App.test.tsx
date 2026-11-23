@@ -4,6 +4,7 @@ import { App } from './App';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { browserPushEndpoint, unsubscribeBrowserPush } from './chat/push';
 
+vi.mock('./chat/e2ee', () => import('./chat/e2eeFake'));
 vi.mock('./chat/push', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./chat/push')>()),
   browserPushEndpoint: vi.fn(async () => 'https://push.example/ep'),

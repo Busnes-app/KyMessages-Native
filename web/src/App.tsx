@@ -21,6 +21,7 @@ import './ky-ui/navigation.css';
 import { errorMessage, secureFetch } from './api';
 import { browserPushEndpoint, unsubscribeBrowserPush } from './chat/push';
 import { announceSignOut, forgetSearchIndex, onSignOutElsewhere } from './chat/searchIndex';
+import { forgetCryptoStore, replaceDevice, retireDevice } from './chat/e2ee';
 import { parseSettings, parseUser, type SessionUser, type SiteSettings } from './dto';
 import { ErrorBoundary } from './components/ErrorBoundary';
 
@@ -42,12 +43,10 @@ export const App: React.FC = () => {
   const leave = useCallback(async (message: string) => {
     setActiveCallSummary(null);
     setUser(null);
-    try {
-      await forgetSearchIndex();
-      setNotice(message);
-    } catch {
-      setNotice(`${message} This browser could not delete its message search index: close every KyMessages tab, then sign in and out again.`.trim());
-    }
+    // Both local stores go: the search index (readable history) and the device's keys.
+    const results = await Promise.allSettled([forgetSearchIndex(), forgetCryptoStore()]);
+    if (results.every((r) => r.status === 'fulfilled')) setNotice(message);
+    else setNotice(`${message} This browser could not delete all of its local message data: close every KyMessages tab, then sign in and out again.`.trim());
   }, []);
 
   // A sign-out in another tab signs this one out too, even if its WebSocket missed the revocation.
@@ -123,10 +122,14 @@ export const App: React.FC = () => {
   // Only a confirmed sign-out leaves the console; otherwise the session may still be live.
   const handleLogout = async () => {
     setError('');
+    let retired = false;
     try {
       // The server drops this browser's push subscription with the session, so a refused
       // sign-out leaves notifications as they were.
       const pushEndpoint = await browserPushEndpoint();
+      // The device's keys go before the session does; its local store goes either way below.
+      await retireDevice();
+      retired = true;
       const res = await secureFetch('/api/auth/logout', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -138,6 +141,8 @@ export const App: React.FC = () => {
       announceSignOut();
       await leave('');
     } catch (err) {
+      // Still signed in, but the old device is gone from the server: start a new one.
+      if (retired) void replaceDevice().catch(() => undefined);
       setError(`You are still signed in: ${err instanceof Error ? err.message : 'sign-out failed'}`);
     }
   };

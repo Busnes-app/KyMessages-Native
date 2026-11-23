@@ -23,7 +23,8 @@ test('production CSP, worker, themes, keyboard, dialog and responsive shell', as
     if (/Content Security Policy|violates.*directive/i.test(message.text())) violations.push(message.text());
   });
   const response = await page.goto('/');
-  expect(response.headers()['content-security-policy']).toContain("script-src 'self'");
+  // WebAssembly compilation (the encryption core) is the only script exception.
+  expect(response.headers()['content-security-policy']).toContain("script-src 'self' 'wasm-unsafe-eval';");
   expect(response.headers()['content-security-policy']).not.toContain("script-src 'self' 'unsafe-inline'");
   await expect.poll(() => page.evaluate(async () => (await navigator.serviceWorker.getRegistration())?.active?.state)).toBe('activated');
   await page.evaluate(async () => {

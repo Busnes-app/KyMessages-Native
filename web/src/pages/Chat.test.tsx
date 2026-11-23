@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { Chat } from './Chat';
+import { deliverKey, fakeEnvelope, resetFakeE2EE } from '../chat/e2eeFake';
+
+// Pages run without the WebAssembly core; crypto/engine.test.ts covers the real one.
+vi.mock('../chat/e2ee', () => import('../chat/e2eeFake'));
 
 const json = (v: unknown, status = 200) =>
   new Response(JSON.stringify(v), { status, headers: { 'Content-Type': 'application/json' } });
@@ -39,6 +43,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  resetFakeE2EE();
   cleanup();
   vi.unstubAllGlobals();
   window.history.replaceState(null, '', '/');
@@ -108,6 +113,7 @@ describe('Native Chat page', () => {
           const headers = new Headers(init?.headers);
           const body = String(init?.body ?? '');
           sentRequests.push({ url, headers, body });
+          const sent = JSON.parse(body) as { body: string; encoding: string };
           return json(
             {
               message: {
@@ -117,8 +123,8 @@ describe('Native Chat page', () => {
                 seq: 2,
                 sender_id: 'u_alice',
                 sender_name: 'Alice',
-                encoding: 'plain_v1',
-                body: 'Hello from native UI!',
+                encoding: sent.encoding,
+                body: sent.body,
                 created_at: 1_700_000_010_000,
                 reactions: [],
               },
@@ -148,6 +154,11 @@ describe('Native Chat page', () => {
     expect(await screen.findByText('Hello from native UI!')).toBeTruthy();
     expect(sentRequests).toHaveLength(1);
     expect(sentRequests[0].headers.get('Idempotency-Key')).toBeTruthy();
+    // The text leaves sealed; the legacy plaintext history says what it is.
+    const posted = JSON.parse(sentRequests[0].body) as { body: string; encoding: string };
+    expect(posted.encoding).toBe('e2ee_room_v1');
+    expect(sentRequests[0].body).not.toContain('Hello from native UI!');
+    expect(screen.getByText('Sent before encryption')).toBeTruthy();
 
     // Stream a live WebSocket message & typing & reaction event.
     const ws = FakeWebSocket.instances[0];
@@ -170,15 +181,19 @@ describe('Native Chat page', () => {
           seq: 3,
           sender_id: 'u_bob',
           sender_name: 'Bob',
-          encoding: 'plain_v1',
-          body: 'Live over WebSocket!',
+          encoding: 'e2ee_room_v1',
+          body: fakeEnvelope({ room_id: 'rm_gen', type: 'text', body: 'Live over WebSocket!' }, 's_bob'),
           created_at: 1_700_000_020_000,
           reactions: [],
         },
       });
     });
 
+    // Bob's room key has not arrived yet; the message opens when it does.
+    expect(await screen.findByText("Waiting for this message's key")).toBeTruthy();
+    act(() => deliverKey('s_bob'));
     expect(await screen.findByText('Live over WebSocket!')).toBeTruthy();
+    expect(screen.queryByText("Waiting for this message's key")).toBeNull();
     // Typing indicator clears automatically when Bob's message arrives.
     expect(screen.queryByText('Bob is typing…')).toBeNull();
 

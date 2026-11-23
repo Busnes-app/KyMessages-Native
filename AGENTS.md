@@ -145,7 +145,11 @@ When the user requests a durable behavior change, record it here or in the relev
   `web/crypto/build.sh` output (pinned Rust in `rust-toolchain.toml`, `wasm-bindgen-cli` 0.2.130;
   CI job "Crypto core"). The key server (`internal/api/e2ee_handlers.go`, `store.E2EEStore`)
   holds public keys and Olm ciphertext only; devices sign `api.E2EEDeviceSigned` and
-  `api.E2EEOneTimeKeySigned` strings, which clients verify again.
+  `api.E2EEOneTimeKeySigned` strings, which clients verify again. Encrypted rooms (E2): the web
+  client (`web/src/crypto/engine.ts`, `web/src/chat/e2ee.ts`) sends only `e2ee_room_v1`; the
+  server refuses `plain_v1` from everything but `kybot_` tokens (`api.CodeE2EERequired`), and the
+  CSP's one script exception is `'wasm-unsafe-eval'` for the crypto core. No release is published
+  while E2 is merged and E3-E5 are not (spec §10).
 - Only the staff org (`KY_STAFF_ORG_ID`) holds administrators (`config.TenancyConfig.MayAdminister`,
   enforced in directory sync and the `admin` middleware). Org-less local operators keep the
   install-wide console; per-org admin pages need a staff-org account.

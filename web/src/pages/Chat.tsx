@@ -87,6 +87,7 @@ import { MessageRow } from '../components/chat/MessageRow';
 import { RoomDetailsDrawer, type DrawerTab } from '../components/chat/RoomDetailsDrawer';
 import { CreateChannelModal, SearchModal, StartDMModal } from '../components/chat/ChatModals';
 import { searchIndexFor } from '../chat/searchIndex';
+import { onRoomKeys, openMessages, receiveRoomKeys, roomMembershipChanged, startE2EE, UNAVAILABLE } from '../chat/e2ee';
 import { CallAudioLayer, CallStage } from '../components/chat/CallStage';
 import { HybridCallController, type HybridCallSnapshot } from '../rtc/hybridCall';
 
@@ -243,6 +244,36 @@ export const Chat: React.FC<ChatProps> = ({
         for (const m of changed) indexedRef.current.delete(m.id);
       });
   }, [buckets, currentUser]);
+  // A message whose key had not arrived (or whose device had not started) is opened again
+  // when keys arrive.
+  useEffect(
+    () =>
+      onRoomKeys(() => {
+        const retry = Object.values(bucketsRef.current).flatMap((b) =>
+          b.messages.filter((m) => m.e2ee?.kind === 'waiting' || (m.e2ee?.kind === 'failed' && m.e2ee.reason === UNAVAILABLE)),
+        );
+        if (retry.length === 0) return;
+        void openMessages(retry).then((list) => {
+          const opened = new Map(list.filter((m) => m.e2ee?.kind !== 'waiting').map((m) => [m.id, m]));
+          if (opened.size === 0) return;
+          setBuckets((prev) => {
+            const next: Record<string, RoomMessageBucket> = {};
+            for (const [rid, b] of Object.entries(prev)) {
+              next[rid] = {
+                ...b,
+                // Only replace what is still unopened: an edit may have landed meanwhile.
+                messages: b.messages.map((m) => {
+                  const o = opened.get(m.id);
+                  return o && m.envelope === o.envelope && m.e2ee?.kind !== 'decrypted' ? o : m;
+                }),
+              };
+            }
+            return next;
+          });
+        });
+      }),
+    [],
+  );
   bucketsRef.current = buckets;
   roomsRef.current = rooms;
   stagedByRoomRef.current = stagedByRoom;
@@ -562,6 +593,9 @@ export const Chat: React.FC<ChatProps> = ({
           setBannerError('Your session has been revoked. Please sign in again.');
           onAuthRevokedRef.current?.();
           return;
+        case 'to_device':
+          receiveRoomKeys();
+          return;
         case 'message.new': {
           if (event.refetch || !event.message) {
             if (bucketsRef.current[event.roomId]?.loaded) {
@@ -699,6 +733,8 @@ export const Chat: React.FC<ChatProps> = ({
         }
         case 'room.member': {
           const self = event.userId === currentUserRef.current?.id;
+          // The next message lists the room's devices again; a departure also starts a new session.
+          if (event.action !== 'role') roomMembershipChanged(event.roomId, event.action === 'removed');
           if (self && event.action === 'removed') {
             setRooms((prev) => prev.filter((r) => r.id !== event.roomId));
             if (activeRoomIdRef.current === event.roomId) {
@@ -836,6 +872,10 @@ export const Chat: React.FC<ChatProps> = ({
           fetchDirectoryUsers().catch(() => [] as ChatDirectoryUser[]),
         ]);
         if (cancelled) return;
+        // Start this browser's encryption device before any room's messages are opened.
+        void startE2EE(boot.user.id).catch(() => {
+          if (!cancelled) setBannerError('Encryption could not start in this browser, so messages cannot be sent or read.');
+        });
         setCurrentUser(boot.user);
         setTenantName(boot.tenant.display_name || 'KyMessages');
         setRooms(boot.rooms);
@@ -899,6 +939,8 @@ export const Chat: React.FC<ChatProps> = ({
           try {
             const boot = await fetchBootstrap();
             if (cancelled) return;
+            // Mail may have arrived while offline, or the device may not have started.
+            void startE2EE(boot.user.id).then(receiveRoomKeys, () => undefined);
             setRooms(boot.rooms);
             const callMap: Record<string, CallState> = {};
             for (const [rid, c] of Object.entries(boot.active_calls)) {
@@ -1290,7 +1332,8 @@ export const Chat: React.FC<ChatProps> = ({
       sender_id: me.id,
       sender_name: me.display_name || me.username,
       reply_to_id: replyToId,
-      encoding: 'plain_v1',
+      encoding: 'e2ee_room_v1',
+      e2ee: { kind: 'decrypted' },
       body,
       created_at: Date.now(),
       reactions: [],
@@ -1427,7 +1470,8 @@ export const Chat: React.FC<ChatProps> = ({
 
   const handleEditMessage = async (messageId: string, newBody: string) => {
     if (!activeRoomId) return;
-    const updated = await editMessage(activeRoomId, messageId, newBody);
+    const original = bucketsRef.current[activeRoomId]?.messages.find((m) => m.id === messageId);
+    const updated = await editMessage(activeRoomId, messageId, newBody, original?.reply_to_id);
     setBuckets((prev) => {
       const current = prev[activeRoomId];
       if (!current) return prev;

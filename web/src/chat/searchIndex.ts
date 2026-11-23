@@ -129,9 +129,12 @@ export class SearchIndex {
     // A deletion always drops the copy; other unindexable states only drop a copy no newer than them.
     const drop: { id: string; edited_at?: number }[] = [];
     for (const m of messages) {
-      // Anything no longer indexable (deleted, emptied, unreadable, not yet stored) also loses an
-      // earlier copy, so the device never keeps old text it would not index now.
-      if (m.deleted_at || !m.body.trim() || m.encoding === 'system_v1' || m.delivery.kind !== 'synced') {
+      // Only text this device has read: never an envelope, a message still waiting for its key or
+      // one that failed to decrypt (their body is empty, and e2ee says why). Anything not indexable
+      // now (deleted, emptied, unreadable, not yet stored) also loses an earlier copy, so the
+      // device never keeps old text it would not index now.
+      const unread = m.encoding === 'e2ee_room_v1' && m.e2ee?.kind !== 'decrypted';
+      if (m.deleted_at || unread || !m.body.trim() || m.encoding === 'system_v1' || m.delivery.kind !== 'synced') {
         drop.push(m.deleted_at ? { id: m.id } : { id: m.id, edited_at: m.edited_at ?? 0 });
         continue;
       }

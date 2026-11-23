@@ -122,6 +122,12 @@ export type MessageDeliveryState =
   | { kind: 'sending'; idempotencyKey: string }
   | { kind: 'failed'; idempotencyKey: string; error: string };
 
+/**
+ * What this device could do with an e2ee_room_v1 message: read it, not yet (its key has not
+ * arrived), or never (with the reason shown in its place).
+ */
+export type E2EEState = { kind: 'decrypted' } | { kind: 'waiting' } | { kind: 'failed'; reason: string };
+
 export interface ChatMessage {
   id: string;
   tenant_id: string;
@@ -138,6 +144,9 @@ export interface ChatMessage {
   reactions: ChatReactionSummary[];
   attachments: ChatAttachment[];
   delivery: MessageDeliveryState;
+  /** For e2ee_room_v1: the envelope as stored. `body` holds only decrypted text, never this. */
+  envelope?: string;
+  e2ee?: E2EEState;
 }
 
 export type CallMode = 'p2p_mesh' | 'sfu_livekit';
@@ -289,7 +298,8 @@ export type WsServerEvent =
   | { kind: 'call.migrate'; roomId: string; migrate: CallMigratePayload }
   | { kind: 'lobby.knock'; roomId: string; guest: LobbyGuest }
   | { kind: 'lobby.decision'; roomId: string; guestId: string; decision: 'admitted' | 'denied'; meetingId: string }
-  | { kind: 'auth.revoked' };
+  | { kind: 'auth.revoked' }
+  | { kind: 'to_device' };
 
 const ROOM_KINDS: readonly RoomKind[] = ['dm', 'channel', 'meeting'];
 const ROOM_ROLES: readonly RoomRole[] = ['owner', 'admin', 'member', 'bot'];
@@ -402,6 +412,10 @@ export function parseAttachment(v: unknown): ChatAttachment {
 
 export function parseMessage(v: unknown): ChatMessage {
   const o = obj(v);
+  const encoding = opt(o.encoding, (e) => oneOf(e, ENCODINGS)) ?? 'plain_v1';
+  const body = opt(o.body, (s) => str(s, 65536)) ?? '';
+  // Ciphertext never sits in body, so nothing that shows or indexes body can leak it.
+  const sealed = encoding === 'e2ee_room_v1' && !opt(o.deleted_at, num);
   return {
     id: str(o.id, 128),
     tenant_id: opt(o.tenant_id, (s) => str(s, 128)) ?? 'default',
@@ -410,8 +424,9 @@ export function parseMessage(v: unknown): ChatMessage {
     sender_id: str(o.sender_id, 128),
     sender_name: opt(o.sender_name, (s) => str(s, 255)) ?? '',
     reply_to_id: opt(o.reply_to_id, (s) => str(s, 128)),
-    encoding: opt(o.encoding, (e) => oneOf(e, ENCODINGS)) ?? 'plain_v1',
-    body: opt(o.body, (s) => str(s, 32768)) ?? '',
+    encoding,
+    body: encoding === 'e2ee_room_v1' ? '' : body,
+    ...(sealed ? { envelope: body, e2ee: { kind: 'waiting' } as E2EEState } : {}),
     edited_at: opt(o.edited_at, num),
     deleted_at: opt(o.deleted_at, num),
     created_at: opt(o.created_at, num) ?? Date.now(),
@@ -768,6 +783,8 @@ export function parseWsEvent(raw: unknown): WsServerEvent | null {
       }
       case 'auth.revoked':
         return { kind: 'auth.revoked' };
+      case 'to_device':
+        return { kind: 'to_device' };
       default:
         return null;
     }

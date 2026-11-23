@@ -621,6 +621,9 @@ export const GuestMeeting: React.FC<GuestMeetingProps> = ({ token, appName }) =>
                     <div className="ky-guest-msg-body">
                       {m.deleted_at ? (
                         <em style={{ color: 'var(--ink)' }}>This message was deleted</em>
+                      ) : m.encoding === 'e2ee_room_v1' ? (
+                        // Guests hold no room keys: members' messages are end-to-end encrypted.
+                        <em style={{ color: 'var(--ink)' }}>Encrypted message: only members can read it</em>
                       ) : (
                         <>
                           {m.body}

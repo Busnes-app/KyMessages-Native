@@ -42,6 +42,15 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
   typing indicators, read receipts, unread badges, and message search that runs on the device: each
   browser indexes the messages it has read in IndexedDB, encrypted at rest, and deletes the index
   on sign-out. A browser finds only what it has read. The server has no search endpoint.
+- Room messages and edits are end-to-end encrypted by the web client (Olm + Megolm, E2 of
+  `docs/superpowers/specs/2026-11-22-e2ee-design.md`): each browser is a device with its own
+  keys, members' sessions may post only `e2ee_room_v1` envelopes, and the server stores
+  ciphertext it cannot open. Bots (`kybot_` tokens) still post plaintext, shown as "Not encrypted
+  (bot)"; older messages show "Sent before encryption"; files stay plaintext, shown as "File not
+  encrypted", until E5; meeting guests cannot read members' messages. Not released: no encryption
+  release is published until E1-E5 ship together, and until E3 keys go to every device the server
+  lists for a member. Because the server cannot read an encrypted message, the `mentions`
+  notification mode does not fire for one.
 - Native WebSocket fan-out (`/api/v1/ws`) with presence and immediate revocation disconnects.
 - File and image attachments stored on local disk (`KY_ATTACHMENTS_DIR`) with SHA-256 content
   hashing, per-upload/per-user/per-tenant quotas, inline image thumbnails, and encrypted backup
@@ -83,7 +92,8 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
 - Per-room notification preferences (`all`, `mentions`, `mute`), push subscription management
   (`/api/v1/push/*`), and automatic pruning of stale `404`/`410` browser endpoints.
 - Only current room members with active human accounts in an active org get a push. A message's
-  sender, room and a short preview pass through the browser vendor's push service, encrypted to
+  sender and room, and the text "New message" (never its content), pass through the browser
+  vendor's push service, encrypted to
   the browser (RFC 8291). Signing out, offboarding, org suspension and a restore remove
   subscriptions.
 
@@ -157,7 +167,8 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
 
 - Matrix protocol / Synapse / MAS / Element Web / server-to-server federation (retired; see
   `docs/superpowers/` for historical records).
-- Client-side end-to-end encryption, for now: messages are protected in transit via TLS and stored
-  readable in the operator's database until the end-to-end encryption phases ship
-  (`docs/superpowers/specs/2026-11-22-e2ee-design.md`).
+- A released end-to-end encryption claim, for now: encrypted rooms (E2) are built, but identity
+  verification (E3), bot devices (E4), file encryption (E5) and calls (E6) are not, so no release
+  says "end-to-end encrypted" yet (`docs/superpowers/specs/2026-11-22-e2ee-design.md` §10).
+  Bot messages, files and messages from before the upgrade are stored readable by the operator.
 - Call recording or third-party hosted calling SaaS.

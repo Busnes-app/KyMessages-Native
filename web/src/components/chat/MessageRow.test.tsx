@@ -234,4 +234,54 @@ describe('MessageRow', () => {
     expect(fileLink.getAttribute('href')).toBe('/api/v1/attachments/att_file1');
     expect(fileLink.getAttribute('download')).toBe('notes.txt');
   });
+
+  describe('encryption labels', () => {
+    const row = (message: ChatMessage, currentUserId = 'u_bob') =>
+      render(
+        <MessageRow
+          message={message}
+          grouped={false}
+          currentUserId={currentUserId}
+          canModerate={false}
+          onReply={vi.fn()}
+          onToggleReaction={vi.fn()}
+          onEdit={vi.fn().mockResolvedValue(undefined)}
+          onDelete={vi.fn().mockResolvedValue(undefined)}
+          onRetryFailed={vi.fn()}
+          onDismissFailed={vi.fn()}
+        />,
+      );
+    const sealed: ChatMessage = { ...baseMsg, encoding: 'e2ee_room_v1', body: 'Ship it', envelope: '{}', e2ee: { kind: 'decrypted' } };
+
+    it('says plaintext from a person was sent before encryption, and from a bot that it is not encrypted', () => {
+      row(baseMsg);
+      expect(screen.getByText('Sent before encryption')).toBeTruthy();
+      cleanup();
+      row({ ...baseMsg, sender_id: 'bot_1', sender_name: 'Triage Bot' });
+      expect(screen.getByText('Not encrypted (bot)')).toBeTruthy();
+      expect(screen.queryByText('Sent before encryption')).toBeNull();
+    });
+
+    it('shows a decrypted message without a label, but marks its files as not encrypted', () => {
+      row(sealed);
+      expect(screen.getByText('Ship it')).toBeTruthy();
+      expect(screen.queryByText('Sent before encryption')).toBeNull();
+      expect(screen.queryByText('File not encrypted')).toBeNull();
+      cleanup();
+      row({
+        ...sealed,
+        attachments: [{ id: 'att_1', tenant_id: 't1', room_id: 'r1', uploader_id: 'u1', filename: 'plan.pdf', mime_type: 'application/pdf', size_bytes: 10, sha256_hex: '', created_at: 1 }],
+      });
+      expect(screen.getByText('File not encrypted')).toBeTruthy();
+    });
+
+    it('says when a message waits for its key or cannot be decrypted, and offers no edit', () => {
+      row({ ...sealed, body: '', e2ee: { kind: 'waiting' } }, 'u1');
+      expect(screen.getByText("Waiting for this message's key")).toBeTruthy();
+      expect(screen.queryByRole('button', { name: /edit/i })).toBeNull();
+      cleanup();
+      row({ ...sealed, body: '', e2ee: { kind: 'failed', reason: 'This message was encrypted for another room.' } });
+      expect(screen.getByText("Can't decrypt this message. This message was encrypted for another room.")).toBeTruthy();
+    });
+  });
 });
