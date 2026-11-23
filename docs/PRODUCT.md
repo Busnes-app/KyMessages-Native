@@ -98,7 +98,7 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
   staff org. Local operator accounts, which belong to no org, keep the install-wide console
   (backups, audit, health, settings); per-org pages (Agents, Media policy) need a staff-org
   administrator and answer 403 to an account with no org. The audit log is install-wide, so
-  staff can see the usernames of every org's members in it. Staff never see message content.
+  staff can see the usernames of every org's members in it. The console shows no message content.
 - Local operator login remains available for single-tenant recovery/console access, with mandatory
   initial password replacement and optional TOTP MFA with recovery codes.
 
