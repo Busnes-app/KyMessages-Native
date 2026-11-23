@@ -226,14 +226,16 @@ func TestSharedLobbyConnectedGuestSurvivesAnOutage(t *testing.T) {
 	}
 	l := NewLobbyManager(NewHub(&captureBus{}), nil)
 	l.UseShared(st.GuestSessions())
-	l.SetLeaveGrace(time.Hour) // no heartbeat runs during the test
+	l.SetLeaveGrace(400 * time.Millisecond) // presence window 500 ms
 	s, err := l.Knock(ctx, &store.MeetingGuest{MeetingID: "m", GuestKey: "k"}, res.Meeting, nil, "Visitor")
 	if err != nil {
 		t.Fatal(err)
 	}
-	l.MarkConnected(s.GuestID)
-	l.SetLeaveGrace(400 * time.Millisecond) // presence window 500 ms
-	time.Sleep(700 * time.Millisecond)      // the "outage": nothing refreshed the row
+	// A socket open here whose heartbeats all failed during the outage: connected, never refreshed.
+	l.mu.Lock()
+	l.live[s.GuestID] = struct{}{}
+	l.mu.Unlock()
+	time.Sleep(700 * time.Millisecond)
 	active := func(context.Context, string) (bool, error) { return true, nil }
 	if !l.GuestCheck(active)(s.GuestID) {
 		t.Fatal("a guest still connected here was dropped after the outage")
