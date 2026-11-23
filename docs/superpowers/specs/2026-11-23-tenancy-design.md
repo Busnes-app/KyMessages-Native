@@ -196,9 +196,18 @@ Multi mode, `origin/main` plus PR #27. Every row has a cross-org test in
    (`internal/store/chat.go:188-200`). **Fix:** after the status write commits, a leased job
    (§8.1) deletes the org's rows in batches, child tables first, then deletes its blobs (prefix
    `orgs/<org_id>/` in S3, or the listed keys on disk). The `tenants` row stays as a tombstone, so
-   a late event cannot revive it. A restore of an older backup must not bring a deleted org back.
-   On startup and after a restore, every tombstoned tenant is purged again before serving.
-4. **Mail-style 550s do not apply.** KyMessages has no inbound mail.
+   a late event cannot revive it.
+5. **A restore must not bring back a deleted org or an erased person.** A backup taken before
+   the deletion has no tombstone, so the restored database cannot be the authority. KyIdentity
+   is: after any restore, and before serving, multi mode re-reads `GET /api/suite/erased` from
+   `since=0` and the org list `GET /api/suite/orgs`, as T requires of every app (T,
+   "`GET /api/suite/erased`"). Each erased subject is erased again (§7.2), and each org that
+   KyIdentity reports deleted or no longer lists is tombstoned and purged (§7.3). The server
+   refuses to serve until both reads succeed. KyMessages does not read either list today
+   (its only suite-API call is `dir.Peer`, `internal/api/suite.go:173-180`), so this adds two reads to the existing `suitedir` client (`internal/sso/kyidentity.go:418-424`).
+   Whether `/api/suite/orgs` lists a deleted org as a tombstone or drops it is unverified, so
+   both mean "deleted".
+6. **Mail-style 550s do not apply.** KyMessages has no inbound mail.
 
 ## 8. Replica safety
 
@@ -225,9 +234,11 @@ Multi mode, `origin/main` plus PR #27. Every row has a cross-org test in
 
 ### 8.3 Meetings, guests and calls
 
-- **Meeting upserts** take `pg_advisory_xact_lock` on `(tenant_id, meeting_id)` before the
-  read, like the quota lock (`internal/store/chat.go:1316-1327`). A taken ID in another org
-  answers 409 `meeting_conflict`, not 500. KyCalendar meeting IDs are its own UUIDs, so this
+- **Meeting upserts** take `pg_advisory_xact_lock` on the meeting ID alone, matching the global
+  key on `meetings.id`, before the read, like the quota lock (`internal/store/chat.go:1316-1327`).
+  Two orgs racing on one new ID then take the same lock. A taken ID in another org answers 409
+  `meeting_conflict`, not 500, and a unique-key violation on insert maps to the same 409 as a
+  backstop. KyCalendar meeting IDs are its own UUIDs, so this
   should never happen (unverified in KyCalendar).
 - **Guest sessions** move to a `meeting_guest_sessions` table keyed by the SHA-256 of the
   secret, with tenant, meeting, status and expiry. The in-memory maps become a cache that the
@@ -244,7 +255,7 @@ is off, and its status says why. The database is backed up by PostgreSQL tooling
 and base backups, off-host), and attachments by the bucket's versioning or replica copy (§9.4).
 The shared secrets (§5: VAPID key, encryption key, session secret, and the S3 seal key) live
 in the operator's secret store, never in the bucket. `RESTORE.md`
-gets a multi-mode section. It must replay the org purge (§7.3) after any restore.
+gets a multi-mode section. After any restore it must re-read KyIdentity's erased and org lists before serving (§7.5).
 
 ## 9. Attachments in S3-compatible storage (decision 8)
 
@@ -294,8 +305,10 @@ single mode cannot change by accident.
 
 The bucket gets versioning, or a provider replica, and a lifecycle rule that removes
 non-current versions after 30 days. That is the "backup copy" in the decision's price. A user's
-delete removes the current version. The purge (§7.3) deletes every version under the org's
-prefix, so "delete everything" holds once the 30 days have passed (open question 7). The
+delete removes the current version only, so it stays recoverable for 30 days (open question 7).
+The org purge (§7.3) and an erasure (§7.2) are different. They delete **every version** of each
+object at once, and the same objects on a provider replica, so nothing waits for the lifecycle
+rule. The
 local mirror (`MirrorAttachments`) is off in multi mode.
 
 ### 9.5 What KyMessages needs from ky-primitives
@@ -361,7 +374,7 @@ test proves the answers are byte for byte the same.
 | Org A lists, resolves, invites or messages org B's users | §6. Every path is tenant-scoped, and cross-org answers match unknown ones. |
 | A user-targeted event reaches room members | PR #27: `Dispatch` sends `user_id` events to that user only. |
 | A member signs in with full access during `deletion_scheduled` | M9: refuse `export_only` tokens. |
-| An erased person's or deleted org's data stays | §7.2, §7.3. Purge, tombstone, and re-purge after a restore. |
+| An erased person's or deleted org's data stays, or a restore brings it back | §7.2, §7.3, §7.5: purge every object version, tombstone, and re-read KyIdentity's erased and org lists after a restore. |
 | N replicas give an attacker N sign-in budgets, or N uses of one PoW | §8.2: shared counters and a shared spent table. |
 | Two replicas migrate at once and one stops | §8.1: advisory lock. |
 | A guest is lost, or let in twice, across replicas | §8.3: guest sessions in PostgreSQL, keyed by a hash of the secret. |
@@ -381,7 +394,7 @@ replay or stale revision where it applies, oversize input), and runs CI on SQLit
 | PR | Scope | Blocks launch | Depends on |
 |---|---|---|---|
 | 0 | **#27 (open):** the hub fix and the cross-org tests | Yes | — |
-| 1 | Lifecycle (§7): refuse `export_only`, handle `user.erased`, purge on `org.deleted`, re-purge after a restore | Yes | — |
+| 1 | Lifecycle (§7): refuse `export_only`, handle `user.erased`, purge on `org.deleted`, re-read KyIdentity's erased and org lists after a restore (§7.5) | Yes | — |
 | 2 | Replica safety I (§8.1, §8.4, §5): migration lock, `job_leases`, the capsule scheduler off in multi mode, `RESTORE.md` multi section, multi mode requires the shared VAPID key, encryption key and session secret (§5) | Yes | — |
 | 3 | Replica safety II (§8.2, §8.3): shared limiters, the PoW table, meeting upsert lock and 409, guest sessions in PostgreSQL | Yes | 2 |
 | 4 | Calls across replicas (§8.3), as open question 5 decides | Yes | 3 |
@@ -406,7 +419,7 @@ Tests each PR must add, beyond its own:
 - Until PR 4, a call needs both peers on one replica. The bus carries signalling, but seats are
   local.
 - A stale allowance can let the pool be overshot by other apps' growth for up to 15 minutes.
-- Old object versions remain for 30 days after a purge.
+- A user's own deleted attachment stays as an old object version for 30 days.
 - Staff see every org's usernames in the install-wide audit (open question 6).
 
 ## 14. Open questions, each with a default
@@ -425,8 +438,9 @@ Tests each PR must add, beyond its own:
    `call_sessions` as the record to rebuild from.
 6. **Staff audit shows usernames from every org.** *Default:* keep (platform operations),
    staff only, and say so in `docs/PRODUCT.md`.
-7. **How long old object versions stay after a purge.** *Default:* 30 days, matching the
-   database's backup window (unverified: the hosted PostgreSQL retention is not set yet).
+7. **How long a user's deleted attachment stays as an old version.** *Default:* 30 days,
+   matching the database's backup window (unverified: the hosted PostgreSQL retention is not set
+   yet). A purge or an erasure never waits for it (§9.4).
 8. **The S3 client:** one ky-primitives type shared with KyNotes. *Default:* yes. The other
    choice, a KyMessages-only SigV4 client, duplicates signing code.
 9. **`org.unsuspended`:** *Default:* keep accepting it until KyIdentity confirms it never sends it,
