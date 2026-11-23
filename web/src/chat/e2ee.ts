@@ -5,7 +5,7 @@ import { errorMessage, secureFetch } from '../api';
 import { arr, bool, obj, str } from '../dto';
 import { CryptoEngine, type ClaimedKey, type DeviceKeys, type KeyServer, type Mail, type RoomInner } from '../crypto/engine';
 import { loadCrypto } from '../crypto/index';
-import { deleteCryptoStore, deleteCryptoStores, openCryptoStore } from '../crypto/store';
+import { type CryptoStore, deleteCryptoStore, deleteCryptoStores, openCryptoStore } from '../crypto/store';
 import { parseRoomDetail, type ChatMessage, type E2EEState } from './types';
 
 export class KeyServerError extends Error {
@@ -97,7 +97,15 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
   const engine = (async () => {
     await loadCrypto();
     let e: CryptoEngine;
-    const store = await openCryptoStore(userId);
+    // Another tab deleted the store (sign-out, device reset): drop this engine, so the next use
+    // starts afresh instead of writing to a closed or deleted store.
+    const dropOnClose = (s: CryptoStore) => {
+      s.onClosed(() => {
+        if (current === entry) current = undefined;
+      });
+      return s;
+    };
+    const store = dropOnClose(await openCryptoStore(userId));
     try {
       e = await CryptoEngine.open(userId, httpKeyServer, store);
     } catch (err) {
@@ -106,7 +114,7 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
       // start over as a new device.
       if (!(err instanceof KeyServerError && err.status === 404)) throw err;
       await deleteCryptoStore(userId);
-      e = await CryptoEngine.open(userId, httpKeyServer, await openCryptoStore(userId));
+      e = await CryptoEngine.open(userId, httpKeyServer, dropOnClose(await openCryptoStore(userId)));
     }
     void retireAbandoned(userId).catch(() => undefined);
     e.onKeys(() => {

@@ -18,7 +18,12 @@ export interface CryptoStore {
   /** The 32-byte key vodozemac encrypts pickles under. */
   pickleKey(): Promise<Uint8Array>;
   close(): void;
+  /** Calls fn once if another tab deletes this store and the connection is closed under us. */
+  onClosed(fn: () => void): void;
 }
+
+// How long a delete waits for other tabs to let go before reporting failure.
+const DELETE_TIMEOUT_MS = 5_000;
 
 function req<T>(r: IDBRequest<T>): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -42,8 +47,20 @@ interface WrappedKey {
 
 class IdbCryptoStore implements CryptoStore {
   private key?: Promise<Uint8Array>;
+  private closedFns: (() => void)[] = [];
 
-  constructor(private readonly db: IDBDatabase) {}
+  constructor(private readonly db: IDBDatabase) {
+    // Sign-out or a device reset in any tab deletes this database: let go at once so the delete
+    // completes, and tell the owner, which drops this device instead of using a deleted one.
+    db.onversionchange = () => {
+      this.close();
+      for (const fn of this.closedFns.splice(0)) fn();
+    };
+  }
+
+  onClosed(fn: () => void): void {
+    this.closedFns.push(fn);
+  }
 
   async get<T>(key: string): Promise<T | undefined> {
     return (await req(this.db.transaction(KV).objectStore(KV).get(key))) as T | undefined;
@@ -120,11 +137,21 @@ export async function openCryptoStore(userId: string): Promise<CryptoStore> {
   return new IdbCryptoStore(await req(r));
 }
 
+// Resolves only once the database is gone. Other tabs close on versionchange; one that still
+// holds it past the timeout (an old tab) makes this reject. The delete itself stays queued and
+// completes when that connection closes.
 function deleteDb(name: string): Promise<void> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const r = indexedDB.deleteDatabase(name);
-    // A blocked delete (another tab still open) completes once that tab closes the database.
-    r.onsuccess = r.onerror = r.onblocked = () => resolve();
+    const timer = setTimeout(() => reject(new Error('The encryption store is still open in another tab')), DELETE_TIMEOUT_MS);
+    r.onsuccess = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    r.onerror = () => {
+      clearTimeout(timer);
+      reject(r.error ?? new Error('Could not delete the encryption store'));
+    };
   });
 }
 
@@ -133,9 +160,11 @@ export function deleteCryptoStore(userId: string): Promise<void> {
   return typeof indexedDB === 'undefined' ? Promise.resolve() : deleteDb(DB_PREFIX + userId);
 }
 
-/** Deletes every KyMessages crypto store in this browser, for sign-out. */
+/** Deletes every KyMessages crypto store in this browser, for sign-out; rejects if any remains. */
 export async function deleteCryptoStores(): Promise<void> {
   if (typeof indexedDB === 'undefined') return;
-  const dbs = await indexedDB.databases().catch(() => []);
-  await Promise.all(dbs.filter((d) => d.name?.startsWith(DB_PREFIX)).map((d) => deleteDb(d.name!)));
+  const dbs = await indexedDB.databases();
+  const results = await Promise.allSettled(dbs.filter((d) => d.name?.startsWith(DB_PREFIX)).map((d) => deleteDb(d.name!)));
+  const failed = results.find((r): r is PromiseRejectedResult => r.status === 'rejected');
+  if (failed) throw failed.reason;
 }
