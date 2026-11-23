@@ -223,12 +223,28 @@ Multi mode, `origin/main` plus PR #27. Every row has a cross-org test in
      ordinary restart or a rolling deploy during a KyIdentity outage stays up. The
      `RESTORE.md` multi section (PR 2) says to restart every replica after a restore.
 
-   Each erased subject is erased again (§7.2), and each org that KyIdentity reports deleted or no
-   longer lists is tombstoned and purged (§7.3). Both are idempotent, so a re-read that finds
-   nothing new changes nothing. KyMessages does not read either list today
-   (its only suite-API call is `dir.Peer`, `internal/api/suite.go:173-180`), so this adds two reads to the existing `suitedir` client (`internal/sso/kyidentity.go:418-424`).
-   Whether `/api/suite/orgs` lists a deleted org as a tombstone or drops it is unverified, so
-   both mean "deleted".
+   Each erased subject is erased again (§7.2). An org is purged (§7.3) **only** on an explicit
+   deletion: an `org.deleted` event, or an entry in `/api/suite/orgs` whose `status` is
+   `deleted`. T's downstream contract says the same: "Keep its data unless the status is
+   `deleted`" (T, "Downstream contract", item 5), so T lists deleted orgs with that status.
+   Other cases never purge:
+   - An org that is missing from a complete, fully paged read is marked `suspended` (it stops
+     serving, and its data is kept), audited as `tenancy.org_missing`, and raised to the
+     operator's alerts.
+   - A read that is not complete (a page error, a short page without `next`) changes nothing.
+   - **Sanity guard on missing orgs:** if one read finds more than 5% of active orgs missing,
+     the sync suspends none of them, audits `tenancy.sync_aborted`, and alerts. A start-up read
+     never suspends a missing org; it only alerts. A wrong issuer, a paging bug or an empty
+     answer during an incident therefore cannot take every org offline, and none of them can
+     purge anything.
+   - An explicit `deleted` status always applies, because it names one of our org IDs with
+     KyIdentity's signed answer. A wrong KyIdentity cannot name our IDs, and an empty answer
+     names none.
+
+   Both erasure and purge are idempotent, so a re-read that finds nothing new changes nothing.
+   KyMessages does not read either list today (its only suite-API call is `dir.Peer`,
+   `internal/api/suite.go:173-180`), so this adds two reads to the existing `suitedir` client
+   (`internal/sso/kyidentity.go:418-424`).
 5. **Mail-style 550s do not apply.** KyMessages has no inbound mail.
 
 ## 8. Replica safety
@@ -464,6 +480,7 @@ test proves the answers are byte for byte the same.
 | A user-targeted event reaches room members | PR #27: `Dispatch` sends `user_id` events to that user only. |
 | A member signs in with full access during `deletion_scheduled` | M9: refuse `export_only` tokens. |
 | An erased person's or deleted org's data stays, or a restore brings it back | §7.2, §7.3, §7.4: purge every object version, tombstone, and re-read KyIdentity's erased and org lists after a restore. |
+| A short or wrong org list from KyIdentity purges or suspends live orgs | §7.4: purge only on an explicit `deleted` status or `org.deleted`. A missing org is suspended, never purged, never on a start-up read, and not at all past a 5% guard. Incomplete reads change nothing. |
 | N replicas give an attacker N sign-in budgets, or N uses of one PoW | §8.2: shared counters and a shared spent table. |
 | Two replicas migrate at once and one stops | §8.1: advisory lock. |
 | A guest is lost, or let in twice, across replicas | §8.3: guest sessions in PostgreSQL, keyed by a hash of the secret. |
@@ -500,6 +517,10 @@ Tests each PR must add, beyond its own:
   same meeting ID, each with a waiting guest, never share lobby state or admission. A migration race, a
   lease handover, a sign-in budget shared across both, a PoW spent on one and refused on the
   other, a guest admitted on one and recognised on the other.
+- **Tenancy sync:** a fake KyIdentity returns an empty `/api/suite/orgs`, then a partial one, with
+  no tombstones. Every tenant stays non-deleted, with its attachment rows and blobs. Missing orgs
+  are not suspended on a start-up read or past the 5% guard. A `deleted` entry purges exactly
+  that org. Run on SQLite and PostgreSQL.
 - **Pool:** a new org's first upload (allowance unknown: fetched and then admitted, or `503`
   with KyIdentity down), at the allowance, one byte over, a stale allowance before and after 15 minutes,
   shrinking writes while over, two concurrent uploads on two replicas that together pass the
@@ -513,6 +534,8 @@ Tests each PR must add, beyond its own:
 - A stale allowance can let the pool be overshot by other apps' growth for up to 15 minutes.
 - A user's own deleted attachment stays as an old object version for 30 days.
 - Staff see every org's usernames in the install-wide audit (open question 6).
+- An org that KyIdentity stops listing without a `deleted` status is suspended and kept, not
+  purged, until staff resolve it. Its data costs storage until then.
 - A restore to a point less than a day old, made while KyIdentity is unreachable, can serve an
   erased person's or a deleted org's restored data until KyIdentity answers again. Then the
   incremental re-read replays the erasures (§7.4).
