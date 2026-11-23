@@ -133,6 +133,8 @@ When the user requests a durable behavior change, record it here or in the relev
   `docs/superpowers/specs/2026-11-22-tenancy-design.md` §4: required canonical UUID in `multi`,
   refused (even `""`/`null`) in `single`, cross-org callers and targets answered exactly like
   unknown ones. Event IDs go to the shared `suite_replay_events` ledger; a 429/503 releases them.
+  Suite presence (`internal/presence` decoders, `store.PresenceStore` keyed by tenant and user)
+  serves `/api/suite/presence/{lookup,out-of-office,calendar,me}`.
 - Only the staff org (`KY_STAFF_ORG_ID`) holds administrators (`config.TenancyConfig.MayAdminister`,
   enforced in directory sync and the `admin` middleware). Org-less local operators keep the
   install-wide console; per-org admin pages need a staff-org account.

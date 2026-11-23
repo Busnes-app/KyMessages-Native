@@ -26,6 +26,7 @@ type SQLStore struct {
 	agents      *agentStore
 	chat        *chatStore
 	suiteReplay *suiteReplayStore
+	presence    *presenceStore
 }
 
 // newSQLStore creates and initializes a SQLStore, running migrations automatically.
@@ -62,6 +63,7 @@ func newSQLStore(ctx context.Context, db, readDB *sql.DB, driver string) (*SQLSt
 	s.agents = &agentStore{store: s}
 	s.chat = &chatStore{store: s}
 	s.suiteReplay = &suiteReplayStore{store: s}
+	s.presence = &presenceStore{store: s}
 
 	return s, nil
 }
@@ -75,6 +77,7 @@ func (s *SQLStore) Settings() SettingsStore       { return s.settings }
 func (s *SQLStore) Agents() AgentStore            { return s.agents }
 func (s *SQLStore) Chat() ChatStore               { return s.chat }
 func (s *SQLStore) SuiteReplay() SuiteReplayStore { return s.suiteReplay }
+func (s *SQLStore) Presence() PresenceStore       { return s.presence }
 
 func (s *SQLStore) read() *sql.DB {
 	if s.readDB != nil {
