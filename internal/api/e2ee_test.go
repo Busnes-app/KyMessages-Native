@@ -17,7 +17,7 @@ var b64 = base64.RawStdEncoding
 // testDevice is a client device: an Ed25519 signing key and a Curve25519 public key.
 type testDevice struct {
 	userID, id, curve string
-	priv          ed25519.PrivateKey
+	priv              ed25519.PrivateKey
 }
 
 func newTestDevice(t *testing.T, userID, id string) *testDevice {
@@ -34,7 +34,9 @@ func newTestDevice(t *testing.T, userID, id string) *testDevice {
 
 func (d *testDevice) ed() string { return b64.EncodeToString(d.priv.Public().(ed25519.PublicKey)) }
 
-func (d *testDevice) sign(msg string) string { return b64.EncodeToString(ed25519.Sign(d.priv, []byte(msg))) }
+func (d *testDevice) sign(msg string) string {
+	return b64.EncodeToString(ed25519.Sign(d.priv, []byte(msg)))
+}
 
 func (d *testDevice) keys() map[string]string {
 	return map[string]string{"curve25519": d.curve, "ed25519": d.ed(), "signature": d.sign(api.E2EEDeviceSigned(d.userID, d.id, d.curve, d.ed()))}
