@@ -332,10 +332,14 @@ export async function abandonDevice(): Promise<void> {
  * the key server at its user's next sign-in here instead of being left listed with nobody
  * holding it. The signed-in user's device may already be retired; its later delete is a 404.
  */
+const DEVICE_READ_MS = 1000;
+
 export async function forgetCryptoStore(): Promise<void> {
   stopE2EE();
   deletedElsewhere = false;
-  saveAbandoned([...abandoned(), ...(await storedDevices())]);
+  // Best effort: a device read that fails or stalls must never stop the wipe.
+  const devices = await Promise.race([storedDevices().catch(() => []), new Promise<[]>((r) => setTimeout(r, DEVICE_READ_MS, []))]);
+  saveAbandoned([...abandoned(), ...devices]);
   await deleteCryptoStores();
 }
 

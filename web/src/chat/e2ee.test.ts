@@ -4,6 +4,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { abandonDevice, forgetCryptoStore, NOT_YET, onRoomKeys, openMessage, retireDevice, retryable, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
 import { parseMessage } from './types';
 
+// Tests may replace the device read; everything else is the real store.
+const deviceRead = vi.hoisted(() => ({ replace: undefined as undefined | (() => Promise<{ user_id: string; device_id: string }[]>) }));
+vi.mock('../crypto/store', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../crypto/store')>();
+  return { ...real, storedDevices: () => deviceRead.replace?.() ?? real.storedDevices() };
+});
+
 // jsdom cannot fetch the module by URL; load it from disk instead.
 vi.mock('../crypto/index', async (importOriginal) => {
   const real = await importOriginal<typeof import('../crypto/index')>();
@@ -13,6 +20,7 @@ vi.mock('../crypto/index', async (importOriginal) => {
 const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { 'Content-Type': 'application/json' } });
 
 afterEach(async () => {
+  deviceRead.replace = undefined;
   await forgetCryptoStore();
   localStorage.clear();
   vi.unstubAllGlobals();
@@ -93,6 +101,25 @@ describe('the signed-in device', () => {
     const bobAgain = await startE2EE('u_bob');
     await vi.waitFor(() => expect(deleted).toContain(bob.deviceId));
     expect(bobAgain.deviceId).not.toBe(bob.deviceId);
+  });
+
+  it.each([
+    ['fails', () => Promise.reject(new DOMException('disk failure', 'UnknownError'))],
+    ['never finishes', () => new Promise<never>(() => undefined)],
+  ])('deletes local keys when reading the stored devices %s', async (_, read) => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/v1/keys/upload') {
+        const req = JSON.parse(String(init?.body)) as { one_time_keys: unknown[] };
+        return json({ one_time_key_count: req.one_time_keys.length });
+      }
+      if (url.startsWith('/api/v1/to-device')) return json({ messages: [] });
+      return json({ error: `unexpected ${url}` }, 404);
+    }));
+    await startE2EE('u_alice');
+    deviceRead.replace = read;
+    await forgetCryptoStore();
+    expect((await indexedDB.databases()).filter((d) => d.name?.startsWith('kymessages-crypto-'))).toEqual([]);
   });
 
   it('deletes local keys on revocation without waiting for a start-up stuck on the network', async () => {
