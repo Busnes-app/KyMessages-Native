@@ -32,8 +32,9 @@ const device = (v: unknown): DeviceKeys => {
 
 export const httpKeyServer: KeyServer = {
   async upload(req) {
-    const n = obj(await call('/api/v1/keys/upload', 'POST', req)).one_time_key_count;
-    return typeof n === 'number' ? n : 0;
+    const o = obj(await call('/api/v1/keys/upload', 'POST', req));
+    // Only an explicit false asks for a new fallback key.
+    return { count: typeof o.one_time_key_count === 'number' ? o.one_time_key_count : 0, fallback: o.has_fallback_key !== false };
   },
   async query(userIds) {
     const devices = obj(obj(await call('/api/v1/keys/query', 'POST', { user_ids: userIds })).devices);

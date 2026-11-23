@@ -58,7 +58,7 @@ export class FakeKeyServer {
           if (!ok(req.fallback_key)) throw new Error('The fallback key must be validly signed');
           this.fallbackKeys.set(id, req.fallback_key);
         }
-        return stored.length;
+        return { count: stored.length, fallback: this.fallbackKeys.has(id) };
       },
       query: async (userIds) => {
         const out: Record<string, DeviceKeys[]> = {};

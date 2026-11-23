@@ -70,8 +70,8 @@ export interface Mail {
 }
 
 export interface KeyServer {
-  /** POST /api/v1/keys/upload; answers the stored one-time key count. */
-  upload(req: UploadRequest): Promise<number>;
+  /** POST /api/v1/keys/upload; answers the stored one-time key count and whether a fallback key is live. */
+  upload(req: UploadRequest): Promise<{ count: number; fallback: boolean }>;
   query(userIds: string[]): Promise<Record<string, DeviceKeys[]>>;
   claim(devices: { user_id: string; device_id: string }[]): Promise<ClaimedKey[]>;
   sendToDevice(deviceId: string, messages: ToDeviceMessage[]): Promise<void>;
@@ -307,11 +307,17 @@ export class CryptoEngine {
           account.generateFallbackKey();
           extra.push(['fallback', true]);
         }
-        let count = await this.uploadPending(account, extra);
+        let up = await this.uploadPending(account, extra);
+        if (!up.fallback) {
+          // The server holds no live fallback key (a restore retired it): publish a new one.
+          account.generateFallbackKey();
+          up = await this.uploadPending(account, []);
+        }
+        let count = up.count;
         const max = account.maxOneTimeKeys();
         if (count < max) {
           account.generateOneTimeKeys(max - count);
-          count = await this.uploadPending(account, []);
+          count = (await this.uploadPending(account, [])).count;
         }
         return count;
       } finally {
@@ -320,7 +326,7 @@ export class CryptoEngine {
     });
   }
 
-  private async uploadPending(account: Account, extra: [string, unknown][]): Promise<number> {
+  private async uploadPending(account: Account, extra: [string, unknown][]): Promise<{ count: number; fallback: boolean }> {
     const device = (await this.store.get<DeviceRecord>('device'))!;
     const sign = ([keyId, key]: [string, string]): SignedKey => ({
       key_id: keyId,
@@ -331,7 +337,7 @@ export class CryptoEngine {
     const [fallback] = Object.entries(JSON.parse(account.fallbackKey()) as Record<string, string>).map(sign);
     // Keep the new keys before they leave, so a failed upload retries the same keys.
     await this.store.write([['account', account.pickle(this.key)], ...extra]);
-    const count = await this.server.upload({
+    const result = await this.server.upload({
       device_id: this.deviceId,
       ...(device.registered
         ? {}
@@ -350,7 +356,7 @@ export class CryptoEngine {
       ['account', account.pickle(this.key)],
       ['device', { ...device, registered: true } satisfies DeviceRecord],
     ]);
-    return count;
+    return result;
   }
 
   // --- Devices ---

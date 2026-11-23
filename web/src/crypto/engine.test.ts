@@ -203,6 +203,23 @@ describe('encrypted rooms between two client engines', () => {
     expect(await read(carol, later)).toBe('waiting');
   });
 
+  it('publishes a new fallback key when the server has none live, as after a restore', async () => {
+    const server = new FakeKeyServer();
+    const bob = await device(server, 'u_bob');
+    const id = `u_bob\n${bob.deviceId}`;
+    const before = server.fallbackKeys.get(id)!.key_id;
+    // A restore retires every key the device had published.
+    server.fallbackKeys.delete(id);
+    server.oneTimeKeys.delete(id);
+    bob.close();
+    const again = await CryptoEngine.open('u_bob', server.as('u_bob'), await openCryptoStore('u_bob'));
+    opened.push(again);
+    expect(again.deviceId).toBe(bob.deviceId);
+    expect(server.fallbackKeys.get(id)?.key_id).toBeDefined();
+    expect(server.fallbackKeys.get(id)!.key_id).not.toBe(before);
+    expect(server.oneTimeKeyCount('u_bob', bob.deviceId)).toBe(50);
+  });
+
   it('shares the key with a member’s new device on the very next send', async () => {
     const server = new FakeKeyServer();
     const alice = await device(server, 'u_alice');
