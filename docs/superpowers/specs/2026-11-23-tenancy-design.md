@@ -394,14 +394,24 @@ rows. A message body is bounded per message and refusing text would break chat.
 
 ### 10.3 Report
 
-The leased reporter job (§8.1) sends each active org's absolute total to KyIdentity's usage
-report about every 60 seconds when it changed, and at once after a purge, a restore or a
-`pool_low` mark. Separately, it refreshes **every** active org's allowance at least every 5
-minutes, whether or not its usage changed. An idle org's `pool_checked_at` therefore never ages
-past the 15-minute limit while KyIdentity is up. An absolute total, not a delta, so a retry or a lost report cannot drift. The
-report is signed with `syncauth` under KyIdentity's pair secret, carries `org_id` and a
-monotonic revision, and contains no names, file names or room IDs. The same answer refreshes
-`pool_allowance_bytes`.
+The leased reporter job (§8.1) does two separate things:
+
+- **Report.** It sends each active org's absolute total to KyIdentity's usage report. It sends
+  about every 60 seconds when the total changed, at once after a purge or a `pool_low` mark, and
+  at least every 5 minutes for every active org anyway. That last rule covers a restore, which
+  the server cannot detect (§7.4): the next report carries the restored database's true total.
+  It sends an absolute total, not a delta, so a retry or a lost report cannot drift. The report
+  is signed with `syncauth` under KyIdentity's pair secret, carries `org_id`, and contains no
+  names, file names or room IDs. Its revision is the send time in Unix milliseconds, not a
+  stored counter. A restore therefore cannot rewind it, and KyIdentity keeps the newest report
+  per org and app. Clock skew between replicas is bounded by `syncauth`'s ±5-minute window, and
+  a report up to that much older than the stored one is dropped as stale. The next report
+  replaces it within 5 minutes.
+- **Refresh.** It reads every active org's allowance from KyIdentity's headroom answer at least
+  every 5 minutes, and sets `pool_allowance_bytes` and `pool_checked_at`. This read does not
+  depend on a report being accepted, so a refused or stale report never ages an org's
+  allowance. An idle org's `pool_checked_at` therefore never passes the 15-minute limit while
+  KyIdentity is up.
 
 ### 10.4 Single-tenant
 
