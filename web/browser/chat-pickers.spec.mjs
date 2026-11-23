@@ -185,10 +185,11 @@ test('new DM and search: arrows move through options from the box and Enter pick
     await composer.press('Enter');
     await expect(conversation.getByText(body)).toBeVisible();
   }
-  await expect(conversation.getByText('Sending…')).toHaveCount(0);
   // The server holds envelopes it cannot read; search below finds the text this device decrypted.
-  const stored = (await (await page.request.get(`/api/v1/rooms/${room.id}/messages`)).json()).messages;
-  expect(stored).toHaveLength(2);
+  // Poll: a grouped row shows no "Sending…", so the second send may still be in flight.
+  const listStored = async () => (await (await page.request.get(`/api/v1/rooms/${room.id}/messages`)).json()).messages;
+  await expect.poll(async () => (await listStored()).length).toBe(2);
+  const stored = await listStored();
   for (const m of stored) {
     expect(m.encoding).toBe('e2ee_room_v1');
     expect(m.body).not.toContain(word);
