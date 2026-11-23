@@ -428,57 +428,41 @@ func (s *Server) SweepOrphanAttachments(ctx context.Context, now time.Time) (int
 	return deleted, nil
 }
 
-// blobLayoutSetting records that every flat blob has moved to the org layout (multi mode).
-const blobLayoutSetting = "blobs.layout"
-
-// sharedBlobVolume makes a multi-mode store prove it is the volume every replica shares, and
-// stops the flat fallback when the relocation already finished.
+// sharedBlobVolume makes a multi-mode store prove it is the volume every replica shares.
 func sharedBlobVolume(st store.Store, bs *blobs.Store) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := bs.EnsureStoreID(func(id string) (string, error) {
+	return bs.EnsureStoreID(func(id string) (string, error) {
 		return st.Settings().SetSettingOnce(ctx, "blobs.store_id", id)
-	}); err != nil {
-		return err
-	}
-	if layout, err := st.Settings().GetSetting(ctx, blobLayoutSetting); err == nil && layout == "org" {
-		bs.RelocationDone()
-	}
-	return nil
+	})
 }
 
-// relocateFlatBlobs moves blobs written flat (multi mode before the org layout) to their org
-// paths, then records blobs.layout = org. It runs under the attachment sweep's lease and resumes
-// where it stopped; single mode and finished installs return at once.
+// relocateFlatBlobs moves blobs stored flat (written before the org layout, or by a replica of
+// an older build during a rolling upgrade) to their org paths. It runs on every attachment
+// sweep, under that job's lease; a flat file is cheap to find (the directory's top level), and
+// reads find it meanwhile through the flat fallback. A file with no attachment row (an upload
+// still committing, or an orphan) is left alone.
 func (s *Server) relocateFlatBlobs(ctx context.Context) error {
 	disk, ok := s.blobs.(*blobs.Store)
 	if !ok || !disk.OrgLayout() {
 		return nil
 	}
-	if layout, err := s.store.Settings().GetSetting(ctx, blobLayoutSetting); err == nil && layout == "org" {
-		disk.RelocationDone()
-		return nil
+	keys, err := disk.FlatKeys()
+	if err != nil {
+		return err
 	}
-	after := ""
-	for {
-		refs, err := s.store.Chat().ListAttachmentBlobs(ctx, after, 500)
+	for _, key := range keys {
+		tenantID, err := s.store.Chat().AttachmentTenant(ctx, key)
+		if errors.Is(err, store.ErrNotFound) {
+			continue
+		}
 		if err != nil {
 			return err
 		}
-		for _, ref := range refs {
-			// A row whose org or key is not a valid name was never servable; skip it.
-			if err := disk.Relocate(ref.TenantID, ref.Key); err != nil && !errors.Is(err, blobs.ErrInvalidKey) {
-				return err
-			}
-			after = ref.ID
-		}
-		if len(refs) < 500 {
-			break
+		// A row whose org is not a valid name was never servable; skip it.
+		if err := disk.Relocate(tenantID, key); err != nil && !errors.Is(err, blobs.ErrInvalidKey) {
+			return err
 		}
 	}
-	if err := s.store.Settings().SetSetting(ctx, blobLayoutSetting, "org"); err != nil {
-		return err
-	}
-	disk.RelocationDone()
 	return nil
 }

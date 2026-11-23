@@ -16,7 +16,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"sync/atomic"
 	"time"
 	"unicode"
 )
@@ -58,8 +57,6 @@ type Backend interface {
 type Store struct {
 	dir  string
 	orgs bool
-	// flatFallback lets an org-layout read find a blob the relocation has not moved yet.
-	flatFallback atomic.Bool
 }
 
 var _ Backend = (*Store)(nil)
@@ -67,20 +64,32 @@ var _ Backend = (*Store)(nil)
 // validTenant restricts org directory names (canonical UUIDs, or "default").
 var validTenant = regexp.MustCompile(`^[a-z0-9-]{1,64}$`)
 
-// NewOrgStore is NewStore with the org layout, for multi mode. Reads fall back to the flat
-// path until RelocationDone.
+// NewOrgStore is NewStore with the org layout, for multi mode. A read or delete that misses the
+// org path also tries the flat path, always: a replica of an older build may still write flat
+// during a rolling upgrade, and the sweep relocates what it finds (FlatKeys, Relocate).
 func NewOrgStore(dir string) (*Store, error) {
 	s, err := NewStore(dir)
 	if err != nil {
 		return nil, err
 	}
 	s.orgs = true
-	s.flatFallback.Store(true)
 	return s, nil
 }
 
-// RelocationDone stops the flat-path fallback once every flat blob has moved.
-func (s *Store) RelocationDone() { s.flatFallback.Store(false) }
+// FlatKeys lists the blob keys stored flat in the directory (org layout: blobs not relocated yet).
+func (s *Store) FlatKeys() ([]string, error) {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return nil, err
+	}
+	var keys []string
+	for _, e := range entries {
+		if e.Type().IsRegular() && ValidKey(e.Name()) {
+			keys = append(keys, e.Name())
+		}
+	}
+	return keys, nil
+}
 
 // OrgLayout reports whether this store keeps each org under its own prefix.
 func (s *Store) OrgLayout() bool { return s.orgs }
@@ -231,7 +240,7 @@ func (s *Store) Open(tenantID, key string) (io.ReadSeekCloser, int64, error) {
 	defer root.Close()
 
 	f, err := root.Open(rel)
-	if errors.Is(err, os.ErrNotExist) && s.orgs && s.flatFallback.Load() {
+	if errors.Is(err, os.ErrNotExist) && s.orgs {
 		f, err = root.Open(key)
 		if errors.Is(err, os.ErrNotExist) {
 			f, err = root.Open(rel) // relocated between the two opens
@@ -267,7 +276,7 @@ func (s *Store) Delete(tenantID, key string) error {
 	}
 	defer root.Close()
 
-	if s.orgs && s.flatFallback.Load() {
+	if s.orgs {
 		// Flat copy first: a relocation that moves the blob between the two removes then finds
 		// no source, and one that moved it earlier left it at rel, which is removed next.
 		if err := root.Remove(key); err != nil && !errors.Is(err, os.ErrNotExist) {

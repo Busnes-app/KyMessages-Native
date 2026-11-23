@@ -384,8 +384,8 @@ type ChatStore interface {
 	SumAttachmentBytesByTenant(ctx context.Context, tenantID string) (int64, error)
 	SumPendingAttachmentBytesByUploader(ctx context.Context, tenantID, uploaderID string) (int64, error)
 	PurgeOrphanAttachments(ctx context.Context, olderThanMilli int64, limit int) ([]BlobRef, error)
-	// ListAttachmentBlobs pages every attachment's blob by row ID, after afterID.
-	ListAttachmentBlobs(ctx context.Context, afterID string, limit int) ([]BlobRef, error)
+	// AttachmentTenant returns the org of the attachment stored under blobKey.
+	AttachmentTenant(ctx context.Context, blobKey string) (string, error)
 
 	// Call Sessions
 	CreateCallSession(ctx context.Context, cs *CallSession) error

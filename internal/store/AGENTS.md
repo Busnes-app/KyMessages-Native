@@ -104,7 +104,7 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   running anything. It takes only `sqlite` or `postgres`/`postgresql` and picks its placeholder
   from that.
 - `GetAllSettings` returns any row scan error rather than omitting the row. `SetSettingOnce` stores a value only when the key is unset and returns the stored one, so the first replica wins (`blobs.store_id`).
-- `PurgeOrphanAttachments` returns `BlobRef`s (tenant and key), and `ListAttachmentBlobs` pages every attachment's blob by row ID, because the multi-mode blob layout needs each blob's org.
+- `PurgeOrphanAttachments` returns `BlobRef`s (tenant and key), and `AttachmentTenant` returns a blob key's org, because the multi-mode blob layout needs each blob's org.
 - SQLite runs in WAL mode with foreign keys enabled.
 - PostgreSQL queries are rebound dynamically from standard positional parameters.
 - MFA challenges and device pairings are consumed with database state transitions that permit exactly one successful use.

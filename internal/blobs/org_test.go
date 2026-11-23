@@ -35,7 +35,6 @@ func TestOrgLayoutKeepsOrgsApart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st.RelocationDone()
 	if _, err := st.Put(orgA, key, strings.NewReader("alpha"), 64); err != nil {
 		t.Fatal(err)
 	}
@@ -112,19 +111,22 @@ func TestRelocationOfFlatBlobs(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	st.RelocationDone()
 	if got, err := read(t, st, orgA, key); err != nil || got != "old" {
 		t.Fatalf("relocated read = %q %v", got, err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, key)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("flat copy left behind")
 	}
-	// After the relocation a flat file is never served.
-	if err := os.WriteFile(filepath.Join(dir, "att_019a0000-0000-7000-8000-000000000002"), []byte("stray"), 0o600); err != nil {
+	// FlatKeys lists only flat blobs: not temps, the store ID or the orgs directory.
+	if err := os.WriteFile(filepath.Join(dir, "att_019a0000-0000-7000-8000-000000000002"), []byte("late"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := read(t, st, orgA, "att_019a0000-0000-7000-8000-000000000002"); !errors.Is(err, os.ErrNotExist) {
-		t.Fatal("flat fallback still on after RelocationDone")
+	if err := st.EnsureStoreID(func(id string) (string, error) { return id, nil }); err != nil {
+		t.Fatal(err)
+	}
+	keys, err := st.FlatKeys()
+	if err != nil || len(keys) != 1 || keys[0] != "att_019a0000-0000-7000-8000-000000000002" {
+		t.Fatalf("FlatKeys = %v %v", keys, err)
 	}
 }
 

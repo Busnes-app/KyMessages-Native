@@ -58,8 +58,19 @@ func TestMultiTenantBlobLayout(t *testing.T) {
 	if _, err := os.Stat(orgPath); err != nil {
 		t.Fatalf("flat blob not relocated: %v", err)
 	}
-	if v, err := st.Settings().GetSetting(context.Background(), "blobs.layout"); err != nil || v != "org" {
-		t.Fatalf("blobs.layout = %q %v", v, err)
+	// A replica of an older build may still write flat during a rolling upgrade: the next sweep
+	// moves that blob too, and reads find it meanwhile.
+	if err := os.Rename(orgPath, filepath.Join(dir, att.Attachment.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if get(tokA) != http.StatusOK {
+		t.Fatal("flat blob written after the first relocation is unreadable")
+	}
+	if _, err := a.SweepOrphanAttachments(context.Background(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(orgPath); err != nil {
+		t.Fatalf("late flat blob not relocated: %v", err)
 	}
 	if get(tokA) != http.StatusOK {
 		t.Fatal("relocated blob unreadable")

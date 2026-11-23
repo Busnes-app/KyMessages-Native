@@ -1554,19 +1554,12 @@ func (c *chatStore) attachAttachments(ctx context.Context, db rowQueryer, msgs [
 	return rows.Err()
 }
 
-func (c *chatStore) ListAttachmentBlobs(ctx context.Context, afterID string, limit int) ([]BlobRef, error) {
-	rows, err := c.store.db.QueryContext(ctx, c.store.rebind(`SELECT id, tenant_id, blob_key FROM attachments WHERE id > ? ORDER BY id LIMIT ?`), afterID, limit)
-	if err != nil {
-		return nil, err
+// AttachmentTenant returns the org of the attachment stored under blobKey.
+func (c *chatStore) AttachmentTenant(ctx context.Context, blobKey string) (string, error) {
+	var t string
+	err := c.store.db.QueryRowContext(ctx, c.store.rebind(`SELECT tenant_id FROM attachments WHERE blob_key = ?`), blobKey).Scan(&t)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
 	}
-	defer rows.Close()
-	var out []BlobRef
-	for rows.Next() {
-		var r BlobRef
-		if err := rows.Scan(&r.ID, &r.TenantID, &r.Key); err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
+	return t, err
 }
