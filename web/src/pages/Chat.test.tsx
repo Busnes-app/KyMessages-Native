@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { Chat } from './Chat';
-import { deliverKey, fakeEnvelope, resetFakeE2EE } from '../chat/e2eeFake';
+import { deliverKey, fakeEnvelope, resetFakeE2EE, setFakeUnavailable } from '../chat/e2eeFake';
 
 // Pages run without the WebAssembly core; crypto/engine.test.ts covers the real one.
 vi.mock('../chat/e2ee', () => import('../chat/e2eeFake'));
@@ -206,6 +206,26 @@ describe('Native Chat page', () => {
       });
     });
     expect(await screen.findByLabelText('🎉 1')).toBeTruthy();
+
+    // A message read before the device started says so, then shows its real outcome once it is up.
+    setFakeUnavailable(true);
+    act(() => {
+      ws.emit({
+        t: 'message.new',
+        room: 'rm_gen',
+        seq: 4,
+        d: {
+          id: 'msg_4', tenant_id: 'default', room_id: 'rm_gen', seq: 4, sender_id: 'u_bob', sender_name: 'Bob',
+          encoding: 'e2ee_room_v1', body: fakeEnvelope({ room_id: 'rm_other', type: 'text', body: 'moved here' }, 's_bob'),
+          created_at: 1_700_000_030_000, reactions: [],
+        },
+      });
+    });
+    expect(await screen.findByText(/Encryption is not available in this browser yet\./)).toBeTruthy();
+    setFakeUnavailable(false);
+    act(() => deliverKey('s_bob'));
+    expect(await screen.findByText(/This message was encrypted for another room\./)).toBeTruthy();
+    expect(screen.queryByText(/Encryption is not available in this browser yet\./)).toBeNull();
 
     // Instant auth revocation notifies parent shell.
     act(() => {

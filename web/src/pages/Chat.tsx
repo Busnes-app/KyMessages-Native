@@ -113,6 +113,9 @@ interface ChatProps {
 
 type ActiveModal = 'none' | 'new-channel' | 'new-dm' | 'search';
 
+// What a row says about its encryption state; a retry replaces the row only when this changes.
+const e2eeLabel = (m: ChatMessage) => (m.e2ee?.kind === 'failed' ? `failed:${m.e2ee.reason}` : m.e2ee?.kind ?? '');
+
 interface RoomMessageBucket {
   messages: ChatMessage[];
   hasMore: boolean;
@@ -266,7 +269,7 @@ export const Chat: React.FC<ChatProps> = ({
                 // Only replace what is still unopened: an edit may have landed meanwhile.
                 messages: b.messages.map((m) => {
                   const o = opened.get(m.id);
-                  return o && m.envelope === o.envelope && m.e2ee?.kind !== 'decrypted' && m.e2ee?.kind !== o.e2ee?.kind ? o : m;
+                  return o && m.envelope === o.envelope && m.e2ee?.kind !== 'decrypted' && e2eeLabel(m) !== e2eeLabel(o) ? o : m;
                 }),
               };
             }

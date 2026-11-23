@@ -21,9 +21,17 @@ export function deliverKey(session: string): void {
   for (const fn of listeners) fn();
 }
 
+let unavailable = false;
+
+/** Makes every encrypted message fail as if this browser's device had not started. */
+export function setFakeUnavailable(v: boolean): void {
+  unavailable = v;
+}
+
 export function resetFakeE2EE(): void {
   keys.clear();
   keys.add('s_own');
+  unavailable = false;
 }
 
 export const startE2EE = async () => ({});
@@ -46,6 +54,7 @@ export async function sealRoomMessage(roomId: string, inner: Omit<RoomInner, 'ro
 
 export async function openMessage(m: ChatMessage): Promise<ChatMessage> {
   if (m.encoding !== 'e2ee_room_v1' || !m.envelope || m.deleted_at) return m;
+  if (unavailable) return { ...m, body: '', e2ee: { kind: 'failed', reason: UNAVAILABLE } };
   const env = JSON.parse(m.envelope) as { session_id: string; ciphertext: string };
   if (!keys.has(env.session_id)) return { ...m, body: '', e2ee: { kind: 'waiting' } };
   const inner = JSON.parse(atob(env.ciphertext)) as RoomInner;
