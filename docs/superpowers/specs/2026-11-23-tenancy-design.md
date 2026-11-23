@@ -262,7 +262,10 @@ Multi mode, `origin/main` plus PR #27. Every row has a cross-org test in
 - **Meeting key.** `meetings` moves to `PRIMARY KEY (tenant_id, id)`. `meeting_windows` and
   `meeting_guests` gain `tenant_id` and reference `meetings (tenant_id, id)`
   (`internal/store/migrations/chat.go:95-120`), and every lookup by meeting ID also matches
-  `tenant_id`. Each org then has its own ID space. A
+  `tenant_id`. So does every key outside the database. Today `LobbyManager` keys a guest's
+  live session by meeting ID and guest key (`byMeetingKey`, `internal/chat/meetings.go:63`,
+  `:466`). That key, the `meeting_guest_sessions` rows, and every bus event that names a meeting
+  carry `tenant_id` too. Each org then has its own ID space. A
   `PUT /api/meetings/{id}` for an ID another org holds gets exactly the answer an unknown ID
   gets, which creates the caller's own meeting, as K22 §4 requires. Nothing reveals the other
   org's meeting. In single mode every row is in `default`, so the answers do not change, and the
@@ -295,7 +298,7 @@ KyIdentity's erased and org lists before serving (§7.4).
 `internal/blobs` gets one interface with the methods its callers use today: `Put(key, r,
 maxBytes)`, `Open(key)`, `Delete(key)`, `SweepStaleTemps` (`internal/blobs/store.go:83`, `:148`,
 `:175`, `:196`; called from `internal/api/attachment_handlers.go:197`, `:223`, `:299`, `:398`,
-`:416`, `:423` and `internal/api/chat_handlers.go:891`), plus `DeletePrefix` for the purge.
+`:416`, `:423` and `internal/api/chat_handlers.go:891`), plus `DeletePrefix` for the purge and `Erase` (every version; PR 6).
 `Open` returns an `io.ReadSeekCloser` and the size, so downloads keep range requests
 (`http.ServeContent`, `internal/api/attachment_handlers.go:329`).
 
@@ -326,7 +329,7 @@ single mode cannot change by accident.
   `GET` through KyMessages, which checks membership first. The `s3` backend fetches the whole
   object into a private temp file on the replica, verifies the GCM tag, and only then serves it,
   ranges included, from that file. It never serves unauthenticated bytes. One object is at most
-  `KY_MAX_UPLOAD_BYTES` (25 MiB by default, 100 MiB at most, `internal/config/config.go:92-95`),
+  `KY_MAX_UPLOAD_BYTES` (25 MiB by default, 100 MiB at most, `internal/config/config.go:91-95`),
   so a whole-object fetch is bounded.
 - **Verified cache.** Media players send many small `Range` requests per view. So the verified
   temp file stays in a per-replica cache, keyed by object key and S3 version ID, and later
@@ -468,14 +471,15 @@ replay or stale revision where it applies, oversize input), and runs CI on SQLit
 | 3 | Replica safety II (§8.2, §8.3): shared limiters, the PoW table, the meetings key per org and the upsert lock, guest sessions in PostgreSQL | Yes | 2 |
 | 4 | Calls across replicas (§8.3), as open question 5 decides | Yes | 3 |
 | 5 | The blob interface, the shared-volume store-ID check, and `disk` behind it (§9.1) | Yes (volumes at launch) | 2 |
-| 6 | The `s3` backend, sealing, the purge by prefix (§9.2-§9.5) | No | 5, the ky-primitives S3 type |
+| 6 | The `s3` backend, sealing, the purge by prefix, and versioned deletes for erasure and purge (§9.2-§9.5). The interface gains `Erase(key)`, which removes every version (on `disk` it is `Delete`). Erasure and purge call it, and PR 1a's per-key deletes switch to it here. A user's own delete keeps `Delete` (current version only, §9.4). | No | 5, the ky-primitives S3 type |
 | 7 | The org pool: columns, check, `org_storage_full`, reporter (§10) | Yes | 2 (leases), KyIdentity's pool API |
 | 8 | Multi-region cells (K22 §6.2, its PR D) | No | 3, 4 |
 
 Tests each PR must add, beyond its own:
 - **Cross-org:** the §6 matrix keeps passing. New: an org-B attachment key is never readable from
   org A, through either backend.
-- **Two replicas:** two servers on one PostgreSQL schema (`internal/testdb`). A migration race, a
+- **Two replicas:** two servers on one PostgreSQL schema (`internal/testdb`). Two orgs holding the
+  same meeting ID, each with a waiting guest, never share lobby state or admission. A migration race, a
   lease handover, a sign-in budget shared across both, a PoW spent on one and refused on the
   other, a guest admitted on one and recognised on the other.
 - **Pool:** a new org's first upload (allowance unknown: fetched and then admitted, or `503`
