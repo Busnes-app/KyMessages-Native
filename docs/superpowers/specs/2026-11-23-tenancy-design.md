@@ -166,7 +166,7 @@ Multi mode, `origin/main` plus PR #27. Every row has a cross-org test in
 | WebSocket fan-out | Room IDs from `ListUserRoomIDs(tenantID…)` | Built, tested (PR #27) |
 | User-targeted events (call SDP/ICE, LiveKit tokens, lobby decisions) | Sent to that user only | **Fixed in PR #27** (`internal/chat/hub.go` `Dispatch`). It leaked to the whole room in both modes. |
 | Guest links `/api/meet/{token}` | The hashed token resolves one meeting, whose tenant must be active | Built, tested |
-| KyCalendar `PUT /api/meetings/{id}` | `resolveSub` drops other-org users | Built, tested. A meeting ID taken by another org fails with 500 (§8.3). |
+| KyCalendar `PUT /api/meetings/{id}` | `resolveSub` drops other-org users | Built, tested. Today a meeting ID taken by another org fails with 500. §8.3 gives each org its own ID space. |
 | `/api/suite/chat` | Same body for a cross-org and an unknown target | Built, tested |
 | Suite presence | K22 §4.5 | **Not on main.** PR #24 merged into a feature branch after its base had merged. Its commits ride on `feat/e2ee-core` (PR #26). |
 | Admin agents | Owner's tenant (`internal/api/agent_handlers.go:107-113`) | Built |
@@ -204,13 +204,15 @@ Multi mode, `origin/main` plus PR #27. Every row has a cross-org test in
    "`GET /api/suite/erased`"). A PostgreSQL restore bypasses the app, so the server cannot know
    one happened. The re-read is therefore not triggered by a restore. It always runs:
    - **incrementally**, on every tick of the leased tenancy-sync job (§8.1, about every 5
-     minutes), from the erased-list revision stored in the
-     database. A restore rewinds that stored revision with everything else, so the next
+     minutes), from the erased-list and org-list revisions stored in the database. Each
+     successful tick also refreshes `tenancy.kyidentity_synced_at` (below). A restore rewinds that stored revision with everything else, so the next
      successful tick replays every erasure the restore undid, without detecting the restore;
    - **daily**, from `since=0`, in the same tenancy-sync job, as a backstop;
    - on **every start** of every replica, before it serves. If KyIdentity cannot be reached,
      the replica still serves, and keeps retrying, as long as the database records a successful
-     full re-read (`server_settings`, `tenancy.kyidentity_synced_at`) less than 24 hours old. A
+     sync, incremental or full (`server_settings`, `tenancy.kyidentity_synced_at`), less than 24
+     hours old. Ticks run every 5 minutes, so in normal operation the record is minutes old, and a
+     KyIdentity outage has about 24 hours before a restart is refused. A
      database with no such record or an older one (a fresh install, or a restore from a backup
      more than a day old) does not serve until the reads succeed. This bounds the coupling: an
      ordinary restart or a rolling deploy during a KyIdentity outage stays up. The
@@ -252,12 +254,17 @@ Multi mode, `origin/main` plus PR #27. Every row has a cross-org test in
 
 ### 8.3 Meetings, guests and calls
 
-- **Meeting upserts** take `pg_advisory_xact_lock` on the meeting ID alone, matching the global
-  key on `meetings.id`, before the read, like the quota lock (`internal/store/chat.go:1316-1327`).
-  Two orgs racing on one new ID then take the same lock. A taken ID in another org answers 409
-  `meeting_conflict`, not 500, and a unique-key violation on insert maps to the same 409 as a
-  backstop. KyCalendar meeting IDs are its own UUIDs, so this
-  should never happen (unverified in KyCalendar).
+- **Meeting key.** `meetings` moves to `PRIMARY KEY (tenant_id, id)`. `meeting_windows` and
+  `meeting_guests` gain `tenant_id` and reference `meetings (tenant_id, id)`
+  (`internal/store/migrations/chat.go:95-120`), and every lookup by meeting ID also matches
+  `tenant_id`. Each org then has its own ID space. A
+  `PUT /api/meetings/{id}` for an ID another org holds gets exactly the answer an unknown ID
+  gets, which creates the caller's own meeting, as K22 §4 requires. Nothing reveals the other
+  org's meeting. In single mode every row is in `default`, so the answers do not change, and the
+  upgrade test proves it.
+- **Meeting upserts** take `pg_advisory_xact_lock` on `(tenant_id, id)`, the same pair as the
+  key, before the read, like the quota lock (`internal/store/chat.go:1316-1327`). Two writers of
+  one org's meeting are serialised, and writers in different orgs no longer share a key.
 - **Guest sessions** move to a `meeting_guest_sessions` table keyed by the SHA-256 of the
   secret, with tenant, meeting, status and expiry. The in-memory maps become a cache that the
   user bus invalidates. Lobby decisions already cross pods through the bus (PR #27).
@@ -431,7 +438,7 @@ replay or stale revision where it applies, oversize input), and runs CI on SQLit
 | 1a | Lifecycle, webhook side (§7.1, §7.2): refuse `export_only`, handle `user.erased` (rows, plus blob deletes by key through today's `blobs.Store`) | Yes | — |
 | 1b | Lifecycle, job side (§7.3, §7.4): the leased org purge, and the leased tenancy-sync job with the start-up check | Yes | 2 (leases), 5 (blob interface and `DeletePrefix`) |
 | 2 | Replica safety I (§8.1, §8.4, §5): migration lock, `job_leases`, the capsule scheduler off in multi mode, `RESTORE.md` multi section, multi mode requires the shared VAPID key, encryption key and session secret (§5) | Yes | — |
-| 3 | Replica safety II (§8.2, §8.3): shared limiters, the PoW table, meeting upsert lock and 409, guest sessions in PostgreSQL | Yes | 2 |
+| 3 | Replica safety II (§8.2, §8.3): shared limiters, the PoW table, the meetings key per org and the upsert lock, guest sessions in PostgreSQL | Yes | 2 |
 | 4 | Calls across replicas (§8.3), as open question 5 decides | Yes | 3 |
 | 5 | The blob interface, the shared-volume store-ID check, and `disk` behind it (§9.1) | Yes (volumes at launch) | 2 |
 | 6 | The `s3` backend, sealing, the purge by prefix (§9.2-§9.5) | No | 5, the ky-primitives S3 type |
