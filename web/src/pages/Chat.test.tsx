@@ -578,6 +578,7 @@ describe('Native Chat page', () => {
 
     render(<Chat />);
     await screen.findByRole('heading', { name: 'Welcome to #general' });
-    expect(window.location.hash).toBe('#room=rm_gen');
+    // The hash is written by an effect after the room renders.
+    await waitFor(() => expect(window.location.hash).toBe('#room=rm_gen'));
   });
 });
