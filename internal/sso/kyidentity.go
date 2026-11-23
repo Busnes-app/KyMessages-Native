@@ -14,6 +14,7 @@ import (
 
 	"github.com/Busnes-app/ky-primitives/applysetup"
 	"github.com/Busnes-app/ky-primitives/recoveryclient"
+	"github.com/Busnes-app/ky-primitives/suitedir"
 	"github.com/Busnes-app/ky-primitives/syncauth"
 	"github.com/Busnes-app/ky_server_base/internal/config"
 	"github.com/Busnes-app/ky_server_base/internal/crypto"
@@ -209,7 +210,7 @@ func (k *KyIdentityClient) applySyncWebhook(ctx context.Context, headers syncaut
 	}
 
 	switch event.Type {
-	case "org.suspended", "org.unsuspended", "org.deleted":
+	case "org.suspended", "org.unsuspended", "org.resumed", "org.deleted":
 		return event.Type, k.applyOrgLifecycle(ctx, event.Type, body)
 	}
 
@@ -264,7 +265,7 @@ func (k *KyIdentityClient) applyOrgLifecycle(ctx context.Context, eventType stri
 	if orgID == "" {
 		orgID = strings.TrimSpace(payload.ID)
 	}
-	if orgID == "" {
+	if !config.IsCanonicalUUID(orgID) {
 		return ErrSyncMalformed
 	}
 	if _, err := k.store.Chat().EnsureTenant(ctx, orgID); err != nil {
@@ -274,7 +275,7 @@ func (k *KyIdentityClient) applyOrgLifecycle(ctx context.Context, eventType stri
 	switch eventType {
 	case "org.suspended":
 		nextStatus = store.TenantStatusSuspended
-	case "org.unsuspended":
+	case "org.unsuspended", "org.resumed":
 		nextStatus = store.TenantStatusActive
 	case "org.deleted":
 		nextStatus = store.TenantStatusDeleted
@@ -322,12 +323,38 @@ func (k *KyIdentityClient) applyOrgLifecycle(ctx context.Context, eventType stri
 	return nil
 }
 
+func (k *KyIdentityClient) auditCustomerAdminIgnored(ctx context.Context, subject, orgID string) {
+	details := fmt.Sprintf("subject=%q org_id=%q", subject, orgID)
+	log.Printf("[SSO] customer org admin role downgraded to user: %s", details)
+	actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := k.store.Audit().LogAudit(actx, &store.AuditRecord{
+		Action:   "sso.customer_admin_ignored",
+		Resource: recoveryclient.AuditSafe(subject),
+		Details:  recoveryclient.AuditSafe(details),
+	}); err != nil {
+		log.Printf("[AUDIT] sso.customer_admin_ignored not recorded: %v", err)
+	}
+}
+
 func (k *KyIdentityClient) upsertDirectoryUser(ctx context.Context, in DirectoryUser, ev store.DirectoryEvent) error {
 	// KyIdentity sends this app's roles when it defines any, else the user's global role.
 	orgID := strings.TrimSpace(in.OrgID)
+	if k.tenancy.IsMultiTenant() {
+		if !config.IsCanonicalUUID(orgID) {
+			return ErrSyncMalformed
+		}
+		if _, err := k.store.Chat().EnsureTenant(ctx, orgID); err != nil {
+			return err
+		}
+	}
 	role := "user"
-	if primaryValue(in.Roles) == "admin" && k.tenancy.MayAdminister(orgID) {
-		role = "admin"
+	if primaryValue(in.Roles) == "admin" {
+		if k.tenancy.MayAdminister(orgID) {
+			role = "admin"
+		} else if k.tenancy.IsMultiTenant() {
+			k.auditCustomerAdminIgnored(ctx, in.ID, orgID)
+		}
 	}
 	status := "inactive"
 	if in.Active {
@@ -337,14 +364,6 @@ func (k *KyIdentityClient) upsertDirectoryUser(ctx context.Context, in Directory
 	displayName := in.DisplayName
 	if displayName == "" && in.Name != nil {
 		displayName = in.Name.Formatted
-	}
-	if k.tenancy.IsMultiTenant() {
-		if orgID == "" {
-			return ErrSyncMalformed
-		}
-		if _, err := k.store.Chat().EnsureTenant(ctx, orgID); err != nil {
-			return err
-		}
 	}
 
 	existing, err := k.store.Users().GetUserBySSO(ctx, "kyidentity", in.ID)
@@ -392,6 +411,38 @@ func (k *KyIdentityClient) upsertDirectoryUser(ctx context.Context, in Directory
 		}
 	}
 	return nil
+}
+
+// SuiteDirectory returns a client for KyIdentity's suite directory using this app's own OAuth
+// client credentials, or nil when KyIdentity is not configured.
+func (k *KyIdentityClient) SuiteDirectory() (*suitedir.Client, error) {
+	if m := k.config.Installer; m != nil && m.IssuerURL != "" {
+		secret, err := applysetup.Secret(m.ClientSecretFile)
+		if err != nil {
+			return nil, err
+		}
+		return &suitedir.Client{Issuer: m.IssuerURL, ClientID: m.ClientID, ClientSecret: secret}, nil
+	}
+	if !k.config.Enabled || k.config.KyIdentityIssuer == "" {
+		return nil, nil
+	}
+	return &suitedir.Client{
+		Issuer:       k.config.KyIdentityIssuer,
+		ClientID:     k.config.KyIdentityClientID,
+		ClientSecret: k.config.KyIdentitySecret,
+	}, nil
+}
+
+// EffectiveIssuer returns the canonical KyIdentity issuer URL configured for this server, by the
+// same installer-first rule as SuiteDirectory.
+func (k *KyIdentityClient) EffectiveIssuer() string {
+	if m := k.config.Installer; m != nil && m.IssuerURL != "" {
+		return strings.TrimRight(strings.TrimSpace(m.IssuerURL), "/")
+	}
+	if !k.config.Enabled {
+		return ""
+	}
+	return strings.TrimRight(strings.TrimSpace(k.config.KyIdentityIssuer), "/")
 }
 
 // Owned runtime credentials are private target references; missing files fail closed.

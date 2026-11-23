@@ -17,6 +17,7 @@ import (
 
 	"github.com/Busnes-app/ky-primitives/applysetup"
 	"github.com/Busnes-app/ky-primitives/keyfile"
+	"github.com/google/uuid"
 )
 
 // Config encapsulates all runtime configuration for KyMessages.
@@ -33,6 +34,24 @@ type Config struct {
 	RTC          RTCConfig         `json:"rtc"`
 	Attachments  AttachmentsConfig `json:"attachments"`
 	Push         PushConfig        `json:"push"`
+	KyPost       PairConfig        `json:"kypost"`
+	KyCalendar   PairConfig        `json:"kycalendar"`
+}
+
+// PairConfig holds an explicit suite peer configuration (KY_<PEER>_URL and _SECRET_FILE).
+// When unset, the peer may be fetched automatically from KyIdentity's suite directory.
+type PairConfig struct {
+	URL    string `json:"url"`
+	Secret []byte `json:"-"`
+}
+
+// IsCanonicalUUID reports whether s is a canonical 36-character lowercase hyphenated UUID.
+func IsCanonicalUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	u, err := uuid.Parse(s)
+	return err == nil && s == u.String()
 }
 
 // Tenancy modes for KY_TENANCY_MODE. Single is the default and preserves existing self-hosted
@@ -289,15 +308,31 @@ func LoadFromEnv() (*Config, error) {
 	if tenancyMode != TenancySingle && tenancyMode != TenancyMulti {
 		return nil, fmt.Errorf("KY_TENANCY_MODE: must be %q or %q, got %q", TenancySingle, TenancyMulti, tenancyMode)
 	}
+	staffOrgID := strings.TrimSpace(os.Getenv("KY_STAFF_ORG_ID"))
 	scimEnabled := getEnvBool("KY_SCIM_ENABLED", true)
 	if tenancyMode == TenancyMulti {
+		if driver != "postgres" {
+			return nil, errors.New("KY_TENANCY_MODE=multi requires KY_DB_DRIVER=postgres")
+		}
+		if !IsCanonicalUUID(staffOrgID) {
+			return nil, errors.New("KY_STAFF_ORG_ID is required and must be a canonical lowercase UUID when KY_TENANCY_MODE=multi")
+		}
 		scimEnabled = false
+	}
+
+	kypostPair, err := pairFromEnv("KY_KYPOST")
+	if err != nil {
+		return nil, err
+	}
+	kycalendarPair, err := pairFromEnv("KY_KYCALENDAR")
+	if err != nil {
+		return nil, err
 	}
 
 	cfg := &Config{
 		Tenancy: TenancyConfig{
 			Mode:       tenancyMode,
-			StaffOrgID: strings.TrimSpace(os.Getenv("KY_STAFF_ORG_ID")),
+			StaffOrgID: staffOrgID,
 		},
 		Server: ServerConfig{
 			Host:         host,
@@ -362,6 +397,8 @@ func LoadFromEnv() (*Config, error) {
 			VAPIDPrivateKey: strings.TrimSpace(os.Getenv("KY_VAPID_PRIVATE_KEY")),
 			VAPIDSubject:    strings.TrimSpace(os.Getenv("KY_VAPID_SUBJECT")),
 		},
+		KyPost:     kypostPair,
+		KyCalendar: kycalendarPair,
 	}
 	if rawMax := strings.TrimSpace(os.Getenv("KY_MAX_UPLOAD_BYTES")); rawMax != "" {
 		n, err := strconv.ParseInt(rawMax, 10, 64)
@@ -579,4 +616,46 @@ func unmapPrefix(p netip.Prefix) netip.Prefix {
 		return p
 	}
 	return netip.PrefixFrom(p.Addr().Unmap(), p.Bits()-96)
+}
+
+// pairFromEnv reads an explicit suite pair, <prefix>_URL and <prefix>_SECRET_FILE: both or
+// neither. The secret is at least 32 bytes and never echoed.
+func pairFromEnv(prefix string) (PairConfig, error) {
+	raw, file := getEnv(prefix+"_URL", ""), getEnv(prefix+"_SECRET_FILE", "")
+	if raw == "" && file == "" {
+		return PairConfig{}, nil
+	}
+	if raw == "" || file == "" {
+		return PairConfig{}, fmt.Errorf("%s_URL and %s_SECRET_FILE are set together or not at all", prefix, prefix)
+	}
+	u, err := PeerOrigin(raw)
+	if err != nil {
+		return PairConfig{}, fmt.Errorf("%s_URL: %w", prefix, err)
+	}
+	b, err := os.ReadFile(file)
+	secret := []byte(strings.TrimSpace(string(b)))
+	if err != nil || len(secret) < 32 {
+		return PairConfig{}, fmt.Errorf("%s_SECRET_FILE %q must name a readable file of at least 32 bytes", prefix, file)
+	}
+	return PairConfig{URL: u, Secret: secret}, nil
+}
+
+// PeerOrigin checks that raw is an https origin (host and optional port only, not loopback)
+// and returns it without a trailing slash.
+func PeerOrigin(raw string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	switch {
+	case err != nil:
+		return "", err
+	case u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/"):
+		return "", errors.New("must be an https origin such as https://host[:port]")
+	}
+	host := u.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return "", errors.New("must not be a loopback address")
+	}
+	if ip, err := netip.ParseAddr(host); err == nil && ip.IsLoopback() {
+		return "", errors.New("must not be a loopback address")
+	}
+	return "https://" + u.Host, nil
 }

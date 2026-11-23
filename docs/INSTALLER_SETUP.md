@@ -24,8 +24,15 @@ stored setup, so a conflicting environment override added later stops the server
   rooms, or accounts other than local operators that belong to no org, is refused: start it
   with `single`), inbound SCIM is permanently disabled
   (`/scim/v2/*` returns JSON 404), and every OIDC sign-in and directory webhook must carry a
-  verified `org_id`. Set `KY_STAFF_ORG_ID` to KyIdentity's staff org: only its accounts may be
-  administrators, and customer orgs have none.
+  verified `org_id`. `multi` requires PostgreSQL (`KY_DB_DRIVER=postgres`) and
+  `KY_STAFF_ORG_ID`, KyIdentity's staff org as a canonical lowercase UUID: only its accounts may
+  be administrators, and customer orgs have none. The staff org is locked in the database on
+  first boot; a replica started with a different value refuses to start.
+- KyPost and KyCalendar pair automatically through KyIdentity's suite directory. To pin a pair
+  instead, set `KY_KYPOST_URL` + `KY_KYPOST_SECRET_FILE` (or `KY_KYCALENDAR_URL` +
+  `KY_KYCALENDAR_SECRET_FILE`) together: an `https://host[:port]` origin and a file holding at
+  least 32 bytes. `GET /api/admin/kypost` and `/api/admin/kycalendar` show the pair's state,
+  never its secret.
 
 ## Setup bundle contract (`ky.product-setup/1`)
 

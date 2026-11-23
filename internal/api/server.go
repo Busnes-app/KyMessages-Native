@@ -53,6 +53,8 @@ type Server struct {
 	calls            *chat.CallManager
 	lobby            *chat.LobbyManager
 	recovery         recoveryClient
+	kypost           *suitePair
+	kycal            *suitePair
 	probeHTTP        *http.Client
 	mux              *http.ServeMux
 	cspHeader        string
@@ -236,6 +238,8 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 		calls:           callMgr,
 		lobby:           lobbyMgr,
 		recovery:        recovery,
+		kypost:          newSuitePair("kypost", cfg.KyPost),
+		kycal:           newSuitePair("kycalendar", cfg.KyCalendar),
 		probeHTTP:       health.NewHTTPClient(),
 		mux:             http.NewServeMux(),
 		cspHeader:       buildCSP(cfg),
@@ -304,6 +308,13 @@ func (l *attemptLimiter) makeRoom(now time.Time) {
 			break
 		}
 	}
+}
+
+// resetIn is how long until key's current window ends.
+func (l *attemptLimiter) resetIn(key string) time.Duration {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return max(time.Until(l.m[key].reset), 0)
 }
 
 // blocked reports whether key has used up limit in its current window, without counting.
@@ -401,6 +412,8 @@ func (s *Server) routes() {
 
 	// Console.
 	s.mux.HandleFunc("GET /api/admin/health", s.requireAdmin(s.handleHealth))
+	s.mux.HandleFunc("GET /api/admin/kypost", s.requireAdmin(s.handlePairStatus(s.kypost)))
+	s.mux.HandleFunc("GET /api/admin/kycalendar", s.requireAdmin(s.handlePairStatus(s.kycal)))
 	s.mux.HandleFunc("GET /api/admin/audit", s.requireAdmin(s.handleAudit))
 
 	// Native Bot & Agent accounts.
@@ -468,6 +481,7 @@ func (s *Server) routes() {
 
 	// KyCalendar signed meeting sync
 	s.mux.HandleFunc("PUT /api/meetings/{id}", s.handleKyCalendarUpsertMeeting)
+	s.mux.HandleFunc("POST /api/suite/chat", s.handleSuiteChat)
 	s.mux.HandleFunc("DELETE /api/meetings/{id}", s.handleKyCalendarCloseMeeting)
 
 	// Confined external guest waiting room & meeting endpoints
@@ -634,6 +648,7 @@ func csrfExempt(path string) bool {
 		path == "/api/sso/kyidentity/sync" ||
 		strings.HasPrefix(path, "/api/v1/webhooks/in/") ||
 		strings.HasPrefix(path, "/api/meetings/") ||
+		strings.HasPrefix(path, "/api/suite/") ||
 		strings.HasPrefix(path, "/api/meet/")
 }
 

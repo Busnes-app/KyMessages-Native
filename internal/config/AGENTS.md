@@ -27,7 +27,8 @@ Owns environment variable parsing, configuration validation, default fallbacks, 
 
 - `KY_ADMIN_USERNAME` (default `admin`) is `Security.AdminUsername`: the local admin `cmd/server` creates on an empty database and `init-admin`'s `-username` default. It must pass `ValidUsername` (3-64 of `[A-Za-z0-9._-]`, the rule `auth.ValidateUsername` shares), else startup fails.
 - `KY_SCIM_TOKEN` is `SCIM.BearerToken`; unset, it is random per start and `SCIM.TokenSet` (`json:"-"`) is false, which the console reports without the token. The installer clears both.
-- `KY_TENANCY_MODE` (`single`, default, or `multi`; anything else fails startup) is `Tenancy.Mode`; `multi` forces `SCIM.Enabled` off. `KY_STAFF_ORG_ID` is `Tenancy.StaffOrgID`: in `multi`, `Tenancy.MayAdminister` allows the admin role only for that org, so unset means no org-bound administrators.
+- `KY_TENANCY_MODE` (`single`, default, or `multi`; anything else fails startup) is `Tenancy.Mode`; `multi` forces `SCIM.Enabled` off and requires `KY_DB_DRIVER=postgres` plus `KY_STAFF_ORG_ID` (`Tenancy.StaffOrgID`) as a canonical lowercase UUID (`IsCanonicalUUID`); `Tenancy.MayAdminister` allows the admin role only for that org.
+- `KY_KYPOST_URL`/`KY_KYPOST_SECRET_FILE` and `KY_KYCALENDAR_URL`/`KY_KYCALENDAR_SECRET_FILE` fill `Config.KyPost`/`Config.KyCalendar` (`PairConfig`; both or neither, `PeerOrigin` https origin, secret ≥ 32 bytes, `json:"-"`). Unset, the pair comes from KyIdentity's suite directory.
 - Web Push fills `Config.Push`: `KY_PUSH_ENABLED` (default true; false means no dispatcher and bootstrap reports push unavailable), `KY_VAPID_PRIVATE_KEY` (overrides `<KY_DATA_DIR>/vapid.key`) and `KY_VAPID_SUBJECT` (else derived from `KY_APP_URL`). `Push.AllowPrivate` is tests only.
 - `KY_CAPTCHA_PROVIDER` is `pow` (default) or `none`; anything else fails startup, because login verifies nothing else. `KY_CAPTCHA_POW_DIFFICULTY` defaults to 50000.
 

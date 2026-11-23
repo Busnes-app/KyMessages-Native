@@ -790,6 +790,9 @@ export const Chat: React.FC<ChatProps> = ({
   // Initial bootstrap + WebSocket connection.
   useEffect(() => {
     let cancelled = false;
+    // A suite link (POST /api/suite/chat) opens the app on #dm=<user id>; read it before the
+    // room hash replaces it.
+    const dmTarget = window.location.hash.match(/^#dm=([A-Za-z0-9_-]{1,128})$/)?.[1];
     const init = async () => {
       try {
         const [boot, users] = await Promise.all([
@@ -826,6 +829,16 @@ export const Chat: React.FC<ChatProps> = ({
           const requestedRoom = hashRoom || queryRoom;
           const matched = requestedRoom ? boot.rooms.find((r) => r.id === requestedRoom) : undefined;
           setActiveRoomId(matched ? matched.id : boot.rooms[0].id);
+        }
+        if (dmTarget) {
+          try {
+            const { room } = await openDirectMessage(dmTarget);
+            if (cancelled) return;
+            await refreshRoomsList();
+            setActiveRoomId(room.id);
+          } catch (e) {
+            if (!cancelled) setBannerError(e instanceof Error ? e.message : 'Could not open direct message');
+          }
         }
       } catch (e) {
         if (!cancelled) {

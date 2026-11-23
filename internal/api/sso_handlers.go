@@ -10,6 +10,7 @@ import (
 
 	"github.com/Busnes-app/ky-primitives/syncauth"
 	"github.com/Busnes-app/ky_server_base/internal/auth"
+	"github.com/Busnes-app/ky_server_base/internal/config"
 	"github.com/Busnes-app/ky_server_base/internal/crypto"
 	"github.com/Busnes-app/ky_server_base/internal/sso"
 	"github.com/Busnes-app/ky_server_base/internal/store"
@@ -90,9 +91,9 @@ func (s *Server) handleKyIdentityCallback(w http.ResponseWriter, r *http.Request
 	}
 	orgID := strings.TrimSpace(claims.OrgID)
 	if s.config.Tenancy.IsMultiTenant() {
-		if orgID == "" {
+		if !config.IsCanonicalUUID(orgID) {
 			s.audit(r.Context(), "", r, "sso.missing_org_id", "session", fmt.Sprintf("subject=%q", claims.Subject))
-			s.writeError(w, http.StatusForbidden, "Organization claim (org_id) is required")
+			s.writeError(w, http.StatusForbidden, "Valid organization claim (org_id) is required")
 			return
 		}
 		tenant, err := s.store.Chat().EnsureTenant(r.Context(), orgID)

@@ -21,7 +21,7 @@ import (
 	"github.com/google/uuid"
 )
 
-const testStaffOrg = "org-staff"
+const testStaffOrg = "00000000-0000-4000-8000-000000000001"
 
 const testMultiTenantHMAC = "4f1c2a9e8b7d6c5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e"
 
@@ -119,7 +119,7 @@ func TestEnsureTenancyModeLocksDatabase(t *testing.T) {
 	if err := api.EnsureTenancyMode(ctx, stSingle, config.TenancyConfig{Mode: config.TenancySingle}); err != nil {
 		t.Fatalf("repeat single boot: %v", err)
 	}
-	if err := api.EnsureTenancyMode(ctx, stSingle, config.TenancyConfig{Mode: config.TenancyMulti}); err == nil {
+	if err := api.EnsureTenancyMode(ctx, stSingle, config.TenancyConfig{Mode: config.TenancyMulti, StaffOrgID: testStaffOrg}); err == nil {
 		t.Fatal("expected single-tenant DB to fail closed when booted in multi-tenant mode")
 	}
 
@@ -130,14 +130,41 @@ func TestEnsureTenancyModeLocksDatabase(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = stMulti.Close() })
 
-	if err := api.EnsureTenancyMode(ctx, stMulti, config.TenancyConfig{Mode: config.TenancyMulti}); err != nil {
+	if err := api.EnsureTenancyMode(ctx, stMulti, config.TenancyConfig{Mode: config.TenancyMulti, StaffOrgID: testStaffOrg}); err != nil {
 		t.Fatalf("first multi boot: %v", err)
 	}
-	if err := api.EnsureTenancyMode(ctx, stMulti, config.TenancyConfig{Mode: config.TenancyMulti}); err != nil {
+	if err := api.EnsureTenancyMode(ctx, stMulti, config.TenancyConfig{Mode: config.TenancyMulti, StaffOrgID: testStaffOrg}); err != nil {
 		t.Fatalf("repeat multi boot: %v", err)
+	}
+	if err := api.EnsureTenancyMode(ctx, stMulti, config.TenancyConfig{Mode: config.TenancyMulti, StaffOrgID: "00000000-0000-4000-8000-0000000000ff"}); err == nil {
+		t.Fatal("expected a multi-tenant DB to refuse a different KY_STAFF_ORG_ID")
+	}
+	if err := api.EnsureTenancyMode(ctx, stMulti, config.TenancyConfig{Mode: config.TenancyMulti, StaffOrgID: "org-staff"}); err == nil {
+		t.Fatal("expected a non-canonical KY_STAFF_ORG_ID to be refused")
 	}
 	if err := api.EnsureTenancyMode(ctx, stMulti, config.TenancyConfig{Mode: config.TenancySingle}); err == nil {
 		t.Fatal("expected multi-tenant DB to fail closed when booted in single-tenant mode")
+	}
+	// A database from before canonical org IDs that binds an account to "org-alpha" refuses
+	// to start: KyIdentity could never suspend or offboard that account.
+	multi := config.TenancyConfig{Mode: config.TenancyMulti, StaffOrgID: testStaffOrg}
+	if err := stMulti.Users().CreateUser(ctx, &store.User{ID: "u_legacy", Username: "legacy", Role: "user", Status: "active", SSOProvider: "kyidentity", SSOSubject: "sub-legacy", OrgID: "org-alpha"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := api.EnsureTenancyMode(ctx, stMulti, multi); err == nil || !strings.Contains(err.Error(), "org-alpha") {
+		t.Fatalf("legacy org ID boot: %v", err)
+	}
+	if err := stMulti.Users().DeleteUser(ctx, "u_legacy"); err != nil {
+		t.Fatal(err)
+	}
+	if err := api.EnsureTenancyMode(ctx, stMulti, multi); err != nil {
+		t.Fatalf("boot after the legacy account is gone: %v", err)
+	}
+	if _, err := stMulti.Chat().EnsureTenant(ctx, "org-beta"); err != nil {
+		t.Fatal(err)
+	}
+	if err := api.EnsureTenancyMode(ctx, stMulti, multi); err == nil || !strings.Contains(err.Error(), "org-beta") {
+		t.Fatalf("legacy tenant boot: %v", err)
 	}
 }
 
@@ -177,10 +204,10 @@ func TestMultiTenantSCIMDisabled(t *testing.T) {
 func TestMultiTenantCrossOrgIsolation(t *testing.T) {
 	srv, st, _ := newMultiTenantTestServer(t)
 
-	alice, aliceTok := createOrgUser(t, st, "usr_a_alice", "alice", "admin", "org-alpha")
-	bob, _ := createOrgUser(t, st, "usr_a_bob", "bob", "user", "org-alpha")
-	carol, carolTok := createOrgUser(t, st, "usr_b_carol", "carol", "admin", "org-beta")
-	_, _ = createOrgUser(t, st, "usr_b_dave", "dave", "user", "org-beta")
+	alice, aliceTok := createOrgUser(t, st, "usr_a_alice", "alice", "admin", "00000000-0000-4000-8000-00000000000a")
+	bob, _ := createOrgUser(t, st, "usr_a_bob", "bob", "user", "00000000-0000-4000-8000-00000000000a")
+	carol, carolTok := createOrgUser(t, st, "usr_b_carol", "carol", "admin", "00000000-0000-4000-8000-00000000000b")
+	_, _ = createOrgUser(t, st, "usr_b_dave", "dave", "user", "00000000-0000-4000-8000-00000000000b")
 
 	// 1. User directory must only list caller's org.
 	rec := doBearerJSON(t, srv, http.MethodGet, "/api/v1/users", aliceTok, nil, nil)
@@ -238,7 +265,7 @@ func TestMultiTenantCrossOrgIsolation(t *testing.T) {
 		} `json:"room"`
 	}
 	_ = json.Unmarshal(rec.Body.Bytes(), &roomResp)
-	if roomResp.Room.TenantID != "org-alpha" {
+	if roomResp.Room.TenantID != "00000000-0000-4000-8000-00000000000a" {
 		t.Fatalf("room tenant_id = %q, want org-alpha", roomResp.Room.TenantID)
 	}
 	roomID := roomResp.Room.ID
@@ -344,7 +371,7 @@ func TestMultiTenantDirectoryAdminsOnlyFromStaffOrg(t *testing.T) {
 		}
 		return u
 	}
-	if u := sync("kid-tenant-admin", "org-alpha"); u.Role != "user" {
+	if u := sync("kid-tenant-admin", "00000000-0000-4000-8000-00000000000a"); u.Role != "user" {
 		t.Fatalf("customer-org admin stored as %q, want user", u.Role)
 	}
 	if u := sync("kid-staff-admin", testStaffOrg); u.Role != "admin" {
@@ -352,7 +379,7 @@ func TestMultiTenantDirectoryAdminsOnlyFromStaffOrg(t *testing.T) {
 	}
 
 	// Even with an admin row, a customer-org account cannot change backups or read the audit log.
-	_, tenantTok := createOrgUser(t, st, "usr_a_admin", "alphaadmin", "admin", "org-alpha")
+	_, tenantTok := createOrgUser(t, st, "usr_a_admin", "alphaadmin", "admin", "00000000-0000-4000-8000-00000000000a")
 	if rec := doBearerJSON(t, srv, http.MethodPut, "/api/backup/schedule", tenantTok, map[string]any{"interval": "24h"}, nil); rec.Code != http.StatusForbidden {
 		t.Fatalf("customer-org admin backup schedule = %d, want 403: %s", rec.Code, rec.Body.String())
 	}
@@ -376,8 +403,8 @@ func TestMultiTenantDirectoryAdminsOnlyFromStaffOrg(t *testing.T) {
 func TestMultiTenantKyCalendarMeetingSync(t *testing.T) {
 	srv, st, _ := newMultiTenantTestServer(t)
 
-	alice, _ := createOrgUser(t, st, "usr_cal_alice", "calalice", "user", "org-alpha")
-	carol, _ := createOrgUser(t, st, "usr_cal_carol", "calcarol", "user", "org-beta")
+	alice, _ := createOrgUser(t, st, "usr_cal_alice", "calalice", "user", "00000000-0000-4000-8000-00000000000a")
+	carol, _ := createOrgUser(t, st, "usr_cal_carol", "calcarol", "user", "00000000-0000-4000-8000-00000000000b")
 
 	signedReq := func(method, path string, payload any) *httptest.ResponseRecorder {
 		raw, _ := json.Marshal(payload)
@@ -409,7 +436,7 @@ func TestMultiTenantKyCalendarMeetingSync(t *testing.T) {
 
 	// Valid org_id creates meeting scoped to org-alpha and ignores cross-org attendees.
 	rec = signedReq(http.MethodPut, "/api/meetings/ext-1", map[string]any{
-		"org_id":        "org-alpha",
+		"org_id":        "00000000-0000-4000-8000-00000000000a",
 		"title":         "Alpha Standup",
 		"organizer_sub": alice.SSOSubject,
 		"member_subs":   []string{alice.SSOSubject, carol.SSOSubject},
@@ -425,7 +452,7 @@ func TestMultiTenantKyCalendarMeetingSync(t *testing.T) {
 		RoomID string `json:"room_id"`
 	}
 	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
-	members, err := st.Chat().ListRoomMembers(context.Background(), "org-alpha", resp.RoomID)
+	members, err := st.Chat().ListRoomMembers(context.Background(), "00000000-0000-4000-8000-00000000000a", resp.RoomID)
 	if err != nil {
 		t.Fatalf("ListRoomMembers: %v", err)
 	}
@@ -445,17 +472,17 @@ func TestMultiTenantKyCalendarMeetingSync(t *testing.T) {
 	if rec := signedReq(http.MethodDelete, "/api/meetings/ext-1", map[string]any{}); rec.Code != http.StatusBadRequest {
 		t.Fatalf("DELETE without org_id = %d, want 400", rec.Code)
 	}
-	if rec := signedReq(http.MethodDelete, "/api/meetings/ext-1", map[string]any{"org_id": "org-beta"}); rec.Code != http.StatusOK {
+	if rec := signedReq(http.MethodDelete, "/api/meetings/ext-1", map[string]any{"org_id": "00000000-0000-4000-8000-00000000000b"}); rec.Code != http.StatusOK {
 		t.Fatalf("DELETE with wrong org_id = %d, want idempotent 200", rec.Code)
 	}
-	stillOpen, _, _, err := st.Chat().GetMeeting(context.Background(), "org-alpha", "ext-1")
+	stillOpen, _, _, err := st.Chat().GetMeeting(context.Background(), "00000000-0000-4000-8000-00000000000a", "ext-1")
 	if err != nil || stillOpen.ClosedAt != nil {
 		t.Fatalf("org-alpha meeting should still be open after org-beta DELETE, got %+v err=%v", stillOpen, err)
 	}
-	if rec := signedReq(http.MethodDelete, "/api/meetings/ext-1", map[string]any{"org_id": "org-alpha"}); rec.Code != http.StatusOK {
+	if rec := signedReq(http.MethodDelete, "/api/meetings/ext-1", map[string]any{"org_id": "00000000-0000-4000-8000-00000000000a"}); rec.Code != http.StatusOK {
 		t.Fatalf("DELETE with matching org_id = %d, want 200: %s", rec.Code, rec.Body.String())
 	}
-	nowClosed, _, _, err := st.Chat().GetMeeting(context.Background(), "org-alpha", "ext-1")
+	nowClosed, _, _, err := st.Chat().GetMeeting(context.Background(), "00000000-0000-4000-8000-00000000000a", "ext-1")
 	if err != nil || nowClosed.ClosedAt == nil {
 		t.Fatalf("org-alpha meeting should be closed after org-alpha DELETE, got %+v err=%v", nowClosed, err)
 	}
@@ -484,7 +511,7 @@ func TestMultiTenantDirectoryWebhookAndOrgLifecycle(t *testing.T) {
 	}
 
 	// 2. Valid user.created with org_id provisions user in org-alpha.
-	alphaUser := []byte(`{"schemas":["urn:ietf:params:scim:schemas:core:2.0:User"],"id":"kid-100","externalId":"kid-100","userName":"eva","org_id":"org-alpha","roles":[{"value":"admin"}],"active":true,"meta":{"resourceType":"User","version":"W/\"1\""}}`)
+	alphaUser := []byte(`{"schemas":["urn:ietf:params:scim:schemas:core:2.0:User"],"id":"kid-100","externalId":"kid-100","userName":"eva","org_id":"00000000-0000-4000-8000-00000000000a","roles":[{"value":"admin"}],"active":true,"meta":{"resourceType":"User","version":"W/\"1\""}}`)
 	if rec := postSync("user.created", alphaUser); rec.Code != http.StatusOK {
 		t.Fatalf("user.created with org_id = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -492,12 +519,12 @@ func TestMultiTenantDirectoryWebhookAndOrgLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetUserBySSO: %v", err)
 	}
-	if eva.OrgID != "org-alpha" {
+	if eva.OrgID != "00000000-0000-4000-8000-00000000000a" {
 		t.Fatalf("eva.OrgID = %q, want org-alpha", eva.OrgID)
 	}
 
 	// 3. Re-assigning the same subject to org-beta must fail with 409 + audit sso.org_mismatch.
-	mismatchUser := []byte(`{"schemas":["urn:ietf:params:scim:schemas:core:2.0:User"],"id":"kid-100","externalId":"kid-100","userName":"eva","org_id":"org-beta","roles":[{"value":"admin"}],"active":true,"meta":{"resourceType":"User","version":"W/\"2\""}}`)
+	mismatchUser := []byte(`{"schemas":["urn:ietf:params:scim:schemas:core:2.0:User"],"id":"kid-100","externalId":"kid-100","userName":"eva","org_id":"00000000-0000-4000-8000-00000000000b","roles":[{"value":"admin"}],"active":true,"meta":{"resourceType":"User","version":"W/\"2\""}}`)
 	if rec := postSync("user.updated", mismatchUser); rec.Code != http.StatusConflict {
 		t.Fatalf("cross-org reassignment = %d, want 409: %s", rec.Code, rec.Body.String())
 	}
@@ -517,7 +544,7 @@ func TestMultiTenantDirectoryWebhookAndOrgLifecycle(t *testing.T) {
 	}, ""); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	_, betaTok := createOrgUser(t, st, "usr_beta_zoe", "zoe", "user", "org-beta")
+	_, betaTok := createOrgUser(t, st, "usr_beta_zoe", "zoe", "user", "00000000-0000-4000-8000-00000000000b")
 
 	rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", evaTok, map[string]any{
 		"kind": "channel",
@@ -599,7 +626,7 @@ func TestMultiTenantDirectoryWebhookAndOrgLifecycle(t *testing.T) {
 	}
 
 	// 5. org.suspended revokes sessions and blocks API, incoming webhook, and guest link for org-alpha.
-	suspendBody := []byte(`{"org_id":"org-alpha","revision":1}`)
+	suspendBody := []byte(`{"org_id":"00000000-0000-4000-8000-00000000000a","revision":1}`)
 	if rec := postSync("org.suspended", suspendBody); rec.Code != http.StatusOK {
 		t.Fatalf("org.suspended = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -649,7 +676,7 @@ func TestMultiTenantDirectoryWebhookAndOrgLifecycle(t *testing.T) {
 	}
 
 	// 6. org.unsuspended restores org-alpha.
-	if rec := postSync("org.unsuspended", []byte(`{"org_id":"org-alpha","revision":2}`)); rec.Code != http.StatusOK {
+	if rec := postSync("org.unsuspended", []byte(`{"org_id":"00000000-0000-4000-8000-00000000000a","revision":2}`)); rec.Code != http.StatusOK {
 		t.Fatalf("org.unsuspended = %d: %s", rec.Code, rec.Body.String())
 	}
 	if err := mint(); err != nil {
@@ -663,10 +690,10 @@ func TestMultiTenantDirectoryWebhookAndOrgLifecycle(t *testing.T) {
 	}
 
 	// 7. org.deleted permanently blocks org-alpha.
-	if rec := postSync("org.deleted", []byte(`{"org_id":"org-alpha","revision":3}`)); rec.Code != http.StatusOK {
+	if rec := postSync("org.deleted", []byte(`{"org_id":"00000000-0000-4000-8000-00000000000a","revision":3}`)); rec.Code != http.StatusOK {
 		t.Fatalf("org.deleted = %d: %s", rec.Code, rec.Body.String())
 	}
-	tenant, err := st.Chat().GetTenant(context.Background(), "org-alpha")
+	tenant, err := st.Chat().GetTenant(context.Background(), "00000000-0000-4000-8000-00000000000a")
 	if err != nil || tenant.Status != store.TenantStatusDeleted {
 		t.Fatalf("tenant after org.deleted = %+v err=%v, want deleted", tenant, err)
 	}
@@ -676,16 +703,16 @@ func TestMultiTenantDirectoryWebhookAndOrgLifecycle(t *testing.T) {
 func TestMultiTenantLogoutDropsPushSubscription(t *testing.T) {
 	srv, st, _ := newMultiTenantTestServer(t)
 	ctx := context.Background()
-	u, tok := createOrgUser(t, st, "usr_lo_mt", "lomt", "user", "org-alpha")
+	u, tok := createOrgUser(t, st, "usr_lo_mt", "lomt", "user", "00000000-0000-4000-8000-00000000000a")
 	if _, err := st.Chat().UpsertPushSubscription(ctx, crypto.SHA256Hex([]byte(tok)), &store.PushSubscription{
-		TenantID: "org-alpha", UserID: u.ID, Endpoint: "https://push.example/mt", P256DH: "k", AuthSecret: "a",
+		TenantID: "00000000-0000-4000-8000-00000000000a", UserID: u.ID, Endpoint: "https://push.example/mt", P256DH: "k", AuthSecret: "a",
 	}, 10); err != nil {
 		t.Fatal(err)
 	}
 	if rec := doBearerJSON(t, srv, http.MethodPost, "/api/auth/logout", tok, map[string]any{"push_endpoint": "https://push.example/mt"}, nil); rec.Code != http.StatusOK {
 		t.Fatalf("logout = %d: %s", rec.Code, rec.Body.String())
 	}
-	if subs, _ := st.Chat().ListPushSubscriptions(ctx, "org-alpha", u.ID); len(subs) != 0 {
+	if subs, _ := st.Chat().ListPushSubscriptions(ctx, "00000000-0000-4000-8000-00000000000a", u.ID); len(subs) != 0 {
 		t.Fatalf("org-alpha push subscription survived sign-out: %d", len(subs))
 	}
 }
@@ -706,33 +733,33 @@ func TestMultiTenantStaleOrgLifecycleIsIgnored(t *testing.T) {
 		return rec.Code
 	}
 	status := func() string {
-		tenant, err := st.Chat().GetTenant(ctx, "org-gamma")
+		tenant, err := st.Chat().GetTenant(ctx, "00000000-0000-4000-8000-00000000000c")
 		if err != nil {
 			t.Fatal(err)
 		}
 		return tenant.Status
 	}
-	if code := post(srv, "org.suspended", `{"org_id":"org-gamma"}`); code != http.StatusBadRequest {
+	if code := post(srv, "org.suspended", `{"org_id":"00000000-0000-4000-8000-00000000000c"}`); code != http.StatusBadRequest {
 		t.Fatalf("lifecycle event without a revision = %d, want 400", code)
 	}
-	if code := post(srv, "org.suspended", `{"org_id":"org-gamma","revision":5}`); code != http.StatusOK || status() != store.TenantStatusSuspended {
+	if code := post(srv, "org.suspended", `{"org_id":"00000000-0000-4000-8000-00000000000c","revision":5}`); code != http.StatusOK || status() != store.TenantStatusSuspended {
 		t.Fatalf("suspend rev 5 = %d, status %q", code, status())
 	}
-	if code := post(srv, "org.unsuspended", `{"org_id":"org-gamma","revision":4}`); code != http.StatusOK || status() != store.TenantStatusSuspended {
+	if code := post(srv, "org.unsuspended", `{"org_id":"00000000-0000-4000-8000-00000000000c","revision":4}`); code != http.StatusOK || status() != store.TenantStatusSuspended {
 		t.Fatalf("stale unsuspend rev 4 = %d, status %q, want suspended", code, status())
 	}
 	restarted := api.NewServer(cfg, st)
 	t.Cleanup(restarted.WaitDetached)
-	if code := post(restarted, "org.unsuspended", `{"org_id":"org-gamma","revision":5}`); code != http.StatusOK || status() != store.TenantStatusSuspended {
+	if code := post(restarted, "org.unsuspended", `{"org_id":"00000000-0000-4000-8000-00000000000c","revision":5}`); code != http.StatusOK || status() != store.TenantStatusSuspended {
 		t.Fatalf("replayed rev 5 after restart = %d, status %q, want suspended", code, status())
 	}
-	if code := post(restarted, "org.unsuspended", `{"org_id":"org-gamma","revision":6}`); code != http.StatusOK || status() != store.TenantStatusActive {
+	if code := post(restarted, "org.unsuspended", `{"org_id":"00000000-0000-4000-8000-00000000000c","revision":6}`); code != http.StatusOK || status() != store.TenantStatusActive {
 		t.Fatalf("newer unsuspend rev 6 = %d, status %q, want active", code, status())
 	}
-	if code := post(restarted, "org.deleted", `{"org_id":"org-gamma","revision":2}`); code != http.StatusOK || status() != store.TenantStatusDeleted {
+	if code := post(restarted, "org.deleted", `{"org_id":"00000000-0000-4000-8000-00000000000c","revision":2}`); code != http.StatusOK || status() != store.TenantStatusDeleted {
 		t.Fatalf("delete = %d, status %q, want deleted", code, status())
 	}
-	if code := post(restarted, "org.unsuspended", `{"org_id":"org-gamma","revision":99}`); code != http.StatusOK || status() != store.TenantStatusDeleted {
+	if code := post(restarted, "org.unsuspended", `{"org_id":"00000000-0000-4000-8000-00000000000c","revision":99}`); code != http.StatusOK || status() != store.TenantStatusDeleted {
 		t.Fatalf("unsuspend after delete = %d, status %q, want deleted", code, status())
 	}
 }
@@ -751,7 +778,7 @@ func TestEnsureTenancyModeRefusesMultiOnAUsedDatabase(t *testing.T) {
 	if err := st.Chat().CreateRoom(ctx, &store.Room{Kind: store.RoomKindChannel, Name: "general", CreatedBy: "u_old"}, []string{"u_old"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := api.EnsureTenancyMode(ctx, st, config.TenancyConfig{Mode: config.TenancyMulti}); err == nil {
+	if err := api.EnsureTenancyMode(ctx, st, config.TenancyConfig{Mode: config.TenancyMulti, StaffOrgID: testStaffOrg}); err == nil {
 		t.Fatal("a database that served single-tenant chat was locked to multi")
 	}
 	if _, err := st.Settings().GetSetting(ctx, store.TenancyModeSettingKey); !errors.Is(err, store.ErrNotFound) {
@@ -781,10 +808,10 @@ func TestEnsureTenancyModeCountsDirectoryAccounts(t *testing.T) {
 	if err := synced.Users().CreateUser(ctx, &store.User{ID: "u_dir", Username: "dir", Role: "user", Status: "active", SSOProvider: "kyidentity", SSOSubject: "sub-dir"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := api.EnsureTenancyMode(ctx, synced, config.TenancyConfig{Mode: config.TenancyMulti}); err == nil {
+	if err := api.EnsureTenancyMode(ctx, synced, config.TenancyConfig{Mode: config.TenancyMulti, StaffOrgID: testStaffOrg}); err == nil {
 		t.Fatal("a database with org-less directory accounts was locked to multi")
 	}
-	if err := api.EnsureTenancyMode(ctx, open(), config.TenancyConfig{Mode: config.TenancyMulti}); err != nil {
+	if err := api.EnsureTenancyMode(ctx, open(), config.TenancyConfig{Mode: config.TenancyMulti, StaffOrgID: testStaffOrg}); err != nil {
 		t.Fatalf("a fresh database with only the bootstrap admin: %v", err)
 	}
 }

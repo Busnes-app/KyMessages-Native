@@ -361,9 +361,34 @@ func TestTenancyModeFromEnv(t *testing.T) {
 		}
 	})
 
-	t.Run("multi_forces_scim_off", func(t *testing.T) {
+	multiEnv := func(t *testing.T) {
 		t.Setenv("KY_DATA_DIR", t.TempDir())
 		t.Setenv("KY_TENANCY_MODE", "multi")
+		t.Setenv("KY_DB_DRIVER", "postgres")
+		t.Setenv("KY_DB_DSN", "postgres://user:pass@localhost:5432/testdb")
+		t.Setenv("KY_STAFF_ORG_ID", "00000000-0000-4000-8000-000000000001")
+	}
+
+	t.Run("multi_requires_postgres", func(t *testing.T) {
+		multiEnv(t)
+		t.Setenv("KY_DB_DRIVER", "sqlite")
+		if _, err := config.LoadFromEnv(); err == nil || !strings.Contains(err.Error(), "requires KY_DB_DRIVER=postgres") {
+			t.Fatalf("multi on sqlite: %v", err)
+		}
+	})
+
+	t.Run("multi_requires_canonical_staff_org", func(t *testing.T) {
+		for _, staff := range []string{"", "org-staff", "00000000-0000-4000-8000-00000000000A", "{00000000-0000-4000-8000-000000000001}"} {
+			multiEnv(t)
+			t.Setenv("KY_STAFF_ORG_ID", staff)
+			if _, err := config.LoadFromEnv(); err == nil || !strings.Contains(err.Error(), "KY_STAFF_ORG_ID") {
+				t.Errorf("KY_STAFF_ORG_ID=%q: %v", staff, err)
+			}
+		}
+	})
+
+	t.Run("multi_forces_scim_off", func(t *testing.T) {
+		multiEnv(t)
 		t.Setenv("KY_SCIM_ENABLED", "true")
 		cfg, err := config.LoadFromEnv()
 		if err != nil {
@@ -375,24 +400,23 @@ func TestTenancyModeFromEnv(t *testing.T) {
 		if cfg.SCIM.Enabled {
 			t.Fatal("expected KY_TENANCY_MODE=multi to force SCIM.Enabled=false")
 		}
-		if cfg.Tenancy.MayAdminister("org-a") {
-			t.Fatal("with KY_STAFF_ORG_ID unset, no org may administer in multi-tenant mode")
+		if cfg.Tenancy.MayAdminister("00000000-0000-4000-8000-0000000000aa") {
+			t.Fatal("only the staff org may administer in multi-tenant mode")
 		}
 	})
 
 	t.Run("staff_org_administers", func(t *testing.T) {
-		t.Setenv("KY_DATA_DIR", t.TempDir())
-		t.Setenv("KY_TENANCY_MODE", "multi")
-		t.Setenv("KY_STAFF_ORG_ID", " org-staff ")
+		multiEnv(t)
+		t.Setenv("KY_STAFF_ORG_ID", " 00000000-0000-4000-8000-000000000001 ")
 		cfg, err := config.LoadFromEnv()
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if !cfg.Tenancy.MayAdminister("org-staff") || cfg.Tenancy.MayAdminister("org-a") || cfg.Tenancy.MayAdminister("") {
+		if !cfg.Tenancy.MayAdminister("00000000-0000-4000-8000-000000000001") || cfg.Tenancy.MayAdminister("00000000-0000-4000-8000-0000000000aa") || cfg.Tenancy.MayAdminister("") {
 			t.Fatalf("MayAdminister wrong for staff org %q", cfg.Tenancy.StaffOrgID)
 		}
 		single := config.TenancyConfig{Mode: config.TenancySingle}
-		if !single.MayAdminister("org-a") {
+		if !single.MayAdminister("00000000-0000-4000-8000-0000000000aa") {
 			t.Fatal("single-tenant mode must keep every org's admins")
 		}
 	})

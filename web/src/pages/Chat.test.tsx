@@ -269,6 +269,52 @@ describe('Native Chat page', () => {
     expect(await screen.findByRole('heading', { name: 'Welcome to #general' })).toBeTruthy();
   });
 
+  it('opens the direct message a suite #dm= link names', async () => {
+    const dmBodies: string[] = [];
+    const dmRoom = {
+      id: 'rm_dm',
+      tenant_id: 'default',
+      kind: 'dm',
+      name: 'Bob',
+      topic: '',
+      is_private: true,
+      last_seq: 0,
+      created_by: 'u_alice',
+      created_at: Date.now(),
+    };
+    window.history.replaceState(null, '', '/#dm=u_bob');
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? 'GET';
+        if (url === '/api/v1/bootstrap') {
+          return json({
+            user: { id: 'u_alice', username: 'alice', display_name: 'Alice', role: 'user' },
+            tenant: { id: 'default', slug: 'default', display_name: 'KyMessages', plan: 'self_hosted' },
+            rooms: [],
+          });
+        }
+        if (url === '/api/v1/users') return json({ users: [] });
+        if (url === '/api/v1/rooms' && method === 'POST') {
+          dmBodies.push(String(init?.body ?? ''));
+          return json({ room: dmRoom, created: true }, 201);
+        }
+        if (url === '/api/v1/rooms' && method === 'GET') {
+          return json({
+            rooms: dmBodies.length ? [{ ...dmRoom, role: 'owner', last_read_seq: 0, unread_count: 0, notify_mode: 'all' }] : [],
+          });
+        }
+        if (url.startsWith('/api/v1/rooms/rm_dm')) return json({ messages: [], has_more: false });
+        return json({ error: 'not found' }, 404);
+      }),
+    );
+
+    render(<Chat />);
+    await waitFor(() => expect(dmBodies).toEqual([JSON.stringify({ kind: 'dm', dm_user_id: 'u_bob' })]));
+    await waitFor(() => expect(window.location.hash).toBe('#room=rm_dm'));
+  });
+
   it('aborts and deletes a staged attachment removed while its upload is still in flight', async () => {
     let resolveUpload!: (res: Response) => void;
     let uploadSignal: AbortSignal | undefined;
@@ -532,6 +578,7 @@ describe('Native Chat page', () => {
 
     render(<Chat />);
     await screen.findByRole('heading', { name: 'Welcome to #general' });
-    expect(window.location.hash).toBe('#room=rm_gen');
+    // The hash is written by an effect after the room renders.
+    await waitFor(() => expect(window.location.hash).toBe('#room=rm_gen'));
   });
 });

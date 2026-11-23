@@ -47,6 +47,11 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
 - KyCalendar meeting sync (`PUT`/`DELETE /api/meetings/{id}`, signed with `KY_MEETING_SYNC_SECRET`)
   creates meeting-scoped rooms with scheduled time windows, attendee resolution, and external
   guest links (`/api/meet/{token}`) gated by an interactive waiting-room lobby.
+- Chat from mail and calendar: `POST /api/suite/chat` (`kypost.chat.open`, `kycalendar.chat.open`)
+  answers a same-org colleague's `#dm=<user id>` link, which the PWA opens as a direct message.
+  Signed suite requests carry `org_id` only in `KY_TENANCY_MODE=multi`, and every event ID is
+  recorded in a shared replay ledger (`suite_replay_events`). Contract:
+  [the tenancy spec §4](superpowers/specs/2026-11-22-tenancy-design.md).
 - Instant meetings (`POST /api/v1/meetings`) and room guest invite links
   (`POST /api/v1/rooms/{id}/meeting/guest-link`) for ad-hoc external calls.
 

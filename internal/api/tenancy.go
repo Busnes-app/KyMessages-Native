@@ -20,6 +20,11 @@ func EnsureTenancyMode(ctx context.Context, st store.Store, cfg config.TenancyCo
 		return nil
 	}
 	want := cfg.EffectiveMode()
+	if want == config.TenancyMulti {
+		if !config.IsCanonicalUUID(strings.TrimSpace(cfg.StaffOrgID)) {
+			return fmt.Errorf("KY_STAFF_ORG_ID must be a canonical lowercase UUID when KY_TENANCY_MODE=multi")
+		}
+	}
 	stored, err := st.Settings().GetSetting(ctx, store.TenancyModeSettingKey)
 	if errors.Is(err, store.ErrNotFound) {
 		if want == config.TenancyMulti {
@@ -31,7 +36,13 @@ func EnsureTenancyMode(ctx context.Context, st store.Store, cfg config.TenancyCo
 				return fmt.Errorf("this database already holds single-tenant rooms or accounts; refusing to lock it to KY_TENANCY_MODE=multi (start it with single, or use a fresh database)")
 			}
 		}
-		return st.Settings().SetSetting(ctx, store.TenancyModeSettingKey, want)
+		if err := st.Settings().SetSetting(ctx, store.TenancyModeSettingKey, want); err != nil {
+			return err
+		}
+		if want == config.TenancyMulti {
+			return st.Settings().SetSetting(ctx, store.TenancyStaffOrgSettingKey, strings.TrimSpace(cfg.StaffOrgID))
+		}
+		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("read %s: %w", store.TenancyModeSettingKey, err)
@@ -39,6 +50,31 @@ func EnsureTenancyMode(ctx context.Context, st store.Store, cfg config.TenancyCo
 	stored = strings.ToLower(strings.TrimSpace(stored))
 	if stored != want {
 		return fmt.Errorf("database tenancy mode is %q; refusing to start with KY_TENANCY_MODE=%q", stored, want)
+	}
+	if want == config.TenancyMulti {
+		// KyIdentity's org IDs are canonical UUIDs, and lifecycle events and directory sync
+		// refuse anything else, so an account bound to another org ID could never be
+		// suspended or offboarded. Refuse to serve it.
+		ids, err := st.Chat().OrgIDs(ctx)
+		if err != nil {
+			return fmt.Errorf("check org IDs: %w", err)
+		}
+		for _, id := range ids {
+			if !config.IsCanonicalUUID(id) {
+				return fmt.Errorf("database binds org %q, which is not a canonical lowercase UUID; KyIdentity could never suspend or offboard it, so refusing to start", id)
+			}
+		}
+		wantStaff := strings.TrimSpace(cfg.StaffOrgID)
+		storedStaff, err := st.Settings().GetSetting(ctx, store.TenancyStaffOrgSettingKey)
+		if errors.Is(err, store.ErrNotFound) {
+			return st.Settings().SetSetting(ctx, store.TenancyStaffOrgSettingKey, wantStaff)
+		}
+		if err != nil {
+			return fmt.Errorf("read %s: %w", store.TenancyStaffOrgSettingKey, err)
+		}
+		if strings.TrimSpace(storedStaff) != wantStaff {
+			return fmt.Errorf("database staff org is %q; refusing to start with KY_STAFF_ORG_ID=%q", storedStaff, wantStaff)
+		}
 	}
 	return nil
 }

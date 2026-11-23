@@ -39,16 +39,16 @@ func TestOrgSuspensionRetriesFailedRevocation(t *testing.T) {
 	sessions := &flakySessions{SessionStore: d.st.Sessions()}
 	d.client = sso.NewKyIdentityClient(config.SSOConfig{KyIdentityHMACSecret: webhookSecret}, flakyStore{Store: d.st, sessions: sessions})
 	d.client.SetTenancy(config.TenancyConfig{Mode: config.TenancyMulti})
-	if _, err := d.st.Chat().EnsureTenant(ctx, "org-x"); err != nil {
+	if _, err := d.st.Chat().EnsureTenant(ctx, "00000000-0000-4000-8000-0000000000f1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.st.Users().CreateUser(ctx, &store.User{ID: "u_x", Username: "ux", Role: "user", Status: "active", OrgID: "org-x"}); err != nil {
+	if err := d.st.Users().CreateUser(ctx, &store.User{ID: "u_x", Username: "ux", Role: "user", Status: "active", OrgID: "00000000-0000-4000-8000-0000000000f1"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := d.st.Sessions().CreateSession(ctx, &store.Session{TokenHash: "sess-x", UserID: "u_x", CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)}, ""); err != nil {
 		t.Fatal(err)
 	}
-	body := []byte(`{"org_id":"org-x","revision":1}`)
+	body := []byte(`{"org_id":"00000000-0000-4000-8000-0000000000f1","revision":1}`)
 
 	sessions.fail.Store(true)
 	if err := d.sendID("evt-suspend", "org.suspended", body); err == nil {
@@ -77,10 +77,10 @@ func TestOrgSuspensionRetriesFailedPublication(t *testing.T) {
 		published++
 		return nil
 	})
-	if _, err := d.st.Chat().EnsureTenant(ctx, "org-y"); err != nil {
+	if _, err := d.st.Chat().EnsureTenant(ctx, "00000000-0000-4000-8000-0000000000f2"); err != nil {
 		t.Fatal(err)
 	}
-	body := []byte(`{"org_id":"org-y","revision":1}`)
+	body := []byte(`{"org_id":"00000000-0000-4000-8000-0000000000f2","revision":1}`)
 	down.Store(true)
 	if err := d.sendID("evt-y", "org.suspended", body); err == nil {
 		t.Fatal("suspension acknowledged although its revocation was never published")
