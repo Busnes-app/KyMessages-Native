@@ -142,3 +142,19 @@ round trip, wrong-service/key/threshold refusals, restored-grant invalidation, a
 restoration, and cleanup on failed preparation. `backup-drill` validates capsule sealing and
 restore readiness with a disposable key; a periodic controlled restore using real custodian cards
 remains an operator responsibility.
+
+### Hosted storage-report sequence reconciliation
+
+After restoring PostgreSQL, a stale KyIdentity storage response records `pool_required_seq`
+and fences new attachment uploads. Stop every replica and reconcile the restored attachment
+usage against the intended database before advancing any sequence. Inspect:
+
+```sql
+SELECT id, pool_seq, pool_required_seq FROM tenants WHERE pool_required_seq > 0;
+```
+
+For each verified restored org, explicitly set `pool_seq` to at least the inspected
+`pool_required_seq` and clear `pool_required_seq`; keep `pool_ceiling_bytes` and
+`pool_expires_at` NULL. Then restart every replica. Its next report has a higher sequence and
+must obtain a fresh grant before uploads resume. A stale or isolated replica must remain
+stopped: automatic sequence advancement could overwrite a newer writer's usage.

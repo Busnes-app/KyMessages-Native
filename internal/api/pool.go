@@ -33,7 +33,7 @@ const (
 	// poolSyncTimeout bounds the report an upload makes when its org has no usable grant.
 	poolSyncTimeout = 5 * time.Second
 	// maxPoolTTL caps the grant lifetime this app accepts.
-	maxPoolTTL = time.Hour
+	maxPoolTTL = 15 * time.Minute
 )
 
 var errPoolOff = errors.New("pool: KyIdentity suite directory not configured")
@@ -128,6 +128,7 @@ func isLoopbackHost(h string) bool { return h == "127.0.0.1" || h == "::1" || h 
 // as KyIdentity requires.
 func (s *Server) reportPool(ctx context.Context, usages []store.PoolUsage) error {
 	chat := s.store.Chat()
+	var blocked []error
 	for len(usages) > 0 {
 		batch := usages[:min(len(usages), poolReportBatch)]
 		usages = usages[len(batch):]
@@ -135,11 +136,18 @@ func (s *Server) reportPool(ctx context.Context, usages []store.PoolUsage) error
 		used := make(map[string]int64, len(batch))
 		for _, u := range batch {
 			seq, now, err := chat.NextPoolReport(ctx, u.TenantID)
+			if errors.Is(err, store.ErrPoolUnavailable) {
+				blocked = append(blocked, err)
+				continue
+			}
 			if err != nil {
 				return err
 			}
 			reports = append(reports, poolReport{OrgID: u.TenantID, UsedBytes: now, Seq: seq, WantBytes: poolWantBytes})
 			used[u.TenantID] = now
+		}
+		if len(reports) == 0 {
+			continue
 		}
 		sentAt := time.Now()
 		results, err := s.postPoolReports(ctx, reports)
@@ -159,9 +167,10 @@ func (s *Server) reportPool(ctx context.Context, usages []store.PoolUsage) error
 				}
 				err = chat.SetPoolGrant(ctx, rep.OrgID, rep.Seq, used[rep.OrgID], r.CeilingBytes, sentAt.Add(ttl).UnixMilli())
 			case "stale":
-				// KyIdentity holds a later report (a restored database rewound ours): move past it,
-				// keep no grant from it, and report again.
-				err = chat.RaisePoolSeq(ctx, rep.OrgID, r.Seq)
+				// A newer writer or restored database needs explicit operator reconciliation.
+				// Never jump past that writer automatically or keep a restored grant usable.
+				err = chat.RecordStalePoolReport(ctx, rep.OrgID, rep.Seq, r.Seq)
+				log.Printf("[POOL] ALERT: report sequence requires offline operator reconciliation")
 			case "unknown_org":
 				// Not a pool member KyIdentity knows: nothing may be added until it is.
 				err = chat.SetPoolGrant(ctx, rep.OrgID, rep.Seq, used[rep.OrgID], 0, sentAt.Add(15*time.Minute).UnixMilli())
@@ -171,7 +180,7 @@ func (s *Server) reportPool(ctx context.Context, usages []store.PoolUsage) error
 			}
 		}
 	}
-	return nil
+	return errors.Join(blocked...)
 }
 
 // RefreshPool is the leased reporter's tick: it reports each customer org whose usage changed,

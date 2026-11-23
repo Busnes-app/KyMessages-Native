@@ -290,6 +290,7 @@ ALTER TABLE mfa_challenges ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';`,
 
 const tenantPoolSchema = `
 ALTER TABLE tenants ADD COLUMN pool_seq BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE tenants ADD COLUMN pool_required_seq BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE tenants ADD COLUMN pool_ceiling_bytes BIGINT;
 ALTER TABLE tenants ADD COLUMN pool_expires_at BIGINT;
 ALTER TABLE tenants ADD COLUMN pool_reported_bytes BIGINT;

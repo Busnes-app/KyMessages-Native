@@ -74,9 +74,13 @@ func (c *chatStore) NextPoolReport(ctx context.Context, tenantID string) (seq, u
 		return 0, 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	err = tx.QueryRowContext(ctx, c.store.rebind(`UPDATE tenants SET pool_seq = pool_seq + 1 WHERE id = ? RETURNING pool_seq`), tenantID).Scan(&seq)
+	var required int64
+	err = tx.QueryRowContext(ctx, c.store.rebind(`UPDATE tenants SET pool_seq = CASE WHEN pool_required_seq = 0 THEN pool_seq + 1 ELSE pool_seq END WHERE id = ? RETURNING pool_seq, pool_required_seq`), tenantID).Scan(&seq, &required)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, 0, ErrNotFound
+	}
+	if err == nil && required != 0 {
+		return 0, 0, ErrPoolUnavailable
 	}
 	if err != nil {
 		return 0, 0, err
@@ -94,13 +98,21 @@ func (c *chatStore) NextPoolReport(ctx context.Context, tenantID string) (seq, u
 // numbered since (its answer, not this one, is current).
 func (c *chatStore) SetPoolGrant(ctx context.Context, tenantID string, seq, reportedBytes, ceilingBytes, expiresAtMs int64) error {
 	_, err := c.store.db.ExecContext(ctx, c.store.rebind(`UPDATE tenants SET pool_reported_bytes = ?, pool_ceiling_bytes = ?, pool_expires_at = ?
-WHERE id = ? AND pool_seq = ?`), reportedBytes, ceilingBytes, expiresAtMs, tenantID, seq)
+WHERE id = ? AND pool_seq = ? AND pool_required_seq = 0`), reportedBytes, ceilingBytes, expiresAtMs, tenantID, seq)
 	return err
 }
 
-// RaisePoolSeq moves tenantID's sequence up to seq (KyIdentity holds a higher one, as after a
-// database restore), so the next report applies.
+// RecordStalePoolReport fences growth after sequence rewind without following the newer writer.
+func (c *chatStore) RecordStalePoolReport(ctx context.Context, tenantID string, sentSeq, heldSeq int64) error {
+	if heldSeq < sentSeq {
+		return ErrInvalidInput
+	}
+	_, err := c.store.db.ExecContext(ctx, c.store.rebind(`UPDATE tenants SET pool_required_seq = ?, pool_ceiling_bytes = NULL, pool_expires_at = NULL WHERE id = ? AND pool_seq = ?`), heldSeq, tenantID, sentSeq)
+	return err
+}
+
+// RaisePoolSeq is an explicit offline operator reconciliation, never an automatic reporter action.
 func (c *chatStore) RaisePoolSeq(ctx context.Context, tenantID string, seq int64) error {
-	_, err := c.store.db.ExecContext(ctx, c.store.rebind(`UPDATE tenants SET pool_seq = ? WHERE id = ? AND pool_seq < ?`), seq, tenantID, seq)
+	_, err := c.store.db.ExecContext(ctx, c.store.rebind(`UPDATE tenants SET pool_seq = CASE WHEN pool_seq < ? THEN ? ELSE pool_seq END, pool_required_seq = 0 WHERE id = ? AND pool_required_seq <= ?`), seq, seq, tenantID, seq)
 	return err
 }

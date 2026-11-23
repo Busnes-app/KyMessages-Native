@@ -392,6 +392,7 @@ type ChatStore interface {
 	PoolUsages(ctx context.Context, nowMs int64, tenantID string) ([]PoolUsage, error)
 	NextPoolReport(ctx context.Context, tenantID string) (seq, used int64, err error)
 	SetPoolGrant(ctx context.Context, tenantID string, seq, reportedBytes, ceilingBytes, expiresAtMs int64) error
+	RecordStalePoolReport(ctx context.Context, tenantID string, sentSeq, heldSeq int64) error
 	RaisePoolSeq(ctx context.Context, tenantID string, seq int64) error
 	// AttachmentTenant returns the org of the attachment stored under blobKey.
 	AttachmentTenant(ctx context.Context, blobKey string) (string, error)

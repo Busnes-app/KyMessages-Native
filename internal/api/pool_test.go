@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -224,8 +225,8 @@ func TestPoolConcurrentUploadsOnTwoReplicas(t *testing.T) {
 	}
 }
 
-// The reporter sends absolute totals with a sequence that only rises, follows KyIdentity past a
-// stale sequence (a restored database), and holds no grant for an org KyIdentity does not know.
+// The reporter sends absolute totals and fences stale sequences until explicit operator
+// reconciliation; an org KyIdentity does not know receives no growth grant.
 func TestPoolReporter(t *testing.T) {
 	e := newPoolEnv(t)
 	ctx := context.Background()
@@ -253,19 +254,33 @@ func TestPoolReporter(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantPool(t, e.upload(t, e.a, 8000), http.StatusRequestEntityTooLarge, "org_storage_full", "upload after a mismatched answer")
-	// stale: the next sequence starts above KyIdentity's.
+	// Stale reports fence growth and do not follow the newer writer automatically.
 	e.pool.mu.Lock()
 	e.pool.answer, e.pool.staleSeq = "stale", 1000
 	e.pool.mu.Unlock()
 	if err := e.a.RefreshPool(ctx, time.Now().Add(6*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
+	n = len(e.pool.reports)
 	e.pool.set("", 4096)
+	for range 3 {
+		if err := e.a.RefreshPool(ctx, time.Now().Add(6*time.Minute)); !errors.Is(err, store.ErrPoolUnavailable) {
+			t.Fatalf("stale sequence did not pause reporting: %v", err)
+		}
+	}
+	if len(e.pool.reports) != n {
+		t.Fatal("restored writer kept advancing automatically")
+	}
+	wantPool(t, e.upload(t, e.a, 10), http.StatusServiceUnavailable, "pool_unavailable", "upload before operator reconciliation")
+	// The offline restore procedure explicitly advances the sequence after reconciling usage.
+	if err := e.st.Chat().RaisePoolSeq(ctx, replicaOrgA, 1000); err != nil {
+		t.Fatal(err)
+	}
 	if err := e.a.RefreshPool(ctx, time.Now().Add(6*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if seq := e.pool.reports[len(e.pool.reports)-1]["seq"].(float64); seq <= 1000 {
-		t.Fatalf("seq after stale = %v, want above 1000", seq)
+		t.Fatalf("reconciled sequence %v", seq)
 	}
 	// unknown_org: nothing may be added.
 	e.pool.set("unknown_org", 0)

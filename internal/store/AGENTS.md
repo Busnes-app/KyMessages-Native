@@ -107,7 +107,7 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
 - Migration 59 adds the org storage pool to `tenants`: `pool_seq` (each report's sequence,
   `NextPoolReport`, which takes it and the usage snapshot in one transaction, so it rises across replicas and a later sequence never carries an older total), and KyIdentity's latest grant
   (`pool_ceiling_bytes`, `pool_expires_at` in Unix ms, `pool_reported_bytes`). `SetPoolGrant`
-  applies only to the latest numbered report; `RaisePoolSeq` follows a higher stale sequence.
+  applies only to the latest numbered report; a stale response records `pool_required_seq`, invalidates growth grants and pauses reports for that org. Only explicit offline operator reconciliation (`RaisePoolSeq`) releases it; the reporter never follows a newer writer automatically.
   With `AttachmentQuotaLimits.Pool`, `ReserveAttachmentQuota` and `CommitAttachmentWithQuota`
   check the org's usage plus the new bytes against the unexpired ceiling under the tenant lock:
   `ErrPoolFull`, or `ErrPoolUnavailable` with no grant or an expired one. Single mode never sets
