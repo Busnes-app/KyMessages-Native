@@ -28,7 +28,7 @@ const (
 )
 
 // newReplicas starts two multi-mode servers on one database, as two replicas would run.
-func newReplicas(t *testing.T) (a, b *api.Server, st store.Store, cfg *config.Config) {
+func newReplicas(t *testing.T, opts ...func(*config.Config)) (a, b *api.Server, st store.Store, cfg *config.Config) {
 	t.Helper()
 	db := testdb.Config(t)
 	cfg = &config.Config{
@@ -38,6 +38,9 @@ func newReplicas(t *testing.T) (a, b *api.Server, st store.Store, cfg *config.Co
 		SSO:      config.SSOConfig{KyIdentityHMACSecret: testMultiTenantHMAC},
 		RTC:      config.RTCConfig{MeetingSyncSecret: testMultiTenantHMAC},
 		Tenancy:  config.TenancyConfig{Mode: config.TenancyMulti, StaffOrgID: testStaffOrg},
+	}
+	for _, o := range opts {
+		o(cfg)
 	}
 	open := func() (*api.Server, store.Store) {
 		s, err := store.Open(context.Background(), db)

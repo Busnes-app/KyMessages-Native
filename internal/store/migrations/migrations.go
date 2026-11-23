@@ -284,7 +284,17 @@ ALTER TABLE mfa_challenges ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';`,
 	{Version: 57, Name: "shared_limits", SQLite: sharedLimitsSchema, Postgres: sharedLimitsSchema},
 	// Meeting guest lobby sessions shared by every replica (multi mode).
 	{Version: 58, Name: "meeting_guest_sessions", SQLite: guestSessionsSchema, Postgres: guestSessionsSchema},
+	// The org storage pool (multi mode): each org's report sequence and KyIdentity's latest grant.
+	{Version: 59, Name: "tenant_storage_pool", SQLite: tenantPoolSchema, Postgres: tenantPoolSchema},
 }
+
+const tenantPoolSchema = `
+ALTER TABLE tenants ADD COLUMN pool_seq BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE tenants ADD COLUMN pool_required_seq BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE tenants ADD COLUMN pool_ceiling_bytes BIGINT;
+ALTER TABLE tenants ADD COLUMN pool_expires_at BIGINT;
+ALTER TABLE tenants ADD COLUMN pool_reported_bytes BIGINT;
+`
 
 const sharedLimitsSchema = `
 CREATE TABLE attempt_counters (

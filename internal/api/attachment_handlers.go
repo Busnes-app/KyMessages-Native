@@ -119,6 +119,10 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 	limits := store.AttachmentQuotaLimits{
 		MaxTotalBytes:       s.maxTotalAttachmentBytes(),
 		MaxPendingUserBytes: s.maxPendingUserBytes(),
+		Pool:                s.poolActive(tenantID),
+	}
+	if s.config.Tenancy.IsMultiTenant() {
+		limits.MaxTotalBytes = 0 // the org pool replaces the install-wide per-tenant cap
 	}
 
 	// Extend read deadline for larger uploads on real connections; ignored on httptest recorders.
@@ -164,8 +168,27 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 	if r.ContentLength > 0 && r.ContentLength < requestedBytes {
 		requestedBytes = r.ContentLength
 	}
-	res, err := s.store.Chat().ReserveAttachmentQuota(r.Context(), tenantID, user.ID, requestedBytes, limits, attachmentUploadDeadline(maxBytes)+time.Minute)
+	reserve := func() (*store.AttachmentQuotaReservation, error) {
+		return s.store.Chat().ReserveAttachmentQuota(r.Context(), tenantID, user.ID, requestedBytes, limits, attachmentUploadDeadline(maxBytes)+time.Minute)
+	}
+	res, err := reserve()
+	// No usable grant, or less of it than this upload may need: report the org once and look
+	// again (a short reservation is released first, so the report does not count it). The
+	// attempt limit keeps a full org from turning every upload into a KyIdentity call.
+	short := err == nil && res.LimitingKind == store.AttachmentQuotaLimitPool
+	if (short || errors.Is(err, store.ErrPoolUnavailable) || errors.Is(err, store.ErrPoolFull)) &&
+		s.allowAccountAttempt("pool-sync:"+tenantID, 6, time.Minute) {
+		if short {
+			_ = s.store.Chat().ReleaseAttachmentQuota(r.Context(), tenantID, res.ID)
+		}
+		if rerr := s.refreshOrgPool(r.Context(), tenantID); rerr == nil || short {
+			res, err = reserve()
+		}
+	}
 	if err != nil {
+		if s.writePoolError(w, err) {
+			return
+		}
 		switch {
 		case errors.Is(err, store.ErrAttachmentTenantQuotaExceeded):
 			s.writeError(w, http.StatusRequestEntityTooLarge, "Workspace attachment storage quota exceeded")
@@ -199,6 +222,8 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 	if err != nil {
 		var maxErr *http.MaxBytesError
 		switch {
+		case (errors.Is(err, blobs.ErrTooLarge) || errors.As(err, &maxErr)) && res.LimitingKind == store.AttachmentQuotaLimitPool:
+			s.writePoolError(w, store.ErrPoolFull)
 		case errors.Is(err, blobs.ErrTooLarge) || errors.As(err, &maxErr):
 			s.writeError(w, http.StatusRequestEntityTooLarge, quotaErrMsg)
 		case errors.Is(err, blobs.ErrEmpty):
@@ -222,6 +247,9 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 	}
 	if err := s.store.Chat().CommitAttachmentWithQuota(r.Context(), res.ID, att, limits); err != nil {
 		_ = s.blobs.Delete(tenantID, putRes.Key)
+		if s.writePoolError(w, err) {
+			return
+		}
 		switch {
 		case errors.Is(err, store.ErrAttachmentTenantQuotaExceeded):
 			s.writeError(w, http.StatusRequestEntityTooLarge, "Workspace attachment storage quota exceeded")

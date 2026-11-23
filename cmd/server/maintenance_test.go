@@ -131,3 +131,19 @@ func TestLoopsSkipWithoutTheLease(t *testing.T) {
 	<-done1
 	<-done2
 }
+
+func TestPoolLoopRunsUnderItsLease(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	called := make(chan string, 1)
+	done := make(chan struct{})
+	gate := func(_ context.Context, job string, every time.Duration) bool {
+		called <- job
+		return false
+	}
+	go poolLoop(ctx, func(context.Context, time.Time) error { t.Error("report ran without the lease"); return nil }, gate, done)
+	if job := <-called; job != "pool_report" {
+		t.Fatalf("lease %q", job)
+	}
+	cancel()
+	<-done
+}

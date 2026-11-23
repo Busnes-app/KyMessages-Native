@@ -26,7 +26,11 @@ var (
 	ErrAttachmentInvalid              = errors.New("attachment not found, not owned by sender, or already attached")
 	ErrAttachmentTenantQuotaExceeded  = errors.New("workspace attachment storage quota exceeded")
 	ErrAttachmentPendingQuotaExceeded = errors.New("pending attachment quota exceeded")
-	ErrForbidden                      = errors.New("forbidden")
+	// ErrPoolFull: the write would pass the org's storage-pool grant.
+	ErrPoolFull = errors.New("org storage pool grant exceeded")
+	// ErrPoolUnavailable: the org holds no unexpired storage-pool grant.
+	ErrPoolUnavailable = errors.New("org storage pool grant unknown or expired")
+	ErrForbidden       = errors.New("forbidden")
 )
 
 // Store defines the unified storage contract implemented across SQLite, PostgreSQL, and MySQL.
@@ -384,6 +388,12 @@ type ChatStore interface {
 	SumAttachmentBytesByTenant(ctx context.Context, tenantID string) (int64, error)
 	SumPendingAttachmentBytesByUploader(ctx context.Context, tenantID, uploaderID string) (int64, error)
 	PurgeOrphanAttachments(ctx context.Context, olderThanMilli int64, limit int) ([]BlobRef, error)
+	// Org storage pool (multi mode, pool.go).
+	PoolUsages(ctx context.Context, nowMs int64, tenantID string) ([]PoolUsage, error)
+	NextPoolReport(ctx context.Context, tenantID string) (seq, used int64, err error)
+	SetPoolGrant(ctx context.Context, tenantID string, seq, reportedBytes, ceilingBytes, expiresAtMs int64) error
+	RecordStalePoolReport(ctx context.Context, tenantID string, sentSeq, heldSeq int64) error
+	RaisePoolSeq(ctx context.Context, tenantID string, seq int64) error
 	// AttachmentTenant returns the org of the attachment stored under blobKey.
 	AttachmentTenant(ctx context.Context, blobKey string) (string, error)
 
