@@ -108,7 +108,6 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
       await deleteCryptoStore(userId);
       e = await CryptoEngine.open(userId, httpKeyServer, await openCryptoStore(userId));
     }
-    e.setMembershipLive(membershipLive);
     void retireAbandoned(userId).catch(() => undefined);
     e.onKeys(() => {
       for (const fn of keyListeners) fn();
@@ -151,17 +150,9 @@ export function receiveRoomKeys(): void {
   void engine().then((e) => e.receive()).catch(() => undefined);
 }
 
-let membershipLive = false;
-
-/** Tells the device whether membership events are arriving (the chat WebSocket is live). */
-export function setMembershipLive(live: boolean): void {
-  membershipLive = live;
-  void current?.engine.then((e) => e.setMembershipLive(live)).catch(() => undefined);
-}
-
-/** Lists the room's devices again before the next send; rotates its session when someone left. */
-export function roomMembershipChanged(roomId: string, someoneLeft: boolean): void {
-  void engine().then((e) => e.membershipChanged(roomId, someoneLeft)).catch(() => undefined);
+/** Starts a new room session when someone left or was removed, so they never get its key. */
+export function roomMemberLeft(roomId: string): void {
+  void engine().then((e) => e.memberLeft(roomId)).catch(() => undefined);
 }
 
 /** The reason shown while this browser's device could not start; such messages are retried. */

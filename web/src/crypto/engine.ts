@@ -17,8 +17,6 @@ import type { CryptoStore } from './store';
 export const ROOM_KEY_TYPE = 'kymessages.room_key.v1';
 export const ROTATE_AFTER_MESSAGES = 100;
 export const ROTATE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
-// Members' devices are listed again after this long, or at once after a membership change.
-const DEVICE_LIST_TTL_MS = 5 * 60 * 1000;
 const BATCH = 100;
 const MAILBOX_PAGE = 100;
 const DEVICE_ID = /^[A-Za-z0-9_-]{8,64}$/;
@@ -234,10 +232,6 @@ function withLock<T>(name: string, fn: () => Promise<T>): Promise<T> {
 
 export class CryptoEngine {
   private readonly listeners = new Set<(sessionIds: string[]) => void>();
-  private readonly roomDevices = new Map<string, { at: number; members: string[]; devices: Target[] }>();
-  // Device lists are cached only while membership events can reach this tab (its WebSocket is
-  // live); otherwise a removal could be missed and the removed member keep getting the key.
-  private membershipLive = true;
 
   private constructor(
     readonly userId: string,
@@ -395,33 +389,23 @@ export class CryptoEngine {
     return out;
   }
 
+  /**
+   * The room's members and their verified devices, looked up afresh for every send: a cached
+   * list would miss a member's new device (which could then never read what is sent meanwhile)
+   * and could outlive a removal (whose member would keep getting keys). Two small requests per
+   * send buy both.
+   */
   private async devicesInRoom(roomId: string): Promise<{ members: string[]; devices: Target[] }> {
-    const cached = this.roomDevices.get(roomId);
-    if (cached && this.membershipLive && Date.now() - cached.at < DEVICE_LIST_TTL_MS) return cached;
     const members = [...new Set(await this.server.roomMembers(roomId))];
-    const entry = { at: Date.now(), members, devices: await this.verifiedDevices(members) };
-    if (this.membershipLive) this.roomDevices.set(roomId, entry);
-    return entry;
+    return { members, devices: await this.verifiedDevices(members) };
   }
 
   /**
-   * Says whether membership events are reaching this tab. While they are not (the WebSocket is
-   * down or reconnecting) every send lists members again, and losing the connection drops what
-   * was cached, so a removal missed meanwhile still rotates the session on the next send.
+   * Call when someone leaves or is removed: the room's session is dropped, so the next message
+   * starts a new one they never receive. (A send that finds a sharer gone rotates anyway.)
    */
-  setMembershipLive(live: boolean): void {
-    if (!live) this.roomDevices.clear();
-    this.membershipLive = live;
-  }
-
-  /**
-   * Call on any membership change. Devices are listed again before the next send; when someone
-   * left or was removed the room's session is also dropped, so the next message starts a new
-   * one they never receive.
-   */
-  async membershipChanged(roomId: string, someoneLeft: boolean): Promise<void> {
-    this.roomDevices.delete(roomId);
-    if (someoneLeft) await this.locked(() => this.store.write([], [`out:${roomId}`]));
+  async memberLeft(roomId: string): Promise<void> {
+    await this.locked(() => this.store.write([], [`out:${roomId}`]));
   }
 
   // --- Olm ---

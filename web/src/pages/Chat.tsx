@@ -87,7 +87,7 @@ import { MessageRow } from '../components/chat/MessageRow';
 import { RoomDetailsDrawer, type DrawerTab } from '../components/chat/RoomDetailsDrawer';
 import { CreateChannelModal, SearchModal, StartDMModal } from '../components/chat/ChatModals';
 import { searchIndexFor } from '../chat/searchIndex';
-import { onRoomKeys, openMessages, receiveRoomKeys, roomMembershipChanged, setMembershipLive, startE2EE, UNAVAILABLE } from '../chat/e2ee';
+import { onRoomKeys, openMessages, receiveRoomKeys, roomMemberLeft, startE2EE, UNAVAILABLE } from '../chat/e2ee';
 import { CallAudioLayer, CallStage } from '../components/chat/CallStage';
 import { HybridCallController, type HybridCallSnapshot } from '../rtc/hybridCall';
 
@@ -738,8 +738,8 @@ export const Chat: React.FC<ChatProps> = ({
         }
         case 'room.member': {
           const self = event.userId === currentUserRef.current?.id;
-          // The next message lists the room's devices again; a departure also starts a new session.
-          if (event.action !== 'role') roomMembershipChanged(event.roomId, event.action === 'removed');
+          // Every send lists the room's devices afresh; a departure also starts a new session.
+          if (event.action === 'removed') roomMemberLeft(event.roomId);
           if (self && event.action === 'removed') {
             setRooms((prev) => prev.filter((r) => r.id !== event.roomId));
             if (activeRoomIdRef.current === event.roomId) {
@@ -933,8 +933,6 @@ export const Chat: React.FC<ChatProps> = ({
 
     const sock = new ChatSocket({
       onStatus: (status) => {
-        // Membership events arrive only over a live socket; without one, encryption re-lists members.
-        setMembershipLive(status === 'live');
         if (!cancelled) setWsStatus(status);
       },
       onEvent: (ev) => {

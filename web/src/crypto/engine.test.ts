@@ -152,7 +152,7 @@ describe('encrypted rooms between two client engines', () => {
     expect(await read(carol, before)).toBe('all three');
 
     server.leave('r1', 'u_carol');
-    await alice.membershipChanged('r1', true);
+    await alice.memberLeft('r1');
     const after = await send('r1', alice, 'carol is gone');
     expect(parseEnvelope(after.body)!.session_id).not.toBe(parseEnvelope(before.body)!.session_id);
     await bob.receive();
@@ -168,43 +168,53 @@ describe('encrypted rooms between two client engines', () => {
     server.join('r1', 'u_alice', 'u_bob');
     const before = await send('r1', alice, 'one');
     server.leave('r1', 'u_bob');
-    await alice.membershipChanged('r1', false); // only a refresh, as after a missed event
     const after = await send('r1', alice, 'two');
     expect(parseEnvelope(after.body)!.session_id).not.toBe(parseEnvelope(before.body)!.session_id);
   });
 
-  it('rotates after a removal missed while the connection was down', async () => {
+  it('discards a member list made stale by a removal during device discovery', async () => {
     const server = new FakeKeyServer();
-    const alice = await device(server, 'u_alice');
+    const aliceServer = server.as('u_alice');
+    const alice = await CryptoEngine.open('u_alice', aliceServer, await openCryptoStore('u_alice'));
+    opened.push(alice);
     const bob = await device(server, 'u_bob');
     const carol = await device(server, 'u_carol');
     server.join('r1', 'u_alice', 'u_bob', 'u_carol');
-    const before = await send('r1', alice, 'all three');
-    // The socket drops; carol is removed meanwhile and the room.member event never arrives.
-    alice.setMembershipLive(false);
+    // The room's first send discovers its devices slowly; carol is removed while that is in flight.
+    const query = aliceServer.query;
+    let unblock: (() => void) | undefined;
+    aliceServer.query = (ids) => new Promise((resolve) => { unblock = () => void query(ids).then(resolve); });
+    const inFlight = alice.encrypt('r1', { type: 'text', body: 'racing the removal' });
+    await vi.waitFor(() => expect(unblock).toBeDefined());
     server.leave('r1', 'u_carol');
-    // Reconnected well inside the device-list cache's lifetime.
-    alice.setMembershipLive(true);
+    const left = alice.memberLeft('r1');
+    unblock!();
+    await inFlight;
+    await left;
+    aliceServer.query = query;
+    // Every later message is sealed under a session carol never receives.
     const after = await send('r1', alice, 'carol is gone');
-    expect(parseEnvelope(after.body)!.session_id).not.toBe(parseEnvelope(before.body)!.session_id);
     await bob.receive();
     await carol.receive();
     expect(await read(bob, after)).toBe('carol is gone');
     expect(await read(carol, after)).toBe('waiting');
+    const later = await send('r1', alice, 'still gone');
+    await carol.receive();
+    expect(await read(carol, later)).toBe('waiting');
   });
 
-  it('lists members again for every send while the connection is down', async () => {
+  it('shares the key with a member’s new device on the very next send', async () => {
     const server = new FakeKeyServer();
     const alice = await device(server, 'u_alice');
-    const carol = await device(server, 'u_carol');
-    server.join('r1', 'u_alice', 'u_carol');
-    alice.setMembershipLive(false);
-    const before = await send('r1', alice, 'one');
-    server.leave('r1', 'u_carol');
-    const after = await send('r1', alice, 'two');
-    expect(parseEnvelope(after.body)!.session_id).not.toBe(parseEnvelope(before.body)!.session_id);
-    await carol.receive();
-    expect(await read(carol, after)).toBe('waiting');
+    await device(server, 'u_bob');
+    server.join('r1', 'u_alice', 'u_bob');
+    await send('r1', alice, 'before');
+    // Bob signs in on a second browser; no event tells alice.
+    const laptop = await CryptoEngine.open('u_bob', server.as('u_bob'), await openCryptoStore('u_bob_laptop'));
+    opened.push(laptop);
+    const m = await send('r1', alice, 'reaches the laptop');
+    await laptop.receive();
+    expect(await read(laptop, m)).toBe('reaches the laptop');
   });
 
   it('keeps the largest allowed message under the server envelope limit', async () => {
@@ -241,7 +251,6 @@ describe('encrypted rooms between two client engines', () => {
 
     const dave = await device(server, 'u_dave');
     server.join('r1', 'u_dave');
-    await alice.membershipChanged('r1', false);
     const now = await send('r1', alice, 'welcome dave');
     // Same session (a join does not rotate), shared from its current index on.
     expect(parseEnvelope(now.body)!.session_id).toBe(parseEnvelope(old.body)!.session_id);
@@ -291,7 +300,6 @@ describe('encrypted rooms between two client engines', () => {
     await send('r1', alice, 'not for mallory');
     // Bob's forged key was refused, so he gets nothing this time; mallory never does.
     expect(server.sent).toEqual([]);
-    await alice.membershipChanged('r1', false);
     const m2 = await send('r1', alice, 'second try');
     expect(server.sent.map((s) => s.to)).toEqual(['u_bob']);
     await bob.receive();

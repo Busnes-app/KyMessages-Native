@@ -37,8 +37,7 @@ export function resetFakeE2EE(): void {
 
 export const startE2EE = async () => ({});
 export const receiveRoomKeys = () => undefined;
-export const roomMembershipChanged = () => undefined;
-export const setMembershipLive = () => undefined;
+export const roomMemberLeft = () => undefined;
 export const retireDevice = async () => true;
 export const abandonDevice = async () => undefined;
 export const forgetCryptoStore = async () => undefined;
