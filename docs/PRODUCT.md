@@ -24,7 +24,9 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
   Built so far, for multi mode: migrations under a PostgreSQL lock, background jobs leased to one
   replica, secrets every replica shares, the capsule scheduler off in `multi` (PostgreSQL tooling
   backs it up), sign-in limits and proof-of-work shared by every replica, a meeting ID space per
-  org, and meeting guest sessions in PostgreSQL. Calls still need both peers on one replica.
+  org, and meeting guest sessions in PostgreSQL, and attachments stored per org on one shared
+  volume. Calls still need both peers on one replica. Object storage and the org storage pool are
+  not built.
 - **Invite-only:** accounts come from KyIdentity (OIDC + signed directory sync webhooks) or local
   admin provisioning in single-tenant mode. No public sign-up. External guests can join only
   scheduled or instant meeting rooms through time-bounded guest links with host-approved lobby

@@ -2,6 +2,7 @@ package blobs
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -39,10 +40,72 @@ type PutResult struct {
 	MimeType  string
 }
 
+// Backend is what the attachment routes need from blob storage. Every call names the blob's
+// org: a backend with the org layout keeps each org under orgs/<tenant_id>/att/, so one org's
+// blobs are one prefix (DeletePrefix), and a flat backend ignores it.
+type Backend interface {
+	Put(tenantID, key string, r io.Reader, maxBytes int64) (PutResult, error)
+	Open(tenantID, key string) (io.ReadSeekCloser, int64, error)
+	Delete(tenantID, key string) error
+	DeletePrefix(tenantID string) error
+	SweepStaleTemps(olderThan time.Duration) int
+}
+
 // Store persists attachment bytes in a dedicated local directory outside the web root.
-// All file access is confined through os.OpenRoot and strict flat key validation.
+// All file access is confined through os.OpenRoot and strict key validation. Single mode keeps
+// every blob flat in the directory; multi mode (NewOrgStore) uses the org layout.
 type Store struct {
-	dir string
+	dir  string
+	orgs bool
+}
+
+var _ Backend = (*Store)(nil)
+
+// validTenant restricts org directory names (canonical UUIDs, or "default").
+var validTenant = regexp.MustCompile(`^[a-z0-9-]{1,64}$`)
+
+// NewOrgStore is NewStore with the org layout, for multi mode. A read or delete that misses the
+// org path also tries the flat path, always: a replica of an older build may still write flat
+// during a rolling upgrade, and the sweep relocates what it finds (FlatKeys, Relocate).
+func NewOrgStore(dir string) (*Store, error) {
+	s, err := NewStore(dir)
+	if err != nil {
+		return nil, err
+	}
+	s.orgs = true
+	return s, nil
+}
+
+// FlatKeys lists the blob keys stored flat in the directory (org layout: blobs not relocated yet).
+func (s *Store) FlatKeys() ([]string, error) {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return nil, err
+	}
+	var keys []string
+	for _, e := range entries {
+		if e.Type().IsRegular() && ValidKey(e.Name()) {
+			keys = append(keys, e.Name())
+		}
+	}
+	return keys, nil
+}
+
+// OrgLayout reports whether this store keeps each org under its own prefix.
+func (s *Store) OrgLayout() bool { return s.orgs }
+
+// rel is key's path inside the store: flat, or orgs/<tenant>/att/<key>.
+func (s *Store) rel(tenantID, key string) (string, error) {
+	if !ValidKey(key) {
+		return "", ErrInvalidKey
+	}
+	if !s.orgs {
+		return key, nil
+	}
+	if !validTenant.MatchString(tenantID) {
+		return "", ErrInvalidKey
+	}
+	return "orgs/" + tenantID + "/att/" + key, nil
 }
 
 // NewStore creates a Store rooted at dir, creating the directory (0700) if needed
@@ -80,9 +143,10 @@ func ValidKey(key string) bool {
 
 // Put streams r into the store under key, enforcing 1 <= size <= maxBytes, computing SHA-256,
 // sniffing and validating a safe MIME type, and atomically moving the file into place (mode 0600).
-func (s *Store) Put(key string, r io.Reader, maxBytes int64) (PutResult, error) {
-	if !ValidKey(key) {
-		return PutResult{}, ErrInvalidKey
+func (s *Store) Put(tenantID, key string, r io.Reader, maxBytes int64) (PutResult, error) {
+	rel, err := s.rel(tenantID, key)
+	if err != nil {
+		return PutResult{}, err
 	}
 	if maxBytes <= 0 {
 		return PutResult{}, ErrTooLarge
@@ -130,8 +194,11 @@ func (s *Store) Put(key string, r io.Reader, maxBytes int64) (PutResult, error) 
 		return PutResult{}, fmt.Errorf("blobs: close temp file: %w", err)
 	}
 
-	destPath := filepath.Join(s.dir, key)
-	if err := os.Rename(tmpPath, destPath); err != nil {
+	if s.orgs {
+		if err := s.commitOrg(filepath.Base(tmpPath), rel); err != nil {
+			return PutResult{}, err
+		}
+	} else if err := os.Rename(tmpPath, filepath.Join(s.dir, key)); err != nil {
 		return PutResult{}, fmt.Errorf("blobs: commit file: %w", err)
 	}
 	committed = true
@@ -144,10 +211,27 @@ func (s *Store) Put(key string, r io.Reader, maxBytes int64) (PutResult, error) 
 	}, nil
 }
 
+// commitOrg moves a finished temp file into its org directory, inside the root.
+func (s *Store) commitOrg(tmpName, rel string) error {
+	root, err := os.OpenRoot(s.dir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	if err := root.MkdirAll(filepath.Dir(rel), 0o700); err != nil {
+		return fmt.Errorf("blobs: create org directory: %w", err)
+	}
+	if err := root.Rename(tmpName, rel); err != nil {
+		return fmt.Errorf("blobs: commit file: %w", err)
+	}
+	return nil
+}
+
 // Open opens an existing blob strictly confined to the store root directory.
-func (s *Store) Open(key string) (*os.File, int64, error) {
-	if !ValidKey(key) {
-		return nil, 0, ErrInvalidKey
+func (s *Store) Open(tenantID, key string) (io.ReadSeekCloser, int64, error) {
+	rel, err := s.rel(tenantID, key)
+	if err != nil {
+		return nil, 0, err
 	}
 	root, err := os.OpenRoot(s.dir)
 	if err != nil {
@@ -155,7 +239,13 @@ func (s *Store) Open(key string) (*os.File, int64, error) {
 	}
 	defer root.Close()
 
-	f, err := root.Open(key)
+	f, err := root.Open(rel)
+	if errors.Is(err, os.ErrNotExist) && s.orgs {
+		f, err = root.Open(key)
+		if errors.Is(err, os.ErrNotExist) {
+			f, err = root.Open(rel) // relocated between the two opens
+		}
+	}
 	if err != nil {
 		return nil, 0, err
 	}
@@ -172,9 +262,10 @@ func (s *Store) Open(key string) (*os.File, int64, error) {
 }
 
 // Delete removes a blob if present. Missing files are not an error.
-func (s *Store) Delete(key string) error {
-	if !ValidKey(key) {
-		return ErrInvalidKey
+func (s *Store) Delete(tenantID, key string) error {
+	rel, err := s.rel(tenantID, key)
+	if err != nil {
+		return err
 	}
 	root, err := os.OpenRoot(s.dir)
 	if err != nil {
@@ -185,11 +276,56 @@ func (s *Store) Delete(key string) error {
 	}
 	defer root.Close()
 
-	err = root.Remove(key)
+	if s.orgs {
+		// Flat copy first: a relocation that moves the blob between the two removes then finds
+		// no source, and one that moved it earlier left it at rel, which is removed next.
+		if err := root.Remove(key); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	err = root.Remove(rel)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	return err
+}
+
+// DeletePrefix removes every blob of tenantID, orphans included (org layout only; a flat
+// store has no per-org prefix and refuses).
+func (s *Store) DeletePrefix(tenantID string) error {
+	if !s.orgs || !validTenant.MatchString(tenantID) {
+		return ErrInvalidKey
+	}
+	root, err := os.OpenRoot(s.dir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	return root.RemoveAll("orgs/" + tenantID)
+}
+
+// Relocate moves one flat blob to its org path. Renames on one volume are atomic, and a blob
+// already moved (or gone) is not an error, so a rerun after a crash is safe.
+func (s *Store) Relocate(tenantID, key string) error {
+	rel, err := s.rel(tenantID, key)
+	if err != nil || !s.orgs {
+		return ErrInvalidKey
+	}
+	root, err := os.OpenRoot(s.dir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	if _, err := root.Lstat(key); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err := root.MkdirAll(filepath.Dir(rel), 0o700); err != nil {
+		return err
+	}
+	if err := root.Rename(key, rel); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err // gone meanwhile: deleted, nothing to move
+	}
+	return nil
 }
 
 // SweepStaleTemps removes crashed .upload-* temp files older than olderThan inside the store.
@@ -395,4 +531,49 @@ func trimUTF8(s string, maxBytes int) string {
 		n = i
 	}
 	return s[:n]
+}
+
+// storeIDFile names the volume: every replica must find the same ID in its directory as the
+// database records, so a replica on a private disk refuses to start instead of losing blobs.
+const storeIDFile = ".store-id"
+
+// EnsureStoreID reads (or, on an empty volume, creates) the directory's store ID and passes it
+// to claim, which returns the ID the database holds (the first replica's). A mismatch is an
+// error: this directory is not the volume the other replicas share.
+func (s *Store) EnsureStoreID(claim func(id string) (string, error)) error {
+	root, err := os.OpenRoot(s.dir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	raw, err := root.ReadFile(storeIDFile)
+	if errors.Is(err, os.ErrNotExist) {
+		var b [16]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			return err
+		}
+		// Written whole, then linked into place: no replica ever reads a partial ID.
+		tmp := storeIDFile + "." + hex.EncodeToString(b[:4])
+		cerr := root.WriteFile(tmp, []byte(hex.EncodeToString(b[:])), 0o600)
+		if cerr == nil {
+			cerr = root.Link(tmp, storeIDFile)
+		}
+		_ = root.Remove(tmp)
+		if cerr != nil && !errors.Is(cerr, os.ErrExist) {
+			return fmt.Errorf("blobs: write store ID: %w", cerr)
+		}
+		raw, err = root.ReadFile(storeIDFile) // ours, or a replica's that won the create
+	}
+	if err != nil {
+		return fmt.Errorf("blobs: read store ID: %w", err)
+	}
+	id := strings.TrimSpace(string(raw))
+	want, err := claim(id)
+	if err != nil {
+		return fmt.Errorf("blobs: record store ID: %w", err)
+	}
+	if want != id {
+		return errors.New("blobs: KY_ATTACHMENTS_DIR is not the volume the other replicas use (its store ID differs from the database's); mount the shared volume")
+	}
+	return nil
 }

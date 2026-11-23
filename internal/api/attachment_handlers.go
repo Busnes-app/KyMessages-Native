@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"os"
@@ -194,7 +195,7 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 	}
 
 	attID := "att_" + uuid.Must(uuid.NewV7()).String()
-	putRes, err := s.blobs.Put(attID, filePart, res.ReservedBytes)
+	putRes, err := s.blobs.Put(tenantID, attID, filePart, res.ReservedBytes)
 	if err != nil {
 		var maxErr *http.MaxBytesError
 		switch {
@@ -220,7 +221,7 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 		SHA256Hex:  putRes.SHA256Hex,
 	}
 	if err := s.store.Chat().CommitAttachmentWithQuota(r.Context(), res.ID, att, limits); err != nil {
-		_ = s.blobs.Delete(putRes.Key)
+		_ = s.blobs.Delete(tenantID, putRes.Key)
 		switch {
 		case errors.Is(err, store.ErrAttachmentTenantQuotaExceeded):
 			s.writeError(w, http.StatusRequestEntityTooLarge, "Workspace attachment storage quota exceeded")
@@ -296,7 +297,7 @@ func (s *Server) handleChatDownloadAttachment(w http.ResponseWriter, r *http.Req
 		}
 	}
 
-	f, _, err := s.blobs.Open(att.BlobKey)
+	f, _, err := s.blobs.Open(att.TenantID, att.BlobKey)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) || errors.Is(err, blobs.ErrInvalidKey) {
 			s.writeError(w, http.StatusNotFound, "Attachment not found")
@@ -395,7 +396,7 @@ func (s *Server) handleChatDeleteAttachment(w http.ResponseWriter, r *http.Reque
 		}
 		return
 	}
-	_ = s.blobs.Delete(blobKey)
+	_ = s.blobs.Delete(tenantID, blobKey)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -405,6 +406,9 @@ func (s *Server) SweepOrphanAttachments(ctx context.Context, now time.Time) (int
 	if s.blobs == nil {
 		return 0, nil
 	}
+	if err := s.relocateFlatBlobs(ctx); err != nil && ctx.Err() == nil {
+		log.Printf("[ATTACHMENTS] flat blob relocation incomplete (retrying next sweep): %v", err)
+	}
 	cutoff := now.Add(-s.pendingAttachmentTTL()).UnixMilli()
 	deleted := 0
 	for {
@@ -413,7 +417,7 @@ func (s *Server) SweepOrphanAttachments(ctx context.Context, now time.Time) (int
 			return deleted, err
 		}
 		for _, key := range keys {
-			_ = s.blobs.Delete(key)
+			_ = s.blobs.Delete(key.TenantID, key.Key)
 			deleted++
 		}
 		if len(keys) < 200 {
@@ -422,4 +426,43 @@ func (s *Server) SweepOrphanAttachments(ctx context.Context, now time.Time) (int
 	}
 	s.blobs.SweepStaleTemps(time.Hour)
 	return deleted, nil
+}
+
+// sharedBlobVolume makes a multi-mode store prove it is the volume every replica shares.
+func sharedBlobVolume(st store.Store, bs *blobs.Store) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return bs.EnsureStoreID(func(id string) (string, error) {
+		return st.Settings().SetSettingOnce(ctx, "blobs.store_id", id)
+	})
+}
+
+// relocateFlatBlobs moves blobs stored flat (written before the org layout, or by a replica of
+// an older build during a rolling upgrade) to their org paths. It runs on every attachment
+// sweep, under that job's lease; a flat file is cheap to find (the directory's top level), and
+// reads find it meanwhile through the flat fallback. A file with no attachment row (an upload
+// still committing, or an orphan) is left alone.
+func (s *Server) relocateFlatBlobs(ctx context.Context) error {
+	disk, ok := s.blobs.(*blobs.Store)
+	if !ok || !disk.OrgLayout() {
+		return nil
+	}
+	keys, err := disk.FlatKeys()
+	if err != nil {
+		return err
+	}
+	for _, key := range keys {
+		tenantID, err := s.store.Chat().AttachmentTenant(ctx, key)
+		if errors.Is(err, store.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		// A row whose org is not a valid name was never servable; skip it.
+		if err := disk.Relocate(tenantID, key); err != nil && !errors.Is(err, blobs.ErrInvalidKey) {
+			return err
+		}
+	}
+	return nil
 }

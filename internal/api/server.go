@@ -41,7 +41,7 @@ type recoveryClient interface {
 type Server struct {
 	config           *config.Config
 	store            store.Store
-	blobs            *blobs.Store
+	blobs            blobs.Backend
 	blobsErr         error
 	push             *push.Dispatcher
 	sessions         *auth.SessionManager
@@ -221,7 +221,14 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 		attDir = filepath.Join(cfg.Database.DataDir, "attachments")
 	}
 	if attDir != "" {
-		bs, err := blobs.NewStore(attDir)
+		newStore := blobs.NewStore
+		if cfg.Tenancy.IsMultiTenant() {
+			newStore = blobs.NewOrgStore
+		}
+		bs, err := newStore(attDir)
+		if err == nil && cfg.Tenancy.IsMultiTenant() && st != nil {
+			err = sharedBlobVolume(st, bs)
+		}
 		if err != nil {
 			blobsErr = err
 			log.Printf("[ATTACHMENTS] failed to initialize attachment storage at %q: %v", attDir, err)
@@ -233,7 +240,6 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 	s := &Server{
 		config:          cfg,
 		store:           st,
-		blobs:           blobStore,
 		blobsErr:        blobsErr,
 		push:            initPushDispatcher(cfg, st),
 		sessions:        sessions,
@@ -253,6 +259,9 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 		accountAttempts: attemptLimiter{m: make(map[string]attemptWindow)},
 	}
 
+	if blobStore != nil {
+		s.blobs = blobStore
+	}
 	if cfg.Tenancy.IsMultiTenant() && st != nil {
 		// Several replicas: limits, spent challenges and lobby sessions live in the database.
 		s.clientAttempts.shared = st

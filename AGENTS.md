@@ -129,6 +129,8 @@ When the user requests a durable behavior change, record it here or in the relev
 
 ## Tenancy
 
+- Hosted multi mode requires S3-compatible object storage only; there is no disk-volume fallback.
+  Org-layout disk constructors are internal migration/isolation fixtures while startup is gated.
 - Only `KY_TENANCY_MODE=single` (default) can start until the final tenancy build phase.
   Preserve the first-boot `tenancy.mode` database lock, including on refused startup.
   Exercise the multi-tenant contracts below through internal constructors. Product contract: [docs/PRODUCT.md](docs/PRODUCT.md).
@@ -157,8 +159,10 @@ When the user requests a durable behavior change, record it here or in the relev
 - The shared multi-server install (every paid plan is an org), replica safety, attachments in
   S3-compatible storage and the per-org storage pool are designed in
   `docs/superpowers/specs/2026-11-23-tenancy-design.md`. Its PR 2 (migration lock, job leases,
-  shared secrets, capsule scheduler off) and PR 3 (shared sign-in limits and proof-of-work,
-  per-org meeting IDs, guest sessions in PostgreSQL) are built; the rest is not. It extends the 2026-11-22
+  shared secrets, capsule scheduler off) PR 3 (shared sign-in limits and proof-of-work,
+  per-org meeting IDs, guest sessions in PostgreSQL) and PR 5 (the blob interface, the org
+  layout on a shared volume, its store-ID check and the flat-blob relocation) are built; the rest
+  is not. It extends the 2026-11-22
   spec, whose §4 wire contract stays authoritative.
 - Single mode must not change: `TestSingleTenantGolden` replays a fixed single-mode script and
   compares it with `internal/api/testdata/single-tenant-golden.txt`, recorded before the tenancy

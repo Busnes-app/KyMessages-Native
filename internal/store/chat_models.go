@@ -277,3 +277,10 @@ type UpsertMeetingResult struct {
 	IssuedGuestKeys  []string // guest keys newly created or re-issued
 	RevokedGuestKeys []string
 }
+
+// BlobRef names one attachment blob: its org and its key.
+type BlobRef struct {
+	ID       string // the attachment row, where known
+	TenantID string
+	Key      string
+}

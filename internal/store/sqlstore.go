@@ -1229,6 +1229,17 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.upd
 	return err
 }
 
+func (s *settingsStore) SetSettingOnce(ctx context.Context, key, val string) (string, error) {
+	if strings.HasPrefix(key, "installer.") {
+		return "", errors.New("installer-owned setting")
+	}
+	if _, err := s.store.db.ExecContext(ctx, s.store.rebind(`INSERT INTO server_settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO NOTHING`),
+		key, val, time.Now().UTC()); err != nil {
+		return "", err
+	}
+	return s.GetSetting(ctx, key)
+}
+
 func (s *settingsStore) DeleteSetting(ctx context.Context, key string) error {
 	if strings.HasPrefix(key, "installer.") {
 		return errors.New("installer-owned setting")

@@ -33,9 +33,9 @@ Every `file:line` below was checked against `Busnes-app/KyMessages-Native` `orig
 7. **Multi-tenant needs multi-server** (2026-11-22). Multi mode runs as several replicas
    across hosts.
 8. **Object storage** (2026-11-23). On the hosted install, primary content (for KyMessages:
-   attachments) goes in S3-compatible object storage. Launch runs on disk volumes if object
-   storage is not ready, so the volume backend keeps working behind one interface. Single-tenant
-   keeps the volume path unchanged. Credentials never go in a log or in this spec.
+   attachments) goes in S3-compatible object storage only. There is no disk-volume fallback
+   for multi mode: launch waits for the object backend. Single-tenant keeps its existing
+   disk path unchanged. Credentials never go in a log or in this spec.
 9. **One storage pool per org, across all apps, required for launch** (2026-11-23). Personal
    20 GB, Couple 40 GB, Family 100 GB, Business 30 GB per seat (pooled), Enterprise custom.
    KyIdentity holds the pool. Each app checks it before a write that adds bytes and reports its
@@ -66,7 +66,7 @@ What is left for a shared, multi-server launch:
 | M2 | Multi mode needs PostgreSQL. It is already enforced at startup (`internal/config/config.go:313-316`). | SQLite is one writer on one host, and decision 7 needs several. |
 | M3 | Every background job in multi mode runs under a PostgreSQL lease, so one replica runs it. Migrations run under one advisory lock. | §8. |
 | M4 | Every limit or ledger that must hold across replicas lives in PostgreSQL. No Redis or other new service. | The shared database and its `LISTEN/NOTIFY` bus (`internal/chat/pgbus.go:16`, `:139`) already exist. |
-| M5 | Attachments go behind one `blobs` interface with two backends, `disk` (today's code) and `s3`. Single-tenant always uses `disk`. | Decision 8. |
+| M5 | Attachments go behind one `blobs` interface with two backends, `disk` (today's code) and `s3`. Single-tenant always uses `disk`; hosted multi mode requires `s3`. | Decision 8. |
 | M6 | The S3 client comes from ky-primitives, so KyMessages adds no dependency. | It is the same request KyNotes makes (PR #176 open question 1). One signed-request implementation in the suite, not one per app. |
 | M7 | The org's storage figure is its attachment bytes (§10). Message text is not counted. | Text is small and bounded per message. Refusing text when the pool is full would break chat for a full KyDrive. Open question 1. |
 | M8 | Over the pool, KyMessages refuses only a new attachment upload. Reading, downloading, deleting, sending text and calls keep working. | A full pool must never lock anyone out of their messages. |
@@ -143,7 +143,7 @@ State outside the database:
 
 | State | Where | Multi-server target |
 |---|---|---|
-| Attachment blobs | `KY_ATTACHMENTS_DIR` | S3, or a volume every replica mounts (§9) |
+| Attachment blobs | `KY_ATTACHMENTS_DIR` | S3 only (§9); no multi-mode disk fallback |
 | Attachment backup mirror | `<KY_BACKUP_DIR>/attachments` (`internal/backup/AGENTS.md`) | Off in multi mode. The bucket's own versioned copy is the backup (§9.4). |
 | Encryption key (TOTP secrets) | `KY_ENCRYPTION_KEY`, else `data/encryption.key`, **created when missing** (`internal/config/config.go:259-267`) | Multi mode requires `KY_ENCRYPTION_KEY` or a shared file, and refuses to create one |
 | Session secret (signs PoW challenges) | `KY_SESSION_SECRET`, required only when `env=production`, else **random per process** (`internal/config/config.go:251-257`) | Multi mode requires it, so a challenge from one replica verifies on another |
@@ -318,35 +318,19 @@ KyIdentity's erased and org lists before serving (§7.4).
 
 ### 9.1 Interface
 
-`internal/blobs` gets one interface with the methods its callers use today: `Put(key, r,
-maxBytes)`, `Open(key)`, `Delete(key)`, `SweepStaleTemps` (`internal/blobs/store.go:83`, `:148`,
-`:175`, `:196`; called from `internal/api/attachment_handlers.go:197`, `:223`, `:299`, `:398`,
-`:416`, `:423` and `internal/api/chat_handlers.go:891`), plus `DeletePrefix` for the purge and `Erase` (every version; PR 6). Like `Erase`, `DeletePrefix`
-removes **every version** of every object under the prefix, so the purge's final orphan sweep
-leaves no old versions behind (§9.4). On `disk` in multi mode, each blob is stored at
-`orgs/<tenant_id>/att/<blob_key>` under `KY_ATTACHMENTS_DIR`, the same key as in S3 (§9.3), so
-one key builder serves both backends. `ValidKey`
-still checks the bare key, and the backend adds the prefix itself, through the same
-`os.OpenRoot`. `DeletePrefix` there removes the org's directory, orphans included, and it is the
-same call on both backends. Single mode keeps today's flat layout, unchanged.
+`internal/blobs` exposes the attachment operations through one interface: `Put`, `Open`
+(an `io.ReadSeekCloser` and size, preserving range responses), `Delete`, `DeletePrefix` and
+`SweepStaleTemps`. PR 6 adds `Erase` for every version of one object; `DeletePrefix` removes
+every version under the org prefix. Keys stay random bare identifiers validated by `ValidKey`;
+the backend builds `orgs/<tenant_id>/att/<blob_key>`.
 
-Multi mode exists since PR #18, so a multi install may already hold flat blobs (whether any
-does is unverified; the hosted install has not launched). PR 5 therefore adds a one-time,
-leased relocation:
-- It renames each flat file named by an `attachments` row to its org path. A rename on the same
-  volume is atomic and idempotent.
-- Until it finishes, a read that misses the org path falls back to the flat path, and the purge
-  also deletes each row's flat path.
-- When it finishes, it sets `blobs.layout = org` in `server_settings`. The fallback stops there.
-`Open` returns an `io.ReadSeekCloser` and the size, so downloads keep range requests
-(`http.ServeContent`, `internal/api/attachment_handlers.go:329`).
-
-- `disk` is today's code. It is the only backend in single mode, where its flat layout does not
-  change. In multi mode it uses the org layout above.
-- `s3` is new. In multi mode, `KY_ATTACHMENTS_BACKEND=s3` or `disk`. With `disk` in multi mode,
-  `KY_ATTACHMENTS_DIR` must be a volume every replica mounts. At start, each replica checks a
-  store-ID file in the directory against a value in `server_settings`, and refuses to start on
-  a mismatch, so a replica on a private disk cannot lose blobs silently (as KyNotes N15).
+- Single mode uses `disk`, with its existing flat layout and wire behavior unchanged.
+- Hosted multi mode requires `s3`. A disk backend or incomplete S3 configuration refuses startup.
+  The release startup gate stays closed until this is built and verified.
+- PR 5's org-layout disk constructor, store-ID check and flat relocation support internal
+  migration/isolation tests of the interface while startup is gated. They do not authorize a
+  hosted volume deployment or a mixed-version rolling deployment. Older multi-mode experiments
+  must be stopped and migrated offline before the S3-only hosted release is enabled.
 
 ### 9.2 Configuration
 
@@ -390,13 +374,15 @@ single mode cannot change by accident.
 
 ### 9.4 Backup copy and deletion
 
-The bucket gets versioning, or a provider replica, and a lifecycle rule that removes
-non-current versions after 30 days. That is the "backup copy" in the decision's price. A user's
-delete removes the current version only, so it stays recoverable for 30 days (open question 7).
-The org purge (§7.3) and an erasure (§7.2) are different. They delete **every version** of each
-object at once, and the same objects on a provider replica, so nothing waits for the lifecycle
-rule. The
-local mirror (`MirrorAttachments`) is off in multi mode.
+The bucket uses versioning or a provider replica as its backup copy. The owner decided there
+is **no automatic version pruning at launch**: every retained previous version counts in the
+org pool until a person explicitly removes it. PR 6 must extend the usage ledger to account for
+those retained bytes and provide explicit removal; attachment-row totals alone are insufficient
+once versions survive a row deletion. Provider lifecycle rules must not silently delete versions.
+
+A person's erasure and an org purge delete every version of each affected object immediately,
+and the same objects on a provider replica. Neither waits for retention. The local attachment
+mirror remains off in multi mode.
 
 ### 9.5 What KyMessages needs from ky-primitives
 
@@ -498,7 +484,7 @@ test proves the answers are byte for byte the same.
 | The object store provider reads files | §9.3: E5 ciphertext, and server sealing until then. |
 | An object key or URL is guessed or reused | Random IDs, never content hashes. Proxied downloads with a membership check. No presigned URLs. |
 | S3 credentials leak | Environment or file only. Never logged, returned or audited. HTTPS only. |
-| One org fills the pool or the bucket for others | The pool per org, plus the per-user staging cap and the upload limit. Bucket or volume capacity is watched by the operator's alerts. |
+| One org fills the pool or the bucket for others | The pool per org, plus the per-user staging cap and the upload limit. Bucket capacity is watched by the operator's alerts. |
 | A forged or replayed usage report | Signed with `syncauth`, whose event ID and ±5-minute timestamp window are the replay guard. The revision is `max(now_ms, last_sent + 1)`, stored per org, so it only grows across replicas and lease handovers (§10.3). Totals are absolute, so order never changes a sum. |
 | Pool overshoot while KyIdentity is down | Bounded to 15 minutes of other apps' growth. Then fail closed for adding writes. |
 | Single-tenant changes by accident | Every change is gated on `IsMultiTenant()`. S3 settings refuse to start in single mode. Golden and upgrade tests. |
@@ -516,8 +502,8 @@ replay or stale revision where it applies, oversize input), and runs CI on SQLit
 | 2 | Replica safety I (§8.1, §8.4, §5): migration lock, `job_leases`, the capsule scheduler off in multi mode, `RESTORE.md` multi section, multi mode requires the shared VAPID key, encryption key and session secret (§5; the S3 seal key is PR 6's) | Yes | — |
 | 3 | Replica safety II (§8.2, §8.3): shared limiters, the PoW table, the meetings key per org and the upsert lock, guest sessions in PostgreSQL | Yes | 2 |
 | 4 | Calls across replicas (§8.3), as open question 5 decides | Yes | 3 |
-| 5 | The blob interface, the shared-volume store-ID check, `disk` behind it with the org layout in multi mode, and the one-time relocation of flat blobs (§9.1) | Yes (volumes at launch) | 2 |
-| 6 | The `s3` backend, sealing, the purge by prefix, and versioned deletes for erasure and purge (§9.2-§9.5). The interface gains `Erase(key)`, which removes every version (on `disk` it is `Delete`). Erasure and purge call it, and PR 1a's per-key deletes switch to it here. A user's own delete keeps `Delete` (current version only, §9.4). | No | 5, the ky-primitives S3 type |
+| 5 | The blob interface and internal org-layout disk migration/isolation checks (§9.1); hosted startup stays gated | Yes (interface prerequisite) | 2 |
+| 6 | The `s3` backend, sealing, the purge by prefix, and versioned deletes for erasure and purge (§9.2-§9.5). The interface gains `Erase(key)`, which removes every version (on `disk` it is `Delete`). Erasure and purge call it, and PR 1a's per-key deletes switch to it here. A user's own delete keeps `Delete` (current version only, §9.4). | Yes | 5, the ky-primitives S3 type |
 | 7 | The org pool: columns, check, `org_storage_full`, reporter (§10) | Yes | 2 (leases), KyIdentity's pool API |
 | 8 | Multi-region cells (K22 §6.2, its PR D) | No | 3, 4 |
 
@@ -546,7 +532,8 @@ Tests each PR must add, beyond its own:
 - Until PR 4, a call needs both peers on one replica. The bus carries signalling, but seats are
   local.
 - A stale allowance can let the pool be overshot by other apps' growth for up to 15 minutes.
-- A user's own deleted attachment stays as an old object version for 30 days.
+- Retained object versions continue to consume the org pool until explicitly removed; there is
+  no automatic pruning at launch.
 - Staff see every org's usernames in the install-wide audit (open question 6).
 - An org that KyIdentity stops listing without a `deleted` status is held offline and kept, not
   purged, until a later full read lists it again or staff resolve it. Its data costs storage
@@ -571,9 +558,8 @@ Tests each PR must add, beyond its own:
    `call_sessions` as the record to rebuild from.
 6. **Staff audit shows usernames from every org.** *Default:* keep (platform operations),
    staff only, and say so in `docs/PRODUCT.md`.
-7. **How long a user's deleted attachment stays as an old version.** *Default:* 30 days,
-   matching the database's backup window (unverified: the hosted PostgreSQL retention is not set
-   yet). A purge or an erasure never waits for it (§9.4).
+7. **Retained versions (decided).** No automatic pruning at launch. Every kept version counts
+   in the pool until explicitly removed; erasure and org purge remove all versions immediately.
 8. **The S3 client:** one ky-primitives type shared with KyNotes. *Default:* yes. The other
    choice, a KyMessages-only SigV4 client, duplicates signing code.
 9. **`org.unsuspended`:** *Default:* keep accepting it until KyIdentity confirms it never sends it,
