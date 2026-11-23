@@ -199,11 +199,20 @@ Multi mode, `origin/main` plus PR #27. Every row has a cross-org test in
    a late event cannot revive it.
 4. **A restore must not bring back a deleted org or an erased person.** A backup taken before
    the deletion has no tombstone, so the restored database cannot be the authority. KyIdentity
-   is: after any restore, and before serving, multi mode re-reads `GET /api/suite/erased` from
-   `since=0` and the org list `GET /api/suite/orgs`, as T requires of every app (T,
-   "`GET /api/suite/erased`"). Each erased subject is erased again (§7.2), and each org that
-   KyIdentity reports deleted or no longer lists is tombstoned and purged (§7.3). The server
-   refuses to serve until both reads succeed. KyMessages does not read either list today
+   is. Multi mode re-reads `GET /api/suite/erased` from `since=0` and the org list
+   `GET /api/suite/orgs`, as T requires of every app after a restore (T,
+   "`GET /api/suite/erased`"). A PostgreSQL restore bypasses the app, so the server cannot know
+   one happened. The re-read is therefore not triggered by a restore. It always runs:
+   - on **every start** of every replica in multi mode, before it serves. A replica refuses to
+     serve until both reads succeed. A restore needs every replica restarted anyway, and
+     the `RESTORE.md` multi section (PR 2) must say so;
+   - **daily**, from `since=0`, in the leased reporter job (§8.1), as a backstop for a restore
+     done under running replicas;
+   - **incrementally**, from the last revision applied, on every reporter tick.
+
+   Each erased subject is erased again (§7.2), and each org that KyIdentity reports deleted or no
+   longer lists is tombstoned and purged (§7.3). Both are idempotent, so a re-read that finds
+   nothing new changes nothing. KyMessages does not read either list today
    (its only suite-API call is `dir.Peer`, `internal/api/suite.go:173-180`), so this adds two reads to the existing `suitedir` client (`internal/sso/kyidentity.go:418-424`).
    Whether `/api/suite/orgs` lists a deleted org as a tombstone or drops it is unverified, so
    both mean "deleted".
@@ -255,7 +264,8 @@ is off, and its status says why. The database is backed up by PostgreSQL tooling
 and base backups, off-host), and attachments by the bucket's versioning or replica copy (§9.4).
 The shared secrets (§5: VAPID key, encryption key, session secret, and the S3 seal key) live
 in the operator's secret store, never in the bucket. `RESTORE.md`
-gets a multi-mode section. After any restore it must re-read KyIdentity's erased and org lists before serving (§7.4).
+gets a multi-mode section. It says to restart every replica after a restore, so each re-reads
+KyIdentity's erased and org lists before serving (§7.4).
 
 ## 9. Attachments in S3-compatible storage (decision 8)
 
@@ -265,7 +275,8 @@ gets a multi-mode section. After any restore it must re-read KyIdentity's erased
 maxBytes)`, `Open(key)`, `Delete(key)`, `SweepStaleTemps` (`internal/blobs/store.go:83`, `:148`,
 `:175`, `:196`; called from `internal/api/attachment_handlers.go:197`, `:223`, `:299`, `:398`,
 `:416`, `:423` and `internal/api/chat_handlers.go:891`), plus `DeletePrefix` for the purge.
-`Open` returns an `io.ReadSeekCloser` and the size, so downloads keep range requests.
+`Open` returns an `io.ReadSeekCloser` and the size, so downloads keep range requests
+(`http.ServeContent`, `internal/api/attachment_handlers.go:329`).
 
 - `disk` is today's code, unchanged, and the only backend in single mode.
 - `s3` is new. In multi mode, `KY_ATTACHMENTS_BACKEND=s3` or `disk`. With `disk` in multi mode,
@@ -291,7 +302,12 @@ single mode cannot change by accident.
   prefix delete.
 - Uploads stream to a private temp file on the replica, hashing and sniffing as today, then make
   one `PUT`. The MIME rules (`internal/blobs/AGENTS.md`) do not change. A download is a proxied
-  `GET` through KyMessages, which checks membership first. It is never a presigned URL, so a
+  `GET` through KyMessages, which checks membership first. The `s3` backend fetches the whole
+  object into a private temp file on the replica, verifies the GCM tag, and only then serves it,
+  ranges included, from that file. It never serves unauthenticated bytes. One object is at most
+  `KY_MAX_UPLOAD_BYTES` (25 MiB by default, 100 MiB at most, `internal/config/config.go:92-95`),
+  so a whole-object fetch is bounded. Chunked sealing, which would allow ranged `GET`s, is not
+  needed at these sizes. It is never a presigned URL, so a
   revoked member cannot reuse a link.
 - **Content.** Under E5, every file is already ciphertext from the client, and quota uses
   ciphertext size (E §5). Keep it that way: the server never decrypts and never thumbnails. Until
@@ -313,7 +329,7 @@ local mirror (`MirrorAttachments`) is off in multi mode.
 
 ### 9.5 What KyMessages needs from ky-primitives
 
-An S3 type with `PUT`, `GET` (with range), `HEAD`, `DELETE`, list by prefix, and versioned
+An S3 type with `PUT`, `GET`, `HEAD`, `DELETE`, list by prefix, and versioned
 delete, using SigV4 signing over `net/http`, with no new module dependency. KyNotes asks for the
 same type (PR #176). One shared type is the default (open question 8).
 
@@ -356,7 +372,9 @@ rows. A message body is bounded per message and refusing text would break chat.
 
 The leased reporter job (§8.1) sends each active org's absolute total to KyIdentity's usage
 report about every 60 seconds when it changed, and at once after a purge, a restore or a
-`pool_low` mark. An absolute total, not a delta, so a retry or a lost report cannot drift. The
+`pool_low` mark. Separately, it refreshes **every** active org's allowance at least every 5
+minutes, whether or not its usage changed. An idle org's `pool_checked_at` therefore never ages
+past the 15-minute limit while KyIdentity is up. An absolute total, not a delta, so a retry or a lost report cannot drift. The
 report is signed with `syncauth` under KyIdentity's pair secret, carries `org_id` and a
 monotonic revision, and contains no names, file names or room IDs. The same answer refreshes
 `pool_allowance_bytes`.
