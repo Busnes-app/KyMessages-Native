@@ -176,3 +176,57 @@ Your real client IP address — not the proxy's `10.91.0.x` IP — must be shown
   docker network disconnect -f kymessages-net <container>
   docker network rm kymessages-net
   ```
+
+
+## Gated hosted call affinity
+
+`KY_TENANCY_MODE=multi` is still refused at startup. The following describes the runtime
+contract for internal qualification, not an authorized hosted deployment or an alternative to
+S3. Single-mode proxy configuration stays unchanged.
+
+Route all `/api/v1/rooms/{room}/calls/…` requests by the **same room ID**, including member
+state/join/leave/escalate/WebSocket and guest `calls/guest/{token}/…` paths. Hashing the whole
+URL, cookie, guest token or client IP splits call control. Ordinary `/api/v1/ws` and
+`/api/meet/{token}/ws` carry chat/lobby traffic and may reach any replica. Keep the same
+eligible call replicas and consistent hash policy on every edge. One Nginx illustration:
+
+```nginx
+# http context; example backend names only, not a deployment manifest
+map $uri $ky_call_room {
+    ~^/api/v1/rooms/([^/]+)/calls/ $1;
+    default "";
+}
+map $http_upgrade $ky_call_connection {
+    default upgrade;
+    "" close;
+}
+upstream ky_room_calls {
+    hash $ky_call_room consistent;
+    server messages-a:8080;
+    server messages-b:8080;
+}
+# Inside the existing HTTPS server, retaining its trusted-proxy/TLS policy:
+location ~ ^/api/v1/rooms/[^/]+/calls/ {
+    proxy_pass http://ky_room_calls;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $ky_call_connection;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_read_timeout 75s;
+}
+```
+
+The application authorizes the exact principal/org/room before claiming ownership. A request
+on a competing replica returns 503 `call_owner_unavailable` with `Retry-After: 1`; it neither
+redirects credentials to a pod address nor creates another call. Correct inconsistent edge
+routing instead of retrying a different unverified host. After a dead owner stops renewing,
+its lease expires within 90 seconds; a new owner retires old media before issuing fresh
+credentials and clients rejoin through the same room route. Media can be interrupted.
+
+Keep the eligible call pool stable while calls are active. For a topology change, drain and
+stop removed owners' call processing before changing the eligible pool; a still-running old
+owner would otherwise keep renewing its lease. Do not claim seamless rolling migration or
+hosted capacity from this example. PostgreSQL/S3, isolation, browser/media, recovery and all
+other launch gates remain required. Guest E2EE is not established by room affinity.

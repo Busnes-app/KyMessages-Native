@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -554,6 +555,10 @@ func (s *Server) authenticateGuestRequest(w http.ResponseWriter, r *http.Request
 		return nil, nil, false
 	}
 
+	if room := r.PathValue("id"); room != "" && room != meeting.RoomID {
+		s.writeError(w, http.StatusNotFound, "Meeting link is invalid or has ended")
+		return nil, nil, false
+	}
 	secret := strings.TrimSpace(r.Header.Get("X-Guest-Session"))
 	if secret == "" {
 		if c, err := r.Cookie(guestSessionCookieName); err == nil {
@@ -596,6 +601,9 @@ func (s *Server) handleGuestMeetInfo(w http.ResponseWriter, r *http.Request) {
 		"in_window":     inWindow,
 		"pow_required":  s.config.Captcha.Provider == "pow",
 		"sfu_available": s.calls.SFUAvailable(),
+	}
+	if s.config.Tenancy.IsMultiTenant() {
+		resp["call_room_id"] = meeting.RoomID
 	}
 	// If guest already has a valid session cookie for this link, report their current status.
 	if c, err := r.Cookie(guestSessionCookieName); err == nil {
@@ -690,11 +698,14 @@ func (s *Server) handleGuestMeetWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sess, meeting, ok := s.authenticateGuestRequest(w, r, false)
+	roomCall := r.PathValue("id") != ""
+	sess, meeting, ok := s.authenticateGuestRequest(w, r, roomCall)
 	if !ok {
 		return
 	}
-
+	if roomCall && !s.requireCallOwner(w, r, meeting.TenantID, meeting.RoomID) {
+		return
+	}
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		InsecureSkipVerify: true, // Origin strictly checked above against AppURL.
 	})
@@ -707,7 +718,11 @@ func (s *Server) handleGuestMeetWS(w http.ResponseWriter, r *http.Request) {
 	if sess.Status == "admitted" {
 		rooms = []string{meeting.RoomID}
 	}
-	s.chatHub.ServeGuestConn(r.Context(), conn, meeting.TenantID, sess.GuestID, rooms)
+	if roomCall {
+		s.chatHub.ServeGuestRoomCallConn(r.Context(), conn, meeting.TenantID, sess.GuestID, meeting.RoomID)
+	} else {
+		s.chatHub.ServeGuestConn(r.Context(), conn, meeting.TenantID, sess.GuestID, rooms)
+	}
 }
 
 // POST /api/meet/{token}/call/join
@@ -717,6 +732,16 @@ func (s *Server) handleGuestCallJoin(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if s.config.Tenancy.IsMultiTenant() {
+		if r.PathValue("id") != meeting.RoomID {
+			s.writeError(w, http.StatusNotFound, "Call room route required")
+			return
+		}
+		if !s.requireCallOwner(w, r, meeting.TenantID, meeting.RoomID) {
+			return
+		}
+	}
+
 	var body struct {
 		Audio       *bool           `json:"audio"`
 		Video       bool            `json:"video"`
@@ -743,6 +768,11 @@ func (s *Server) handleGuestCallJoin(w http.ResponseWriter, r *http.Request) {
 		ProtectIP:   body.ProtectIP,
 		ECDHPubJWK:  body.ECDHPubJWK,
 	})
+	if errors.Is(err, store.ErrCallOwnerLost) || errors.Is(err, store.ErrCallCleanupPending) || errors.Is(err, store.ErrCallStateStale) {
+		w.Header().Set("Retry-After", "1")
+		s.writeError(w, http.StatusServiceUnavailable, "Call control is temporarily unavailable; retry")
+		return
+	}
 	if errors.Is(err, chat.ErrCallSeatLost) {
 		s.writeError(w, http.StatusConflict, "The call seat ended while joining; join again")
 		return
@@ -762,6 +792,9 @@ func (s *Server) handleGuestCallJoin(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusInternalServerError, "Failed to join meeting call")
 		return
 	}
+	if s.config.Tenancy.IsMultiTenant() {
+		resp.CallWSPath = "/api/v1/rooms/" + url.PathEscape(meeting.RoomID) + "/calls/guest/" + url.PathEscape(r.PathValue("token")) + "/ws"
+	}
 	s.writeJSON(w, http.StatusOK, resp)
 }
 
@@ -772,7 +805,20 @@ func (s *Server) handleGuestCallLeave(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	s.calls.Leave(r.Context(), meeting.RoomID, sess.GuestID)
+	if s.config.Tenancy.IsMultiTenant() {
+		if r.PathValue("id") != meeting.RoomID {
+			s.writeError(w, http.StatusNotFound, "Call room route required")
+			return
+		}
+		if !s.requireCallOwner(w, r, meeting.TenantID, meeting.RoomID) {
+			return
+		}
+	}
+
+	if err := s.calls.LeaveCall(r.Context(), meeting.RoomID, sess.GuestID); err != nil {
+		s.writeError(w, http.StatusServiceUnavailable, "Call departure cleanup is pending; retry")
+		return
+	}
 	s.writeJSON(w, http.StatusOK, map[string]bool{"left": true})
 }
 

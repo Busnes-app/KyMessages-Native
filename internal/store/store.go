@@ -333,6 +333,9 @@ type AgentStore interface {
 
 // ChatStore handles multi-tenant native KyMessages tenants, rooms, messages and reactions.
 type ChatStore interface {
+	QueueOwnedCallSeatRemoval(ctx context.Context, cs *CallSession, seat CallSeat) error
+	RecoverCallSession(ctx context.Context, lease CallLease) (*CallSession, error)
+	CallSeats(ctx context.Context, tenantID, roomID string) ([]CallSeat, error)
 	AcquireCallRoom(ctx context.Context, tenantID, roomID, holder string, ttl time.Duration) (CallLease, error)
 	CallRoomHeld(ctx context.Context, lease CallLease) (bool, error)
 	ReleaseCallRoom(ctx context.Context, lease CallLease) error

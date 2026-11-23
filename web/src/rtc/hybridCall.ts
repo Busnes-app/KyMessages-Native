@@ -6,7 +6,7 @@ import type {
   CallSignalData,
   CallState,
 } from '../chat/types';
-import type { ChatSocket } from '../chat/client';
+import { ChatSocket } from '../chat/client';
 
 export interface CallParticipantTile {
   id: string;
@@ -57,6 +57,7 @@ export interface HybridCallControllerOptions {
   localDisplayName: string;
   isGuest: boolean;
   socket: () => ChatSocket | null;
+  rejoin?: (media: { audio: boolean; video: boolean; screenShare: boolean; protectIp: boolean }) => Promise<CallJoinResponse>;
   onChange: (snapshot: HybridCallSnapshot) => void;
 }
 
@@ -100,6 +101,87 @@ export class HybridCallController {
   private livekitStreams = new Map<string, { cam: MediaStream; screen: MediaStream }>();
 
   private disposed = false;
+  private roomSocket: ChatSocket | null = null;
+  private recovering = false;
+  private cancelSocketStart: (() => void) | null = null;
+  private epoch = 0;
+
+  isRoomRouted(): boolean {
+    return this.roomSocket !== null;
+  }
+
+  private signalSocket(): ChatSocket | null {
+    return this.roomSocket ?? this.opts.socket();
+  }
+
+  private async openRoomSocket(path: string): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.roomSocket?.close();
+        this.roomSocket = null;
+        reject(new Error('Call connection unavailable; join again'));
+      }, 10_000);
+      this.cancelSocketStart = () => {
+        clearTimeout(timer);
+        reject(new Error('Call ended'));
+      };
+      let reconnect = false;
+      const socket = new ChatSocket({
+        onStatus: (status) => {
+          if (status === 'revoked') this.dispose();
+        },
+        onEvent: (event) => {
+          if (event.kind === 'hello') {
+            clearTimeout(timer);
+            this.cancelSocketStart = null;
+            resolve();
+            if (reconnect) {
+              reconnect = false;
+              void this.recoverRoom();
+            }
+          }
+          if (event.kind === 'call.state') this.handleCallState(event.state);
+          if (event.kind === 'call.signal') void this.handleSignal(event.signal);
+          if (event.kind === 'call.migrate') void this.handleMigrate(event.migrate);
+          if (event.kind === 'auth.revoked' || event.kind === 'room.closed') this.dispose();
+        },
+        onReconnect: () => { reconnect = true; },
+      }, path);
+      this.roomSocket = socket;
+      socket.connect();
+    });
+  }
+
+  private async recoverRoom(): Promise<void> {
+    if (this.disposed || this.recovering || !this.opts.rejoin) return;
+    this.recovering = true;
+    try {
+      this.closeAllPeerConnections();
+      await this.disconnectLiveKit();
+      const response = await this.opts.rejoin({
+        audio: this.audioEnabled, video: this.videoEnabled, screenShare: this.screenShareEnabled,
+        protectIp: this.protectIp || this.protectIpPending,
+      });
+      if (this.disposed) return;
+      this.callId = response.call_id;
+      this.myPeerId = response.peer_id || this.opts.localUserId;
+      this.epoch = response.epoch ?? 0;
+      this.mode = response.mode;
+      this.sfuSticky = response.sfu_sticky;
+      this.syncPeersMeta(response.peers);
+      if (response.mode === 'sfu_livekit' && response.livekit_url && response.livekit_token) {
+        await this.connectLiveKit(response.livekit_url, response.livekit_token);
+      } else {
+        this.reconcileP2PPeers();
+      }
+      this.notice = '';
+    } catch {
+      this.notice = 'Call connection interrupted — leave and join again to reconnect.';
+    } finally {
+      this.recovering = false;
+      this.emit();
+    }
+  }
 
   constructor(private readonly opts: HybridCallControllerOptions) {
     this.myPeerId = opts.localUserId;
@@ -120,6 +202,19 @@ export class HybridCallController {
     joinResp: CallJoinResponse,
     initialMedia: { audio: boolean; video: boolean; protectIp: boolean },
   ): Promise<void> {
+    if (joinResp.call_ws_path) {
+      if (!this.opts.rejoin) throw new Error('Call reconnect is unavailable');
+      try {
+        await this.openRoomSocket(joinResp.call_ws_path);
+        if (this.disposed) return;
+        // A route change between HTTP join and socket registration must refresh the seat.
+        joinResp = await this.opts.rejoin({ ...initialMedia, screenShare: false });
+      } catch (error) {
+        this.dispose();
+        throw error;
+      }
+    }
+    this.epoch = joinResp.epoch ?? 0;
     this.callId = joinResp.call_id;
     this.roomId = joinResp.room_id;
     this.myPeerId = joinResp.peer_id || this.opts.localUserId;
@@ -148,7 +243,7 @@ export class HybridCallController {
 
   /** Called whenever the server broadcasts a `call.state` event for this room. */
   handleCallState(state: CallState): void {
-    if (this.disposed || state.room_id !== this.roomId) return;
+    if (this.disposed || state.room_id !== this.roomId || (this.roomSocket && state.epoch !== undefined && state.epoch < this.epoch)) return;
     if (state.ended || state.active === false) {
       this.dispose();
       return;
@@ -182,7 +277,7 @@ export class HybridCallController {
         await this.flushCandidates(entry);
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        this.opts.socket()?.sendCallSignal(this.roomId, this.callId, sig.from, 'answer', pc.localDescription);
+        this.signalSocket()?.sendCallSignal(this.roomId, this.callId, sig.from, 'answer', pc.localDescription);
       } else if (sig.kind === 'answer') {
         if (pc.signalingState === 'have-local-offer') {
           const desc = sig.payload as RTCSessionDescriptionInit;
@@ -206,13 +301,17 @@ export class HybridCallController {
 
   /** Called when the server instructs this peer to escalate (P2P -> SFU) or step down (SFU -> P2P). */
   async handleMigrate(mig: CallMigratePayload): Promise<void> {
-    if (this.disposed || mig.room_id !== this.roomId) return;
+    if (this.disposed || mig.room_id !== this.roomId || (this.roomSocket && (mig.call_id !== this.callId || (mig.epoch !== undefined && mig.epoch < this.epoch)))) return;
     if (mig.ice_servers && mig.ice_servers.length > 0) {
       this.iceServers = mig.ice_servers;
     }
 
     if (mig.target_mode === 'sfu_livekit' && mig.livekit_url && mig.livekit_token) {
-      if (this.mode === 'sfu_livekit' && this.livekitRoom) return;
+      if (this.mode === 'sfu_livekit' && this.livekitRoom) {
+        if (!this.roomSocket || (mig.epoch ?? 0) <= this.epoch) return;
+        await this.disconnectLiveKit();
+      }
+      this.epoch = mig.epoch ?? this.epoch;
       this.clearProtectIpTimer();
       this.migrating = true;
       this.migrationReason = mig.reason ?? 'escalating';
@@ -228,7 +327,7 @@ export class HybridCallController {
           this.protectIpPending = false;
         }
         this.notice = '';
-        this.opts.socket()?.sendCallMigrated(this.roomId, this.callId, mig.epoch);
+        this.signalSocket()?.sendCallMigrated(this.roomId, this.callId, mig.epoch);
       } catch (err) {
         await this.disconnectLiveKit();
         if (this.protectIpPending) {
@@ -261,7 +360,7 @@ export class HybridCallController {
         }
         this.reconcileP2PPeers();
         await this.disconnectLiveKit();
-        this.opts.socket()?.sendCallMigrated(this.roomId, this.callId, mig.epoch);
+        this.signalSocket()?.sendCallMigrated(this.roomId, this.callId, mig.epoch);
       } finally {
         this.migrating = false;
         this.migrationReason = '';
@@ -438,7 +537,7 @@ export class HybridCallController {
     if (protect && (this.protectIp || this.protectIpPending)) return;
     if (!protect && !this.protectIp && !this.protectIpPending) return;
 
-    const sock = this.opts.socket();
+    const sock = this.signalSocket();
     if (!sock || !sock.isOpen()) {
       this.notice = 'Reconnect to change relay privacy mode';
       this.emit();
@@ -493,6 +592,10 @@ export class HybridCallController {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.cancelSocketStart?.();
+    this.cancelSocketStart = null;
+    this.roomSocket?.close();
+    this.roomSocket = null;
     this.clearProtectIpTimer();
     this.stopScreenShare();
     this.closeAllPeerConnections();
@@ -759,7 +862,7 @@ export class HybridCallController {
 
     pc.onicecandidate = (ev) => {
       if (ev.candidate) {
-        this.opts.socket()?.sendCallSignal(this.roomId, this.callId, peerId, 'ice', ev.candidate.toJSON());
+        this.signalSocket()?.sendCallSignal(this.roomId, this.callId, peerId, 'ice', ev.candidate.toJSON());
       }
     };
 
@@ -771,12 +874,12 @@ export class HybridCallController {
           entry.disconnectTimer = null;
         }
       } else if (st === 'failed') {
-        this.opts.socket()?.sendCallICEFailed(this.roomId, this.callId);
+        this.signalSocket()?.sendCallICEFailed(this.roomId, this.callId);
       } else if (st === 'disconnected' && !entry.disconnectTimer) {
         entry.disconnectTimer = setTimeout(() => {
           entry.disconnectTimer = null;
           if (!this.disposed && this.mode === 'p2p_mesh' && pc.iceConnectionState === 'disconnected') {
-            this.opts.socket()?.sendCallICEFailed(this.roomId, this.callId);
+            this.signalSocket()?.sendCallICEFailed(this.roomId, this.callId);
           }
         }, 8000);
       }
@@ -790,7 +893,7 @@ export class HybridCallController {
     try {
       const offer = await entry.pc.createOffer();
       await entry.pc.setLocalDescription(offer);
-      this.opts.socket()?.sendCallSignal(this.roomId, this.callId, peerId, 'offer', entry.pc.localDescription);
+      this.signalSocket()?.sendCallSignal(this.roomId, this.callId, peerId, 'offer', entry.pc.localDescription);
     } catch {
       // Ignore transient renegotiation errors.
     }
@@ -958,7 +1061,7 @@ export class HybridCallController {
   }
 
   private sendMediaUpdate(): void {
-    this.opts.socket()?.sendCallMedia(this.roomId, this.callId, {
+    this.signalSocket()?.sendCallMedia(this.roomId, this.callId, {
       audio: this.audioEnabled,
       video: this.videoEnabled,
       screenShare: this.screenShareEnabled,

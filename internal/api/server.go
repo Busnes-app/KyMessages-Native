@@ -213,7 +213,9 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 	callMgr := chat.NewCallManager(chatStore, chatHub, nativeLK, cfg.RTC.STUNURLs)
 	lobbyMgr := chat.NewLobbyManager(chatHub, callMgr)
 	chatHub.SetDisconnectHandler(func(userID string, isGuest bool, remainingConns int) {
-		callMgr.HandleDisconnect(userID, remainingConns)
+		if !cfg.Tenancy.IsMultiTenant() {
+			callMgr.HandleDisconnect(userID, remainingConns)
+		}
 		if isGuest {
 			lobbyMgr.HandleDisconnect(userID, remainingConns)
 		}
@@ -277,6 +279,8 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 			return st.SpendPoW(ctx, sig, expiresAt)
 		}
 		lobbyMgr.UseShared(st.GuestSessions())
+		callMgr.EnableRoomRouting()
+		chatHub.EnableRoomCalls(callMgr.HandleRoomDisconnect)
 	}
 
 	revokeUser := func(ctx context.Context, userID string) {
@@ -554,6 +558,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/v1/to-device/ack", s.handleE2EEAck)
 	s.mux.HandleFunc("POST /api/v1/webhooks/in/{id}", s.handleChatIncomingWebhook)
 	s.mux.HandleFunc("GET /api/v1/ws", s.handleChatWS)
+	if s.config.Tenancy.IsMultiTenant() {
+		s.mux.HandleFunc("GET /api/v1/rooms/{id}/calls/ws", s.handleChatWS)
+		s.mux.HandleFunc("GET /api/v1/rooms/{id}/calls/guest/{token}/ws", s.handleGuestMeetWS)
+		s.mux.HandleFunc("POST /api/v1/rooms/{id}/calls/guest/{token}/join", s.handleGuestCallJoin)
+		s.mux.HandleFunc("POST /api/v1/rooms/{id}/calls/guest/{token}/leave", s.handleGuestCallLeave)
+	}
 
 	// Hybrid P2P-first / LiveKit SFU Calling & Meeting Waiting Rooms
 	s.mux.HandleFunc("GET /api/v1/rooms/{id}/calls/state", s.requireAuthenticated(s.handleCallState))

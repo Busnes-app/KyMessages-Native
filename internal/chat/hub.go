@@ -47,7 +47,9 @@ type Hub struct {
 	// roomSource, when set, rebuilds each socket's rooms from the store after it registers
 	// and on every ping, so a membership change the bus never delivered (one made during
 	// connect, or while the Postgres listener reconnected) lasts one ping at most.
-	roomSource func(ctx context.Context, tenantID, userID string) ([]string, error)
+	roomSource           func(ctx context.Context, tenantID, userID string) ([]string, error)
+	roomCalls            bool
+	roomCallDisconnected func(userID, roomID, sessionHash string)
 }
 
 // Client represents one authenticated WebSocket connection (member or confined guest).
@@ -57,6 +59,7 @@ type Client struct {
 	userID      string
 	tenantID    string
 	sessionHash string
+	callRoomID  string
 	isGuest     bool
 
 	roomsMu sync.RWMutex
@@ -94,6 +97,13 @@ func NewHub(bus EventBus) *Hub {
 		mb.SetHandler(h.Dispatch)
 	}
 	return h
+}
+
+// EnableRoomCalls confines hosted signaling to a room-addressed socket, so edge affinity
+// routes both HTTP and WebSocket call control to the same owner. Configure before serving.
+func (h *Hub) EnableRoomCalls(onDisconnect func(userID, roomID, sessionHash string)) {
+	h.roomCalls = true
+	h.roomCallDisconnected = onDisconnect
 }
 
 // SetSessionCheck registers the per-ping session check. Call it before serving connections.
@@ -230,11 +240,17 @@ func (h *Hub) Stats() (clients, users, rooms int) {
 
 // Dispatch delivers an EventBus event to all matching local WebSocket clients.
 func (h *Hub) Dispatch(ev Event) {
+	sessionHash := ev.SessionHash
+	ev.SessionHash = ""
 	raw, err := json.Marshal(ev)
 	if err != nil {
 		return
 	}
 
+	if h.roomCalls && (ev.Type == EventCallSignal || ev.Type == EventCallMigrate) {
+		h.dispatchRoomCall(ev, sessionHash, raw)
+		return
+	}
 	switch ev.Type {
 	case EventTenantRevoked:
 		var t tenantRevoke
@@ -275,6 +291,16 @@ func (h *Hub) Dispatch(ev Event) {
 			case "added":
 				h.subscribeUserToRoom(delta.UserID, ev.RoomID)
 				h.broadcastRoom(ev.RoomID, raw)
+				if h.roomCalls && ev.Type == EventCallState {
+					h.mu.RLock()
+					targets := copyClients(h.byRoom[ev.RoomID])
+					h.mu.RUnlock()
+					for _, c := range targets {
+						if c.callRoomID == ev.RoomID {
+							c.enqueue(raw)
+						}
+					}
+				}
 				return
 			case "removed":
 				h.broadcastRoom(ev.RoomID, raw)
@@ -308,7 +334,9 @@ func (h *Hub) broadcastRoom(roomID string, raw []byte) {
 	h.mu.RUnlock()
 
 	for _, c := range targets {
-		c.enqueue(raw)
+		if c.callRoomID == "" {
+			c.enqueue(raw)
+		}
 	}
 }
 
@@ -318,7 +346,9 @@ func (h *Hub) broadcastUser(userID string, raw []byte) {
 	h.mu.RUnlock()
 
 	for _, c := range targets {
-		c.enqueue(raw)
+		if c.callRoomID == "" {
+			c.enqueue(raw)
+		}
 	}
 }
 
@@ -351,7 +381,9 @@ func (h *Hub) SendToUserLocal(userID string, ev Event) bool {
 		return false
 	}
 	for _, c := range targets {
-		c.enqueue(raw)
+		if c.callRoomID == "" {
+			c.enqueue(raw)
+		}
 	}
 	return true
 }
@@ -366,10 +398,21 @@ func (h *Hub) UnsubscribeUserFromRoom(userID, roomID string) {
 	h.unsubscribeUserFromRoom(userID, roomID)
 }
 
-func (h *Hub) register(c *Client, roomIDs []string) {
+func (h *Hub) register(c *Client, roomIDs []string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	if c.callRoomID != "" {
+		n := 0
+		for other := range h.byUser[c.userID] {
+			if other.callRoomID == c.callRoomID {
+				n++
+			}
+		}
+		if n >= 8 {
+			return false
+		}
+	}
 	h.clients[c] = struct{}{}
 	if h.byUser[c.userID] == nil {
 		h.byUser[c.userID] = make(map[*Client]struct{})
@@ -388,6 +431,7 @@ func (h *Hub) register(c *Client, roomIDs []string) {
 		h.byRoom[rid][c] = struct{}{}
 	}
 	c.roomsMu.Unlock()
+	return true
 }
 
 func (h *Hub) unregister(c *Client) {
@@ -413,8 +457,19 @@ func (h *Hub) unregister(c *Client) {
 		}
 	}
 	c.roomsMu.Unlock()
+	remainingCalls := 0
+	if c.callRoomID != "" {
+		for other := range h.byUser[c.userID] {
+			if other.callRoomID == c.callRoomID && other.sessionHash == c.sessionHash {
+				remainingCalls++
+			}
+		}
+	}
 	hook := h.disconnectHook
 	h.mu.Unlock()
+	if c.callRoomID != "" && remainingCalls == 0 && h.roomCallDisconnected != nil {
+		h.roomCallDisconnected(c.userID, c.callRoomID, c.sessionHash)
+	}
 
 	if hook != nil {
 		hook(c.userID, c.isGuest, remaining)
@@ -433,6 +488,9 @@ func (h *Hub) subscribeUserToRoom(userID, roomID string) {
 		h.byRoom[roomID] = make(map[*Client]struct{})
 	}
 	for c := range set {
+		if c.callRoomID != "" && c.callRoomID != roomID {
+			continue
+		}
 		c.memberEvents++
 		c.roomsMu.Lock()
 		c.rooms[roomID] = struct{}{}
@@ -487,7 +545,7 @@ func (h *Hub) resync(ctx context.Context, c *Client) {
 		}
 		want := make(map[string]struct{}, len(ids))
 		for _, rid := range ids {
-			if rid != "" {
+			if rid != "" && (c.callRoomID == "" || rid == c.callRoomID) {
 				want[rid] = struct{}{}
 			}
 		}
@@ -519,16 +577,26 @@ func (h *Hub) resync(ctx context.Context, c *Client) {
 
 // ServeConn registers conn, sends the hello frame, and runs its read/write pumps until closed.
 func (h *Hub) ServeConn(ctx context.Context, conn *websocket.Conn, tenantID, userID, sessionHash string, roomIDs []string) {
-	h.serveClient(ctx, conn, tenantID, userID, sessionHash, false, roomIDs)
+	h.serveClient(ctx, conn, tenantID, userID, sessionHash, false, roomIDs, "")
 }
 
 // ServeGuestConn serves a strictly confined WebSocket for an external meeting guest.
 // Until admitted, roomIDs is empty and the guest only receives targeted lobby.decision events.
 func (h *Hub) ServeGuestConn(ctx context.Context, conn *websocket.Conn, tenantID, guestID string, roomIDs []string) {
-	h.serveClient(ctx, conn, tenantID, guestID, "", true, roomIDs)
+	h.serveClient(ctx, conn, tenantID, guestID, "", true, roomIDs, "")
 }
 
-func (h *Hub) serveClient(ctx context.Context, conn *websocket.Conn, tenantID, userID, sessionHash string, isGuest bool, roomIDs []string) {
+// ServeRoomCallConn is a member's room-affine signaling socket; chat stays on ServeConn.
+func (h *Hub) ServeRoomCallConn(ctx context.Context, conn *websocket.Conn, tenantID, userID, sessionHash, roomID string) {
+	h.serveClient(ctx, conn, tenantID, userID, sessionHash, false, []string{roomID}, roomID)
+}
+
+// ServeGuestRoomCallConn requires an already-admitted guest of this exact room.
+func (h *Hub) ServeGuestRoomCallConn(ctx context.Context, conn *websocket.Conn, tenantID, guestID, roomID string) {
+	h.serveClient(ctx, conn, tenantID, guestID, "", true, []string{roomID}, roomID)
+}
+
+func (h *Hub) serveClient(ctx context.Context, conn *websocket.Conn, tenantID, userID, sessionHash string, isGuest bool, roomIDs []string, callRoomID string) {
 	conn.SetReadLimit(clientMaxReadBytes)
 
 	c := &Client{
@@ -537,6 +605,7 @@ func (h *Hub) serveClient(ctx context.Context, conn *websocket.Conn, tenantID, u
 		userID:      userID,
 		tenantID:    tenantID,
 		sessionHash: sessionHash,
+		callRoomID:  callRoomID,
 		isGuest:     isGuest,
 		rooms:       make(map[string]struct{}, len(roomIDs)),
 		send:        make(chan []byte, clientSendBuffer),
@@ -545,7 +614,10 @@ func (h *Hub) serveClient(ctx context.Context, conn *websocket.Conn, tenantID, u
 		lastTyping:  make(map[string]time.Time),
 	}
 
-	h.register(c, roomIDs)
+	if !h.register(c, roomIDs) {
+		_ = conn.Close(websocket.StatusPolicyViolation, "too many call sockets")
+		return
+	}
 	defer func() {
 		c.kick(websocket.StatusNormalClosure, "")
 		h.unregister(c)
@@ -714,6 +786,9 @@ func (c *Client) readLoop(ctx context.Context) {
 			pong, _ := json.Marshal(Event{Type: EventPong})
 			c.enqueue(pong)
 		case ClientFrameTyping:
+			if c.callRoomID != "" {
+				continue
+			}
 			if frame.RoomID == "" || !c.hasRoom(frame.RoomID) {
 				continue
 			}
@@ -732,9 +807,81 @@ func (c *Client) readLoop(ctx context.Context) {
 				Data:   MustMarshalData(TypingPayload{UserID: c.userID, Active: frame.Active}),
 			})
 		case ClientFrameCallSignal, ClientFrameCallMedia, ClientFrameCallMigrated, ClientFrameCallICEFailed:
+			if c.hub.roomCalls && (c.callRoomID == "" || frame.RoomID != c.callRoomID || !c.hasRoom(c.callRoomID)) {
+				continue
+			}
+			frame.SessionHash = c.sessionHash
 			if c.hub.callFrameHook != nil {
 				c.hub.callFrameHook(ctx, c.userID, c.isGuest, frame)
 			}
 		}
 	}
+}
+
+// dispatchRoomCall never sends a fresh media grant to another session or the global chat
+// socket. Primary revocation checks precede delivery; transient database failures just defer it.
+func (h *Hub) dispatchRoomCall(ev Event, sessionHash string, raw []byte) {
+	if ev.UserID == "" || ev.RoomID == "" {
+		return
+	}
+	h.mu.RLock()
+	targets := copyClients(h.byUser[ev.UserID])
+	h.mu.RUnlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for _, c := range targets {
+		if c.callRoomID != ev.RoomID || !c.hasRoom(ev.RoomID) {
+			continue
+		}
+		if c.isGuest {
+			if h.guestValid != nil && !h.guestValid(c.userID) {
+				continue
+			}
+		} else {
+			if sessionHash == "" || c.sessionHash != sessionHash {
+				continue
+			}
+			if h.sessionValid != nil {
+				valid, err := h.sessionValid(ctx, c.userID, c.sessionHash)
+				if err != nil {
+					continue
+				}
+				if !valid {
+					c.kick(websocket.StatusPolicyViolation, "session revoked")
+					continue
+				}
+			}
+		}
+		c.enqueue(raw)
+	}
+}
+
+// CloseRoomCalls makes clients reconnect through the room's new edge affinity after loss
+// of ownership. Ordinary chat and another room's sockets remain connected.
+func (h *Hub) CloseRoomCalls(roomID string) {
+	h.mu.RLock()
+	targets := copyClients(h.byRoom[roomID])
+	h.mu.RUnlock()
+	for _, c := range targets {
+		if c.callRoomID == roomID {
+			c.kick(websocket.StatusGoingAway, "call owner changed")
+		}
+	}
+}
+
+// HasRoomCallSocket rechecks a captured disconnect after acquiring room control. A late
+// callback must not evict the same session's already-connected replacement socket.
+func (h *Hub) HasRoomCallSocket(user, room, hash string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for c := range h.byUser[user] {
+		if c.callRoomID == room && c.sessionHash == hash {
+			select {
+			case <-c.stop:
+			default:
+				return true
+			}
+		}
+	}
+	return false
 }

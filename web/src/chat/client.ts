@@ -498,10 +498,11 @@ export async function knockGuestMeet(
 export async function joinGuestCall(
   token: string,
   opts: { audio: boolean; video: boolean; screenShare?: boolean; protectIp?: boolean },
+  roomId?: string,
 ): Promise<CallJoinResponse> {
   return parseCallJoinResponse(
     await guestJSON(
-      `/api/meet/${encodeURIComponent(token)}/call/join`,
+      roomId ? `/api/v1/rooms/${encodeURIComponent(roomId)}/calls/guest/${encodeURIComponent(token)}/join` : `/api/meet/${encodeURIComponent(token)}/call/join`,
       {
         method: 'POST',
         body: JSON.stringify({
@@ -516,9 +517,9 @@ export async function joinGuestCall(
   );
 }
 
-export async function leaveGuestCall(token: string): Promise<void> {
+export async function leaveGuestCall(token: string, roomId?: string): Promise<void> {
   await guestJSON(
-    `/api/meet/${encodeURIComponent(token)}/call/leave`,
+    roomId ? `/api/v1/rooms/${encodeURIComponent(roomId)}/calls/guest/${encodeURIComponent(token)}/leave` : `/api/meet/${encodeURIComponent(token)}/call/leave`,
     { method: 'POST', body: '{}' },
     'Could not leave meeting call',
   );

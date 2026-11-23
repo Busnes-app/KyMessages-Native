@@ -845,11 +845,11 @@ export const Chat: React.FC<ChatProps> = ({
           return;
         }
         case 'call.signal': {
-          void callCtrlRef.current?.handleSignal(event.signal);
+          if (!callCtrlRef.current?.isRoomRouted()) void callCtrlRef.current?.handleSignal(event.signal);
           return;
         }
         case 'call.migrate': {
-          void callCtrlRef.current?.handleMigrate(event.migrate);
+          if (!callCtrlRef.current?.isRoomRouted()) void callCtrlRef.current?.handleMigrate(event.migrate);
           return;
         }
         case 'lobby.knock': {
@@ -973,7 +973,7 @@ export const Chat: React.FC<ChatProps> = ({
             setActiveCalls(callMap);
             const activeCallRoom = callRoomIdRef.current;
             const myUid = currentUserRef.current?.id;
-            if (activeCallRoom && myUid) {
+            if (activeCallRoom && myUid && !callCtrlRef.current?.isRoomRouted()) {
               const serverCall = callMap[activeCallRoom];
               const stillJoined = Boolean(serverCall?.peers.some((p) => p.user_id === myUid));
               if (!stillJoined) {
@@ -1641,6 +1641,7 @@ export const Chat: React.FC<ChatProps> = ({
         localDisplayName: me.display_name || me.username,
         isGuest: false,
         socket: () => socketRef.current,
+        rejoin: (media) => joinRoomCall(roomId,media),
         onChange: setCallSnap,
       });
       callCtrlRef.current = ctrl;

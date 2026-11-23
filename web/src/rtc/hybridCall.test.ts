@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ChatSocket } from '../chat/client';
+import { parseCallJoinResponse, type CallJoinResponse } from '../chat/types';
 import { HybridCallController } from './hybridCall';
 
 const { mockRoomInstances, mockDisconnect, mockPublishTrack, mockConnect } = vi.hoisted(() => ({
@@ -90,6 +91,8 @@ describe('HybridCallController SFU/P2P handoff', () => {
       configurable: true,
     });
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
   });
 
   it('keeps local mic/camera tracks live when stepping down from LiveKit SFU to P2P', async () => {
@@ -243,4 +246,75 @@ describe('HybridCallController SFU/P2P handoff', () => {
 
     ctrl.dispose();
   });
+  it('keeps room signaling separate and rebinds media after owner recovery', async () => {
+    vi.useFakeTimers();
+    class WireSocket {
+      static OPEN = 1;
+      static instances: WireSocket[] = [];
+      readyState = 0;
+      onopen: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      onmessage: ((event: { data: string }) => void) | null = null;
+      sent: string[] = [];
+      constructor(readonly url: string) { WireSocket.instances.push(this); }
+      open() { this.readyState = 1; this.onopen?.(); }
+      emit(value: unknown) { this.onmessage?.({ data: JSON.stringify(value) }); }
+      send(value: string) { this.sent.push(value); }
+      close() { this.readyState = 3; this.onclose?.(); }
+    }
+    vi.stubGlobal('WebSocket', WireSocket);
+    const audio = makeFakeTrack('audio');
+    Object.defineProperty(navigator, 'mediaDevices', {
+      value: { getUserMedia: vi.fn().mockResolvedValue(makeFakeStream([audio])) }, configurable: true,
+    });
+    const response: CallJoinResponse = {
+      call_id: 'call_owned', room_id: 'room_owned', peer_id: 'peer_old',
+      call_ws_path: '/api/v1/rooms/room_owned/calls/ws', mode: 'sfu_livekit', epoch: 1,
+      sfu_sticky: true, ice_servers: [], livekit_url: 'wss://lk.example.test', livekit_token: 'initial', peers: [],
+    };
+    const rejoin = vi.fn().mockResolvedValue(response);
+    const globalMedia = vi.fn();
+    const global = { sendCallMedia: globalMedia } as unknown as ChatSocket;
+    const controller = new HybridCallController({ localUserId: 'alice', localDisplayName: 'Alice', isGuest: false,
+      socket: () => global, rejoin, onChange: () => undefined });
+    const started = controller.start(response, { audio: true, video: false, protectIp: true });
+    const wire = WireSocket.instances[0];
+    expect(wire.url).toContain(response.call_ws_path);
+    wire.open();
+    expect(rejoin).not.toHaveBeenCalled(); // Wait for authenticated hello, not only TCP open.
+    wire.emit({ t: 'hello' });
+    await started;
+    expect(controller.isRoomRouted()).toBe(true);
+    await controller.toggleAudio();
+    expect(globalMedia).not.toHaveBeenCalled();
+    expect(wire.sent.map((raw) => JSON.parse(raw))).toContainEqual(expect.objectContaining({ t: 'call.media', room: 'room_owned', audio: false }));
+    await controller.handleMigrate({ call_id: response.call_id, room_id: response.room_id, epoch: 2,
+      target_mode: 'sfu_livekit', livekit_url: response.livekit_url, livekit_token: 'replacement' });
+    expect(mockConnect).toHaveBeenLastCalledWith(response.livekit_url, 'replacement');
+    const calls = mockConnect.mock.calls.length;
+    await controller.handleMigrate({ call_id: response.call_id, room_id: response.room_id, epoch: 1,
+      target_mode: 'sfu_livekit', livekit_url: response.livekit_url, livekit_token: 'stale' });
+    expect(mockConnect).toHaveBeenCalledTimes(calls);
+    rejoin.mockResolvedValue({ ...response, epoch: 3, peer_id: 'peer_recovered', livekit_token: 'recovered' });
+    wire.close();
+    await vi.advanceTimersByTimeAsync(1400);
+    const recovered = WireSocket.instances[1];
+    recovered.open(); recovered.emit({ t: 'hello' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(rejoin).toHaveBeenLastCalledWith({ audio: false, video: false, screenShare: false, protectIp: true });
+    expect(mockConnect).toHaveBeenLastCalledWith(response.livekit_url, 'recovered');
+    expect(audio.readyState).toBe('live');
+    controller.dispose();
+    expect(recovered.readyState).toBe(3);
+    expect(audio.readyState).toBe('ended');
+  });
+
+  it('refuses a socket path outside the joined room', () => {
+    const reply = { call_id: 'c', room_id: 'one', mode: 'p2p_mesh', peers: [], ice_servers: [] };
+    expect(() => parseCallJoinResponse({ ...reply, call_ws_path: '/api/v1/rooms/two/calls/ws' })).toThrow('Invalid call socket path');
+    expect(() => parseCallJoinResponse({ ...reply, call_ws_path: '//outside.example/steal' })).toThrow('Invalid call socket path');
+    expect(parseCallJoinResponse({ ...reply, call_ws_path: '/api/v1/rooms/one/calls/ws' }).call_ws_path).toBe('/api/v1/rooms/one/calls/ws');
+  });
+
 });

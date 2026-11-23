@@ -7,9 +7,10 @@ Exposes HTTP REST routes, authentication endpoints, Single Sign-On callbacks, SC
 Owns HTTP routing, request parsing, session cookie validation, CORS headers, and error response formatting.
 
 ## Local Contracts
+- Hosted member calls use `/api/v1/rooms/{id}/calls/{state,join,leave,escalate,ws}`. Admitted guests use `/api/v1/rooms/{id}/calls/guest/{token}/{join,leave,ws}` with exact token/session/meeting/room binding; token-only guest call writes cannot bypass affinity. The edge must hash the same room ID for every HTTP/WS call route. Ordinary member/guest chat and lobby sockets stay separate. A multi-mode join supplies `call_ws_path`; guest info supplies `call_room_id`, omitted in single mode. HTTP departure reports pending SFU cleanup as 503; revoked in-flight joins return 401 without a grant. See `room_call_routing_test.go` and the gated networking guide.
 - Multi-mode erasure, tenant revocation and org purge drain durable SFU room retirement before acknowledging completion. An SFU failure after row deletion remains retryable and cannot produce a completion audit/terminal purge mark. The shared call-cleanup reconciliation tick is elected with `call_cleanup`; a failed room cannot starve unrelated cleanup batches. `call_cleanup_test.go` exercises a receiving replica without the departed owner's memory, failure/retry and exact-once completion.
 
-- `NewServer` enables bounded call-notification chunking only for the multi-mode PostgreSQL bus; single-mode bus wire behavior stays unchanged. Room-owner routing remains separate from this transport prerequisite.
+- `NewServer` enables bounded call-notification chunking only for the multi-mode PostgreSQL bus; single-mode bus wire behavior stays unchanged. Room ownership is claimed only after exact principal/org/room authorization; wrong owners return retryable 503 `call_owner_unavailable`, with no replica address.
 
 - After multi-mode erasure, a surviving shared-room successor immediately has owner permissions; cleanup failure/retry and duplicate deliveries retain that choice and other members' content. Only owned rooms with no remaining member disappear. `erasure_handover_test.go` exercises real signed deliveries, encrypted member messages, attachments and successor API access.
 

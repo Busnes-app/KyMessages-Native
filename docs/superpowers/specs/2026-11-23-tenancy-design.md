@@ -535,8 +535,8 @@ are carried whole in 2 KiB notification parts. A bounded decoder keeps at most 1
 events (16 MiB of content), expires them after 10 seconds, and verifies the complete event
 before delivery. User targeting remains unchanged; corrupt/incomplete parts are never client
 frames. Single-mode notification bytes and ordinary message refetch behavior are unchanged.
-This does not provide room-owner routing, call-seat ownership or failover reconstruction;
-PR 4 remains unbuilt until those and the room-scoped WebSocket path are implemented.
+This transport alone does not provide ownership or recovery; the following foundation and
+room-runtime sections describe those separate layers. Hosted qualification remains gated.
 
 ### Call ownership and cleanup foundation (implemented, startup still gated)
 
@@ -551,7 +551,7 @@ the old SFU room before removing seats; retries cannot target a later media epoc
 completion and the terminal org-purge mark wait for SFU cleanup, including when the original
 owner is absent. Offline grant invalidation also fences restored owner leases/seats and queues
 known old media rooms. Single-mode call records and notification/grant wire behavior stay
-unchanged. Runtime room affinity, client call sockets and owner reconstruction remain required
+unchanged. Runtime room affinity, client call sockets and owner reconstruction are implemented in the separate runtime follow-up; hosted qualification and the startup gate remain required
 to finish PR 4.
 
 ## 12. Phased build plan
@@ -630,6 +630,30 @@ Tests each PR must add, beyond its own:
 9. **`org.unsuspended`:** *Default:* keep accepting it until KyIdentity confirms it never sends it,
    then remove it in its own PR.
 
+
+### Room-affine call runtime (implementation, startup still gated)
+
+Hosted HTTP and WebSocket control now share a literal room-addressed prefix:
+`/api/v1/rooms/{id}/calls/`, including exact-room guest aliases under `guest/{token}/`.
+Authorization precedes ownership discovery. The edge must hash the same room segment to the
+same replica for every call route; chat/lobby sockets remain independent. A live competing
+owner yields retryable 503, never a second call or an internal-address redirect.
+
+Each process renews its 90-second DB-clock room lease during the 30-second reconciliation
+cycle and on control requests. After owner loss a new generation rebuilds call identity,
+mode and sticky policy from `call_sessions`, queues retired SFU media and seats, and advances
+the epoch before admitting new peers. SFU failure keeps cleanup retryable and blocks fresh
+credentials. Browser call sockets reconnect through the room route and rejoin by HTTP for
+fresh peers/credentials; they do not reconstruct SDP or private media keys from the database.
+Primary session/seat checks fence outbound signaling, migration grants and missed revocations.
+Late disconnect callbacks recheck connected replacement sockets after room serialization.
+
+This is not a seamless-live-media promise: recovery can interrupt media, and a dead owner
+can retain its lease for up to 90 seconds. Keep the eligible call replica pool stable during
+calls; changing pool membership requires draining/stopping the removed owners so they cease
+renewing before their rooms move. Hosted scale, browser/media and operational qualification
+remain launch work, along with S3. See `docs/Reverse_Proxy_Networking.md` for the gated affinity
+contract. Single mode keeps its original global call socket and responses.
 
 ## 15. Owner-approved guest-meeting planning
 

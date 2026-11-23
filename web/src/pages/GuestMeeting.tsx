@@ -163,7 +163,7 @@ export const GuestMeeting: React.FC<GuestMeetingProps> = ({ token, appName }) =>
         onReconnect: () => {
           // The server removes a guest's call peer when their last WS disconnects.
           // Tear down any stale local call controller so the user can cleanly rejoin.
-          if (callCtrlRef.current) {
+          if (callCtrlRef.current && !callCtrlRef.current.isRoomRouted()) {
             callCtrlRef.current.dispose();
             callCtrlRef.current = null;
             setCallSnap(null);
@@ -229,11 +229,11 @@ export const GuestMeeting: React.FC<GuestMeetingProps> = ({ token, appName }) =>
             return;
           }
           if (ev.kind === 'call.signal') {
-            void callCtrlRef.current?.handleSignal(ev.signal);
+            if (!callCtrlRef.current?.isRoomRouted()) void callCtrlRef.current?.handleSignal(ev.signal);
             return;
           }
           if (ev.kind === 'call.migrate') {
-            void callCtrlRef.current?.handleMigrate(ev.migrate);
+            if (!callCtrlRef.current?.isRoomRouted()) void callCtrlRef.current?.handleMigrate(ev.migrate);
           }
         },
       },
@@ -311,13 +311,14 @@ export const GuestMeeting: React.FC<GuestMeetingProps> = ({ token, appName }) =>
     setCallError('');
     setJoiningCall(true);
     try {
-      const joinResp = await joinGuestCall(token, { audio: true, video: withVideo });
+      const joinResp = await joinGuestCall(token, { audio: true, video: withVideo }, info?.call_room_id);
       callCtrlRef.current?.dispose();
       const ctrl = new HybridCallController({
         localUserId: guestId,
         localDisplayName: displayName || 'Guest',
         isGuest: true,
         socket: () => socketRef.current,
+        rejoin: (media) => joinGuestCall(token,media,info?.call_room_id),
         onChange: setCallSnap,
       });
       callCtrlRef.current = ctrl;
@@ -333,7 +334,7 @@ export const GuestMeeting: React.FC<GuestMeetingProps> = ({ token, appName }) =>
     callCtrlRef.current?.dispose();
     callCtrlRef.current = null;
     setCallSnap(null);
-    await leaveGuestCall(token).catch(() => undefined);
+    await leaveGuestCall(token, info?.call_room_id).catch(() => undefined);
   };
 
   const handleSendMessage = async (e: React.FormEvent) => {

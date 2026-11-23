@@ -159,6 +159,19 @@ func (s *Server) handleChatWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	callRoom := r.PathValue("id")
+	if callRoom != "" {
+		if _, ok := s.requireRoomMember(w, r, tenantID, callRoom, user.ID); !ok {
+			return
+		}
+		if user.Role != "user" {
+			s.writeError(w, http.StatusForbidden, "Member account required")
+			return
+		}
+		if !s.requireCallOwner(w, r, tenantID, callRoom) {
+			return
+		}
+	}
 	// Origin was validated strictly above via sameOrigin(origin, AppURL).
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		InsecureSkipVerify: true,
@@ -167,5 +180,9 @@ func (s *Server) handleChatWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.chatHub.ServeConn(r.Context(), conn, tenantID, user.ID, sess.TokenHash, roomIDs)
+	if callRoom != "" {
+		s.chatHub.ServeRoomCallConn(r.Context(), conn, tenantID, user.ID, sess.TokenHash, callRoom)
+	} else {
+		s.chatHub.ServeConn(r.Context(), conn, tenantID, user.ID, sess.TokenHash, roomIDs)
+	}
 }
