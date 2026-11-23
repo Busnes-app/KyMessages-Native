@@ -190,7 +190,7 @@ func TestPoolStaleGrantFailsClosed(t *testing.T) {
 	if rec := doBearerJSON(t, e.a, http.MethodGet, "/api/v1/rooms/"+e.roomID+"/messages", e.tok, nil, nil); rec.Code != http.StatusOK {
 		t.Fatalf("reading on an expired grant = %d", rec.Code)
 	}
-	if rec := doBearerJSON(t, e.a, http.MethodPost, "/api/v1/rooms/"+e.roomID+"/messages", e.tok, map[string]any{"body": "text still works"}, nil); rec.Code != http.StatusCreated {
+	if rec := doBearerJSON(t, e.a, http.MethodPost, "/api/v1/rooms/"+e.roomID+"/messages", e.tok, sealed("text still works", nil), nil); rec.Code != http.StatusCreated {
 		t.Fatalf("sending text on an expired grant = %d", rec.Code)
 	}
 }

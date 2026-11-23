@@ -81,15 +81,15 @@ func TestUserErasedDeletesThePersonsData(t *testing.T) {
 	posted := upload(channel)
 	staged := upload(channel)
 	for room, msg := range map[string]map[string]any{
-		channel: {"body": "alice in the channel", "attachment_ids": []string{posted}},
-		dmBob:   {"body": "alice to bob"},
-		dmCarol: {"body": "alice to carol"},
+		channel: sealed("alice in the channel", map[string]any{"attachment_ids": []string{posted}}),
+		dmBob:   sealed("alice to bob", nil),
+		dmCarol: sealed("alice to carol", nil),
 	} {
 		if rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room+"/messages", aliceTok, msg, nil); rec.Code != http.StatusCreated {
 			t.Fatalf("send: %d %s", rec.Code, rec.Body.String())
 		}
 	}
-	if rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+channel+"/messages", bobTok, map[string]any{"body": "bob stays"}, nil); rec.Code != http.StatusCreated {
+	if rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+channel+"/messages", bobTok, sealed("bob stays", nil), nil); rec.Code != http.StatusCreated {
 		t.Fatal(rec.Code)
 	}
 	if err := st.Users().CreateUser(ctx, &store.User{ID: "usr_er_bot", Username: "er_bot", Role: "bot", Status: "active", SSOProvider: "bot"}); err != nil {
@@ -142,7 +142,7 @@ func TestUserErasedDeletesThePersonsData(t *testing.T) {
 			if m.SenderID == alice.ID && (m.Body != "" || m.SenderName != "" || m.DeletedAt == nil || len(m.Attachments) != 0) {
 				t.Fatalf("not a tombstone: %+v", m)
 			}
-			if m.SenderID == bob.ID && m.Body != "bob stays" {
+			if m.SenderID == bob.ID && m.Body != testEnvelope("bob stays") {
 				t.Fatalf("bob's message changed: %+v", m)
 			}
 		}
@@ -234,7 +234,7 @@ func TestUserErasedAfterUserDeleted(t *testing.T) {
 		Attachment store.Attachment `json:"attachment"`
 	}
 	_ = json.Unmarshal(up.Body.Bytes(), &a)
-	if rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room+"/messages", aliceTok, map[string]any{"body": "mine", "attachment_ids": []string{a.Attachment.ID}}, nil); rec.Code != http.StatusCreated {
+	if rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room+"/messages", aliceTok, sealed("mine", map[string]any{"attachment_ids": []string{a.Attachment.ID}}), nil); rec.Code != http.StatusCreated {
 		t.Fatal(rec.Code)
 	}
 	del := []byte(`{"schemas":["urn:ietf:params:scim:schemas:core:2.0:User"],"id":"` + alice.SSOSubject + `","externalId":"x","userName":"edalice","active":false,"org_id":"` + replicaOrgA + `","meta":{"resourceType":"User","version":"W/\"5\""}}`)
@@ -351,7 +351,7 @@ func TestUserErasedCoversARecreatedAccount(t *testing.T) {
 	old, oldTok := createOrgUser(t, st, "usr_rc_old", "rcold", "user", replicaOrgA)
 	bob, bobTok := createOrgUser(t, st, "usr_rc_bob", "rcbob", "user", replicaOrgA)
 	room := roomOf(t, doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", oldTok, map[string]any{"kind": store.RoomKindChannel, "name": "c", "member_ids": []string{bob.ID}}, nil))
-	if rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room+"/messages", oldTok, map[string]any{"body": "from the first account"}, nil); rec.Code != http.StatusCreated {
+	if rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room+"/messages", oldTok, sealed("from the first account", nil), nil); rec.Code != http.StatusCreated {
 		t.Fatal(rec.Code)
 	}
 	// user.deleted, then the same subject comes back as a new account.
@@ -517,7 +517,7 @@ func TestErasureIncludesOwnedBotContentAcrossCleanupRetry(t *testing.T) {
 			if err := json.Unmarshal(bobUpload.Body.Bytes(), &kept); err != nil || bobUpload.Code != http.StatusCreated {
 				t.Fatalf("other upload: %d %v", bobUpload.Code, err)
 			}
-			if r := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room+"/messages", bobToken, map[string]any{"body": "other member keeps this", "attachment_ids": []string{kept.Attachment.ID}}, nil); r.Code != http.StatusCreated {
+			if r := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room+"/messages", bobToken, sealed("other member keeps this", map[string]any{"attachment_ids": []string{kept.Attachment.ID}}), nil); r.Code != http.StatusCreated {
 				t.Fatal(r.Code)
 			}
 			if r := doBearerJSON(t, srv, http.MethodGet, "/api/v1/attachments/"+up.Attachment.ID, bobToken, nil, nil); r.Code != http.StatusOK {
@@ -575,7 +575,7 @@ func TestErasureIncludesOwnedBotContentAcrossCleanupRetry(t *testing.T) {
 						t.Fatalf("bot message not tombstoned: %+v", m)
 					}
 				}
-				if m.SenderID == bob.ID && m.Body == "other member keeps this" {
+				if m.SenderID == bob.ID && m.Body == testEnvelope("other member keeps this") {
 					bobSeen = true
 				}
 			}
