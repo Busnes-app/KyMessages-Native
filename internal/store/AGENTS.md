@@ -166,3 +166,5 @@ None.
 
 - Shared leave timers rearm while a disconnected guest keeps polling. The eventual database delete emits one departure and evicts the call seat; deterministic scheduler callbacks cover polling beyond the first timer and later inactivity.
 - `user_erasure_state` tracks pending and completed erasures. `ClearPendingBlobDeletes` commits each completion and its sole `sso.user_erased` audit together, only when all of that user's queued deletes are gone. Replays retain completion; retries read their queued keys through `ErasureBlobs`.
+
+- Migration 61 atomically queues missing-org grant revocation with suspension in `tenant_pending_revocations`. Pending cleanup fences primary tenant reads, grant issuance and upload commits even if a lifecycle event resumes the org; only successful revocation removes the fence. Purge also deletes `user_erasure_state`.

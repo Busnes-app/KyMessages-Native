@@ -115,7 +115,9 @@ func (c *chatStore) EnsureTenant(ctx context.Context, tenantID string) (*Tenant,
 func (c *chatStore) GetTenant(ctx context.Context, tenantID string) (*Tenant, error) {
 	tenantID = normalizeTenant(tenantID)
 	q := c.store.rebind(`
-		SELECT id, slug, display_name, plan, status, p2p_policy, p2p_max_video, p2p_max_audio, guest_force_sfu, created_at
+		SELECT id, slug, display_name, plan,
+ CASE WHEN status = 'active' AND EXISTS (SELECT 1 FROM tenant_pending_revocations p WHERE p.tenant_id = tenants.id) THEN 'suspended' ELSE status END,
+ p2p_policy, p2p_max_video, p2p_max_audio, guest_force_sfu, created_at
 		FROM tenants WHERE id = ?`)
 	var t Tenant
 	var guestForce int
@@ -1439,7 +1441,7 @@ func (c *chatStore) CommitAttachmentWithQuota(ctx context.Context, reservationID
 		// Under the tenant lock the org purge also takes: an upload whose person was erased or
 		// whose org was deleted while it was in flight commits nothing.
 		var status, tenant string
-		if err := tx.QueryRowContext(ctx, c.store.rebind(`SELECT u.status, t.status FROM users u JOIN tenants t ON t.id = ? WHERE u.id = ?`), a.TenantID, a.UploaderID).Scan(&status, &tenant); err != nil || status != "active" || tenant != TenantStatusActive {
+		if err := tx.QueryRowContext(ctx, c.store.rebind(`SELECT u.status, t.status FROM users u JOIN tenants t ON t.id = ? WHERE u.id = ? AND NOT EXISTS (SELECT 1 FROM tenant_pending_revocations p WHERE p.tenant_id = t.id)`), a.TenantID, a.UploaderID).Scan(&status, &tenant); err != nil || status != "active" || tenant != TenantStatusActive {
 			return ErrForbidden
 		}
 	}

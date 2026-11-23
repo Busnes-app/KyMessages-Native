@@ -325,6 +325,9 @@ CREATE TABLE user_erasure_actors (
 const tenantMissingSchema = `
 ALTER TABLE tenants ADD COLUMN missing_since BIGINT;
 ALTER TABLE tenants ADD COLUMN purged_at BIGINT;
+CREATE TABLE tenant_pending_revocations (
+    tenant_id VARCHAR(64) PRIMARY KEY REFERENCES tenants(id)
+);
 `
 
 const tenantPoolSchema = `

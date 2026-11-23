@@ -41,14 +41,32 @@ func (c *chatStore) ids(ctx context.Context, q string, args ...any) ([]string, e
 
 // MarkTenantMissing holds an active org offline as if suspended. It reports whether it changed.
 func (c *chatStore) MarkTenantMissing(ctx context.Context, tenantID string, nowMs int64) (bool, error) {
-	return c.changed(ctx, `UPDATE tenants SET status = 'suspended', missing_since = ? WHERE id = ? AND status = 'active'`, nowMs, tenantID)
+	tx, err := c.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx, c.store.rebind(`UPDATE tenants SET status = 'suspended', missing_since = ? WHERE id = ? AND status = 'active'`), nowMs, tenantID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if n == 1 {
+		if _, err := tx.ExecContext(ctx, c.store.rebind(`INSERT INTO tenant_pending_revocations (tenant_id) VALUES (?) ON CONFLICT (tenant_id) DO NOTHING`), tenantID); err != nil {
+			return false, err
+		}
+	}
+	return n == 1, tx.Commit()
 }
 
 // ClearTenantMissing serves a missing org again once KyIdentity lists it as active at revision,
 // unless a newer lifecycle event applied since (which also clears the flag, see
 // ApplyTenantLifecycle): a stale listing never undoes a newer suspension.
 func (c *chatStore) ClearTenantMissing(ctx context.Context, tenantID string, revision int64) (bool, error) {
-	return c.changed(ctx, `UPDATE tenants SET status = 'active', missing_since = NULL WHERE id = ? AND missing_since IS NOT NULL AND status = 'suspended' AND lifecycle_revision <= ?`, tenantID, revision)
+	return c.changed(ctx, `UPDATE tenants SET status = 'active', missing_since = NULL WHERE id = ? AND missing_since IS NOT NULL AND status = 'suspended' AND lifecycle_revision <= ? AND NOT EXISTS (SELECT 1 FROM tenant_pending_revocations p WHERE p.tenant_id = tenants.id)`, tenantID, revision)
 }
 
 // TenantMissing reports whether tenantID carries the missing flag.
@@ -153,6 +171,7 @@ func (c *chatStore) PurgeTenantRows(ctx context.Context, tenantID string) error 
 		{`DELETE FROM users WHERE org_id = ?`, []any{tenantID}},
 		{`DELETE FROM user_subjects WHERE org_id = ?`, []any{tenantID}},
 		{`DELETE FROM pending_blob_deletes WHERE tenant_id = ?`, []any{tenantID}},
+		{`DELETE FROM user_erasure_state WHERE tenant_id = ?`, []any{tenantID}},
 	} {
 		if _, err := tx.ExecContext(ctx, c.store.rebind(s.q), s.args...); err != nil {
 			return err
@@ -179,4 +198,13 @@ func (c *chatStore) MarkTenantPurged(ctx context.Context, tenantID string) error
 		}
 	}
 	return tx.Commit()
+}
+
+// PendingTenantRevocations survives missing detection, lifecycle changes and process restarts.
+func (c *chatStore) PendingTenantRevocations(ctx context.Context) ([]string, error) {
+	return c.ids(ctx, `SELECT tenant_id FROM tenant_pending_revocations ORDER BY tenant_id`)
+}
+func (c *chatStore) CompleteTenantRevocation(ctx context.Context, id string) error {
+	_, err := c.store.db.ExecContext(ctx, c.store.rebind(`DELETE FROM tenant_pending_revocations WHERE tenant_id = ?`), id)
+	return err
 }

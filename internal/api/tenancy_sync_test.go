@@ -544,3 +544,47 @@ func TestTenancySyncStaleSuspendedListingKeepsRecovery(t *testing.T) {
 		t.Fatalf("the active listing did not bring it back: %v %q", err, e.status(t, syncOrgID(3)))
 	}
 }
+
+// A failed missing-org revocation remains work even though the org is no longer active.
+func TestTenancySyncRetriesMissingOrgRevocationBeforeRecovery(t *testing.T) {
+	ctx := context.Background()
+	e := newSyncEnv(t)
+	org := syncOrgID(0)
+	user, tok := createOrgUser(t, e.st, "usr_missing_retry", "missingretry", "user", org)
+	for i := 1; i < 10; i++ {
+		if _, err := e.st.Chat().EnsureTenant(ctx, syncOrgID(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	kyid := sso.NewKyIdentityClient(e.cfg.SSO, &failOnceStore{Store: e.st, sessions: &failOnceSessions{SessionStore: e.st.Sessions()}})
+	kyid.SetTenancy(e.cfg.Tenancy)
+	e.dir.list(listedAll(10, 0)...)
+	if err := kyid.SyncTenancy(ctx, true, false); err == nil {
+		t.Fatal("failed missing revocation reported success")
+	}
+	pending, err := e.st.Chat().PendingTenantRevocations(ctx)
+	if err != nil || len(pending) != 1 || pending[0] != org {
+		t.Fatalf("missing revocation not durable: %v %v", pending, err)
+	}
+	// A concurrent lifecycle resume cannot bypass the cleanup fence.
+	if err := e.st.Chat().SetTenantStatus(ctx, org, store.TenantStatusActive); err != nil {
+		t.Fatal(err)
+	}
+	if e.status(t, org) == store.TenantStatusActive {
+		t.Fatal("resume restored access before revocation completed")
+	}
+	if err := e.st.Sessions().CreateSession(ctx, &store.Session{TokenHash: "missing-retry-session", UserID: user.ID, ExpiresAt: time.Now().Add(time.Hour)}, user.PasswordHash); err == nil {
+		t.Fatal("pending cleanup admitted a new session")
+	}
+	// Even an incremental read, which cannot discover missing orgs, must finish the queued work.
+	e.dir.list(listedAll(10)...)
+	if err := kyid.SyncTenancy(ctx, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := e.st.Chat().PendingTenantRevocations(ctx); err != nil || len(pending) != 0 {
+		t.Fatalf("pending after retry: %v %v", pending, err)
+	}
+	if rec := doBearerJSON(t, e.srv, http.MethodGet, "/api/v1/rooms", tok, nil, nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("surviving session after recovery: %d", rec.Code)
+	}
+}

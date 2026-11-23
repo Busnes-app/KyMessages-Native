@@ -47,3 +47,5 @@ Owns the application adapters around KyIdentity OAuth/OIDC login and the HMAC-SH
 
 ## Child DOX Index
 None.
+
+- Every tenancy sync drains durable `tenant_pending_revocations` before applying any listing; a failed missing-org revocation remains queued independently of active-org discovery. Missing detection queues and drains the same work before reporting success.

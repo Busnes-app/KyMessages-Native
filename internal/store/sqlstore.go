@@ -688,7 +688,7 @@ func (s *SQLStore) withPassword(ctx context.Context, userID, expectedHash string
 	// orders this against a suspension: one that committed first refuses the grant, and one
 	// that waits for it then deletes it with the org's other grants.
 	if orgID != "" {
-		org, err := tx.ExecContext(ctx, s.rebind("UPDATE tenants SET id = id WHERE id = ? AND status = ?"), orgID, TenantStatusActive)
+		org, err := tx.ExecContext(ctx, s.rebind("UPDATE tenants SET id = id WHERE id = ? AND status = ? AND NOT EXISTS (SELECT 1 FROM tenant_pending_revocations p WHERE p.tenant_id = tenants.id)"), orgID, TenantStatusActive)
 		if err != nil {
 			return err
 		}

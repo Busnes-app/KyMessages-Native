@@ -397,6 +397,8 @@ type ChatStore interface {
 	// Tenancy sync and the org purge (multi mode, tenancy_sync.go).
 	ActiveTenantIDs(ctx context.Context) ([]string, error)
 	DeletedUnpurgedTenants(ctx context.Context) ([]string, error)
+	PendingTenantRevocations(ctx context.Context) ([]string, error)
+	CompleteTenantRevocation(ctx context.Context, tenantID string) error
 	MarkTenantMissing(ctx context.Context, tenantID string, nowMs int64) (bool, error)
 	ClearTenantMissing(ctx context.Context, tenantID string, revision int64) (bool, error)
 	TenantMissing(ctx context.Context, tenantID string) (bool, error)

@@ -51,6 +51,10 @@ func (k *KyIdentityClient) SyncTenancy(ctx context.Context, full, startup bool) 
 	if !k.tenancy.IsMultiTenant() {
 		return nil
 	}
+	// Retry durable cleanup before reading any listing that could restore access.
+	if err := k.finishPendingRevocations(ctx); err != nil {
+		return err
+	}
 	dir, err := k.SuiteDirectory()
 	if err != nil {
 		return err
@@ -207,7 +211,7 @@ func (k *KyIdentityClient) checkMissing(ctx context.Context, listed []suitedir.O
 		if marked {
 			log.Printf("[TENANCY] ALERT: an org is missing from KyIdentity's list and is held offline")
 			k.auditSync(ctx, "tenancy.org_missing", id, "")
-			if err := k.revokeTenant(ctx, id); err != nil {
+			if err := k.finishPendingRevocations(ctx); err != nil {
 				return err
 			}
 		}
@@ -317,4 +321,20 @@ func (k *KyIdentityClient) StartupSync(ctx context.Context) error {
 // FullSyncDue reports whether the daily full read is due.
 func (k *KyIdentityClient) FullSyncDue(ctx context.Context) bool {
 	return time.Since(time.Unix(k.storedRevision(ctx, SettingFullSyncAt), 0)) >= StartupSyncMaxAge
+}
+
+func (k *KyIdentityClient) finishPendingRevocations(ctx context.Context) error {
+	ids, err := k.store.Chat().PendingTenantRevocations(ctx)
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if err := k.revokeTenant(ctx, id); err != nil {
+			return err
+		}
+		if err := k.store.Chat().CompleteTenantRevocation(ctx, id); err != nil {
+			return err
+		}
+	}
+	return nil
 }
