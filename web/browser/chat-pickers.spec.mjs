@@ -174,7 +174,9 @@ test('new DM and search: arrows move through options from the box and Enter pick
     const key = `${word}-${i}-${Date.now()}`;
     expect((await page.request.post(`/api/v1/rooms/${room.id}/messages`, { headers: { ...headers, 'Idempotency-Key': key }, data: { body, idempotency_key: key } })).ok()).toBe(true);
   }
-  await page.goto('/');
+  // Search runs on the device, so it finds what this browser has read: open the room first.
+  await page.goto(`/#room=${encodeURIComponent(room.id)}`);
+  await expect(page.getByRole('region', { name: 'Conversation' }).getByText(`second ${word} note`)).toBeVisible();
 
   await (await railButton(page, 'New direct message')).click();
   const dm = page.getByRole('dialog', { name: 'New direct message' });

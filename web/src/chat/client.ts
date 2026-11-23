@@ -311,12 +311,6 @@ export async function deletePushSubscription(endpoint: string): Promise<void> {
   );
 }
 
-export async function searchMessages(query: string, roomId?: string): Promise<ChatMessage[]> {
-  const qs = new URLSearchParams({ q: query, limit: '25' });
-  if (roomId) qs.set('room_id', roomId);
-  const data = obj(await apiJSON(`/api/v1/search?${qs.toString()}`, {}, 'Search failed'));
-  return arr(data.messages ?? []).map(parseMessage);
-}
 
 
 

@@ -1010,42 +1010,6 @@ func (s *Server) handleChatMarkRead(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]any{"room_id": roomID, "last_read_seq": cur})
 }
 
-// GET /api/v1/search?q=&room_id=&limit=
-func (s *Server) handleChatSearch(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Cache-Control", "no-store")
-	user, _, ok := s.currentUser(r)
-	if !ok {
-		s.writeError(w, http.StatusUnauthorized, "Authentication required")
-		return
-	}
-	tenantID, ok := s.requireUserTenant(w, r, user)
-	if !ok {
-		return
-	}
-	query := strings.TrimSpace(r.URL.Query().Get("q"))
-	if query == "" || len(query) > maxSearchQueryLen {
-		s.writeError(w, http.StatusBadRequest, "q must be 1 to 200 characters")
-		return
-	}
-	roomID := strings.TrimSpace(r.URL.Query().Get("room_id"))
-	limit := 25
-	if v := r.URL.Query().Get("limit"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 || n > 50 {
-			s.writeError(w, http.StatusBadRequest, "limit must be between 1 and 50")
-			return
-		}
-		limit = n
-	}
-
-	hits, err := s.store.Chat().SearchMessages(r.Context(), tenantID, user.ID, roomID, query, limit)
-	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "Search failed")
-		return
-	}
-	s.writeJSON(w, http.StatusOK, map[string]any{"messages": hits})
-}
-
 // POST /api/v1/webhooks/in/{id}: incoming webhooks were removed so every room can be end-to-end
 // encrypted (docs/superpowers/specs/2026-11-22-e2ee-design.md §8). It answers every sender alike,
 // without looking the ID up, so it says nothing about which webhooks existed.

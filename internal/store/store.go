@@ -352,7 +352,6 @@ type ChatStore interface {
 	ListMessages(ctx context.Context, q MessagePageQuery) ([]*Message, bool, error)
 	EditMessage(ctx context.Context, tenantID, roomID, messageID, actorID, newBody string) (*Message, error)
 	DeleteMessage(ctx context.Context, tenantID, roomID, messageID, actorID string, allowModerator bool) (*Message, error)
-	SearchMessages(ctx context.Context, tenantID, userID, roomID, query string, limit int) ([]*Message, error)
 
 	AddReaction(ctx context.Context, tenantID, roomID, messageID, userID, emoji string) error
 	RemoveReaction(ctx context.Context, tenantID, roomID, messageID, userID, emoji string) error

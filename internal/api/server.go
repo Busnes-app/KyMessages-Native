@@ -460,7 +460,6 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/push/subscriptions", s.requireAuthenticated(s.handleListPushSubscriptions))
 	s.mux.HandleFunc("POST /api/v1/push/subscriptions", s.requireAuthenticated(s.handleRegisterPushSubscription))
 	s.mux.HandleFunc("DELETE /api/v1/push/subscriptions", s.requireAuthenticated(s.handleDeletePushSubscription))
-	s.mux.HandleFunc("GET /api/v1/search", s.requireAuthenticated(s.handleChatSearch))
 	s.mux.HandleFunc("POST /api/v1/keys/upload", s.handleE2EEUpload)
 	s.mux.HandleFunc("POST /api/v1/keys/query", s.handleE2EEQuery)
 	s.mux.HandleFunc("POST /api/v1/keys/claim", s.handleE2EEClaim)

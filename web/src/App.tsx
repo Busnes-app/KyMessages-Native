@@ -20,6 +20,7 @@ import './ky-ui/tokens.css';
 import './ky-ui/navigation.css';
 import { errorMessage, secureFetch } from './api';
 import { browserPushEndpoint, unsubscribeBrowserPush } from './chat/push';
+import { forgetSearchIndex } from './chat/searchIndex';
 import { parseSettings, parseUser, type SessionUser, type SiteSettings } from './dto';
 import { ErrorBoundary } from './components/ErrorBoundary';
 
@@ -113,6 +114,7 @@ export const App: React.FC = () => {
       });
       if (!res.ok) throw new Error(await errorMessage(res, 'Sign-out failed'));
       if (pushEndpoint) void unsubscribeBrowserPush();
+      void forgetSearchIndex();
       setActiveCallSummary(null);
       setUser(null);
     } catch (err) {
@@ -202,6 +204,7 @@ export const App: React.FC = () => {
               onLogout={handleLogout}
               onActiveCallChange={setActiveCallSummary}
               onAuthRevoked={() => {
+                void forgetSearchIndex();
                 setActiveCallSummary(null);
                 setUser(null);
                 setNotice('Your session ended. Sign in again to continue.');

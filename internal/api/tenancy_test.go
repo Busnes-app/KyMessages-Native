@@ -296,17 +296,9 @@ func TestMultiTenantCrossOrgIsolation(t *testing.T) {
 		}
 	}
 
-	// Cross-org search must return zero hits.
-	rec = doBearerJSON(t, srv, http.MethodGet, "/api/v1/search?q=alpha-launch-code-9981", carolTok, nil, nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("carol search = %d: %s", rec.Code, rec.Body.String())
-	}
-	var searchResp struct {
-		Messages []any `json:"messages"`
-	}
-	_ = json.Unmarshal(rec.Body.Bytes(), &searchResp)
-	if len(searchResp.Messages) != 0 {
-		t.Fatalf("cross-org search leaked %d messages", len(searchResp.Messages))
+	// Server search is gone (search runs on the device), so there is nothing to search across orgs.
+	if rec = doBearerJSON(t, srv, http.MethodGet, "/api/v1/search?q=alpha-launch-code-9981", carolTok, nil, nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("server search = %d, want 404 now that it is removed: %s", rec.Code, rec.Body.String())
 	}
 
 	// 4. Cross-org instant meeting invite must fail.

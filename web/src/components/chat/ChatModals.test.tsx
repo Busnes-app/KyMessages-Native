@@ -4,7 +4,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import type { ChatDirectoryUser, ChatMessage, ChatRoomSummary } from '../../chat/types';
 
 const searchMessages = vi.fn();
-vi.mock('../../chat/client', () => ({ searchMessages: (...args: unknown[]) => searchMessages(...args) }));
+const searchIndexFor = vi.fn();
+vi.mock('../../chat/searchIndex', () => ({ searchIndexFor: (userId: string) => searchIndexFor(userId) }));
 
 const { CreateChannelModal, SearchModal, StartDMModal } = await import('./ChatModals');
 
@@ -136,11 +137,13 @@ describe('SearchModal', () => {
     searchMessages.mockResolvedValue([hit('m1', 4, 'Budget review moves'), hit('m2', 7, 'Check the budget sheet')]);
     const onSelectHit = vi.fn();
     const onClose = vi.fn();
-    render(<SearchModal rooms={rooms} activeRoomId="r1" onClose={onClose} onSelectHit={onSelectHit} />);
+    searchIndexFor.mockResolvedValue({ search: searchMessages });
+    render(<SearchModal userId="me" rooms={rooms} activeRoomId="r1" onClose={onClose} onSelectHit={onSelectHit} />);
     const box = await screen.findByRole('combobox', { name: 'Search messages' });
     await waitFor(() => expect(document.activeElement).toBe(box));
     fireEvent.change(box, { target: { value: 'budget' } });
     await act(() => new Promise((r) => setTimeout(r, 300)));
+    expect(searchIndexFor).toHaveBeenCalledWith('me');
     expect(searchMessages).toHaveBeenCalledWith('budget', undefined);
     expect(await screen.findAllByRole('option')).toHaveLength(2);
     expect(screen.getByRole('listbox', { name: 'Search results' })).toBeTruthy();

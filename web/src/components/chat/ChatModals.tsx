@@ -3,8 +3,8 @@ import { Autocomplete } from '@base-ui/react/autocomplete';
 import { Combobox } from '@base-ui/react/combobox';
 import { Dialog } from '@base-ui/react/dialog';
 import { Hash, Lock, MessageSquare, Search, Video, X } from 'lucide-react';
-import type { ChatDirectoryUser, ChatMessage, ChatRoomSummary } from '../../chat/types';
-import { searchMessages } from '../../chat/client';
+import type { ChatDirectoryUser, ChatRoomSummary } from '../../chat/types';
+import { type SearchHit, searchIndexFor } from '../../chat/searchIndex';
 import { formatTime, isBotSender, isWebhookSender } from '../../chat/state';
 
 interface ChatDialogProps {
@@ -326,16 +326,17 @@ export const StartDMModal: React.FC<StartDMModalProps> = ({
 };
 
 interface SearchModalProps {
+  userId: string;
   rooms: ChatRoomSummary[];
   activeRoomId: string | null;
   onClose: () => void;
   onSelectHit: (roomId: string, seq?: number) => void;
 }
 
-export const SearchModal: React.FC<SearchModalProps> = ({ rooms, activeRoomId, onClose, onSelectHit }) => {
+export const SearchModal: React.FC<SearchModalProps> = ({ userId, rooms, activeRoomId, onClose, onSelectHit }) => {
   const [query, setQuery] = useState('');
   const [scopeCurrent, setScopeCurrent] = useState(false);
-  const [hits, setHits] = useState<ChatMessage[]>([]);
+  const [hits, setHits] = useState<SearchHit[]>([]);
   const [searching, setSearching] = useState(false);
   const [err, setErr] = useState('');
 
@@ -354,7 +355,8 @@ export const SearchModal: React.FC<SearchModalProps> = ({ rooms, activeRoomId, o
     setHits([]);
     setErr('');
     const timer = setTimeout(() => {
-      void searchMessages(trimmed, scopeCurrent && activeRoomId ? activeRoomId : undefined)
+      void searchIndexFor(userId)
+        .then((index) => index.search(trimmed, scopeCurrent && activeRoomId ? activeRoomId : undefined))
         .then((res) => {
           if (!cancelled) setHits(res);
         })
@@ -370,9 +372,9 @@ export const SearchModal: React.FC<SearchModalProps> = ({ rooms, activeRoomId, o
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [query, scopeCurrent, activeRoomId]);
+  }, [query, scopeCurrent, activeRoomId, userId]);
 
-  const selectHit = (hit: ChatMessage) => {
+  const selectHit = (hit: SearchHit) => {
     onSelectHit(hit.room_id, hit.seq);
     onClose();
   };
@@ -399,7 +401,7 @@ export const SearchModal: React.FC<SearchModalProps> = ({ rooms, activeRoomId, o
           keepHighlight
           items={hits}
           filter={null}
-          itemToStringValue={(hit: ChatMessage) => hit.body}
+          itemToStringValue={(hit: SearchHit) => hit.body}
           value={query}
           onValueChange={(v, d) => {
             if (typed(d.reason)) setQuery(v);

@@ -244,15 +244,6 @@ func TestChatEndToEndRESTAndWebSocket(t *testing.T) {
 		}
 	}
 
-	rec = doBearerJSON(t, srv, http.MethodGet, "/api/v1/search?q=native", eveTok, nil, nil)
-	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), msgID) {
-		t.Fatalf("eve search leaked message: code=%d body=%s", rec.Code, rec.Body.String())
-	}
-	rec = doBearerJSON(t, srv, http.MethodGet, "/api/v1/search?q=native", bobTok, nil, nil)
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), msgID) {
-		t.Fatalf("bob search missed message: code=%d body=%s", rec.Code, rec.Body.String())
-	}
-
 	// 7. DM deduplication.
 	dm1 := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", aliceTok, map[string]any{
 		"kind": "dm", "dm_user_id": bob.ID,
