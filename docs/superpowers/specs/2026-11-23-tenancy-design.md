@@ -230,9 +230,13 @@ Multi mode, `origin/main` plus PR #27. Every row has a cross-org test in
    Other cases never purge:
    - Missing-org detection (this rule and the guard below) runs **only** on a full read from
      `since=0`, never on an incremental one, which by design lists only changed orgs. An org
-     that is missing from a complete, fully paged full read is marked `suspended` (it stops
-     serving, and its data is kept), audited as `tenancy.org_missing`, and raised to the
-     operator's alerts.
+     that is missing from a complete, fully paged full read gets `tenants.missing_since` set.
+     That is a local flag, not a lifecycle status, so it never touches KyIdentity's `revision`
+     order (`ApplyTenantLifecycle`). The org stops serving as if suspended, its data is kept, the
+     read audits `tenancy.org_missing`, and the operator is alerted. The next complete full read
+     (at most a day later, or at the next start) that lists the org with `status: active` clears
+     the flag and audits `tenancy.org_found`. A transient glitch therefore heals by itself.
+     Staff can also clear the flag at once.
    - A read that is not complete (a page error, a short page without `next`) changes nothing.
    - **Sanity guard on missing orgs:** if one read finds more than max(5% of active orgs, 3)
      orgs missing,
@@ -441,8 +445,10 @@ rows. A message body is bounded per message and refusing text would break chat.
   per-user staging cap (`KY_ATTACHMENTS_MAX_PENDING_USER_BYTES`). The per-tenant cap
   `KY_ATTACHMENTS_MAX_TOTAL_BYTES` does **not** apply in multi mode, because the pool replaces
   it. It is one install-wide value, so it could never fit Business (30 GB per seat) and Personal
-  at once. Setting it in multi mode fails startup, so it cannot cap an org below what its plan
-  sells. Single mode keeps it unchanged (§10.4).
+  at once. In multi mode the value is ignored, and startup logs one warning naming the
+  variable. Ignoring it, rather than refusing to start, means an existing multi deployment that
+  sets it keeps starting after the upgrade. PR 7's notes and the README's configuration list say
+  so. Single mode keeps it unchanged (§10.4).
 - **If KyIdentity is unreachable,** writes keep checking the last allowance for 15 minutes
   after `pool_checked_at`. After that, a write that adds bytes is refused with `503
   pool_unavailable`, and shrinking writes still pass. The 15 minutes match KyCalendar (its open
@@ -525,7 +531,8 @@ Tests each PR must add, beyond its own:
 - **Tenancy sync:** a fake KyIdentity returns an empty `/api/suite/orgs`, then a partial one, with
   no tombstones. Every tenant stays non-deleted, with its attachment rows and blobs. Missing orgs
   are not suspended on a start-up read or past the guard. An incremental read that lists only
-  changed orgs suspends nothing. On a small install (10 active orgs),
+  changed orgs suspends nothing. A missing org that a later full read lists as active serves
+  again, with its `revision` unchanged. On a small install (10 active orgs),
   one missing org is suspended, and four missing are not. A `deleted` entry purges exactly
   that org. Run on SQLite and PostgreSQL.
 - **Pool:** a new org's first upload (allowance unknown: fetched and then admitted, or `503`
@@ -541,7 +548,7 @@ Tests each PR must add, beyond its own:
 - A stale allowance can let the pool be overshot by other apps' growth for up to 15 minutes.
 - A user's own deleted attachment stays as an old object version for 30 days.
 - Staff see every org's usernames in the install-wide audit (open question 6).
-- An org that KyIdentity stops listing without a `deleted` status is suspended and kept, not
+- An org that KyIdentity stops listing without a `deleted` status is held offline and kept, not
   purged, until staff resolve it. Its data costs storage until then.
 - A restore to a point less than a day old, made while KyIdentity is unreachable, can serve an
   erased person's or a deleted org's restored data until KyIdentity answers again. Then the
