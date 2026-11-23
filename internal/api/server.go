@@ -174,6 +174,7 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 	sessions := auth.NewSessionManager(st, cfg.Security)
 	pairing := devices.NewPairingService(st, cfg.Server.AppName, cfg.Server.AppURL)
 	kyidentity := sso.NewKyIdentityClient(cfg.SSO, st)
+	kyidentity.SetTenancy(cfg.Tenancy)
 	scimSrv := scim.NewServer(st, cfg.SCIM, cfg.Server.AppURL)
 	recovery := recoveryclient.NewClient(recoveryclient.Options{AllowPrivate: cfg.Backup.AllowPrivateRecovery})
 
@@ -248,6 +249,12 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 		s.revokeAgentsForOwner(ctx, userID)
 	}
 	kyidentity.OnUserRevoked(revokeUser)
+	chatHub.SetGuestCheck(lobbyMgr.GuestCheck(s.isTenantActive))
+	chatHub.SetTenantRevokeHandler(func(tenantID string) {
+		lobbyMgr.RevokeTenant(context.Background(), tenantID)
+		callMgr.RevokeTenant(context.Background(), tenantID)
+	})
+	kyidentity.OnTenantRevoked(chatHub.RevokeTenant)
 	scimSrv.OnUserRevoked(revokeUser)
 
 	s.routes()
@@ -472,8 +479,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/meet/{token}/messages", s.handleGuestListMessages)
 	s.mux.HandleFunc("POST /api/meet/{token}/messages", s.handleGuestSendMessage)
 
-	// SCIM 2.0 routes
-	s.scim.RegisterRoutes(s.mux)
+	// SCIM 2.0 routes (disabled in multi-tenant mode; provisioning arrives via signed KyIdentity webhooks).
+	if !s.config.Tenancy.IsMultiTenant() {
+		s.scim.RegisterRoutes(s.mux)
+	}
 
 	// Unmatched API paths fail instead of falling through to the SPA's 200: a webhook sender
 	// on a retired or mistyped route must see an error and retry, never a false acknowledgement.
@@ -511,9 +520,16 @@ func (s *Server) admin(h http.HandlerFunc, fresh bool) http.HandlerFunc {
 			}
 			return
 		}
-		if user.Role != "admin" {
+		// A customer org's account never administers the install, whatever its stored role.
+		if user.Role != "admin" || (user.OrgID != "" && !s.config.Tenancy.MayAdminister(user.OrgID)) {
 			s.writeError(w, http.StatusForbidden, "Administrator role required")
 			return
+		}
+		if user.OrgID != "" {
+			if active, err := s.isTenantActive(r.Context(), user.OrgID); err != nil || !active {
+				s.writeError(w, http.StatusForbidden, "Organization is suspended or inactive")
+				return
+			}
 		}
 		if fresh && time.Since(sess.CreatedAt) > stepUpWindow {
 			s.writeStepUp(w, user)
@@ -589,8 +605,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	}
 
-	// SCIM middleware
+	// SCIM middleware (inbound SCIM is disabled in multi-tenant mode).
 	if strings.HasPrefix(r.URL.Path, "/scim/v2") {
+		if s.config.Tenancy.IsMultiTenant() {
+			s.writeError(w, http.StatusNotFound, "SCIM is disabled in multi-tenant mode")
+			return
+		}
 		s.scim.AuthMiddleware(s.mux).ServeHTTP(w, r)
 		return
 	}

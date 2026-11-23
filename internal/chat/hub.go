@@ -37,7 +37,11 @@ type Hub struct {
 	sessionValid   func(ctx context.Context, userID, sessionHash string) (bool, error)
 	callFrameHook  CallFrameHandler
 	disconnectHook DisconnectHandler
-	pingInterval   time.Duration
+	tenantRevoked  func(tenantID string)
+	// guestValid, when set, reports whether a guest still holds a lobby session. It is checked
+	// when the socket registers and on every ping, as sessionValid is for members.
+	guestValid   func(guestID string) bool
+	pingInterval time.Duration
 
 	// roomSource, when set, rebuilds each socket's rooms from the store after it registers
 	// and on every ping, so a membership change the bus never delivered (one made during
@@ -106,6 +110,16 @@ func (h *Hub) SetDisconnectHandler(fn DisconnectHandler) {
 	h.disconnectHook = fn
 }
 
+// SetGuestCheck registers the guest session lookup. Call it before serving connections.
+func (h *Hub) SetGuestCheck(fn func(guestID string) bool) {
+	h.guestValid = fn
+}
+
+// SetTenantRevokeHandler registers what each pod does when a tenant's access is revoked.
+func (h *Hub) SetTenantRevokeHandler(fn func(tenantID string)) {
+	h.tenantRevoked = fn
+}
+
 // SetRoomSource registers the store lookup resync uses. Call it before serving connections.
 func (h *Hub) SetRoomSource(fn func(ctx context.Context, tenantID, userID string) ([]string, error)) {
 	h.roomSource = fn
@@ -150,6 +164,21 @@ func (h *Hub) RevokeUser(ctx context.Context, userID string) error {
 		Type:   EventAuthRevoked,
 		UserID: userID,
 	})
+}
+
+// RevokeTenant tells every pod that tenantID lost access, so each drops its guests.
+func (h *Hub) RevokeTenant(ctx context.Context, tenantID string) error {
+	if tenantID == "" {
+		return nil
+	}
+	return h.bus.PublishUser(ctx, "", Event{
+		Type: EventTenantRevoked,
+		Data: MustMarshalData(tenantRevoke{TenantID: tenantID}),
+	})
+}
+
+type tenantRevoke struct {
+	TenantID string `json:"tenant_id"`
 }
 
 // RevokeSession disconnects the user's WebSockets bound to sessionHash across all pods.
@@ -198,6 +227,13 @@ func (h *Hub) Dispatch(ev Event) {
 	}
 
 	switch ev.Type {
+	case EventTenantRevoked:
+		var t tenantRevoke
+		if json.Unmarshal(ev.Data, &t) == nil && t.TenantID != "" && h.tenantRevoked != nil {
+			h.tenantRevoked(t.TenantID)
+		}
+		return
+
 	case EventAuthRevoked:
 		if ev.UserID == "" {
 			return
@@ -493,6 +529,12 @@ func (h *Hub) serveClient(ctx context.Context, conn *websocket.Conn, tenantID, u
 		c.kick(websocket.StatusNormalClosure, "")
 		h.unregister(c)
 	}()
+	// A guest authenticated before a revocation swept its session may register after the
+	// sweep's kick; registered first, this check or the kick always catches it.
+	if isGuest && h.guestValid != nil && !h.guestValid(userID) {
+		_ = conn.Close(websocket.StatusPolicyViolation, "guest session ended")
+		return
+	}
 	// roomIDs was listed before register, so a change between the two reached no client.
 	rctx, rcancel := context.WithTimeout(ctx, clientWriteTimeout)
 	h.resync(rctx, c)
@@ -602,6 +644,10 @@ func (c *Client) writeLoop(ctx context.Context, cancel context.CancelFunc) {
 				return
 			}
 		case <-ticker.C:
+			if c.isGuest && c.hub.guestValid != nil && !c.hub.guestValid(c.userID) {
+				c.kick(websocket.StatusPolicyViolation, "guest session ended")
+				continue
+			}
 			if !c.isGuest && c.hub.sessionValid != nil {
 				vctx, vcancel := context.WithTimeout(ctx, clientWriteTimeout)
 				valid, err := c.hub.sessionValid(vctx, c.userID, c.sessionHash)

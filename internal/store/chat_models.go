@@ -57,12 +57,20 @@ const (
 	WebhookDirectionOutgoing = "outgoing"
 )
 
+// Tenant lifecycle states.
+const (
+	TenantStatusActive    = "active"
+	TenantStatusSuspended = "suspended"
+	TenantStatusDeleted   = "deleted"
+)
+
 // Tenant represents an isolated organization or personal space on a hosted or self-hosted instance.
 type Tenant struct {
 	ID            string `json:"id"`
 	Slug          string `json:"slug"`
 	DisplayName   string `json:"display_name"`
 	Plan          string `json:"plan"`
+	Status        string `json:"status"`
 	P2PPolicy     string `json:"p2p_policy"`
 	P2PMaxVideo   int    `json:"p2p_max_video"`
 	P2PMaxAudio   int    `json:"p2p_max_audio"`

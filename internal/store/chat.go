@@ -59,6 +59,9 @@ func (c *chatStore) CreateTenant(ctx context.Context, t *Tenant) error {
 	if t.Plan == "" {
 		t.Plan = "business"
 	}
+	if t.Status == "" {
+		t.Status = TenantStatusActive
+	}
 	if t.P2PPolicy == "" {
 		t.P2PPolicy = P2PPolicyHybrid
 	}
@@ -72,24 +75,53 @@ func (c *chatStore) CreateTenant(ctx context.Context, t *Tenant) error {
 		t.CreatedAt = nowMilli()
 	}
 	q := c.store.rebind(`
-		INSERT INTO tenants (id, slug, display_name, plan, p2p_policy, p2p_max_video, p2p_max_audio, guest_force_sfu, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		INSERT INTO tenants (id, slug, display_name, plan, status, p2p_policy, p2p_max_video, p2p_max_audio, guest_force_sfu, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	_, err := c.store.db.ExecContext(ctx, q,
-		t.ID, t.Slug, t.DisplayName, t.Plan, t.P2PPolicy,
+		t.ID, t.Slug, t.DisplayName, t.Plan, t.Status, t.P2PPolicy,
 		t.P2PMaxVideo, t.P2PMaxAudio, boolToInt(t.GuestForceSFU), t.CreatedAt,
 	)
 	return uniqueError(err)
 }
 
+// EnsureTenant idempotently provisions a tenant row for a verified org_id and returns it.
+func (c *chatStore) EnsureTenant(ctx context.Context, tenantID string) (*Tenant, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return nil, errors.New("tenant id is required")
+	}
+	if existing, err := c.GetTenant(ctx, tenantID); err == nil {
+		return existing, nil
+	} else if !errors.Is(err, ErrNotFound) {
+		return nil, err
+	}
+	t := &Tenant{
+		ID:          tenantID,
+		Slug:        tenantID,
+		DisplayName: tenantID,
+		Plan:        "business",
+		Status:      TenantStatusActive,
+		P2PPolicy:   P2PPolicyHybrid,
+		P2PMaxVideo: 2,
+		P2PMaxAudio: 4,
+		CreatedAt:   nowMilli(),
+	}
+	if err := c.CreateTenant(ctx, t); err != nil && !errors.Is(err, ErrAlreadyExists) {
+		return nil, err
+	}
+	return c.GetTenant(ctx, tenantID)
+}
+
 func (c *chatStore) GetTenant(ctx context.Context, tenantID string) (*Tenant, error) {
 	tenantID = normalizeTenant(tenantID)
 	q := c.store.rebind(`
-		SELECT id, slug, display_name, plan, p2p_policy, p2p_max_video, p2p_max_audio, guest_force_sfu, created_at
+		SELECT id, slug, display_name, plan, status, p2p_policy, p2p_max_video, p2p_max_audio, guest_force_sfu, created_at
 		FROM tenants WHERE id = ?`)
 	var t Tenant
 	var guestForce int
-	err := c.store.read().QueryRowContext(ctx, q, tenantID).Scan(
-		&t.ID, &t.Slug, &t.DisplayName, &t.Plan, &t.P2PPolicy,
+	// Tenant status gates access, so it is read from the primary, never a lagging replica.
+	err := c.store.db.QueryRowContext(ctx, q, tenantID).Scan(
+		&t.ID, &t.Slug, &t.DisplayName, &t.Plan, &t.Status, &t.P2PPolicy,
 		&t.P2PMaxVideo, &t.P2PMaxAudio, &guestForce, &t.CreatedAt,
 	)
 	if errorsIs(err, sql.ErrNoRows) {
@@ -98,8 +130,61 @@ func (c *chatStore) GetTenant(ctx context.Context, tenantID string) (*Tenant, er
 	if err != nil {
 		return nil, err
 	}
+	if t.Status == "" {
+		t.Status = TenantStatusActive
+	}
 	t.GuestForceSFU = guestForce != 0
 	return &t, nil
+}
+
+func (c *chatStore) SetTenantStatus(ctx context.Context, tenantID, status string) error {
+	tenantID = strings.TrimSpace(tenantID)
+	switch status {
+	case TenantStatusActive, TenantStatusSuspended, TenantStatusDeleted:
+	default:
+		return fmt.Errorf("invalid tenant status %q", status)
+	}
+	q := c.store.rebind(`UPDATE tenants SET status = ? WHERE id = ?`)
+	return oneRow(c.store.db.ExecContext(ctx, q, status, tenantID))
+}
+
+// HoldsSingleTenantData reports whether the database already serves single-tenant use: any room,
+// or any org-less account other than a local password one (directory-synced, SSO or bot). Local
+// accounts are the bootstrap and recovery operators every fresh database has.
+func (c *chatStore) HoldsSingleTenantData(ctx context.Context) (bool, error) {
+	var one int
+	err := c.store.db.QueryRowContext(ctx, `
+		SELECT 1 WHERE EXISTS (SELECT 1 FROM rooms)
+		   OR EXISTS (SELECT 1 FROM users WHERE org_id = '' AND sso_provider <> 'local')`).Scan(&one)
+	if errorsIs(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// ApplyTenantLifecycle sets an org's status from a KyIdentity lifecycle event carrying the org's
+// revision. Only a revision above the last applied one changes status, so a delayed event never
+// undoes a newer one; deletion applies whatever its revision and is never undone. It reports
+// whether the status changed.
+func (c *chatStore) ApplyTenantLifecycle(ctx context.Context, tenantID, status string, revision int64) (bool, error) {
+	var q string
+	var args []any
+	switch status {
+	case TenantStatusActive, TenantStatusSuspended:
+		q = `UPDATE tenants SET status = ?, lifecycle_revision = ? WHERE id = ? AND lifecycle_revision < ? AND status <> ?`
+		args = []any{status, revision, strings.TrimSpace(tenantID), revision, TenantStatusDeleted}
+	case TenantStatusDeleted:
+		q = `UPDATE tenants SET status = ?, lifecycle_revision = CASE WHEN lifecycle_revision < ? THEN ? ELSE lifecycle_revision END WHERE id = ? AND status <> ?`
+		args = []any{status, revision, revision, strings.TrimSpace(tenantID), TenantStatusDeleted}
+	default:
+		return false, fmt.Errorf("invalid tenant status %q", status)
+	}
+	res, err := c.store.db.ExecContext(ctx, c.store.rebind(q), args...)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
 }
 
 // ---------------------------------------------------------------------

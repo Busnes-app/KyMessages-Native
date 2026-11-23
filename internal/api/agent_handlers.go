@@ -53,8 +53,12 @@ func mintAgentToken() (raw, hash string, err error) {
 	return raw, hex.EncodeToString(sum[:]), nil
 }
 
-func (s *Server) loadUsersByID(ctx context.Context) (map[string]*store.User, error) {
-	users, _, err := s.store.Users().ListUsers(ctx, 0, 10000, store.UserFilter{})
+func (s *Server) loadUsersByID(ctx context.Context, orgID string) (map[string]*store.User, error) {
+	filter := store.UserFilter{}
+	if s.config.Tenancy.IsMultiTenant() {
+		filter.OrgID = orgID
+	}
+	users, _, err := s.store.Users().ListUsers(ctx, 0, 10000, filter)
 	if err != nil {
 		return nil, err
 	}
@@ -95,9 +99,18 @@ func toAgentView(a *store.Agent, users map[string]*store.User) agentView {
 
 // handleAgents lists native bot/agent accounts and active non-bot users eligible to own one.
 func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
+	user, _, ok := s.currentUser(r)
+	if !ok {
+		s.writeError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), agentTimeout)
 	defer cancel()
-	users, err := s.loadUsersByID(ctx)
+	users, err := s.loadUsersByID(ctx, tenantID)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Could not load users")
 		return
@@ -109,6 +122,11 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]agentView, 0, len(agents))
 	for _, a := range agents {
+		if s.config.Tenancy.IsMultiTenant() {
+			if _, inOrg := users[a.OwnerUserID]; !inOrg {
+				continue
+			}
+		}
 		out = append(out, toAgentView(a, users))
 	}
 	owners := make([]agentOwnerView, 0)
@@ -155,7 +173,7 @@ func (s *Server) tokenReply(w http.ResponseWriter, v agentView, token string) {
 }
 
 // agentAction runs an agent change detached so a dropped connection cannot leave a token
-// minted or revoked without its audit row.
+// minted in the store without an audit row.
 func (s *Server) agentAction(r *http.Request, action string) (ctx context.Context, cancel func(), record func(resource, outcome string)) {
 	actor := s.actorID(r)
 	ctx, cancel = context.WithTimeout(context.WithoutCancel(r.Context()), agentTimeout)
@@ -168,6 +186,15 @@ func (s *Server) agentAction(r *http.Request, action string) (ctx context.Contex
 }
 
 func (s *Server) handleAgentCreate(w http.ResponseWriter, r *http.Request) {
+	actorUser, _, ok := s.currentUser(r)
+	if !ok {
+		s.writeError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+	tenantID, ok := s.requireUserTenant(w, r, actorUser)
+	if !ok {
+		return
+	}
 	var req struct {
 		Name        string `json:"name"`
 		DisplayName string `json:"display_name"`
@@ -196,7 +223,7 @@ func (s *Server) handleAgentCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	owner, err := s.store.Users().GetUserByID(ctx, req.Owner)
-	if err != nil || owner.Status != "active" || owner.Role == "bot" {
+	if err != nil || owner.Status != "active" || owner.Role == "bot" || (s.config.Tenancy.IsMultiTenant() && owner.OrgID != tenantID) {
 		refuse(http.StatusBadRequest, "The owner must be an active member")
 		return
 	}
@@ -215,6 +242,7 @@ func (s *Server) handleAgentCreate(w http.ResponseWriter, r *http.Request) {
 		Role:        "bot",
 		Status:      "active",
 		SSOProvider: "bot",
+		OrgID:       owner.OrgID,
 	}
 	if err := s.store.Users().CreateUser(ctx, botUser); err != nil {
 		if errors.Is(err, store.ErrAlreadyExists) {
@@ -254,6 +282,15 @@ func (s *Server) handleAgentCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) agentFor(w http.ResponseWriter, r *http.Request, ctx context.Context) (*store.Agent, bool) {
+	actorUser, _, ok := s.currentUser(r)
+	if !ok {
+		s.writeError(w, http.StatusUnauthorized, "Authentication required")
+		return nil, false
+	}
+	tenantID, ok := s.requireUserTenant(w, r, actorUser)
+	if !ok {
+		return nil, false
+	}
 	id := r.PathValue("id")
 	if _, err := uuid.Parse(id); err != nil {
 		s.writeError(w, http.StatusBadRequest, "Invalid agent ID")
@@ -267,6 +304,13 @@ func (s *Server) agentFor(w http.ResponseWriter, r *http.Request, ctx context.Co
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Could not read the agent")
 		return nil, false
+	}
+	if s.config.Tenancy.IsMultiTenant() {
+		owner, err := s.store.Users().GetUserByID(ctx, a.OwnerUserID)
+		if err != nil || owner.OrgID != tenantID {
+			s.writeError(w, http.StatusNotFound, "No such agent")
+			return nil, false
+		}
 	}
 	return a, true
 }

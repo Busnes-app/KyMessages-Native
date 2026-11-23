@@ -191,6 +191,19 @@ When the user requests a durable behavior change, record it here or in the relev
   maintenance drain before the store closes. Previously issued LiveKit tokens can reconnect
   between sweeps; this is not instantaneous media revocation. Call acceptance is a release gate.
 
+## Tenancy
+
+- `KY_TENANCY_MODE` (`single` default, `multi`) is locked in the database (`tenancy.mode`) on first
+  boot. In `multi` every account is bound to a KyIdentity `org_id`, and every org-owned query is
+  scoped to it. Product contract: [docs/PRODUCT.md](docs/PRODUCT.md).
+- Only the staff org (`KY_STAFF_ORG_ID`) holds administrators (`config.TenancyConfig.MayAdminister`,
+  enforced in directory sync and the `admin` middleware). Org-less local operators keep the
+  install-wide console; per-org admin pages need a staff-org account.
+- Org lifecycle webhooks apply in KyIdentity's per-org `revision` order
+  (`ChatStore.ApplyTenantLifecycle`; deletion is terminal). Tenant status is read from the
+  primary. Grant issuance (`withPassword`) locks an org-bound account's active tenant row, and
+  suspension publishes `tenant.revoked` so every pod drops that org's meeting guests.
+
 ## Installer setup
 
 - `kymessages apply-setup` is the container-local installer boundary; see

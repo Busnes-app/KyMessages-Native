@@ -93,7 +93,10 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 	}
 
 	roomID := r.PathValue("id")
-	tenantID := store.DefaultTenantID
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	if _, ok := s.requireRoomMember(w, r, tenantID, roomID, user.ID); !ok {
 		return
 	}
@@ -255,7 +258,10 @@ func (s *Server) handleChatDownloadAttachment(w http.ResponseWriter, r *http.Req
 		s.writeError(w, http.StatusNotFound, "Attachment not found")
 		return
 	}
-	tenantID := store.DefaultTenantID
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 
 	att, err := s.store.Chat().GetAttachment(r.Context(), tenantID, attID)
 	if err != nil {
@@ -332,8 +338,11 @@ func (s *Server) handleChatListStagedAttachments(w http.ResponseWriter, r *http.
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	roomID := strings.TrimSpace(r.PathValue("id"))
-	tenantID := store.DefaultTenantID
 	if _, err := s.store.Chat().GetRoomMember(r.Context(), tenantID, roomID, user.ID); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			s.writeError(w, http.StatusNotFound, "Room not found")
@@ -370,7 +379,10 @@ func (s *Server) handleChatDeleteAttachment(w http.ResponseWriter, r *http.Reque
 		s.writeError(w, http.StatusNotFound, "Attachment not found")
 		return
 	}
-	tenantID := store.DefaultTenantID
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	blobKey, err := s.store.Chat().DeleteStagedAttachment(r.Context(), tenantID, attID, user.ID)
 	if err != nil {
 		switch {

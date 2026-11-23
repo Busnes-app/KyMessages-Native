@@ -22,6 +22,7 @@ import (
 // Config encapsulates all runtime configuration for KyMessages.
 type Config struct {
 	InstallerSSO *applysetup.SSO   `json:"-"`
+	Tenancy      TenancyConfig     `json:"tenancy"`
 	Server       ServerConfig      `json:"server"`
 	Database     DatabaseConfig    `json:"database"`
 	Security     SecurityConfig    `json:"security"`
@@ -32,6 +33,40 @@ type Config struct {
 	RTC          RTCConfig         `json:"rtc"`
 	Attachments  AttachmentsConfig `json:"attachments"`
 	Push         PushConfig        `json:"push"`
+}
+
+// Tenancy modes for KY_TENANCY_MODE. Single is the default and preserves existing self-hosted
+// single-organization behavior unchanged.
+const (
+	TenancySingle = "single"
+	TenancyMulti  = "multi"
+)
+
+// TenancyConfig controls whether the server operates as a single-organization deployment or
+// isolates multiple KyIdentity organizations by org_id.
+type TenancyConfig struct {
+	Mode string `json:"mode"` // "single" (default) or "multi"
+	// StaffOrgID is KyIdentity's staff org (KY_STAFF_ORG_ID). In multi-tenant mode only its
+	// accounts may be administrators; customer orgs have none.
+	StaffOrgID string `json:"staff_org_id"`
+}
+
+// MayAdminister reports whether an account bound to orgID may hold the install-wide admin role.
+func (t TenancyConfig) MayAdminister(orgID string) bool {
+	return !t.IsMultiTenant() || (t.StaffOrgID != "" && orgID == t.StaffOrgID)
+}
+
+// EffectiveMode returns the normalized tenancy mode, defaulting to single-tenant.
+func (t TenancyConfig) EffectiveMode() string {
+	if strings.EqualFold(strings.TrimSpace(t.Mode), TenancyMulti) {
+		return TenancyMulti
+	}
+	return TenancySingle
+}
+
+// IsMultiTenant reports whether multi-tenant org_id isolation is active.
+func (t TenancyConfig) IsMultiTenant() bool {
+	return t.EffectiveMode() == TenancyMulti
 }
 
 // DefaultMaxUploadBytes is the default per-attachment upload size limit (25 MiB).
@@ -250,7 +285,20 @@ func LoadFromEnv() (*Config, error) {
 		return nil, errors.New("KY_ADMIN_USERNAME: must be 3-64 characters of letters, digits, '.', '_' or '-'")
 	}
 
+	tenancyMode := strings.ToLower(strings.TrimSpace(getEnv("KY_TENANCY_MODE", TenancySingle)))
+	if tenancyMode != TenancySingle && tenancyMode != TenancyMulti {
+		return nil, fmt.Errorf("KY_TENANCY_MODE: must be %q or %q, got %q", TenancySingle, TenancyMulti, tenancyMode)
+	}
+	scimEnabled := getEnvBool("KY_SCIM_ENABLED", true)
+	if tenancyMode == TenancyMulti {
+		scimEnabled = false
+	}
+
 	cfg := &Config{
+		Tenancy: TenancyConfig{
+			Mode:       tenancyMode,
+			StaffOrgID: strings.TrimSpace(os.Getenv("KY_STAFF_ORG_ID")),
+		},
 		Server: ServerConfig{
 			Host:         host,
 			Port:         port,
@@ -287,7 +335,7 @@ func LoadFromEnv() (*Config, error) {
 			AutoProvision:        getEnvBool("KY_SSO_AUTO_PROVISION", true),
 		},
 		SCIM: SCIMConfig{
-			Enabled:     getEnvBool("KY_SCIM_ENABLED", true),
+			Enabled:     scimEnabled,
 			BearerToken: getEnv("KY_SCIM_TOKEN", generateRandomHex(24)),
 			TokenSet:    getEnv("KY_SCIM_TOKEN", "") != "",
 		},
