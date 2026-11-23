@@ -318,7 +318,8 @@ leased relocation:
 `Open` returns an `io.ReadSeekCloser` and the size, so downloads keep range requests
 (`http.ServeContent`, `internal/api/attachment_handlers.go:329`).
 
-- `disk` is today's code, unchanged, and the only backend in single mode.
+- `disk` is today's code. It is the only backend in single mode, where its flat layout does not
+  change. In multi mode it uses the org layout above.
 - `s3` is new. In multi mode, `KY_ATTACHMENTS_BACKEND=s3` or `disk`. With `disk` in multi mode,
   `KY_ATTACHMENTS_DIR` must be a volume every replica mounts. At start, each replica checks a
   store-ID file in the directory against a value in `server_settings`, and refuses to start on
