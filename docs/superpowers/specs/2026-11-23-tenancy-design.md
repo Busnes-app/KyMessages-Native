@@ -301,10 +301,20 @@ maxBytes)`, `Open(key)`, `Delete(key)`, `SweepStaleTemps` (`internal/blobs/store
 `:416`, `:423` and `internal/api/chat_handlers.go:891`), plus `DeletePrefix` for the purge and `Erase` (every version; PR 6). Like `Erase`, `DeletePrefix`
 removes **every version** of every object under the prefix, so the purge's final orphan sweep
 leaves no old versions behind (§9.4). On `disk` in multi mode, each blob is stored at
-`orgs/<tenant_id>/<blob_key>` under `KY_ATTACHMENTS_DIR`, mirroring the S3 key. `ValidKey`
+`orgs/<tenant_id>/att/<blob_key>` under `KY_ATTACHMENTS_DIR`, the same key as in S3 (§9.3), so
+one key builder serves both backends. `ValidKey`
 still checks the bare key, and the backend adds the prefix itself, through the same
 `os.OpenRoot`. `DeletePrefix` there removes the org's directory, orphans included, and it is the
 same call on both backends. Single mode keeps today's flat layout, unchanged.
+
+Multi mode exists since PR #18, so a multi install may already hold flat blobs (whether any
+does is unverified; the hosted install has not launched). PR 5 therefore adds a one-time,
+leased relocation:
+- It renames each flat file named by an `attachments` row to its org path. A rename on the same
+  volume is atomic and idempotent.
+- Until it finishes, a read that misses the org path falls back to the flat path, and the purge
+  also deletes each row's flat path.
+- When it finishes, it sets `blobs.layout = org` in `server_settings`. The fallback stops there.
 `Open` returns an `io.ReadSeekCloser` and the size, so downloads keep range requests
 (`http.ServeContent`, `internal/api/attachment_handlers.go:329`).
 
@@ -477,7 +487,7 @@ replay or stale revision where it applies, oversize input), and runs CI on SQLit
 | 2 | Replica safety I (§8.1, §8.4, §5): migration lock, `job_leases`, the capsule scheduler off in multi mode, `RESTORE.md` multi section, multi mode requires the shared VAPID key, encryption key and session secret (§5; the S3 seal key is PR 6's) | Yes | — |
 | 3 | Replica safety II (§8.2, §8.3): shared limiters, the PoW table, the meetings key per org and the upsert lock, guest sessions in PostgreSQL | Yes | 2 |
 | 4 | Calls across replicas (§8.3), as open question 5 decides | Yes | 3 |
-| 5 | The blob interface, the shared-volume store-ID check, and `disk` behind it (§9.1) | Yes (volumes at launch) | 2 |
+| 5 | The blob interface, the shared-volume store-ID check, `disk` behind it with the org layout in multi mode, and the one-time relocation of flat blobs (§9.1) | Yes (volumes at launch) | 2 |
 | 6 | The `s3` backend, sealing, the purge by prefix, and versioned deletes for erasure and purge (§9.2-§9.5). The interface gains `Erase(key)`, which removes every version (on `disk` it is `Delete`). Erasure and purge call it, and PR 1a's per-key deletes switch to it here. A user's own delete keeps `Delete` (current version only, §9.4). | No | 5, the ky-primitives S3 type |
 | 7 | The org pool: columns, check, `org_storage_full`, reporter (§10) | Yes | 2 (leases), KyIdentity's pool API |
 | 8 | Multi-region cells (K22 §6.2, its PR D) | No | 3, 4 |
