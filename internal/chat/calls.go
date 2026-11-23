@@ -99,7 +99,8 @@ type CallManager struct {
 
 	// userActive, when set, reports whether a member's account still serves; reconciliation
 	// takes out of their calls the peers whose account does not (a missed revocation).
-	userActive func(ctx context.Context, userID string) (bool, error)
+	userActive   func(ctx context.Context, userID string) (bool, error)
+	cleanupLease func(context.Context) (bool, error)
 
 	mu        sync.Mutex
 	calls     map[string]*activeCall       // roomID -> call
@@ -411,6 +412,15 @@ func (m *CallManager) SetUserCheck(fn func(ctx context.Context, userID string) (
 // calls, so a tenant.revoked notification this pod missed still takes effect, and with a user
 // check the member peers whose account no longer serves, for a missed user revocation.
 func (m *CallManager) ReconcileTenants(ctx context.Context) {
+	if m.cleanupLease != nil {
+		if held, err := m.cleanupLease(ctx); err == nil && held {
+			if err := m.chatStore.PruneCallSeats(ctx, DefaultGuestLeaveGrace*5/4); err != nil {
+				log.Printf("[CALL] seat reconciliation failed")
+			} else if err := m.DrainCleanup(ctx, "", ""); err != nil {
+				log.Printf("[CALL] SFU cleanup remains pending")
+			}
+		}
+	}
 	defer m.reconcileUsers(ctx)
 	m.mu.Lock()
 	tenants := map[string]struct{}{}

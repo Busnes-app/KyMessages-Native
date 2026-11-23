@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"github.com/Busnes-app/ky_server_base/internal/testdb"
 	"testing"
 )
@@ -25,6 +26,11 @@ func TestOrgPurgeClearsEveryErasureWorkflowTable(t *testing.T) {
 			sql  string
 			args []any
 		}{
+			{`INSERT INTO rooms(id,tenant_id,kind,created_by,created_at) VALUES (?,?,'channel',?,123)`, []any{org + "-room", org, owner}},
+			{`INSERT INTO call_sessions(id,tenant_id,room_id,mode,epoch,started_by,started_at) VALUES (?,?,?,'p2p_mesh',1,?,123)`, []any{org + "-call", org, org + "-room", owner}},
+			{`INSERT INTO call_room_owners(room_id,tenant_id,holder,generation,expires_at) VALUES (?,?,'holder',1,123)`, []any{org + "-room", org}},
+			{`INSERT INTO call_seats(room_id,tenant_id,user_id,peer_id,call_id) VALUES (?,?,?,?,?)`, []any{org + "-room", org, owner, org + "-peer", org + "-call"}},
+			{`INSERT INTO pending_call_evictions(tenant_id,livekit_room,peer_id,user_id) VALUES (?,'retired-media',?,?)`, []any{org, org + "-peer", owner}},
 			{`INSERT INTO user_subjects(provider,subject,user_id,org_id) VALUES ('kyidentity',?,?,?)`, []any{org + "-subject", owner, org}},
 			{`INSERT INTO user_erasure_state(user_id,tenant_id,completed_at) VALUES (?,?,123)`, []any{owner, org}},
 			{`INSERT INTO pending_blob_deletes(user_id,tenant_id,blob_key) VALUES (?,?,?)`, []any{owner, org, org + "-blob"}},
@@ -41,9 +47,21 @@ func TestOrgPurgeClearsEveryErasureWorkflowTable(t *testing.T) {
 	}
 	// These are prior-erasure records: no account/agent row remains from which to discover them.
 	// Assert the whole explicit inventory after the terminal mark and again after replay.
-	for range 2 {
+	for replay := range 2 {
 		if err := s.Chat().PurgeTenantRows(ctx, target); err != nil {
 			t.Fatal(err)
+		}
+		if replay == 0 {
+			if err := s.Chat().MarkTenantPurged(ctx, target); !errors.Is(err, ErrCallCleanupPending) {
+				t.Fatalf("purge hid pending SFU work: %v", err)
+			}
+			pending, err := s.Chat().PendingCallEvictions(ctx, target, "", 10)
+			if err != nil || len(pending) != 1 {
+				t.Fatalf("pending cleanup: %+v %v", pending, err)
+			}
+			if err := s.Chat().ClearCallEviction(ctx, pending[0]); err != nil {
+				t.Fatal(err)
+			}
 		}
 		if err := s.Chat().MarkTenantPurged(ctx, target); err != nil {
 			t.Fatal(err)
@@ -56,6 +74,9 @@ func TestOrgPurgeClearsEveryErasureWorkflowTable(t *testing.T) {
 			name, column string
 			otherCount   int
 		}{
+			{"call_room_owners", "tenant_id", 1},
+			{"call_seats", "tenant_id", 1},
+			{"pending_call_evictions", "tenant_id", 1},
 			{"user_subjects", "org_id", 1},
 			{"pending_blob_deletes", "tenant_id", 1},
 			{"user_erasure_state", "tenant_id", 1},

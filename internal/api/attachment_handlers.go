@@ -541,6 +541,11 @@ func (s *Server) eraseUser(ctx context.Context, user *store.User, revoke func(co
 	if err := s.deleteBlobs(late); err != nil {
 		return err
 	}
+	if s.calls != nil {
+		if err := s.calls.DrainCleanup(ctx, user.OrgID, user.ID); err != nil {
+			return err
+		}
+	}
 	return s.store.Chat().ClearPendingBlobDeletes(ctx, append(refs, late...))
 }
 
@@ -622,6 +627,11 @@ func (s *Server) PurgeDeletedOrgs(ctx context.Context, held func() bool) error {
 		}
 		if s.blobs != nil {
 			if err := s.blobs.DeletePrefix(id); err != nil && !errors.Is(err, blobs.ErrInvalidKey) {
+				return err
+			}
+		}
+		if s.calls != nil {
+			if err := s.calls.DrainCleanup(ctx, id, ""); err != nil {
 				return err
 			}
 		}

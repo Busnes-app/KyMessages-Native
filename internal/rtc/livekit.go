@@ -108,6 +108,15 @@ func (c *Client) CreateRoom(ctx context.Context, name, metadata string) error {
 	}, nil)
 }
 
+// DeleteRoom retires every participant/token target of an old owner epoch or purged org.
+func (c *Client) DeleteRoom(ctx context.Context, room string) error {
+	err := c.twirp(ctx, "DeleteRoom", videoGrant{RoomCreate: true}, map[string]any{"room": room}, nil)
+	if err != nil && strings.Contains(err.Error(), "status 404") {
+		return nil
+	}
+	return err
+}
+
 // RemoveParticipant forcefully disconnects a participant from a LiveKit room.
 // LiveKit returns 404 when the room or participant is already gone; that is treated as success.
 func (c *Client) RemoveParticipant(ctx context.Context, room, identity string) error {

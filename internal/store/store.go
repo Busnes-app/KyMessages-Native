@@ -10,8 +10,11 @@ import (
 )
 
 var (
-	ErrNotFound   = errors.New("record not found")
-	ErrSharingOff = errors.New("status sharing is off")
+	ErrCallOwnerLost      = errors.New("call room owner is unavailable")
+	ErrCallStateStale     = errors.New("call epoch is stale")
+	ErrCallCleanupPending = errors.New("call cleanup is pending")
+	ErrNotFound           = errors.New("record not found")
+	ErrSharingOff         = errors.New("status sharing is off")
 	// ErrE2EEKeyMismatch: an upload names an existing device with different identity keys.
 	ErrE2EEKeyMismatch = errors.New("device keys do not match the registered device")
 	// ErrE2EETooManyKeys: an upload would leave a device holding more one-time keys than allowed.
@@ -330,6 +333,16 @@ type AgentStore interface {
 
 // ChatStore handles multi-tenant native KyMessages tenants, rooms, messages and reactions.
 type ChatStore interface {
+	AcquireCallRoom(ctx context.Context, tenantID, roomID, holder string, ttl time.Duration) (CallLease, error)
+	CallRoomHeld(ctx context.Context, lease CallLease) (bool, error)
+	ReleaseCallRoom(ctx context.Context, lease CallLease) error
+	PutCallSeat(ctx context.Context, cs *CallSession, userID, peerID string, guest bool) error
+	QueueCallSeatRemoval(ctx context.Context, roomID, userID string) error
+	QueueCallRoomRemoval(ctx context.Context, tenantID, livekitRoom string) error
+	PruneCallSeats(ctx context.Context, guestLive time.Duration) error
+	PendingCallEvictions(ctx context.Context, tenantID, userID string, limit int) ([]CallEviction, error)
+	ClearCallEviction(ctx context.Context, e CallEviction) error
+	EndOwnedCallSession(ctx context.Context, cs *CallSession, endedAt int64) error
 	ApplyTenantDirectory(ctx context.Context, entry TenantDirectoryEntry) error
 	// Tenants
 	CreateTenant(ctx context.Context, t *Tenant) error

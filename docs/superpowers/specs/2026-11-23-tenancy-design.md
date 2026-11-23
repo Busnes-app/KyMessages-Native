@@ -538,6 +538,18 @@ frames. Single-mode notification bytes and ordinary message refetch behavior are
 This does not provide room-owner routing, call-seat ownership or failover reconstruction;
 PR 4 remains unbuilt until those and the room-scoped WebSocket path are implemented.
 
+### Call ownership and cleanup foundation (implemented, startup still gated)
+
+Migration 64 adds database-clock room-owner generations, opaque account/peer/session seat
+links and durable SFU cleanup independent of deleted user/room rows. Stale owner/media epochs
+cannot rewrite a current call or issue a seat. Revocation retires the media address and queues
+the old SFU room before removing seats; retries cannot target a later media epoch. Erasure
+completion and the terminal org-purge mark wait for SFU cleanup, including when the original
+owner is absent. Offline grant invalidation also fences restored owner leases/seats and queues
+known old media rooms. Single-mode call records and notification/grant wire behavior stay
+unchanged. Runtime room affinity, client call sockets and owner reconstruction remain required
+to finish PR 4.
+
 ## 12. Phased build plan
 
 Each PR is gated on the tenancy mode, carries its negative tests (wrong org, single mode,

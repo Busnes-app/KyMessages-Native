@@ -64,7 +64,7 @@ func TestTwirpCreateAndRemove(t *testing.T) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		if strings.HasSuffix(r.URL.Path, "/RemoveParticipant") {
+		if strings.HasSuffix(r.URL.Path, "/RemoveParticipant") || strings.HasSuffix(r.URL.Path, "/DeleteRoom") {
 			w.WriteHeader(http.StatusNotFound)
 			_, _ = w.Write([]byte(`{"code":"not_found"}`))
 			return
@@ -82,7 +82,10 @@ func TestTwirpCreateAndRemove(t *testing.T) {
 	if err := c.RemoveParticipant(context.Background(), "call-1", "peer-1"); err != nil {
 		t.Fatalf("RemoveParticipant 404 should succeed idempotently: %v", err)
 	}
-	if len(seenPaths) != 2 {
-		t.Fatalf("expected 2 requests, got %v", seenPaths)
+	if err := c.DeleteRoom(context.Background(), "call-1"); err != nil {
+		t.Fatalf("DeleteRoom404 must be idempotent: %v", err)
+	}
+	if len(seenPaths) != 3 {
+		t.Fatalf("expected 3 requests, got %v", seenPaths)
 	}
 }

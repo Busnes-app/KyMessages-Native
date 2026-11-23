@@ -166,6 +166,9 @@ func (c *chatStore) EraseUser(ctx context.Context, tenantID string, user *User) 
 }
 
 func (c *chatStore) eraseActorTx(ctx context.Context, tx *sql.Tx, tenantID, userID, ownerID string) ([]BlobRef, error) {
+	if err := queueCallSeatsTx(ctx, c.store, tx, `call_seats.tenant_id=? AND call_seats.user_id=?`, tenantID, userID); err != nil {
+		return nil, err
+	}
 	var late []BlobRef
 	for _, q := range []struct {
 		sql  string
@@ -254,7 +257,8 @@ func (c *chatStore) ClearPendingBlobDeletes(ctx context.Context, refs []BlobRef)
 			return err
 		}
 	}
-	rows, err := tx.QueryContext(ctx, c.store.rebind(`UPDATE user_erasure_state SET completed_at = ? WHERE completed_at IS NULL AND NOT EXISTS (SELECT 1 FROM pending_blob_deletes p WHERE p.tenant_id = user_erasure_state.tenant_id AND p.user_id = user_erasure_state.user_id) RETURNING user_id`), time.Now().UnixMilli())
+	rows, err := tx.QueryContext(ctx, c.store.rebind(`UPDATE user_erasure_state SET completed_at = ? WHERE completed_at IS NULL AND NOT EXISTS (SELECT 1 FROM pending_blob_deletes p WHERE p.tenant_id = user_erasure_state.tenant_id AND p.user_id = user_erasure_state.user_id)
+ AND NOT EXISTS (SELECT 1 FROM pending_call_evictions p WHERE p.tenant_id=user_erasure_state.tenant_id AND (p.user_id=user_erasure_state.user_id OR p.user_id IN(SELECT a.user_id FROM user_erasure_actors a WHERE a.tenant_id=p.tenant_id AND a.owner_user_id=user_erasure_state.user_id))) RETURNING user_id`), time.Now().UnixMilli())
 	if err != nil {
 		return err
 	}
