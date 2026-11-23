@@ -1,7 +1,8 @@
 import 'fake-indexeddb/auto';
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { abandonDevice, forgetCryptoStore, keyGeneration, NOT_YET, onRoomKeys, openMessage, RETIRE_MS, retireDevice, retryable, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
+import { abandonDevice, forgetCryptoStore, keyGeneration, NOT_YET, onRoomKeys, openMessage, replaceDevice, RETIRE_MS, retireDevice, retryable, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
+import { openCryptoStore } from '../crypto/store';
 import { parseMessage } from './types';
 
 // Tests may replace the device read; everything else is the real store.
@@ -248,6 +249,33 @@ describe('the signed-in device', () => {
     expect(await retireDevice()).toBe(true); // already gone
     deleteStatus = 204;
     expect(await retireDevice()).toBe(true);
+  });
+
+  it('keeps received room keys when it replaces a retired device after a refused sign-out', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/v1/keys/upload') {
+        const req = JSON.parse(String(init?.body)) as { one_time_keys: unknown[] };
+        return json({ one_time_key_count: req.one_time_keys.length });
+      }
+      if (url.startsWith('/api/v1/to-device')) return json({ messages: [] });
+      return json({ error: `unexpected ${url}` }, 404);
+    }));
+    const old = await startE2EE('u_alice');
+    // A room key this device received earlier, and a peer key it pinned.
+    const store = await openCryptoStore('u_alice');
+    await store.write([['in:senderkey:session1', { kept: true }], ['pin:u_bob\nDEV', { kept: true }]]);
+    store.close();
+    await replaceDevice();
+    const fresh = await startE2EE('u_alice');
+    expect(fresh.deviceId).not.toBe(old.deviceId);
+    const after = await openCryptoStore('u_alice');
+    try {
+      expect(await after.get('in:senderkey:session1')).toEqual({ kept: true });
+      expect(await after.get('pin:u_bob\nDEV')).toEqual({ kept: true });
+    } finally {
+      after.close();
+    }
   });
 
   it('does not hold messages behind a device that is still starting', async () => {

@@ -363,6 +363,16 @@ export async function forgetCryptoStore(): Promise<void> {
 /** Replaces this browser's device with a new one, for a sign-out the server refused after the old device was retired. */
 export async function replaceDevice(): Promise<void> {
   const userId = current?.userId;
-  await forgetCryptoStore();
-  if (userId) await startE2EE(userId);
+  if (!userId) return;
+  stopE2EE();
+  // Only this device's identity goes (its account, Olm channels and outbound room sessions). The
+  // room keys it received, their replay log and pinned peer keys stay, so history stays readable.
+  const store = await openCryptoStore(userId);
+  try {
+    const owned = [...(await store.list('olm:')), ...(await store.list('out:'))].map(([k]) => k);
+    await store.write([], ['device', 'account', 'fallback', ...owned]);
+  } finally {
+    store.close();
+  }
+  await startE2EE(userId);
 }
