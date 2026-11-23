@@ -268,14 +268,14 @@ ALTER TABLE mfa_challenges ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';`,
 	{Version: 30, Name: "suite_presence", SQLite: presenceSchema, Postgres: presenceSchema},
 	// End-to-end encryption key server: public device keys, one-time keys, to-device mailbox.
 	{Version: 31, Name: "e2ee_keys", SQLite: e2eeSchema + e2eeToDeviceSQLite, Postgres: e2eeSchema + e2eeToDevicePostgres},
-	// The sender device's self-signed keys at send time, so mail from a device deleted since stays
-	// verifiable. Rows from before carry none and are refused by clients, as unverifiable.
-	{Version: 34, Name: "e2ee_mail_sender_keys", SQLite: e2eeMailSenderKeysSchema, Postgres: e2eeMailSenderKeysSchema},
 	{Version: 51, Name: "sso_session_lifecycle", SQLite: ssoLifecycleSchema, Postgres: ssoLifecycleSchema},
 	// Incoming webhooks are removed for end-to-end encryption; each live one leaves an audit row.
 	{Version: 52, Name: "remove_room_webhooks", SQLite: removeRoomWebhooksSchema, Postgres: removeRoomWebhooksSchema},
 	// Search runs on the device; the server's full-text index has no reader left.
 	{Version: 53, Name: "drop_message_search_index", SQLite: `SELECT 1;`, Postgres: `DROP INDEX IF EXISTS idx_messages_body_fts;`},
+	// The sender device's self-signed keys at send time, so mail from a device deleted since stays
+	// verifiable. Rows from before carry none and are refused by clients, as unverifiable.
+	{Version: 54, Name: "e2ee_mail_sender_keys", SQLite: e2eeMailSenderKeysSchema, Postgres: e2eeMailSenderKeysSchema},
 
 	// Tenancy migrations follow the merged webhook removal and E2EE slots 53–54.
 	{Version: 55, Name: "job_leases", SQLite: jobLeasesSchema, Postgres: jobLeasesSchema},
