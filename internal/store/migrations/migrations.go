@@ -268,6 +268,9 @@ ALTER TABLE mfa_challenges ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';`,
 	{Version: 30, Name: "suite_presence", SQLite: presenceSchema, Postgres: presenceSchema},
 	// End-to-end encryption key server: public device keys, one-time keys, to-device mailbox.
 	{Version: 31, Name: "e2ee_keys", SQLite: e2eeSchema + e2eeToDeviceSQLite, Postgres: e2eeSchema + e2eeToDevicePostgres},
+	// The sender device's self-signed keys at send time, so mail from a device deleted since stays
+	// verifiable. Rows from before carry none and are refused by clients, as unverifiable.
+	{Version: 34, Name: "e2ee_mail_sender_keys", SQLite: e2eeMailSenderKeysSchema, Postgres: e2eeMailSenderKeysSchema},
 }
 
 const multiTenancySchemaSQLite = `
@@ -357,6 +360,12 @@ CREATE TABLE IF NOT EXISTS e2ee_to_device (
 );
 CREATE INDEX IF NOT EXISTS idx_e2ee_to_device_recipient ON e2ee_to_device(recipient_user, recipient_device, id);
 CREATE INDEX IF NOT EXISTS idx_e2ee_to_device_created ON e2ee_to_device(created_at);
+`
+
+const e2eeMailSenderKeysSchema = `
+ALTER TABLE e2ee_to_device ADD COLUMN sender_curve25519 VARCHAR(64) NOT NULL DEFAULT '';
+ALTER TABLE e2ee_to_device ADD COLUMN sender_ed25519 VARCHAR(64) NOT NULL DEFAULT '';
+ALTER TABLE e2ee_to_device ADD COLUMN sender_signature VARCHAR(128) NOT NULL DEFAULT '';
 `
 
 const e2eeToDevicePostgres = `

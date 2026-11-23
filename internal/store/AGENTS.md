@@ -46,7 +46,7 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   after the insert inside the transaction, so a retried upload never trips it; on PostgreSQL it
   first locks the device row (`FOR UPDATE`) so concurrent uploads cannot both pass the cap. Mail has no
   cursor: `ToDevice` returns the oldest unacknowledged rows and `AckToDevice` deletes exactly the
-  IDs named, because PostgreSQL IDs commit out of order. Only public keys and ciphertext are stored.
+  IDs named, because PostgreSQL IDs commit out of order. Migration 34 adds each mail row's sender device keys (`sender_curve25519`, `sender_ed25519`, `sender_signature`, copied at send time), so mail from a device deleted since stays verifiable; older rows carry empty keys, which clients refuse. Only public keys and ciphertext are stored.
 - `store.Open(ctx, cfg)` initializes and auto-migrates the configured database backend.
   `migrations.Run` refuses with `ErrNewerSchema` a database whose `schema_migrations` holds a
   version above this build's newest (image rollback, or a capsule from a newer build), before

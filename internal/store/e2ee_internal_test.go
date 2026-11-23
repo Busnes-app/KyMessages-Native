@@ -32,7 +32,7 @@ func TestE2EEMailCommittedOutOfIDOrderIsDelivered(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	insert := `INSERT INTO e2ee_to_device (tenant_id, recipient_user, recipient_device, sender_user, sender_device, type, content, created_at) VALUES ('t1', 'u-b', 'B1', 'u-a', 'A1', 'olm.v1', $1, 1)`
+	insert := `INSERT INTO e2ee_to_device (tenant_id, recipient_user, recipient_device, sender_user, sender_device, sender_curve25519, sender_ed25519, sender_signature, type, content, created_at) VALUES ('t1', 'u-b', 'B1', 'u-a', 'A1', 'c', 'e', 's', 'olm.v1', $1, 1)`
 
 	// Transaction A takes the lower ID and stays open; B takes the higher ID and commits first.
 	txA, err := st.db.BeginTx(ctx, nil)

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"testing"
 
@@ -222,6 +223,25 @@ func TestE2EEQueryClaimAndMailStayInTheOrg(t *testing.T) {
 	rec = doBearerJSON(t, srv, http.MethodGet, "/api/v1/to-device?device_id="+devs[bob.ID].id, bobTok, nil, nil)
 	if rec.Body.String() != `{"messages":[]}`+"\n" {
 		t.Fatalf("after ack = %s", rec.Body.String())
+	}
+
+	// Mail carries the sender device's keys, so it stays verifiable after that device signs out.
+	if c := send(bob.ID, devs[bob.ID].id); c != http.StatusOK {
+		t.Fatalf("second send to bob = %d", c)
+	}
+	if c := doBearerJSON(t, srv, http.MethodDelete, "/api/v1/keys/devices/"+devs[alice.ID].id, aliceTok, nil, nil).Code; c != http.StatusNoContent {
+		t.Fatalf("alice signing her device out = %d", c)
+	}
+	rec = doBearerJSON(t, srv, http.MethodGet, "/api/v1/to-device?device_id="+devs[bob.ID].id, bobTok, nil, nil)
+	var queued struct {
+		Messages []struct {
+			SenderKeys map[string]string `json:"sender_keys"`
+		}
+	}
+	want := devs[alice.ID].keys()
+	want["device_id"] = devs[alice.ID].id
+	if json.Unmarshal(rec.Body.Bytes(), &queued) != nil || len(queued.Messages) != 1 || !maps.Equal(queued.Messages[0].SenderKeys, want) {
+		t.Fatalf("mail from a signed-out device = %s, want sender_keys %v", rec.Body.String(), want)
 	}
 
 	// Removing a device removes it from queries.

@@ -108,8 +108,11 @@ type E2EEToDevice struct {
 	TenantID                           string
 	RecipientUserID, RecipientDeviceID string
 	SenderUserID, SenderDeviceID       string
-	Type, Content                      string
-	CreatedAt                          time.Time
+	// The sender device's self-signed public keys when it sent the mail.
+	SenderCurve25519, SenderEd25519 string
+	SenderSignature                 string
+	Type, Content                   string
+	CreatedAt                       time.Time
 }
 
 // PresenceStore holds each user's suite status inputs, keyed by (tenant, user).
