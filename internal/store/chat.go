@@ -162,6 +162,25 @@ func (c *chatStore) HoldsSingleTenantData(ctx context.Context) (bool, error) {
 	return err == nil, err
 }
 
+func (c *chatStore) OrgIDs(ctx context.Context) ([]string, error) {
+	rows, err := c.store.db.QueryContext(ctx, c.store.rebind(`
+		SELECT org_id FROM users WHERE org_id <> ''
+		UNION SELECT id FROM tenants WHERE id <> ?`), DefaultTenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // ApplyTenantLifecycle sets an org's status from a KyIdentity lifecycle event carrying the org's
 // revision. Only a revision above the last applied one changes status, so a delayed event never
 // undoes a newer one; deletion applies whatever its revision and is never undone. It reports

@@ -211,6 +211,8 @@ type ChatStore interface {
 	SetTenantStatus(ctx context.Context, tenantID, status string) error
 	ApplyTenantLifecycle(ctx context.Context, tenantID, status string, revision int64) (bool, error)
 	HoldsSingleTenantData(ctx context.Context) (bool, error)
+	// OrgIDs lists every org ID the database binds: account org_ids and non-default tenants.
+	OrgIDs(ctx context.Context) ([]string, error)
 	UpdateTenantMediaPolicy(ctx context.Context, tenantID, policy string, maxVideo, maxAudio int, guestForceSFU bool) (*Tenant, error)
 
 	// Rooms & Membership

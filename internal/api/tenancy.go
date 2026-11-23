@@ -52,6 +52,18 @@ func EnsureTenancyMode(ctx context.Context, st store.Store, cfg config.TenancyCo
 		return fmt.Errorf("database tenancy mode is %q; refusing to start with KY_TENANCY_MODE=%q", stored, want)
 	}
 	if want == config.TenancyMulti {
+		// KyIdentity's org IDs are canonical UUIDs, and lifecycle events and directory sync
+		// refuse anything else, so an account bound to another org ID could never be
+		// suspended or offboarded. Refuse to serve it.
+		ids, err := st.Chat().OrgIDs(ctx)
+		if err != nil {
+			return fmt.Errorf("check org IDs: %w", err)
+		}
+		for _, id := range ids {
+			if !config.IsCanonicalUUID(id) {
+				return fmt.Errorf("database binds org %q, which is not a canonical lowercase UUID; KyIdentity could never suspend or offboard it, so refusing to start", id)
+			}
+		}
 		wantStaff := strings.TrimSpace(cfg.StaffOrgID)
 		storedStaff, err := st.Settings().GetSetting(ctx, store.TenancyStaffOrgSettingKey)
 		if errors.Is(err, store.ErrNotFound) {

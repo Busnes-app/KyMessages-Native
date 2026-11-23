@@ -145,6 +145,27 @@ func TestEnsureTenancyModeLocksDatabase(t *testing.T) {
 	if err := api.EnsureTenancyMode(ctx, stMulti, config.TenancyConfig{Mode: config.TenancySingle}); err == nil {
 		t.Fatal("expected multi-tenant DB to fail closed when booted in single-tenant mode")
 	}
+	// A database from before canonical org IDs that binds an account to "org-alpha" refuses
+	// to start: KyIdentity could never suspend or offboard that account.
+	multi := config.TenancyConfig{Mode: config.TenancyMulti, StaffOrgID: testStaffOrg}
+	if err := stMulti.Users().CreateUser(ctx, &store.User{ID: "u_legacy", Username: "legacy", Role: "user", Status: "active", SSOProvider: "kyidentity", SSOSubject: "sub-legacy", OrgID: "org-alpha"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := api.EnsureTenancyMode(ctx, stMulti, multi); err == nil || !strings.Contains(err.Error(), "org-alpha") {
+		t.Fatalf("legacy org ID boot: %v", err)
+	}
+	if err := stMulti.Users().DeleteUser(ctx, "u_legacy"); err != nil {
+		t.Fatal(err)
+	}
+	if err := api.EnsureTenancyMode(ctx, stMulti, multi); err != nil {
+		t.Fatalf("boot after the legacy account is gone: %v", err)
+	}
+	if _, err := stMulti.Chat().EnsureTenant(ctx, "org-beta"); err != nil {
+		t.Fatal(err)
+	}
+	if err := api.EnsureTenancyMode(ctx, stMulti, multi); err == nil || !strings.Contains(err.Error(), "org-beta") {
+		t.Fatalf("legacy tenant boot: %v", err)
+	}
 }
 
 func TestMultiTenantSCIMDisabled(t *testing.T) {
