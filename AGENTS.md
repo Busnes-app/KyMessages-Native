@@ -138,6 +138,12 @@ When the user requests a durable behavior change, record it here or in the relev
   unknown ones. Event IDs go to the shared `suite_replay_events` ledger; a 429/503 releases them.
   Suite presence (`internal/presence` decoders, `store.PresenceStore` keyed by tenant and user)
   serves `/api/suite/presence/{lookup,out-of-office,calendar,me}`.
+- End-to-end encryption (`docs/superpowers/specs/2026-11-22-e2ee-design.md`): `web/crypto` is a
+  Rust wasm-bindgen wrapper over vodozemac. Its committed build `web/src/crypto/pkg` must equal
+  `web/crypto/build.sh` output (pinned Rust in `rust-toolchain.toml`, `wasm-bindgen-cli` 0.2.130;
+  CI job "Crypto core"). The key server (`internal/api/e2ee_handlers.go`, `store.E2EEStore`)
+  holds public keys and Olm ciphertext only; devices sign `api.E2EEDeviceSigned` and
+  `api.E2EEOneTimeKeySigned` strings, which clients verify again.
 - Only the staff org (`KY_STAFF_ORG_ID`) holds administrators (`config.TenancyConfig.MayAdminister`,
   enforced in directory sync and the `admin` middleware). Org-less local operators keep the
   install-wide console; per-org admin pages need a staff-org account.
