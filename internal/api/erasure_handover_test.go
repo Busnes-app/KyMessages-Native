@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/Busnes-app/ky_server_base/internal/api"
 	"github.com/Busnes-app/ky_server_base/internal/store"
@@ -175,5 +176,67 @@ func TestErasureDeletesOnlyOwnedRoomsWithNoRemainingMember(t *testing.T) {
 	}
 	if m, err := st.Chat().GetRoomMember(ctx, replicaOrgA, shared, disabled.ID); err != nil || m.Role != store.RoomRoleOwner {
 		t.Fatalf("disabled successor: %+v %v", m, err)
+	}
+}
+
+// EraseUser is also used directly by restore/sweep integration fixtures. Room selection must
+// use the durable actor set even when no earlier deactivation marked its bot inactive.
+func TestErasureDeletesOwnedChannelWhoseOnlyOtherMemberIsItsBot(t *testing.T) {
+	ctx := context.Background()
+	srv, _, st, cfg := newReplicas(t, withPool(t, &fakePool{headroom: 1 << 20}))
+	owner, tok := createOrgUser(t, st, "actor-a-owner", "actorowner", "user", replicaOrgA)
+	bot := &store.User{ID: "actor-z-bot", Username: "actorbot", SSOProvider: "bot", OrgID: replicaOrgA, Role: "bot", Status: "active"}
+	if err := st.Users().CreateUser(ctx, bot); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Agents().CreateAgent(ctx, &store.Agent{ID: "actor-bot-agent", UserID: bot.ID, Username: bot.Username, OwnerUserID: owner.ID, TokenHash: "actor-bot-hash", TokenState: store.AgentTokenActive, CreatedBy: owner.ID, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	room := roomOf(t, doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", tok, map[string]any{"kind": "channel", "name": "only erased actors", "member_ids": []string{bot.ID}}, nil))
+	up := doMultipartUpload(t, srv, "/api/v1/rooms/"+room+"/attachments", tok, "file", "f.txt", []byte("owned-room bytes"))
+	var v struct {
+		Attachment store.Attachment `json:"attachment"`
+	}
+	if err := json.Unmarshal(up.Body.Bytes(), &v); err != nil || up.Code != http.StatusCreated {
+		t.Fatalf("upload: %d %s", up.Code, up.Body.String())
+	}
+	if r := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room+"/messages", tok, sealed("erased content", map[string]any{"attachment_ids": []string{v.Attachment.ID}}), nil); r.Code != http.StatusCreated {
+		t.Fatalf("post: %d %s", r.Code, r.Body.String())
+	}
+	late, err := st.Chat().EraseUser(ctx, replicaOrgA, owner)
+	if err != nil || len(late) != 1 {
+		t.Fatalf("direct erasure lost cleanup keys: %+v %v", late, err)
+	}
+	if _, err := st.Chat().GetRoom(ctx, replicaOrgA, room); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("owned actor-only channel survived first erasure: %v", err)
+	}
+	// Cleanup may fail after commit, then retry independently without recreating the room.
+	backend := api.BlobsForTest(srv)
+	api.SetBlobsForTest(srv, &failKey{Backend: backend, key: v.Attachment.ID})
+	if _, err := srv.SweepOrphanAttachments(ctx, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := st.Chat().PendingBlobDeletes(ctx, 10); err != nil || len(pending) != 1 {
+		t.Fatalf("failed cleanup lost: %+v %v", pending, err)
+	}
+	api.SetBlobsForTest(srv, backend)
+	for range 2 {
+		if _, err := srv.SweepOrphanAttachments(ctx, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(cfg.Database.DataDir, "attachments", "orgs", replicaOrgA, "att", v.Attachment.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphan blob survived: %v", err)
+	}
+	for range 2 {
+		if _, err := st.Chat().EraseUser(ctx, replicaOrgA, owner); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.Chat().GetRoom(ctx, replicaOrgA, room); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("replay recreated room: %v", err)
+	}
+	if _, n, err := st.Audit().ListAuditRecords(ctx, 0, 100, "sso.user_erased"); err != nil || n != 1 {
+		t.Fatalf("completion audit: %d %v", n, err)
 	}
 }
