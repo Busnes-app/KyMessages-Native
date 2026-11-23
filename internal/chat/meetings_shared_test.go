@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Busnes-app/ky_server_base/internal/crypto"
 	"github.com/Busnes-app/ky_server_base/internal/store"
 	"github.com/Busnes-app/ky_server_base/internal/testdb"
 )
@@ -40,7 +41,7 @@ func TestSharedLobbyLeaveGraceAcrossReplicas(t *testing.T) {
 		return l
 	}
 	a, b := replica(), replica()
-	s, err := a.Knock(ctx, &store.MeetingGuest{MeetingID: "m", GuestKey: "k"}, res.Meeting, nil, "Visitor")
+	s, err := a.Knock(ctx, sharedInviteFixture(t, st, res.Meeting, "k"), res.Meeting, nil, "Visitor")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +85,7 @@ func TestSharedLobbyOverlappingSocketsAcrossReplicas(t *testing.T) {
 		return l
 	}
 	a, b := replica(), replica()
-	s, err := a.Knock(ctx, &store.MeetingGuest{MeetingID: "m", GuestKey: "k"}, res.Meeting, nil, "Visitor")
+	s, err := a.Knock(ctx, sharedInviteFixture(t, st, res.Meeting, "k"), res.Meeting, nil, "Visitor")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +122,7 @@ func TestSharedLobbyAdmissionLapsesWithoutAnyReplica(t *testing.T) {
 	l := NewLobbyManager(NewHub(&captureBus{}), nil)
 	l.UseShared(st.GuestSessions())
 	l.SetLeaveGrace(time.Hour) // expiry is controlled through the stored fixture
-	s, err := l.Knock(ctx, &store.MeetingGuest{MeetingID: "m", GuestKey: "k"}, res.Meeting, nil, "Visitor")
+	s, err := l.Knock(ctx, sharedInviteFixture(t, st, res.Meeting, "k"), res.Meeting, nil, "Visitor")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +144,7 @@ func TestSharedLobbyAdmissionLapsesWithoutAnyReplica(t *testing.T) {
 		t.Fatalf("admitting a lapsed guest: %v", err)
 	}
 	// A fresh knock and admission work again.
-	s2, err := l.Knock(ctx, &store.MeetingGuest{MeetingID: "m", GuestKey: "k"}, res.Meeting, nil, "Visitor")
+	s2, err := l.Knock(ctx, sharedInviteFixture(t, st, res.Meeting, "k"), res.Meeting, nil, "Visitor")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +169,7 @@ func TestSharedLobbyPollingGuestStaysWaiting(t *testing.T) {
 	l := NewLobbyManager(NewHub(&captureBus{}), nil)
 	l.UseShared(st.GuestSessions())
 	l.SetLeaveGrace(400 * time.Millisecond)
-	s, err := l.Knock(ctx, &store.MeetingGuest{MeetingID: "m", GuestKey: "k"}, res.Meeting, nil, "Visitor")
+	s, err := l.Knock(ctx, sharedInviteFixture(t, st, res.Meeting, "k"), res.Meeting, nil, "Visitor")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +204,7 @@ func TestSharedLobbyPollingAfterDisconnect(t *testing.T) {
 	l := NewLobbyManager(NewHub(&captureBus{}), nil)
 	l.UseShared(st.GuestSessions())
 	l.SetLeaveGrace(time.Hour) // expiry is controlled through the stored fixture
-	s, err := l.Knock(ctx, &store.MeetingGuest{MeetingID: "m", GuestKey: "k"}, res.Meeting, nil, "Visitor")
+	s, err := l.Knock(ctx, sharedInviteFixture(t, st, res.Meeting, "k"), res.Meeting, nil, "Visitor")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +241,7 @@ func TestSharedLobbyConnectedGuestSurvivesAnOutage(t *testing.T) {
 	l := NewLobbyManager(NewHub(&captureBus{}), nil)
 	l.UseShared(st.GuestSessions())
 	l.SetLeaveGrace(time.Hour) // expiry is controlled through the stored fixture
-	s, err := l.Knock(ctx, &store.MeetingGuest{MeetingID: "m", GuestKey: "k"}, res.Meeting, nil, "Visitor")
+	s, err := l.Knock(ctx, sharedInviteFixture(t, st, res.Meeting, "k"), res.Meeting, nil, "Visitor")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,7 +255,7 @@ func TestSharedLobbyConnectedGuestSurvivesAnOutage(t *testing.T) {
 		t.Fatal("a guest still connected here was dropped after the outage")
 	}
 	// A guest with no socket here gets no such refresh.
-	s2, err := l.Knock(ctx, &store.MeetingGuest{MeetingID: "m", GuestKey: "k2"}, res.Meeting, nil, "Other")
+	s2, err := l.Knock(ctx, sharedInviteFixture(t, st, res.Meeting, "k2"), res.Meeting, nil, "Other")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,7 +289,7 @@ func TestSharedGuestRevocationRemovesRemoteCallWithoutSocket(t *testing.T) {
 	b.SetUserRevokeHandler(func(id string) { calls.HandleDisconnect(id, 0) })
 	lobby := NewLobbyManager(a, nil)
 	lobby.UseShared(st.GuestSessions())
-	s, err := lobby.Knock(ctx, &store.MeetingGuest{MeetingID: "remote", GuestKey: "guest"}, res.Meeting, nil, "Guest")
+	s, err := lobby.Knock(ctx, sharedInviteFixture(t, st, res.Meeting, "guest"), res.Meeting, nil, "Guest")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -363,7 +364,7 @@ func TestSharedLobbyDepartureAfterPollingStops(t *testing.T) {
 		t.Cleanup(func() { timer.Stop() })
 		return timer
 	}
-	guest, err := l.Knock(ctx, &store.MeetingGuest{MeetingID: "departure", GuestKey: "guest"}, res.Meeting, nil, "Guest")
+	guest, err := l.Knock(ctx, sharedInviteFixture(t, st, res.Meeting, "guest"), res.Meeting, nil, "Guest")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -402,4 +403,22 @@ func TestSharedLobbyDepartureAfterPollingStops(t *testing.T) {
 	if _, ok := l.GetBySecret(guest.SessionSecret); ok {
 		t.Fatal("departed session still resolves")
 	}
+}
+
+func sharedInviteFixture(t *testing.T, st store.Store, meeting *store.Meeting, key string) *store.MeetingGuest {
+	t.Helper()
+	_, _, guests, err := st.Chat().GetMeeting(context.Background(), meeting.TenantID, meeting.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, guest := range guests {
+		if guest.GuestKey == key {
+			return &guest
+		}
+	}
+	guest := &store.MeetingGuest{TenantID: meeting.TenantID, MeetingID: meeting.ID, GuestKey: key, TokenHash: crypto.SHA256Hex([]byte(meeting.TenantID + ":" + meeting.ID + ":" + key))}
+	if err := st.Chat().CreateMeetingGuest(context.Background(), guest); err != nil {
+		t.Fatal(err)
+	}
+	return guest
 }

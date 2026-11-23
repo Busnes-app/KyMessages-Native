@@ -35,9 +35,9 @@ func fromShared(g store.GuestSession) *GuestSession {
 		GuestKey: g.GuestKey, DisplayName: g.DisplayName, Status: g.Status, KnockedAt: g.KnockedAt, DecidedBy: g.DecidedBy}
 }
 
-func (l *LobbyManager) knockShared(ctx context.Context, meeting *store.Meeting, guestKey, displayName, secret, guestID string, nowMs int64) (*GuestSession, error) {
+func (l *LobbyManager) knockShared(ctx context.Context, meeting *store.Meeting, guestKey, inviteHash, displayName, secret, guestID string, nowMs int64) (*GuestSession, error) {
 	replaced, err := l.db.Create(ctx, secret, store.GuestSession{
-		GuestID: guestID, TenantID: meeting.TenantID, MeetingID: meeting.ID, RoomID: meeting.RoomID, GuestKey: guestKey,
+		GuestID: guestID, TenantID: meeting.TenantID, MeetingID: meeting.ID, RoomID: meeting.RoomID, GuestKey: guestKey, InviteHash: inviteHash,
 		DisplayName: displayName, Status: "waiting", KnockedAt: nowMs, SeenAt: nowMs, ExpiresAt: nowMs + guestSessionTTL.Milliseconds(),
 	})
 	if err != nil {

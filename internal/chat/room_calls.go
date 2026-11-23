@@ -104,6 +104,9 @@ func (m *CallManager) ownedRoom(ctx context.Context, tenant, room string) (*acti
 			m.removePeerLocked(room, cached, id)
 		}
 	}
+	if len(cached.peers) > 0 {
+		m.maybeScheduleStepDownLocked(room, cached)
+	}
 	m.mu.Unlock()
 	if err := m.DrainCleanup(ctx, tenant, ""); err != nil {
 		return nil, err

@@ -158,7 +158,7 @@ func (l *LobbyManager) Knock(ctx context.Context, guest *store.MeetingGuest, mee
 	guestID := "guest_" + uuid.Must(uuid.NewV7()).String()
 	nowMs := l.now().UTC().UnixMilli()
 	if l.db != nil {
-		sess, err := l.knockShared(ctx, meeting, guest.GuestKey, displayName, secret, guestID, nowMs)
+		sess, err := l.knockShared(ctx, meeting, guest.GuestKey, guest.TokenHash, displayName, secret, guestID, nowMs)
 		if err != nil {
 			return nil, err
 		}

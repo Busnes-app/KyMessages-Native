@@ -654,6 +654,16 @@ atomically fences ownership, ends calls, retains SFU cleanup and removes guest a
 failed cleanup remains retryable before the close is acknowledged. This preserves the
 current close permission boundary and does not choose the future host/moderator model.
 
+Migration 65 binds each shared admission to the exact current invitation token hash. Primary
+reads, admission, signaling/media grants and seat reconciliation revalidate the link, room
+and scheduled window even after missed cleanup or an immediate re-invite of the same key.
+Old experimental shared admissions have no provable binding: the migration queues their
+issued media targets and invalidates those guest rows/seats, preserving human grants/seats.
+They must knock again; the migration never assigns a current token to an old principal.
+Stop old experimental multi processes before upgrading; mixed-version hosted operation is
+not supported while startup is gated. Single mode uses the existing in-memory guest path,
+so its routes, grants and golden/upgrade responses remain unchanged.
+
 This is not a seamless-live-media promise: recovery can interrupt media, and a dead owner
 can retain its lease for up to 90 seconds. Keep the eligible call replica pool stable during
 calls; changing pool membership requires draining/stopping the removed owners so they cease

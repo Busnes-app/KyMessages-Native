@@ -83,7 +83,7 @@ func (c *chatStore) PutCallSeat(ctx context.Context, cs *CallSession, seat CallS
 	defer tx.Rollback()
 	var res sql.Result
 	if guest {
-		res, err = tx.ExecContext(ctx, c.store.rebind(`UPDATE meeting_guest_sessions SET guest_id=guest_id WHERE guest_id=? AND tenant_id=? AND room_id=? AND status='admitted' AND expires_at>`+c.store.dbNowMillis()), userID, cs.TenantID, cs.RoomID)
+		res, err = tx.ExecContext(ctx, c.store.rebind(`UPDATE meeting_guest_sessions SET guest_id=guest_id WHERE guest_id=? AND tenant_id=? AND room_id=? AND status='admitted' AND expires_at>`+c.store.dbNowMillis()+` AND `+c.store.liveGuestInviteSQL("meeting_guest_sessions")), userID, cs.TenantID, cs.RoomID)
 	} else {
 		res, err = tx.ExecContext(ctx, c.store.rebind(`UPDATE users SET id=id WHERE id=? AND org_id=? AND status='active' AND role='user' AND NOT must_change_password`), userID, cs.TenantID)
 	}
@@ -302,7 +302,7 @@ func (c *chatStore) PruneCallSeats(ctx context.Context, guestLive time.Duration)
  OR (NOT EXISTS(SELECT 1 FROM users u JOIN room_members m ON m.user_id=u.id
  WHERE u.id=call_seats.user_id AND u.org_id=call_seats.tenant_id AND u.status='active' AND u.role<>'bot' AND m.tenant_id=call_seats.tenant_id AND m.room_id=call_seats.room_id)
  AND NOT EXISTS(SELECT 1 FROM meeting_guest_sessions g WHERE g.guest_id=call_seats.user_id AND g.tenant_id=call_seats.tenant_id AND g.room_id=call_seats.room_id AND g.status='admitted'
- AND g.expires_at>` + c.store.dbNowMillis() + ` AND g.seen_at>` + c.store.dbNowMillis() + `-?))`
+ AND ` + c.store.liveGuestInviteSQL("g") + ` AND g.expires_at>` + c.store.dbNowMillis() + ` AND g.seen_at>` + c.store.dbNowMillis() + `-?))`
 	// Parenthesize the disjunction before the queue helper appends its SFU predicate.
 	if err := queueCallSeatsTx(ctx, c.store, tx, `(`+where+`)`, guestLive.Milliseconds()); err != nil {
 		return err

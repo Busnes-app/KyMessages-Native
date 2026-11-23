@@ -348,3 +348,71 @@ func TestRoomCallStaleJoinRollbackCannotRetireReplacementOwnerSeat(t *testing.T)
 		t.Fatalf("late rollback queued current media:%+v %v", pending, err)
 	}
 }
+
+func TestRoomCallMissedGuestInviteRevocationCannotRefreshMedia(t *testing.T) {
+	ctx := context.Background()
+	st, _, requests := seedRoutedCall(t)
+	oldHash := strings.Repeat("a", 64)
+	params := store.UpsertMeetingParams{ID: "invite-fence", TenantID: routedOrg, OrganizerID: requests[0].UserID, OrganizerSub: requests[0].UserID, Title: "T", KeepGuestKeys: map[string]struct{}{"key": {}}, NewGuestTokens: map[string]store.MeetingGuest{"key": {TokenHash: oldHash}}}
+	meeting, err := st.Chat().UpsertMeeting(ctx, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus := &captureBus{}
+	m := NewCallManager(st.Chat(), NewHub(bus), fakeLiveKitClient(t), nil)
+	m.EnableRoomRouting()
+	m.SetCleanupLease(func(context.Context) (bool, error) { return true, nil })
+	lobby := NewLobbyManager(m.hub, m)
+	lobby.UseShared(st.GuestSessions())
+	link := &store.MeetingGuest{TenantID: routedOrg, MeetingID: params.ID, GuestKey: "key", TokenHash: oldHash}
+	guest, err := lobby.Knock(ctx, link, meeting.Meeting, nil, "Visitor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lobby.Decide(ctx, meeting.Room.ID, guest.GuestID, requests[0].UserID, true); err != nil {
+		t.Fatal(err)
+	}
+	host := requests[0]
+	host.RoomID = meeting.Room.ID
+	if _, err := m.Join(ctx, host); err != nil {
+		t.Fatal(err)
+	}
+	joined, err := m.Join(ctx, JoinCallRequest{TenantID: routedOrg, RoomID: meeting.Room.ID, UserID: guest.GuestID, IsGuest: true, DisplayName: "Visitor", Audio: true, ProtectIP: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	params.KeepGuestKeys = nil
+	params.NewGuestTokens = nil
+	if _, err := st.Chat().UpsertMeeting(ctx, params); err != nil {
+		t.Fatal(err)
+	}
+	params.KeepGuestKeys = map[string]struct{}{"key": {}}
+	params.NewGuestTokens = map[string]store.MeetingGuest{"key": {TokenHash: strings.Repeat("b", 64)}}
+	if _, err := st.Chat().UpsertMeeting(ctx, params); err != nil {
+		t.Fatal(err)
+	}
+	before := len(bus.snapshot())
+	yes := true
+	m.HandleClientFrame(ctx, guest.GuestID, true, ClientFrame{Type: ClientFrameCallMedia, RoomID: meeting.Room.ID, CallID: joined.CallID, Video: &yes})
+	if len(bus.snapshot()) != before {
+		t.Fatal("stale guest controlled a later invitation's call")
+	}
+	m.ReconcileTenants(ctx)
+	state := m.GetState(meeting.Room.ID)
+	if state == nil || len(state.Peers) != 1 || state.Peers[0].UserID != host.UserID {
+		t.Fatalf("stale guest seat or missing host:%+v", state)
+	}
+	if _, err := lobby.Knock(ctx, link, meeting.Meeting, nil, "Replay"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("old link replay minted an admission:%v", err)
+	}
+	pending, err := st.Chat().PendingCallEvictions(ctx, routedOrg, "", 200)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("revoked guest media cleanup remains:%+v %v", pending, err)
+	}
+	m.mu.Lock()
+	if m.calls[meeting.Room.ID].stepDownTimer == nil {
+		t.Error("revoked guest did not retain normal SFU step-down scheduling")
+	}
+	m.calls[meeting.Room.ID].stopStepDownLocked()
+	m.mu.Unlock()
+}

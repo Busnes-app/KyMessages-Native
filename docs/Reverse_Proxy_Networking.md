@@ -230,3 +230,10 @@ stop removed owners' call processing before changing the eligible pool; a still-
 owner would otherwise keep renewing its lease. Do not claim seamless rolling migration or
 hosted capacity from this example. PostgreSQL/S3, isolation, browser/media, recovery and all
 other launch gates remain required. Guest E2EE is not established by room affinity.
+
+
+For experimental multi-mode upgrades through migration 65, stop the old processes first.
+Shared guest admissions created before exact invite binding cannot be trusted after an
+invitation changes, so guests must knock and be admitted again. The upgrade retires known
+old guest media targets and preserves human session grants; single-mode guest sessions keep
+their existing in-memory behavior. This is not a hosted rolling-upgrade procedure.
