@@ -1435,6 +1435,12 @@ func (c *chatStore) CommitAttachmentWithQuota(ctx context.Context, reservationID
 	if limits.MaxPendingUserBytes > 0 && a.MessageID == "" && pendingUsed+a.SizeBytes > limits.MaxPendingUserBytes {
 		return ErrAttachmentPendingQuotaExceeded
 	}
+	if limits.ActiveUploader {
+		var status string
+		if err := tx.QueryRowContext(ctx, c.store.rebind(`SELECT status FROM users WHERE id = ?`), a.UploaderID).Scan(&status); err != nil || status != "active" {
+			return ErrForbidden
+		}
+	}
 	if limits.Pool {
 		ceiling, err := c.poolCeilingTx(ctx, tx, a.TenantID, nowMilli())
 		if err != nil {

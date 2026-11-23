@@ -396,7 +396,9 @@ type ChatStore interface {
 	RaisePoolSeq(ctx context.Context, tenantID string, seq int64) error
 	// Erasure of one person (multi mode, erase.go): blobs first, then rows.
 	ErasureBlobs(ctx context.Context, tenantID, userID string) ([]BlobRef, error)
-	EraseUser(ctx context.Context, tenantID, userID string) (bool, error)
+	ErasureTarget(ctx context.Context, provider, subject string) (*User, error)
+	DeactivateForErasure(ctx context.Context, userID string) error
+	EraseUser(ctx context.Context, tenantID string, user *User) ([]BlobRef, error)
 	// AttachmentTenant returns the org of the attachment stored under blobKey.
 	AttachmentTenant(ctx context.Context, blobKey string) (string, error)
 

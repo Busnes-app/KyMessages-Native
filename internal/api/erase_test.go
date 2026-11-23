@@ -8,11 +8,13 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Busnes-app/ky-primitives/syncauth"
 	"github.com/Busnes-app/ky_server_base/internal/api"
+	"github.com/Busnes-app/ky_server_base/internal/blobs"
 	"github.com/Busnes-app/ky_server_base/internal/store"
 	"github.com/google/uuid"
 )
@@ -175,5 +177,83 @@ func TestUserErasedIsIgnoredInSingleMode(t *testing.T) {
 	}
 	if _, err := st.Users().GetUserByID(ctx, "usr_single"); err != nil {
 		t.Fatal("single mode erased an account")
+	}
+}
+
+// spyBlobs runs check on the first delete, while the erasure is cleaning up blobs.
+type spyBlobs struct {
+	blobs.Backend
+	once  sync.Once
+	check func()
+}
+
+func (b *spyBlobs) Delete(tenantID, key string) error {
+	b.once.Do(b.check)
+	return b.Backend.Delete(tenantID, key)
+}
+
+// The person loses access before anything is disconnected or deleted: by the time blobs are
+// cleaned up, their session no longer signs in to anything, a call join included.
+func TestUserErasedRevokesAccessFirst(t *testing.T) {
+	srv, _, st, _ := newReplicas(t, withPool(t, &fakePool{headroom: 1 << 20}))
+	alice, aliceTok := createOrgUser(t, st, "usr_ef_alice", "efalice", "user", replicaOrgA)
+	room := roomOf(t, doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", aliceTok, map[string]any{"kind": store.RoomKindChannel, "name": "c"}, nil))
+	if rec := doMultipartUpload(t, srv, "/api/v1/rooms/"+room+"/attachments", aliceTok, "file", "a.txt", []byte("x")); rec.Code != http.StatusCreated {
+		t.Fatal(rec.Code)
+	}
+	during := 0
+	api.SetBlobsForTest(srv, &spyBlobs{Backend: api.BlobsForTest(srv), check: func() {
+		during = doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room+"/calls/join", aliceTok, map[string]any{"audio": true}, nil).Code
+	}})
+	if rec := postErased(t, srv, alice.SSOSubject, replicaOrgA); rec.Code != http.StatusOK {
+		t.Fatalf("user.erased = %d", rec.Code)
+	}
+	if during != http.StatusUnauthorized {
+		t.Fatalf("call join during blob cleanup = %d, want 401", during)
+	}
+}
+
+// user.deleted removes the account row first; a later user.erased still finds the person's
+// messages and files through the kept subject mapping.
+func TestUserErasedAfterUserDeleted(t *testing.T) {
+	ctx := context.Background()
+	srv, _, st, cfg := newReplicas(t, withPool(t, &fakePool{headroom: 1 << 20}))
+	alice, aliceTok := createOrgUser(t, st, "usr_ed_alice", "edalice", "user", replicaOrgA)
+	bob, bobTok := createOrgUser(t, st, "usr_ed_bob", "edbob", "user", replicaOrgA)
+	room := roomOf(t, doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", aliceTok, map[string]any{"kind": store.RoomKindChannel, "name": "c", "member_ids": []string{bob.ID}}, nil))
+	up := doMultipartUpload(t, srv, "/api/v1/rooms/"+room+"/attachments", aliceTok, "file", "a.txt", []byte("alice"))
+	var a struct {
+		Attachment store.Attachment `json:"attachment"`
+	}
+	_ = json.Unmarshal(up.Body.Bytes(), &a)
+	if rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room+"/messages", aliceTok, map[string]any{"body": "mine", "attachment_ids": []string{a.Attachment.ID}}, nil); rec.Code != http.StatusCreated {
+		t.Fatal(rec.Code)
+	}
+	del := []byte(`{"schemas":["urn:ietf:params:scim:schemas:core:2.0:User"],"id":"` + alice.SSOSubject + `","externalId":"x","userName":"edalice","active":false,"org_id":"` + replicaOrgA + `","meta":{"resourceType":"User","version":"W/\"5\""}}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/sso/kyidentity/sync", bytes.NewReader(del))
+	req.Header.Set("Content-Type", "application/scim+json")
+	h, _ := syncauth.Sign([]byte(testMultiTenantHMAC), time.Now(), "user.deleted", uuid.NewString(), del)
+	h.Apply(req)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("user.deleted = %d %s", rec.Code, rec.Body.String())
+	}
+	if _, err := st.Users().GetUserByID(ctx, alice.ID); err == nil {
+		t.Fatal("user.deleted kept the row; this test needs it gone")
+	}
+	if rec := postErased(t, srv, alice.SSOSubject, replicaOrgA); rec.Code != http.StatusOK {
+		t.Fatalf("user.erased = %d", rec.Code)
+	}
+	page := doBearerJSON(t, srv, http.MethodGet, "/api/v1/rooms/"+room+"/messages", bobTok, nil, nil)
+	var p struct {
+		Messages []store.Message `json:"messages"`
+	}
+	_ = json.Unmarshal(page.Body.Bytes(), &p)
+	if len(p.Messages) != 1 || p.Messages[0].Body != "" || p.Messages[0].DeletedAt == nil || len(p.Messages[0].Attachments) != 0 {
+		t.Fatalf("after deletion then erasure: %+v", p.Messages)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.Database.DataDir, "attachments", "orgs", replicaOrgA, "att", a.Attachment.ID)); !os.IsNotExist(err) {
+		t.Fatal("blob kept")
 	}
 }

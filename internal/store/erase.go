@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 )
 
@@ -39,34 +40,73 @@ WHERE a.tenant_id = ? AND (a.uploader_id = ?
 	return out, rows.Err()
 }
 
-// EraseUser deletes userID's rows in tenantID and records the erasure under the opaque ID only.
-// It reports whether the user existed.
-func (c *chatStore) EraseUser(ctx context.Context, tenantID, userID string) (bool, error) {
+// ErasureTarget is the account a KyIdentity subject was, from its row or, once the row is gone,
+// from user_subjects.
+func (c *chatStore) ErasureTarget(ctx context.Context, provider, subject string) (*User, error) {
+	var u User
+	err := c.store.db.QueryRowContext(ctx, c.store.rebind(`SELECT user_id, org_id FROM user_subjects WHERE provider = ? AND subject = ?`), provider, subject).Scan(&u.ID, &u.OrgID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	u.SSOProvider, u.SSOSubject = provider, subject
+	return &u, err
+}
+
+// DeactivateForErasure is erasure's first step: the account stops serving before anything is
+// disconnected or deleted, so nothing admitted meanwhile can recreate access.
+func (c *chatStore) DeactivateForErasure(ctx context.Context, userID string) error {
+	_, err := c.store.db.ExecContext(ctx, c.store.rebind(`UPDATE users SET status = 'deleted', updated_at = ? WHERE id = ?`), time.Now().UTC(), userID)
+	return err
+}
+
+// EraseUser deletes the user's rows in tenantID, keeps the subject mapping so a repeat finds
+// them again, records the erasure under the opaque ID only, and returns the blobs of the
+// attachment rows it deleted (an upload that committed after ErasureBlobs), for the caller to
+// delete too. It is idempotent and needs no account row.
+func (c *chatStore) EraseUser(ctx context.Context, tenantID string, user *User) ([]BlobRef, error) {
+	userID := user.ID
 	tx, err := c.store.db.BeginTx(ctx, nil)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	var one int
-	err = tx.QueryRowContext(ctx, c.store.rebind(`SELECT 1 FROM users WHERE id = ? AND org_id = ?`), userID, tenantID).Scan(&one)
-	if err == sql.ErrNoRows {
-		return false, nil
+	if err := rememberSubject(ctx, c.store, tx, &User{ID: userID, OrgID: tenantID, SSOProvider: user.SSOProvider, SSOSubject: user.SSOSubject}); err != nil {
+		return nil, err
 	}
-	if err != nil {
-		return false, err
+	var late []BlobRef
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{`DELETE FROM attachments WHERE room_id IN (` + goneDMs + `) RETURNING id, tenant_id, blob_key`, []any{userID, tenantID, userID}},
+		{`DELETE FROM attachments WHERE tenant_id = ? AND (uploader_id = ? OR message_id IN (SELECT id FROM messages WHERE tenant_id = ? AND sender_id = ?)) RETURNING id, tenant_id, blob_key`, []any{tenantID, userID, tenantID, userID}},
+	} {
+		rows, err := tx.QueryContext(ctx, c.store.rebind(q.sql), q.args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var r BlobRef
+			if err := rows.Scan(&r.ID, &r.TenantID, &r.Key); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			late = append(late, r)
+		}
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			return nil, err
+		}
 	}
 	now := time.Now().UnixMilli()
 	steps := []struct {
 		q    string
 		args []any
 	}{
-		// DMs nobody else uses: everything in them goes.
-		{`DELETE FROM attachments WHERE room_id IN (` + goneDMs + `)`, []any{userID, tenantID, userID}},
+		// DMs nobody else uses: everything left in them goes.
 		{`DELETE FROM message_reactions WHERE message_id IN (SELECT id FROM messages WHERE room_id IN (` + goneDMs + `))`, []any{userID, tenantID, userID}},
 		{`DELETE FROM messages WHERE room_id IN (` + goneDMs + `)`, []any{userID, tenantID, userID}},
 		{`DELETE FROM rooms WHERE id IN (` + goneDMs + `)`, []any{userID, tenantID, userID}},
-		// Elsewhere: tombstones, and nothing of theirs attached or reacted.
-		{`DELETE FROM attachments WHERE tenant_id = ? AND (uploader_id = ? OR message_id IN (SELECT id FROM messages WHERE tenant_id = ? AND sender_id = ?))`, []any{tenantID, userID, tenantID, userID}},
+		// Elsewhere: tombstones, and nothing of theirs reacted.
 		{`UPDATE messages SET body = '', sender_name = '', deleted_at = COALESCE(deleted_at, ?) WHERE tenant_id = ? AND sender_id = ?`, []any{now, tenantID, userID}},
 		{`DELETE FROM message_reactions WHERE user_id = ?`, []any{userID}},
 		{`DELETE FROM room_members WHERE tenant_id = ? AND user_id = ?`, []any{tenantID, userID}},
@@ -76,13 +116,13 @@ func (c *chatStore) EraseUser(ctx context.Context, tenantID, userID string) (boo
 		{`DELETE FROM users WHERE id IN (SELECT user_id FROM agents WHERE owner_user_id = ?)`, []any{userID}},
 		{`DELETE FROM agents WHERE owner_user_id = ?`, []any{userID}},
 		// The account; sessions, MFA challenges, presence and push subscriptions cascade.
-		{`DELETE FROM users WHERE id = ?`, []any{userID}},
+		{`DELETE FROM users WHERE id = ? AND org_id = ?`, []any{userID, tenantID}},
 		{`INSERT INTO audit_records (action, resource, details, created_at) VALUES ('sso.user_erased', ?, '', ?)`, []any{"user:" + userID, time.Now().UTC()}},
 	}
 	for _, s := range steps {
 		if _, err := tx.ExecContext(ctx, c.store.rebind(s.q), s.args...); err != nil {
-			return false, err
+			return nil, err
 		}
 	}
-	return true, tx.Commit()
+	return late, tx.Commit()
 }

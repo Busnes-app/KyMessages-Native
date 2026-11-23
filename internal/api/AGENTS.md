@@ -58,8 +58,11 @@ Owns HTTP routing, request parsing, session cookie validation, CORS headers, and
 - Multi mode refuses a KyIdentity sign-in whose ID token carries `export_only: true` (the org is
   `deletion_scheduled`) with the suspended-org answer (403 "Organization is suspended or
   inactive"), provisions nothing, and audits `sso.export_only_refused` naming only the org
-  (`TestExportOnlyTokenIsRefusedInMultiMode`). `eraseUser` serves `user.erased`: blobs first, then
-  `store.EraseUser` (`TestUserErasedDeletesThePersonsData`).
+  (`TestExportOnlyTokenIsRefusedInMultiMode`). `eraseUser` serves `user.erased`: the account stops
+  serving and loses its grants first, then it is disconnected, then blobs, then
+  `store.EraseUser` (and the blobs it returns), then a last disconnect
+  (`TestUserErasedDeletesThePersonsData`, `TestUserErasedRevokesAccessFirst`,
+  `TestUserErasedAfterUserDeleted`). Multi-mode uploads commit only for an active uploader.
 - The org storage pool (`pool.go`, multi mode, customer orgs only; the staff org and org-less
   operators are exempt). Uploads check KyIdentity's grant (`AttachmentQuotaLimits.Pool`), and
   `KY_ATTACHMENTS_MAX_TOTAL_BYTES` does not apply (startup warns when it is set). An upload with

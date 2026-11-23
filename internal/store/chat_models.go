@@ -139,6 +139,9 @@ type AttachmentQuotaLimits struct {
 	// Pool (multi mode, customer orgs) checks the org's storage-pool grant as well: committed
 	// usage plus the new bytes must fit the ceiling, before the grant expires.
 	Pool bool
+	// ActiveUploader (multi mode) commits only for an uploader whose account still serves, so an
+	// upload in flight when its person is erased cannot leave a row behind.
+	ActiveUploader bool
 }
 
 // AttachmentQuotaLimitKind identifies which cap constrained a reservation.

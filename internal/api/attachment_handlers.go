@@ -120,6 +120,7 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 		MaxTotalBytes:       s.maxTotalAttachmentBytes(),
 		MaxPendingUserBytes: s.maxPendingUserBytes(),
 		Pool:                s.poolActive(tenantID),
+		ActiveUploader:      s.config.Tenancy.IsMultiTenant(),
 	}
 	if s.config.Tenancy.IsMultiTenant() {
 		limits.MaxTotalBytes = 0 // the org pool replaces the install-wide per-tenant cap
@@ -255,6 +256,8 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 			s.writeError(w, http.StatusRequestEntityTooLarge, "Workspace attachment storage quota exceeded")
 		case errors.Is(err, store.ErrAttachmentPendingQuotaExceeded):
 			s.writeError(w, http.StatusRequestEntityTooLarge, "Pending attachment quota exceeded; send or remove staged uploads first")
+		case errors.Is(err, store.ErrForbidden):
+			s.writeError(w, http.StatusForbidden, "Account is disabled or inactive")
 		default:
 			s.writeError(w, http.StatusInternalServerError, "Failed to save attachment metadata")
 		}
@@ -495,21 +498,46 @@ func (s *Server) relocateFlatBlobs(ctx context.Context) error {
 	return nil
 }
 
-// eraseUser deletes one person's data for user.erased: their blobs first, then their rows
-// (store.EraseUser), so a failure part way leaves rows naming every blob still there and the
-// retried delivery finishes the job.
-func (s *Server) eraseUser(ctx context.Context, user *store.User) error {
+// eraseUser deletes one person's data for user.erased. First the account stops serving and
+// loses every grant, then its sockets, calls and bots are disconnected, so nothing admitted
+// later can recreate access. Then the blobs go, then the rows (store.EraseUser), whose returned
+// blobs (an upload that committed meanwhile) go too, and a last disconnect catches a call joined
+// in between. A failure part way leaves rows naming every blob still there, and the retried
+// delivery finishes the job.
+func (s *Server) eraseUser(ctx context.Context, user *store.User, revoke func(context.Context, string)) error {
+	if err := s.store.Chat().DeactivateForErasure(ctx, user.ID); err != nil {
+		return err
+	}
+	if err := s.store.Sessions().DeleteUserSessions(ctx, user.ID); err != nil {
+		return err
+	}
+	revoke(ctx, user.ID)
 	refs, err := s.store.Chat().ErasureBlobs(ctx, user.OrgID, user.ID)
 	if err != nil {
 		return err
 	}
-	if s.blobs != nil {
-		for _, ref := range refs {
-			if err := s.blobs.Delete(ref.TenantID, ref.Key); err != nil && !errors.Is(err, blobs.ErrInvalidKey) {
-				return err
-			}
+	if err := s.deleteBlobs(refs); err != nil {
+		return err
+	}
+	late, err := s.store.Chat().EraseUser(ctx, user.OrgID, user)
+	if err != nil {
+		return err
+	}
+	if err := s.deleteBlobs(late); err != nil {
+		return err
+	}
+	revoke(ctx, user.ID)
+	return nil
+}
+
+func (s *Server) deleteBlobs(refs []store.BlobRef) error {
+	if s.blobs == nil {
+		return nil
+	}
+	for _, ref := range refs {
+		if err := s.blobs.Delete(ref.TenantID, ref.Key); err != nil && !errors.Is(err, blobs.ErrInvalidKey) {
+			return err
 		}
 	}
-	_, err = s.store.Chat().EraseUser(ctx, user.OrgID, user.ID)
-	return err
+	return nil
 }

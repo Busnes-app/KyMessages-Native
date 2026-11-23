@@ -303,7 +303,11 @@ func (k *KyIdentityClient) applyErasure(ctx context.Context, body []byte) error 
 	defer k.syncMu.Unlock()
 	user, err := k.store.Users().GetUserBySSO(ctx, "kyidentity", in.ID)
 	if errors.Is(err, store.ErrNotFound) {
-		return nil
+		// The account row may be gone (user.deleted first, or a repeat): its data may not be.
+		user, err = k.store.Chat().ErasureTarget(ctx, "kyidentity", in.ID)
+	}
+	if errors.Is(err, store.ErrNotFound) {
+		return nil // never held
 	}
 	if err != nil {
 		return err

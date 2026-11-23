@@ -467,9 +467,23 @@ func (u *userStore) DeleteDirectoryUser(ctx context.Context, user *User, ev Dire
 		if err := deleteGrants(ctx, u.store, tx, user.ID); err != nil {
 			return err
 		}
+		if err := rememberSubject(ctx, u.store, tx, user); err != nil {
+			return err
+		}
 		_, err := tx.ExecContext(ctx, u.store.rebind(`DELETE FROM users WHERE id = ?`), user.ID)
 		return err
 	})
+}
+
+// rememberSubject keeps an org-bound account's subject-to-ID mapping when its row goes
+// (multi mode only: single-mode accounts carry no org).
+func rememberSubject(ctx context.Context, s *SQLStore, tx *sql.Tx, user *User) error {
+	if user.ID == "" || user.OrgID == "" || user.SSOSubject == "" {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx, s.rebind(`INSERT INTO user_subjects (provider, subject, user_id, org_id) VALUES (?, ?, ?, ?) ON CONFLICT (provider, subject) DO NOTHING`),
+		user.SSOProvider, user.SSOSubject, user.ID, user.OrgID)
+	return err
 }
 
 func (u *userStore) UpdateRecoveryCodes(ctx context.Context, userID, oldHashes, newHashes string) error {

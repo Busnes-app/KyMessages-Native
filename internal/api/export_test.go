@@ -1,6 +1,7 @@
 package api
 
 import (
+	"github.com/Busnes-app/ky_server_base/internal/blobs"
 	"time"
 
 	"github.com/Busnes-app/ky_server_base/internal/store"
@@ -43,3 +44,7 @@ func RegisterDetachedForTest(s *Server) func() {
 
 // DetailOutcomeForTest exposes the audit view's outcome parser. Test-only.
 func DetailOutcomeForTest(details string) string { return detailOutcome(details) }
+
+// BlobsForTest and SetBlobsForTest let a test wrap the attachment blob backend.
+func BlobsForTest(s *Server) blobs.Backend       { return s.blobs }
+func SetBlobsForTest(s *Server, b blobs.Backend) { s.blobs = b }

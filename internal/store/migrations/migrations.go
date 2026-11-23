@@ -286,7 +286,20 @@ ALTER TABLE mfa_challenges ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';`,
 	{Version: 58, Name: "meeting_guest_sessions", SQLite: guestSessionsSchema, Postgres: guestSessionsSchema},
 	// The org storage pool (multi mode): each org's report sequence and KyIdentity's latest grant.
 	{Version: 59, Name: "tenant_storage_pool", SQLite: tenantPoolSchema, Postgres: tenantPoolSchema},
+	// Which local account a KyIdentity subject was, kept after the account row goes, so an
+	// erasure that arrives after user.deleted (or repeats) still finds that person's data.
+	{Version: 60, Name: "user_subjects", SQLite: userSubjectsSchema, Postgres: userSubjectsSchema},
 }
+
+const userSubjectsSchema = `
+CREATE TABLE user_subjects (
+    provider VARCHAR(32) NOT NULL,
+    subject VARCHAR(255) NOT NULL,
+    user_id VARCHAR(64) NOT NULL,
+    org_id VARCHAR(64) NOT NULL,
+    PRIMARY KEY (provider, subject)
+);
+`
 
 const tenantPoolSchema = `
 ALTER TABLE tenants ADD COLUMN pool_seq BIGINT NOT NULL DEFAULT 0;

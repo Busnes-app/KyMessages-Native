@@ -116,9 +116,17 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   account (sessions, MFA, presence and push cascade), pairings, reservations, reactions,
   memberships, owned bots and their accounts, staged and posted attachments, and every DM whose
   other members are all gone; their messages elsewhere become tombstones (`body`, `sender_name`
-  emptied, `deleted_at` set, row kept). The caller deletes the blobs `ErasureBlobs` lists before
-  `EraseUser` removes the rows; both are idempotent. The audit row `sso.user_erased` names only
-  `user:<id>`.
+  emptied, `deleted_at` set, row kept). The caller first runs `DeactivateForErasure` (status
+  `deleted`) and drops every grant, deletes the blobs `ErasureBlobs` lists, then `EraseUser`
+  removes the rows and returns the blobs of attachment rows it deleted (an upload that committed
+  meanwhile) for the caller to delete. Both are idempotent and need no account row. The audit row
+  `sso.user_erased` names only `user:<id>`.
+- Migration 60 adds `user_subjects (provider, subject, user_id, org_id)`: `DeleteDirectoryUser`
+  and `EraseUser` record an org-bound account's mapping before its row goes, so an erasure after
+  `user.deleted`, or a repeat, still finds the person's data (`ErasureTarget`). Single-mode
+  accounts (no org) are never recorded.
+- `AttachmentQuotaLimits.ActiveUploader` (multi mode) makes `CommitAttachmentWithQuota` refuse
+  (`ErrForbidden`) an uploader whose account no longer serves.
 - `PurgeOrphanAttachments` returns `BlobRef`s (tenant and key), and `AttachmentTenant` returns a blob key's org, because the multi-mode blob layout needs each blob's org.
 - SQLite runs in WAL mode with foreign keys enabled.
 - PostgreSQL queries are rebound dynamically from standard positional parameters.
