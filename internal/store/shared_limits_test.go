@@ -108,15 +108,16 @@ func TestGuestSessionStore(t *testing.T) {
 	if g, err := gs.Admit(ctx, a.RoomID, "ga2", "host", now); err != nil || g.Status != "admitted" {
 		t.Fatalf("admit: %+v %v", g, err)
 	}
-	// A touch after leaving keeps the session; no touch lets it go.
-	if err := gs.Touch(ctx, "ga2", now+10); err != nil {
+	// A session touched within the idle window stays; one left idle goes.
+	if err := gs.Touch(ctx, "ga2", "gb1"); err != nil {
 		t.Fatal(err)
 	}
-	if r, _ := gs.DeleteIfUnseen(ctx, "ga2", now+5); len(r) != 0 {
+	if r, _ := gs.DeleteIfUnseen(ctx, "ga2", time.Minute); len(r) != 0 {
 		t.Fatal("touched session deleted")
 	}
-	if r, _ := gs.DeleteIfUnseen(ctx, "ga2", now+20); len(r) != 1 {
-		t.Fatal("untouched session kept")
+	time.Sleep(30 * time.Millisecond)
+	if r, _ := gs.DeleteIfUnseen(ctx, "ga2", 10*time.Millisecond); len(r) != 1 {
+		t.Fatal("idle session kept")
 	}
 	// Expired sessions do not resolve, and closing one org's tenant leaves the other.
 	if _, err := gs.BySecret(ctx, "secret-b1", now+60001); !errors.Is(err, store.ErrNotFound) {

@@ -42,7 +42,8 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
 - `CompletePasswordChange` atomically compares the old password, updates a flagged local account, clears the flag, deletes sessions/MFA challenges/device pairings and records `auth.password_changed`. Session/MFA/pairing issuance locks the same user row against the verified hash and, for an org-bound account, the `tenants` row while it is active, so a suspension either refuses the grant or sweeps it; MFA challenges persist the creation-time password hash, and consumption returns that snapshot to reject stale completions. Migration 4 discards preexisting challenges because their credential snapshot is unknown.
 - `ResetAdminPassword` reactivates a local administrator with the replacement flag set and shares the atomic grant purge and audit path with `CompletePasswordChange`; it also works for disabled accounts.
 - `InvalidateRestoredGrants` runs only on an offline restored database: atomically
-  delete sessions, MFA challenges, device pairings and push subscriptions, revoke active agent
+  delete sessions, MFA challenges, device pairings, push subscriptions and meeting guest
+  sessions (a restored admission would readmit a removed guest), revoke active agent
   tokens, and audit `restore.grants_invalidated`. Users sign in again.
 - Migrations 5–12 and 17–19 built the retired messaging stack; migration 21 drops its tables
   (children first), `messaging.*` audit rows and the three `messages_*` backup settings, and
@@ -87,7 +88,9 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
 - Migrations 42-43 add multi mode's shared state: `attempt_counters` (`BumpAttempt`,
   `AttemptState`), `pow_spent` (`SpendPoW`) and `meeting_guest_sessions`
   (`GuestSessions()`: keyed by the secret's SHA-256, one live session per tenant, meeting and
-  guest key, 4 h expiry, `seen_at` for cross-replica leave timers). `PruneShared` deletes
+  guest key, 4 h expiry). `seen_at` is on the database clock: each replica `Touch`es the guests
+  it holds sockets for every quarter of the leave grace, and `DeleteIfUnseen` ends a session only
+  when nobody touched it for half the grace (`TestSharedLobbyOverlappingSocketsAcrossReplicas`). `PruneShared` deletes
   expired rows; the leased maintenance loop runs it in multi mode only.
   `migrations.Run` refuses with `ErrNewerSchema` a database whose `schema_migrations` holds a
   version above this build's newest (image rollback, or a capsule from a newer build), before

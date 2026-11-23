@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/Busnes-app/ky_server_base/internal/crypto"
 )
@@ -98,9 +100,9 @@ func (g *GuestSessionStore) create(ctx context.Context, secret string, sess Gues
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 		return nil, err
 	}
-	if _, err := tx.ExecContext(ctx, g.s.rebind(`INSERT INTO meeting_guest_sessions (secret_hash, `+guestSessionCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+	if _, err := tx.ExecContext(ctx, g.s.rebind(`INSERT INTO meeting_guest_sessions (secret_hash, `+guestSessionCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, `+g.s.dbNowMillis()+`, ?)`),
 		crypto.SHA256Hex([]byte(secret)), sess.GuestID, sess.TenantID, sess.MeetingID, sess.RoomID, sess.GuestKey, sess.DisplayName,
-		sess.Status, sess.KnockedAt, sess.DecidedBy, sess.SeenAt, sess.ExpiresAt); err != nil {
+		sess.Status, sess.KnockedAt, sess.DecidedBy, sess.ExpiresAt); err != nil {
 		return nil, fmt.Errorf("guest session insert: %w", err)
 	}
 	return replaced, tx.Commit()
@@ -129,10 +131,18 @@ func (g *GuestSessionStore) Admit(ctx context.Context, roomID, guestID, actorID 
 WHERE guest_id = ? AND room_id = ? AND expires_at > ? RETURNING `+guestSessionCols), actorID, guestID, roomID, nowMs))
 }
 
-// Touch records that guestID has a live socket now, so a leave timer started earlier on any
-// replica does not end its session.
-func (g *GuestSessionStore) Touch(ctx context.Context, guestID string, nowMs int64) error {
-	_, err := g.s.db.ExecContext(ctx, g.s.rebind(`UPDATE meeting_guest_sessions SET seen_at = ? WHERE guest_id = ?`), nowMs, guestID)
+// Touch records, on the database clock, that each guest has a live socket on the caller's
+// replica, so no replica's leave timer ends its session.
+func (g *GuestSessionStore) Touch(ctx context.Context, guestIDs ...string) error {
+	if len(guestIDs) == 0 {
+		return nil
+	}
+	args := make([]any, len(guestIDs))
+	for i, id := range guestIDs {
+		args[i] = id
+	}
+	_, err := g.s.db.ExecContext(ctx, g.s.rebind(`UPDATE meeting_guest_sessions SET seen_at = `+g.s.dbNowMillis()+
+		` WHERE guest_id IN (?`+strings.Repeat(", ?", len(guestIDs)-1)+`)`), args...)
 	return err
 }
 
@@ -144,9 +154,9 @@ func (g *GuestSessionStore) Delete(ctx context.Context, roomID, guestID string) 
 	return g.list(ctx, `DELETE FROM meeting_guest_sessions WHERE guest_id = ? AND room_id = ? RETURNING `+guestSessionCols, guestID, roomID)
 }
 
-// DeleteIfUnseen removes guestID's session only if no socket touched it after seenBefore.
-func (g *GuestSessionStore) DeleteIfUnseen(ctx context.Context, guestID string, seenBefore int64) ([]GuestSession, error) {
-	return g.list(ctx, `DELETE FROM meeting_guest_sessions WHERE guest_id = ? AND seen_at <= ? RETURNING `+guestSessionCols, guestID, seenBefore)
+// DeleteIfUnseen removes guestID's session only if no replica touched it for idle.
+func (g *GuestSessionStore) DeleteIfUnseen(ctx context.Context, guestID string, idle time.Duration) ([]GuestSession, error) {
+	return g.list(ctx, `DELETE FROM meeting_guest_sessions WHERE guest_id = ? AND seen_at <= `+g.s.dbNowMillis()+` - ? RETURNING `+guestSessionCols, guestID, idle.Milliseconds())
 }
 
 // DeleteRoom removes every session in roomID.

@@ -64,8 +64,10 @@ type LobbyManager struct {
 
 	// db, set by UseShared in multi mode, holds every session instead of the maps above;
 	// timers then holds only this replica's leave timers (meetings_shared.go).
-	db     *store.GuestSessionStore
-	timers map[string]*time.Timer
+	db      *store.GuestSessionStore
+	timers  map[string]*time.Timer
+	live    map[string]struct{} // guests with a socket on this replica
+	beating bool                // heartbeat goroutine running
 }
 
 // inviteKey names one invite: its org, meeting and guest key. Orgs share no meeting IDs.

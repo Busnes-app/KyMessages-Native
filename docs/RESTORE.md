@@ -132,8 +132,8 @@ Multi mode runs several replicas on one PostgreSQL database. The capsule schedul
 - **Restored grants.** A restored database still holds sessions, pairings and bot tokens that
   were revoked after its restore point. Before starting any replica, run
   `kymessages invalidate-grants` once with the same environment. It does what `restore` does for
-  a capsule: deletes sessions, MFA challenges, device pairings and push subscriptions, ends
-  active calls, revokes bot tokens, and audits `restore.grants_invalidated`. Users sign in again.
+  a capsule: deletes sessions, MFA challenges, device pairings, push subscriptions and meeting
+  guest sessions, ends active calls, revokes bot tokens, and audits `restore.grants_invalidated`. Users sign in again.
   Then review the audit trail and KyIdentity for offboarding and org changes after the restore
   point, as above.
 

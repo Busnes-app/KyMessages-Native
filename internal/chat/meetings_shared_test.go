@@ -56,3 +56,42 @@ func TestSharedLobbyLeaveGraceAcrossReplicas(t *testing.T) {
 		t.Fatal("left guest still listed")
 	}
 }
+
+// A guest with sockets on two replicas keeps its session when one of them closes: the other
+// replica's heartbeat refreshes it. When the last closes, the session ends after the grace.
+func TestSharedLobbyOverlappingSocketsAcrossReplicas(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, testdb.Config(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	res, err := st.Chat().UpsertMeeting(ctx, store.UpsertMeetingParams{ID: "m", TenantID: store.DefaultTenantID, OrganizerSub: "s", Title: "T"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replica := func() *LobbyManager {
+		l := NewLobbyManager(NewHub(&captureBus{}), nil)
+		l.UseShared(st.GuestSessions())
+		l.SetLeaveGrace(200 * time.Millisecond)
+		return l
+	}
+	a, b := replica(), replica()
+	s, err := a.Knock(ctx, &store.MeetingGuest{MeetingID: "m", GuestKey: "k"}, res.Meeting, nil, "Visitor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.MarkConnected(s.GuestID)
+	b.MarkConnected(s.GuestID)
+	time.Sleep(150 * time.Millisecond) // b's last touch is now older than a's disconnect
+	a.HandleDisconnect(s.GuestID, 0)
+	time.Sleep(400 * time.Millisecond)
+	if _, ok := b.GetBySecret(s.SessionSecret); !ok {
+		t.Fatal("a's leave timer ended a session still connected on b")
+	}
+	b.HandleDisconnect(s.GuestID, 0)
+	time.Sleep(400 * time.Millisecond)
+	if _, ok := a.GetBySecret(s.SessionSecret); ok {
+		t.Fatal("session outlived its last socket")
+	}
+}

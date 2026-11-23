@@ -9,7 +9,10 @@ import (
 
 // Multi mode keeps every lobby session in the shared database, so a guest is known on every
 // replica: a knock on one, an admission on another and the next request on a third all agree.
-// Only leave timers stay in process, on the replica holding the guest's socket.
+// Leave timers stay in process, on the replica whose socket closed. Each replica refreshes the
+// seen_at of the guests it holds sockets for every quarter of the leave grace; a timer ends a
+// session only if no replica refreshed it for half the grace, so a guest still connected
+// elsewhere (overlapping sockets, or a reconnect noticed before the old close) keeps it.
 
 // guestSessionTTL matches the guest cookie's lifetime.
 const guestSessionTTL = 4 * time.Hour
@@ -23,6 +26,7 @@ func (l *LobbyManager) UseShared(db *store.GuestSessionStore) {
 	defer l.mu.Unlock()
 	l.db = db
 	l.timers = make(map[string]*time.Timer)
+	l.live = make(map[string]struct{})
 }
 
 func fromShared(g store.GuestSession) *GuestSession {
@@ -113,25 +117,61 @@ func (l *LobbyManager) decideShared(ctx context.Context, roomID, guestID, actorI
 
 func (l *LobbyManager) markConnectedShared(guestID string) {
 	l.stopTimer(guestID)
+	l.mu.Lock()
+	l.live[guestID] = struct{}{}
+	start := !l.beating
+	l.beating = true
+	l.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), sharedLobbyTimeout)
 	defer cancel()
-	_ = l.db.Touch(ctx, guestID, l.now().UnixMilli())
+	_ = l.db.Touch(ctx, guestID)
+	if start {
+		go l.heartbeat()
+	}
+}
+
+// heartbeat refreshes this replica's connected guests until it holds none.
+func (l *LobbyManager) heartbeat() {
+	for {
+		l.mu.Lock()
+		every := l.leaveGrace / 4
+		l.mu.Unlock()
+		time.Sleep(every)
+		l.mu.Lock()
+		ids := make([]string, 0, len(l.live))
+		for id := range l.live {
+			ids = append(ids, id)
+		}
+		if len(ids) == 0 {
+			l.beating = false
+			l.mu.Unlock()
+			return
+		}
+		l.mu.Unlock()
+		ctx, cancel := context.WithTimeout(context.Background(), sharedLobbyTimeout)
+		_ = l.db.Touch(ctx, ids...)
+		cancel()
+	}
 }
 
 func (l *LobbyManager) disconnectShared(guestID string) {
-	leftAt := l.now().UnixMilli()
 	l.mu.Lock()
+	delete(l.live, guestID)
 	if t := l.timers[guestID]; t != nil {
 		t.Stop()
 	}
-	l.timers[guestID] = time.AfterFunc(l.leaveGrace, func() {
+	grace := l.leaveGrace
+	var timer *time.Timer
+	timer = time.AfterFunc(grace, func() {
 		l.mu.Lock()
-		delete(l.timers, guestID)
+		if l.timers[guestID] == timer {
+			delete(l.timers, guestID)
+		}
 		l.mu.Unlock()
 		ctx, cancel := context.WithTimeout(context.Background(), sharedLobbyTimeout)
 		defer cancel()
-		// A socket that reconnected anywhere since leftAt touched the row, so it survives.
-		rows, err := l.db.DeleteIfUnseen(ctx, guestID, leftAt)
+		// A socket open on any replica refreshed the row within grace/4, so it survives.
+		rows, err := l.db.DeleteIfUnseen(ctx, guestID, grace/2)
 		if err != nil {
 			return
 		}
@@ -144,12 +184,14 @@ func (l *LobbyManager) disconnectShared(guestID string) {
 			}
 		}
 	})
+	l.timers[guestID] = timer
 	l.mu.Unlock()
 }
 
 func (l *LobbyManager) stopTimer(guestID string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	delete(l.live, guestID)
 	if t := l.timers[guestID]; t != nil {
 		t.Stop()
 		delete(l.timers, guestID)
