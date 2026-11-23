@@ -87,7 +87,7 @@ export const httpKeyServer: KeyServer = {
   },
 };
 
-let current: { userId: string; engine: Promise<CryptoEngine> } | undefined;
+let current: { userId: string; engine: Promise<CryptoEngine>; ready?: CryptoEngine } | undefined;
 const keyListeners = new Set<() => void>();
 
 /** Opens (once) the device for userId: loads the crypto core, restores or creates keys, then reads waiting mail. */
@@ -119,8 +119,11 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
   void engine.then(() => {
     for (const fn of keyListeners) fn();
   }, () => undefined);
-  const entry = { userId, engine };
+  const entry: NonNullable<typeof current> = { userId, engine };
   current = entry;
+  void engine.then((e) => {
+    entry.ready = e;
+  }, () => undefined);
   // A failed start (offline, a blocked database) is retried by the next call.
   engine.then((e) => void e.receive().catch(() => undefined)).catch(() => {
     if (current === entry) current = undefined;
@@ -180,12 +183,17 @@ export async function sealRoomMessage(roomId: string, inner: Omit<RoomInner, 'ro
   return e.encrypt(roomId, inner);
 }
 
-/** Decrypts an e2ee_room_v1 message; any other message is returned as it is. */
-export async function openMessage(m: ChatMessage): Promise<ChatMessage> {
+/**
+ * Decrypts an e2ee_room_v1 message; any other message is returned as it is. With `wait: false`
+ * (live events, which must not queue behind start-up) a device still starting is not awaited:
+ * the message reads as unavailable and is opened again once the device is up.
+ */
+export async function openMessage(m: ChatMessage, opts: { wait?: boolean } = {}): Promise<ChatMessage> {
   if (m.encoding !== 'e2ee_room_v1' || !m.envelope || m.deleted_at) return m;
   const shut = (e2ee: E2EEState): ChatMessage => ({ ...m, body: '', e2ee });
   let e: CryptoEngine;
   try {
+    if (opts.wait === false && !current?.ready) throw new Error('starting');
     e = await engine();
   } catch {
     return shut({ kind: 'failed', reason: UNAVAILABLE });
@@ -202,7 +210,7 @@ export async function openMessage(m: ChatMessage): Promise<ChatMessage> {
 }
 
 export function openMessages(list: ChatMessage[]): Promise<ChatMessage[]> {
-  return Promise.all(list.map(openMessage));
+  return Promise.all(list.map((m) => openMessage(m)));
 }
 
 /**

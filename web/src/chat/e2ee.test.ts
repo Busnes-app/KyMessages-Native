@@ -1,7 +1,8 @@
 import 'fake-indexeddb/auto';
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { abandonDevice, forgetCryptoStore, retireDevice, startE2EE } from './e2ee';
+import { abandonDevice, forgetCryptoStore, openMessage, retireDevice, startE2EE, UNAVAILABLE } from './e2ee';
+import { parseMessage } from './types';
 
 // jsdom cannot fetch the module by URL; load it from disk instead.
 vi.mock('../crypto/index', async (importOriginal) => {
@@ -91,5 +92,23 @@ describe('the signed-in device', () => {
     expect(await retireDevice()).toBe(true); // already gone
     deleteStatus = 204;
     expect(await retireDevice()).toBe(true);
+  });
+
+  it('does not hold live messages behind a device that is still starting', async () => {
+    let release: ((r: Response) => void) | undefined;
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) =>
+      String(input) === '/api/v1/keys/upload'
+        ? new Promise<Response>((resolve) => { release = resolve; }) // a stalled key upload
+        : Promise.resolve(json({ messages: [] }))));
+    const starting = startE2EE('u_alice');
+    const m = parseMessage({
+      id: 'm1', room_id: 'r1', sender_id: 'u_bob', encoding: 'e2ee_room_v1',
+      body: '{"alg":"megolm.v1","sender_key":"k","device_id":"DEVICE0001","session_id":"s","ciphertext":"AAAA"}',
+    });
+    await vi.waitFor(() => expect(release).toBeDefined()); // the upload is in flight
+    const live = await openMessage(m, { wait: false });
+    expect(live.e2ee).toEqual({ kind: 'failed', reason: UNAVAILABLE });
+    release!(json({ error: 'stop' }, 500));
+    await starting.catch(() => undefined);
   });
 });
