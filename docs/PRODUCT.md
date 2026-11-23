@@ -181,3 +181,18 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
   says "end-to-end encrypted" yet (`docs/superpowers/specs/2026-11-22-e2ee-design.md` §10).
   Bot messages, files and messages from before the upgrade are stored readable by the operator.
 - Call recording or third-party hosted calling SaaS.
+
+
+## Planned guest-meeting qualification
+
+Owner-approved hosted suite priority 3 (2026-11-23), after critical tenancy, isolation,
+reliability, security and launch/startup gates: validate existing KyMessages meeting capability,
+then scope external-person browser invitation/join links, screen sharing and host controls.
+This extends the existing product; it does not create another meetings product or expand the
+third-party installer catalog. Existing link/lobby/call/screen-sharing code is not evidence of
+hosted qualification. The [existing tenancy plan §15](superpowers/specs/2026-11-23-tenancy-design.md#15-owner-approved-guest-meeting-planning)
+records the acceptance inventory and still-unselected host permissions, limits and guest-media
+encryption contracts. Guest confinement and the existing call-encryption release gate remain.
+
+No first-party password manager is planned; compatibility with existing managers is sufficient
+and no new integration is required. VPN/AI are optional, with no new work requested.

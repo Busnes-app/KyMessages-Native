@@ -109,6 +109,18 @@ Default section order:
 6. Report any docs intentionally left unchanged and why
 
 ## User Preferences
+
+- Hosted suite direction (owner, 2026-11-23): finish critical tenancy, isolation, reliability,
+  security and launch/startup gates first. Then validate and qualify guest-ready meetings in
+  this existing KyMessages product: external-person browser invitation/join links, screen
+  sharing and host controls. Existing implementation is not hosted qualification. Scope and
+  unresolved product decisions live in [the existing tenancy plan §15](docs/superpowers/specs/2026-11-23-tenancy-design.md#15-owner-approved-guest-meeting-planning).
+  The third-party installer catalog's video-call exclusion does not exclude this approved
+  native scope. No second meetings product, first-party password manager or password-manager
+  builder; compatibility with existing managers is sufficient, with no mandatory new
+  integration. VPN/AI remain optional with no new work requested. Preserve guest confinement
+  and evidence-based encryption claims; surface distinct product decisions before selecting
+  their contracts.
 - Bootstrap passwords and passwords installed by `init-admin` must be replaced before privileged use. Operator resets atomically revoke sessions, MFA challenges and device pairings. Untouched existing accounts are not retroactively flagged.
 
 When the user requests a durable behavior change, record it here or in the relevant child AGENTS.md

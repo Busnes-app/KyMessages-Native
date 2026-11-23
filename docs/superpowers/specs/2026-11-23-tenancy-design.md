@@ -629,3 +629,55 @@ Tests each PR must add, beyond its own:
    choice, a KyMessages-only SigV4 client, duplicates signing code.
 9. **`org.unsuspended`:** *Default:* keep accepting it until KyIdentity confirms it never sends it,
    then remove it in its own PR.
+
+
+## 15. Owner-approved guest-meeting planning
+
+Owner direction, 2026-11-23: guest-ready meetings are priority 3 of the hosted suite's
+post-critical product work, through **existing KyMessages**, not a second meetings product.
+The immediate change is durable planning. Critical tenancy/isolation, reliability, security,
+launch and startup gates and current fixes take precedence. Current room-affinity, owner
+recovery and guest/session cleanup continue under their existing authorization; this direction
+neither widens those implementations nor makes a hosted-readiness claim.
+
+### Capability inventory before new scope
+
+Static inspection establishes existing code for signed KyCalendar scheduled meetings,
+instant meetings and room guest-link creation (`internal/api/meeting_handlers.go`),
+account-free guest knock/admission and confined browser joins (`GuestMeeting.tsx`),
+WebRTC/optional LiveKit calls, and screen capture/media publication
+(`web/src/rtc/hybridCall.ts`). Lobby admission/denial is currently available to room members
+(`internal/api/call_handlers.go`); it is not proof of a selected host-only moderation model.
+Existing meeting/call and guest-session tests cover their API boundaries; neither those nor
+source inspection establish complete hosted browser/media qualification. Call ownership and
+cleanup are a separate open foundation PR; runtime room routing/reconstruction is in progress.
+
+After critical gates, first run a capability acceptance pass against the resulting implementation:
+external person follows a browser invitation, knocks, receives the intended admission or refusal,
+joins voice/video, shares and stops a screen, loses access on removal/revocation/expiry, and
+recovers or exits predictably across owner failure. Exercise wrong-org and wrong-room links,
+concurrent/replayed decisions, polling/outage protections and session-specific cleanup. Record
+browser/media conditions and results; distinguish built, tested, qualified and planned.
+Then scope only the missing external invitation/join, screen-sharing and host-control work.
+
+### Product decisions still unselected
+
+- The host/moderator permission model: who may admit, remove, lock, end or re-invite guests,
+  and how authority transfers when that person leaves. Existing room-member admission is the
+  current behavior, not an approved final host-control contract.
+- Participant/duration and abuse limits, supported browser/device combinations, and the
+  resulting public meeting promise. Competitor limits do not select ours.
+- Guest media encryption, key distribution/verification and the claims that can be supported.
+  Current message encryption does not establish guest-call E2EE; preserve the existing E6
+  release gate and state the actually verified transport/encryption boundary.
+
+Surface these distinct decisions before implementing a new contract. No deployment, catalog
+expansion, new product/owner, or startup-gate lift follows from this planning amendment.
+
+Research provenance: the suite workspace's
+`zentrimail-site/docs/research/competitor-product-gaps-2026-11-23.md` supplies first-party
+sources (not roadmap authority); the suite root `AGENTS.md` records the approved priority
+order. Owner direction supersedes the research password-vault recommendation: no first-party
+password manager or builder/task, existing-manager compatibility is sufficient and a new
+integration is optional. VPN and AI remain optional with no new work. Those are planning
+constraints, not additional KyMessages feature tasks.
