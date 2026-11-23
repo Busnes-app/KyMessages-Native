@@ -175,7 +175,11 @@ test('new DM and search: arrows move through options from the box and Enter pick
     expect((await page.request.post(`/api/v1/rooms/${room.id}/messages`, { headers: { ...headers, 'Idempotency-Key': key }, data: { body, idempotency_key: key } })).ok()).toBe(true);
   }
   // Search runs on the device, so it finds what this browser has read: open the room first.
-  await page.goto(`/#room=${encodeURIComponent(room.id)}`);
+  await page.goto('/');
+  await expect(page.getByRole('region', { name: 'Conversation' })).toBeVisible();
+  const openList = page.getByRole('button', { name: 'Open room list' }).filter({ visible: true });
+  if (!(await page.locator('aside.chat-rail.mobile-open').count()) && await openList.count()) await openList.first().click();
+  await page.getByRole('complementary', { name: 'Workspace and conversations' }).locator('.chat-room-btn', { hasText: room.name }).first().click();
   await expect(page.getByRole('region', { name: 'Conversation' }).getByText(`second ${word} note`)).toBeVisible();
 
   await (await railButton(page, 'New direct message')).click();
