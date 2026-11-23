@@ -232,6 +232,10 @@ function withLock<T>(name: string, fn: () => Promise<T>): Promise<T> {
   return run;
 }
 
+export class DeviceChanged extends Error {
+  constructor() { super('This browser device was replaced'); }
+}
+
 export class CryptoEngine {
   private readonly listeners = new Set<(sessionIds: string[]) => void>();
 
@@ -246,7 +250,7 @@ export class CryptoEngine {
   ) {}
 
   /** Restores this browser's device for userId, or creates one, and publishes its keys. */
-  static async open(userId: string, server: KeyServer, store: CryptoStore): Promise<CryptoEngine> {
+  static async open(userId: string, server: KeyServer, store: CryptoStore, onIdentity?: (deviceId: string) => void): Promise<CryptoEngine> {
     const key = await store.pickleKey();
     const ids = await withLock(lockName(userId), async () => {
       let device = await store.get<DeviceRecord>('device');
@@ -269,8 +273,23 @@ export class CryptoEngine {
       }
     });
     const engine = new CryptoEngine(userId, ids.deviceId, ids.curve, ids.ed, server, store, key);
+    onIdentity?.(engine.deviceId);
     await engine.publishKeys();
     return engine;
+  }
+
+  /** Replace only this identity, under the same lock as crypto work; a concurrent replacement wins. */
+  static resetDevice(userId: string, deviceId: string, store: CryptoStore): Promise<void> {
+    return withLock(lockName(userId), async () => {
+      if ((await store.get<DeviceRecord>('device'))?.device_id !== deviceId) return;
+      const owned = [...(await store.list('olm:')), ...(await store.list('out:'))].map(([k]) => k);
+      await store.write([], ['device', 'account', 'fallback', ...owned]);
+    });
+  }
+
+  /** Fast cache check; locked operations repeat it so a reset cannot race the work. */
+  async assertCurrent(): Promise<void> {
+    if ((await this.store.get<DeviceRecord>('device'))?.device_id !== this.deviceId) throw new DeviceChanged();
   }
 
   close(): void {
@@ -284,7 +303,10 @@ export class CryptoEngine {
   }
 
   private locked<T>(fn: () => Promise<T>): Promise<T> {
-    return withLock(lockName(this.userId), fn);
+    return withLock(lockName(this.userId), async () => {
+      await this.assertCurrent();
+      return fn();
+    });
   }
 
   private async loadAccount(): Promise<Account> {

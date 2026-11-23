@@ -1,7 +1,7 @@
 import 'fake-indexeddb/auto';
 import { readFileSync } from 'node:fs';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { CryptoEngine, deviceSigned, oneTimeKeySigned, parseEnvelope, ROTATE_AFTER_MESSAGES, ROTATE_AFTER_MS, type SealedMessage } from './engine';
+import { CryptoEngine, DeviceChanged, deviceSigned, oneTimeKeySigned, parseEnvelope, ROTATE_AFTER_MESSAGES, ROTATE_AFTER_MS, type SealedMessage } from './engine';
 import { FakeKeyServer } from './fakeKeyServer';
 import { Account, GroupSession, loadCryptoSync } from './index';
 import { deleteCryptoStores, openCryptoStore } from './store';
@@ -75,6 +75,55 @@ describe('encrypted rooms between two client engines', () => {
     const m3 = await send('r1', bob, 'hi alice');
     await alice.receive();
     expect(await read(alice, m3)).toBe('hi alice');
+  });
+
+  it('serializes replacement and stale work, preserving inbound keys while concurrent resets converge', async () => {
+    const server = new FakeKeyServer();
+    const alice = await device(server, 'u_alice');
+    const tabServer = server.as('u_alice');
+    const otherTab = await CryptoEngine.open('u_alice', tabServer, await openCryptoStore('u_alice'));
+    opened.push(otherTab);
+    const bob = await device(server, 'u_bob');
+    server.join('r1', 'u_alice', 'u_bob');
+    const history = await send('r1', bob, 'preserved peer history');
+    await alice.receive();
+    expect(await read(otherTab, history)).toBe('preserved peer history');
+    const shared = await openCryptoStore('u_alice');
+    try {
+      const pins = await shared.list('pin:');
+      const replay = await shared.list('seen:');
+      expect(pins.length).toBeGreaterThan(0);
+      expect(replay.length).toBeGreaterThan(0);
+      let release = () => {};
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const query = tabServer.query;
+      const querying = vi.fn(async (ids: string[]) => { await held; return query(ids); });
+      tabServer.query = querying;
+      const sending = send('r1', otherTab, 'before the reset');
+      await vi.waitFor(() => expect(querying).toHaveBeenCalled());
+      let replaced = false;
+      const replacing = CryptoEngine.resetDevice('u_alice', alice.deviceId, shared).then(() => { replaced = true; });
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(replaced).toBe(false); // replacement cannot mutate an operation's account mid-flight
+      } finally {
+        release();
+        await Promise.all([sending, replacing]);
+      }
+      server.devices.get('u_alice')!.delete(alice.deviceId);
+      const fresh = await device(server, 'u_alice');
+      await Promise.all([
+        CryptoEngine.resetDevice('u_alice', alice.deviceId, shared),
+        CryptoEngine.resetDevice('u_alice', alice.deviceId, shared),
+      ]); // late resets of the retired ID cannot delete the new identity
+      await expect(otherTab.encrypt('r1', { type: 'text', body: 'stale' })).rejects.toBeInstanceOf(DeviceChanged);
+      expect(await read(fresh, history)).toBe('preserved peer history');
+      expect(await shared.list('pin:')).toEqual(pins);
+      expect(await shared.list('seen:')).toEqual(replay);
+      await send('r1', fresh, 'valid replacement');
+    } finally {
+      shared.close();
+    }
   });
 
   it('restores the device from IndexedDB', async () => {
