@@ -52,6 +52,10 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
   Signed suite requests carry `org_id` only in `KY_TENANCY_MODE=multi`, and every event ID is
   recorded in a shared replay ledger (`suite_replay_events`). Contract:
   [the tenancy spec §4](superpowers/specs/2026-11-22-tenancy-design.md).
+- Coarse colleague status for mail and calendar: `POST /api/suite/presence/lookup` (up to 50
+  same-org people), fed by KyPost out-of-office (`/out-of-office`), KyCalendar busy blocks
+  (`/calendar`) and the user's own switch and manual status (`/me`). Sharing off hides the user
+  and drops every input; reply text, event titles and last-active times are never stored.
 - Instant meetings (`POST /api/v1/meetings`) and room guest invite links
   (`POST /api/v1/rooms/{id}/meeting/guest-link`) for ad-hoc external calls.
 

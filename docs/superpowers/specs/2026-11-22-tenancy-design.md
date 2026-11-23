@@ -1,8 +1,8 @@
 # KyMessages-Native Tenancy, Suite Peer `org_id`, and Multi-Region Design
 
-Date: 2026-11-22. Status: core org isolation (PR #18) and PR A below (suite pairing, replay
-ledger, `/api/suite/chat`, meeting `org_id` rules, startup hardening) are built; suite presence
-(PR B), multi-replica shared state (PR C) and multi-region routing (PR D) are specified here and
+Date: 2026-11-22. Status: core org isolation (PR #18), PR A (suite pairing, replay ledger,
+`/api/suite/chat`, meeting `org_id` rules, startup hardening) and PR B (suite presence) are
+built; multi-replica shared state (PR C) and multi-region routing (PR D) are specified here and
 not yet implemented. §6.2 decisions (22 Nov): per-region hostnames, one LiveKit SFU per region,
 and KyIdentity as the source of `home_region`.
 
