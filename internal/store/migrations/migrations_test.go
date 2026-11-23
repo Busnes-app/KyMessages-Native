@@ -496,3 +496,54 @@ func TestMeetingsPerTenantKeyKeepsData(t *testing.T) {
 		t.Fatalf("guests after deleting org-a's meeting: %d %v", n, err)
 	}
 }
+
+func TestErasedSubjectUpgradeRetainsPermanentFences(t *testing.T) {
+	ctx := context.Background()
+	cfg := testdb.Config(t)
+	driver := "sqlite"
+	if cfg.Driver == "postgres" {
+		driver = "pgx"
+	}
+	db, err := sql.Open(driver, cfg.DSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := migrations.RunThrough(ctx, db, cfg.Driver, 62); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`INSERT INTO user_subjects(provider,subject,user_id,org_id) VALUES ('kyidentity','upgrade-erased','old-id','old-org')`,
+		`INSERT INTO user_erasure_state(user_id,tenant_id,completed_at) VALUES ('old-id','old-org',123)`,
+		`INSERT INTO users(id,username,created_at,updated_at,sso_provider,sso_subject,org_id,status) VALUES ('restored-id','restored','2026-11-01T00:00:00Z','2026-11-01T00:00:00Z','kyidentity','upgrade-erased','old-org','active')`,
+	} {
+		if _, err := db.ExecContext(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := migrations.Run(ctx, db, cfg.Driver); err != nil {
+		t.Fatal(err)
+	}
+	var subject, org, status string
+	var erasedAt int64
+	if err := db.QueryRowContext(ctx, `SELECT subject,org_id,erased_at FROM erased_subjects`).Scan(&subject, &org, &erasedAt); err != nil || subject != "upgrade-erased" || org != "old-org" || erasedAt != 123 {
+		t.Fatalf("upgrade lost provenance: %q %q %d %v", subject, org, erasedAt, err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT status FROM users WHERE id='restored-id'`).Scan(&status); err != nil || status != "deleted" {
+		t.Fatalf("upgrade left restored subject active: %q %v", status, err)
+	}
+	for _, q := range []string{
+		`UPDATE erased_subjects SET erased_at=0`,
+		`DELETE FROM erased_subjects`,
+		`UPDATE users SET status='active' WHERE id='restored-id'`,
+		`INSERT INTO users(id,username,created_at,updated_at,sso_provider,sso_subject,org_id) VALUES ('new-id','new','2026-11-01T00:00:00Z','2026-11-01T00:00:00Z','kyidentity','upgrade-erased','old-org')`,
+	} {
+		if _, err := db.ExecContext(ctx, q); err == nil {
+			t.Fatalf("permanent fence allowed %s", q)
+		}
+	}
+	// Single-mode accounts remain outside the hosted fence, byte for byte.
+	if _, err := db.ExecContext(ctx, `INSERT INTO users(id,username,created_at,updated_at,sso_provider,sso_subject) VALUES ('single-id','single','2026-11-01T00:00:00Z','2026-11-01T00:00:00Z','kyidentity','upgrade-erased')`); err != nil {
+		t.Fatalf("single-mode account changed: %v", err)
+	}
+}

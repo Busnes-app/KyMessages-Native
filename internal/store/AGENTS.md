@@ -7,10 +7,13 @@ Provides the unified Database Abstraction Layer (DAL) supporting pluggable backe
 Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, `GroupStore`, `AuditStore`, `SettingsStore`, `AgentStore`), dialect translations, and schema migrations.
 
 ## Local Contracts
+- Migration 63 adds immutable `erased_subjects (subject, org_id, erased_at)` tombstones for KyIdentity subjects, retained across account/org deletion. Backfill uses exact `user_subjects` + `user_erasure_state` provenance and deactivates any restored account; inconsistent cross-org provenance fails migration. `RememberErasedSubject` checks all retained bindings, records every current account ID, and deactivates before cleanup. Unknown accepted subjects are fenced too.
+- Native user INSERT/reactivation triggers refuse fenced org-bound subjects, including installer and delayed directory writes. PostgreSQL user creation and erasure share an identity advisory lock; updates serialize on the existing account row. SQLite acquires its writer before erasure binding reads. Single-mode org-less accounts keep their existing behavior. A stale directory event is acknowledged without provisioning; tombstones survive revision resets and event replay.
+
 - Migration 62 adds `tenant_directory`, the verified per-app org snapshot. `ApplyTenantDirectory` serializes with upload admission and grant issuance, rejects conflicting same-revision snapshots, ignores older revisions and keeps deletion terminal. Non-active snapshots queue durable grant cleanup; a newer active snapshot cannot restore access before cleanup completes. Org-bound multi-mode grants and uploads need an active, enabled, valid snapshot at least as new as the tenant lifecycle revision. ID-token/user-event tenant creation alone confers no access.
 - Per-org `max_upload_bytes` and `max_pending_user_bytes` narrow install safety limits under the quota lock, at reservation and commit. SQLite acquires its writer before quota reads, avoiding concurrent deferred read-to-write upgrades; PostgreSQL keeps the per-tenant advisory lock.
 
-- Web Push endpoint ownership changes require both stored subscription keys to match (decoded base64url); comparison and transfer commit in one transaction, with a PostgreSQL row lock. A mismatch returns `ErrInvalidInput` without changing the subscription. Same-owner registration may refresh keys.
+- Web Push endpoint ownership changes require both stored subscription keys to match (decoded base64url); comparison and transfer commit in one transaction, with a PostgreSQL row lock. A mismatch returns `ErrInvalidInput` without changing the subscription. Same-owner registration may refresh keys. Push registration locks the active user before its session, matching logout's user/session order so the foreign-key check cannot deadlock a SID sweep.
 - Migration 51 adds IdP issuer/sid/issuance/generation to sessions and device pairings, permanent
   `sso_logout_events` replay IDs and `sso_revocations` fences. Preserve existing sessions,
   pairings and push subscriptions on upgrade; the new binding columns default to unbound.
@@ -130,7 +133,7 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   account (sessions, MFA, presence and push cascade), pairings, reservations, reactions,
   memberships, owned bots and their content/accounts, staged and posted attachments, and every DM whose
   other members are all gone; their messages elsewhere become tombstones (`body`, `sender_name`
-  emptied, `deleted_at` set, row kept). The caller first runs `DeactivateForErasure` (status
+  emptied, `deleted_at` set, row kept). KyIdentity first records `RememberErasedSubject`; the API then runs `DeactivateForErasure` (status
   `deleted`) and drops every grant, deletes the blobs `ErasureBlobs` lists, then `EraseUser`
   removes the rows and returns the blobs of attachment rows it deleted (an upload that committed
   meanwhile) for the caller to delete; it queues them in `pending_blob_deletes` in the same

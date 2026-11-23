@@ -72,6 +72,11 @@ func (c *chatStore) UpsertPushSubscription(ctx context.Context, sessionHash stri
 	}
 	defer tx.Rollback()
 
+	// Logout locks user then session. Take the same order before the push INSERT's user
+	// foreign-key check, otherwise registration and SID logout can deadlock each other.
+	if err := oneRow(tx.ExecContext(ctx, c.store.rebind(`UPDATE users SET id = id WHERE id = ? AND status = 'active'`), sub.UserID)); err != nil {
+		return nil, err
+	}
 	live, err := tx.ExecContext(ctx, c.store.rebind(`
 		UPDATE sessions SET token_hash = token_hash
 		WHERE token_hash = ? AND user_id = ?
