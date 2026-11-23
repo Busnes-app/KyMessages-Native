@@ -31,7 +31,7 @@ func TestCommitRefusesAnInactiveUploader(t *testing.T) {
 	if err := commit("att_live_0001"); err != nil {
 		t.Fatalf("active uploader: %v", err)
 	}
-	if err := st.Chat().DeactivateForErasure(ctx, "u_up"); err != nil {
+	if err := st.Chat().DeactivateForErasure(ctx, org, "u_up"); err != nil {
 		t.Fatal(err)
 	}
 	if err := commit("att_late_0001"); !errors.Is(err, store.ErrForbidden) {

@@ -16,7 +16,9 @@ import (
 
 	"github.com/Busnes-app/ky-primitives/syncauth"
 	"github.com/Busnes-app/ky_server_base/internal/api"
+	"github.com/Busnes-app/ky_server_base/internal/auth"
 	"github.com/Busnes-app/ky_server_base/internal/blobs"
+	"github.com/Busnes-app/ky_server_base/internal/crypto"
 	"github.com/Busnes-app/ky_server_base/internal/store"
 	"github.com/google/uuid"
 )
@@ -470,4 +472,107 @@ func TestErasureCompletionAuditSurvivesReplayAndCleanupRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	auditCount(1)
+}
+
+func TestErasureIncludesOwnedBotContentAcrossCleanupRetry(t *testing.T) {
+	ctx := context.Background()
+	srv, _, st, cfg := newReplicas(t, withPool(t, &fakePool{headroom: 1 << 20}))
+	owner, _ := createOrgUser(t, st, "usr_bot_owner", "botowner", "user", replicaOrgA)
+	bob, bobToken := createOrgUser(t, st, "usr_bot_bob", "botbob", "user", replicaOrgA)
+	bot := &store.User{ID: "usr_owned_bot", Username: "agent-owned", Role: "bot", Status: "active", SSOProvider: "bot", OrgID: replicaOrgA}
+	if err := st.Users().CreateUser(ctx, bot); err != nil {
+		t.Fatal(err)
+	}
+	botToken := auth.AgentTokenPrefix + "owned-erasure-test"
+	if err := st.Agents().CreateAgent(ctx, &store.Agent{ID: "agt_owned_erasure", UserID: bot.ID, Username: bot.Username, OwnerUserID: owner.ID, TokenHash: crypto.SHA256Hex([]byte(botToken)), TokenState: store.AgentTokenActive, CreatedBy: owner.ID, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	room := roomOf(t, doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", bobToken, map[string]any{"kind": store.RoomKindChannel, "name": "bots-shared", "member_ids": []string{owner.ID, bot.ID}}, nil))
+	upload := doMultipartUpload(t, srv, "/api/v1/rooms/"+room+"/attachments", botToken, "file", "bot.txt", []byte("owned bot bytes"))
+	var up struct {
+		Attachment store.Attachment `json:"attachment"`
+	}
+	if err := json.Unmarshal(upload.Body.Bytes(), &up); err != nil || upload.Code != http.StatusCreated {
+		t.Fatalf("bot upload: %d %s %v", upload.Code, upload.Body.String(), err)
+	}
+	if r := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room+"/messages", botToken, map[string]any{"body": "owned bot message", "attachment_ids": []string{up.Attachment.ID}}, nil); r.Code != http.StatusCreated {
+		t.Fatalf("bot message: %d %s", r.Code, r.Body.String())
+	}
+	bobUpload := doMultipartUpload(t, srv, "/api/v1/rooms/"+room+"/attachments", bobToken, "file", "kept.txt", []byte("other member file"))
+	var kept struct {
+		Attachment store.Attachment `json:"attachment"`
+	}
+	if err := json.Unmarshal(bobUpload.Body.Bytes(), &kept); err != nil || bobUpload.Code != http.StatusCreated {
+		t.Fatalf("other upload: %d %v", bobUpload.Code, err)
+	}
+	if r := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room+"/messages", bobToken, map[string]any{"body": "other member keeps this", "attachment_ids": []string{kept.Attachment.ID}}, nil); r.Code != http.StatusCreated {
+		t.Fatal(r.Code)
+	}
+	if r := doBearerJSON(t, srv, http.MethodGet, "/api/v1/attachments/"+up.Attachment.ID, bobToken, nil, nil); r.Code != http.StatusOK {
+		t.Fatalf("attachment was not readable before erasure: %d", r.Code)
+	}
+	api.SetBlobsForTest(srv, &failSecondBlobDelete{Backend: api.BlobsForTest(srv)})
+	event := uuid.NewString()
+	if r := postErased(t, srv, owner.SSOSubject, replicaOrgA, event); r.Code < 500 {
+		t.Fatalf("expected retryable cleanup failure: %d %s", r.Code, r.Body.String())
+	}
+	// Ownership/account rows are gone after the committed cleanup. Durable actor IDs and the
+	// owner's pending blob work must still make retry possible.
+	if _, err := st.Agents().GetAgent(ctx, "agt_owned_erasure"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("agent row: %v", err)
+	}
+	if _, err := st.Users().GetUserByID(ctx, bot.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("bot account: %v", err)
+	}
+	if _, n, err := st.Audit().ListAuditRecords(ctx, 0, 100, "sso.user_erased"); err != nil || n != 0 {
+		t.Fatalf("premature completion audit: %d %v", n, err)
+	}
+	for _, id := range []string{event, event, uuid.NewString()} {
+		if r := postErased(t, srv, owner.SSOSubject, replicaOrgA, id); r.Code != http.StatusOK {
+			t.Fatalf("replay: %d %s", r.Code, r.Body.String())
+		}
+	}
+	if _, err := os.Stat(filepath.Join(cfg.Database.DataDir, "attachments", "orgs", replicaOrgA, "att", up.Attachment.ID)); !os.IsNotExist(err) {
+		t.Fatalf("bot blob remains: %v", err)
+	}
+	if r := doBearerJSON(t, srv, http.MethodGet, "/api/v1/attachments/"+up.Attachment.ID, bobToken, nil, nil); r.Code != http.StatusNotFound {
+		t.Fatalf("other member can still download erased bot file: %d", r.Code)
+	}
+	msgs, _, err := st.Chat().ListMessages(ctx, store.MessagePageQuery{TenantID: replicaOrgA, RoomID: room, Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	botSeen, bobSeen := false, false
+	for _, m := range msgs {
+		if m.SenderID == bot.ID {
+			botSeen = true
+			if m.Body != "" || m.DeletedAt == nil || len(m.Attachments) != 0 {
+				t.Fatalf("bot message not tombstoned: %+v", m)
+			}
+		}
+		if m.SenderID == bob.ID && m.Body == "other member keeps this" {
+			bobSeen = true
+		}
+	}
+	if r := doBearerJSON(t, srv, http.MethodGet, "/api/v1/attachments/"+kept.Attachment.ID, bobToken, nil, nil); r.Code != http.StatusOK || r.Body.String() != "other member file" {
+		t.Fatalf("other member file changed: %d %s", r.Code, r.Body.String())
+	}
+	if !botSeen || !bobSeen {
+		t.Fatalf("bot tombstone=%v, other member content=%v", botSeen, bobSeen)
+	}
+	members, err := st.Chat().ListRoomMembers(ctx, replicaOrgA, room)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range members {
+		if m.UserID == bot.ID {
+			t.Fatal("bot membership remains")
+		}
+	}
+	if _, n, err := st.Audit().ListAuditRecords(ctx, 0, 100, "sso.user_erased"); err != nil || n != 1 {
+		t.Fatalf("completion audit count: %d %v", n, err)
+	}
+	if refs, err := st.Chat().PendingBlobDeletes(ctx, 100); err != nil || len(refs) != 0 {
+		t.Fatalf("pending cleanup: %+v %v", refs, err)
+	}
 }

@@ -311,6 +311,12 @@ CREATE TABLE user_erasure_state (
     tenant_id VARCHAR(64) NOT NULL,
     completed_at BIGINT
 );
+CREATE TABLE user_erasure_actors (
+ owner_user_id VARCHAR(64) NOT NULL,
+ tenant_id VARCHAR(64) NOT NULL,
+ user_id VARCHAR(64) NOT NULL,
+ PRIMARY KEY (owner_user_id, tenant_id, user_id)
+);
 `
 
 const tenantPoolSchema = `

@@ -59,7 +59,7 @@ Owns HTTP routing, request parsing, session cookie validation, CORS headers, and
   `deletion_scheduled`) with the suspended-org answer (403 "Organization is suspended or
   inactive"), provisions nothing, and audits `sso.export_only_refused` naming only the org
   (`TestExportOnlyTokenIsRefusedInMultiMode`). `eraseUser` serves `user.erased`: the account stops
-  serving and loses its grants first, then it is disconnected, then blobs, then
+  serving with its owned bots (their IDs are persisted before ownership records go) and loses its grants first, then it is disconnected, then blobs, then
   `store.EraseUser` (and the blobs it returns), then a last disconnect
   (`TestUserErasedDeletesThePersonsData`, `TestUserErasedRevokesAccessFirst`,
   `TestUserErasedAfterUserDeleted`). Multi-mode uploads commit only for an active uploader, and a

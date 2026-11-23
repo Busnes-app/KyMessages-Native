@@ -510,7 +510,7 @@ func (s *Server) relocateFlatBlobs(ctx context.Context) error {
 // in between. A failure part way leaves rows naming every blob still there, and the retried
 // delivery finishes the job.
 func (s *Server) eraseUser(ctx context.Context, user *store.User, revoke func(context.Context, string)) error {
-	if err := s.store.Chat().DeactivateForErasure(ctx, user.ID); err != nil {
+	if err := s.store.Chat().DeactivateForErasure(ctx, user.OrgID, user.ID); err != nil {
 		return err
 	}
 	if err := s.store.Sessions().DeleteUserSessions(ctx, user.ID); err != nil {

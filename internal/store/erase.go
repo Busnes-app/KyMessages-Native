@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"time"
 )
@@ -20,10 +21,25 @@ WHERE r.tenant_id = ? AND r.kind = 'dm' AND NOT EXISTS (
 
 // ErasureBlobs lists every blob an erasure of userID removes.
 func (c *chatStore) ErasureBlobs(ctx context.Context, tenantID, userID string) ([]BlobRef, error) {
+	actors, err := c.erasureActors(ctx, c.store.db, tenantID, userID)
+	if err != nil {
+		return nil, err
+	}
+	var out []BlobRef
+	for _, actor := range actors {
+		refs, err := c.erasureActorBlobs(ctx, tenantID, actor, userID)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, refs...)
+	}
+	return out, nil
+}
+
+func (c *chatStore) erasureActorBlobs(ctx context.Context, tenantID, actorID, ownerID string) ([]BlobRef, error) {
 	rows, err := c.store.db.QueryContext(ctx, c.store.rebind(`SELECT a.id, a.tenant_id, a.blob_key FROM attachments a
-WHERE a.tenant_id = ? AND (a.uploader_id = ?
-	OR a.message_id IN (SELECT id FROM messages WHERE tenant_id = ? AND sender_id = ?)
-	OR a.room_id IN (`+goneDMs+`)) UNION SELECT '', tenant_id, blob_key FROM pending_blob_deletes WHERE tenant_id = ? AND user_id = ?`), tenantID, userID, tenantID, userID, userID, tenantID, userID, tenantID, userID)
+ WHERE a.tenant_id = ? AND (a.uploader_id = ? OR a.message_id IN (SELECT id FROM messages WHERE tenant_id = ? AND sender_id = ?) OR a.room_id IN (`+goneDMs+`))
+ UNION SELECT '',tenant_id,blob_key FROM pending_blob_deletes WHERE tenant_id = ? AND user_id = ?`), tenantID, actorID, tenantID, actorID, actorID, tenantID, actorID, tenantID, ownerID)
 	if err != nil {
 		return nil, err
 	}
@@ -59,9 +75,48 @@ func (c *chatStore) ErasureTargets(ctx context.Context, provider, subject string
 
 // DeactivateForErasure is erasure's first step: the account stops serving before anything is
 // disconnected or deleted, so nothing admitted meanwhile can recreate access.
-func (c *chatStore) DeactivateForErasure(ctx context.Context, userID string) error {
-	_, err := c.store.db.ExecContext(ctx, c.store.rebind(`UPDATE users SET status = 'deleted', updated_at = ? WHERE id = ?`), time.Now().UTC(), userID)
+func (c *chatStore) DeactivateForErasure(ctx context.Context, tenantID, userID string) error {
+	tx, err := c.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := c.rememberErasureActors(ctx, tx, tenantID, userID); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, c.store.rebind(`UPDATE users SET status = 'deleted', updated_at = ? WHERE id IN (SELECT user_id FROM user_erasure_actors WHERE owner_user_id = ? AND tenant_id = ?) AND (org_id = ? OR (sso_provider = 'bot' AND org_id = ''))`), time.Now().UTC(), userID, tenantID, tenantID)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (c *chatStore) rememberErasureActors(ctx context.Context, tx *sql.Tx, tenantID, ownerID string) error {
+	if _, err := tx.ExecContext(ctx, c.store.rebind(`INSERT INTO user_erasure_actors (owner_user_id,tenant_id,user_id) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`), ownerID, tenantID, ownerID); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, c.store.rebind(`INSERT INTO user_erasure_actors (owner_user_id,tenant_id,user_id)
+ SELECT ?, ?, a.user_id FROM agents a JOIN users u ON u.id = a.user_id WHERE a.owner_user_id = ? AND (u.org_id = ? OR (u.sso_provider = 'bot' AND u.org_id = '')) ON CONFLICT DO NOTHING`), ownerID, tenantID, ownerID, tenantID)
 	return err
+}
+
+func (c *chatStore) erasureActors(ctx context.Context, db interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}, tenantID, ownerID string) ([]string, error) {
+	rows, err := db.QueryContext(ctx, c.store.rebind(`SELECT user_id FROM user_erasure_actors WHERE owner_user_id = ? AND tenant_id = ? UNION SELECT ? ORDER BY user_id`), ownerID, tenantID, ownerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 // EraseUser deletes the user's rows in tenantID, keeps the subject mapping so a repeat finds
@@ -81,6 +136,28 @@ func (c *chatStore) EraseUser(ctx context.Context, tenantID string, user *User) 
 	if _, err := tx.ExecContext(ctx, c.store.rebind(`INSERT INTO user_erasure_state (user_id, tenant_id) VALUES (?, ?) ON CONFLICT (user_id) DO NOTHING`), userID, tenantID); err != nil {
 		return nil, err
 	}
+	if err := c.rememberErasureActors(ctx, tx, tenantID, userID); err != nil {
+		return nil, err
+	}
+	actors, err := c.erasureActors(ctx, tx, tenantID, userID)
+	if err != nil {
+		return nil, err
+	}
+	var late []BlobRef
+	for _, actorID := range actors {
+		refs, err := c.eraseActorTx(ctx, tx, tenantID, actorID, userID)
+		if err != nil {
+			return nil, err
+		}
+		late = append(late, refs...)
+	}
+	if _, err := tx.ExecContext(ctx, c.store.rebind(`DELETE FROM agents WHERE owner_user_id = ? AND user_id IN (SELECT user_id FROM user_erasure_actors WHERE owner_user_id = ? AND tenant_id = ?)`), userID, userID, tenantID); err != nil {
+		return nil, err
+	}
+	return late, tx.Commit()
+}
+
+func (c *chatStore) eraseActorTx(ctx context.Context, tx *sql.Tx, tenantID, userID, ownerID string) ([]BlobRef, error) {
 	var late []BlobRef
 	for _, q := range []struct {
 		sql  string
@@ -108,7 +185,7 @@ func (c *chatStore) EraseUser(ctx context.Context, tenantID string, user *User) 
 	// Blobs of rows deleted here are queued in the same transaction, so a failed delete after
 	// commit is retried (PendingBlobDeletes) instead of lost with its row.
 	for _, r := range late {
-		if _, err := tx.ExecContext(ctx, c.store.rebind(`INSERT INTO pending_blob_deletes (tenant_id, blob_key, user_id) VALUES (?, ?, ?) ON CONFLICT (tenant_id, blob_key) DO NOTHING`), r.TenantID, r.Key, userID); err != nil {
+		if _, err := tx.ExecContext(ctx, c.store.rebind(`INSERT INTO pending_blob_deletes (tenant_id, blob_key, user_id) VALUES (?, ?, ?) ON CONFLICT (tenant_id, blob_key) DO NOTHING`), r.TenantID, r.Key, ownerID); err != nil {
 			return nil, err
 		}
 	}
@@ -127,18 +204,15 @@ func (c *chatStore) EraseUser(ctx context.Context, tenantID string, user *User) 
 		{`DELETE FROM room_members WHERE tenant_id = ? AND user_id = ?`, []any{tenantID, userID}},
 		{`DELETE FROM attachment_upload_reservations WHERE tenant_id = ? AND uploader_id = ?`, []any{tenantID, userID}},
 		{`DELETE FROM device_pairings WHERE user_id = ?`, []any{userID}},
-		// Their bots, and the bots' accounts.
-		{`DELETE FROM users WHERE id IN (SELECT user_id FROM agents WHERE owner_user_id = ?)`, []any{userID}},
-		{`DELETE FROM agents WHERE owner_user_id = ?`, []any{userID}},
 		// The account; sessions, MFA challenges, presence and push subscriptions cascade.
-		{`DELETE FROM users WHERE id = ? AND org_id = ?`, []any{userID, tenantID}},
+		{`DELETE FROM users WHERE id = ? AND (org_id = ? OR (sso_provider = 'bot' AND org_id = ''))`, []any{userID, tenantID}},
 	}
 	for _, s := range steps {
 		if _, err := tx.ExecContext(ctx, c.store.rebind(s.q), s.args...); err != nil {
 			return nil, err
 		}
 	}
-	return late, tx.Commit()
+	return late, nil
 }
 
 // PendingBlobDeletes lists up to limit queued blob deletes, a random sample of them.
