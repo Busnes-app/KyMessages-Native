@@ -47,6 +47,11 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
 - KyCalendar meeting sync (`PUT`/`DELETE /api/meetings/{id}`, signed with `KY_MEETING_SYNC_SECRET`)
   creates meeting-scoped rooms with scheduled time windows, attendee resolution, and external
   guest links (`/api/meet/{token}`) gated by an interactive waiting-room lobby.
+- End-to-end encryption groundwork (not yet in use): a key server holds devices' public keys,
+  claim-once one-time keys and a mailbox of Olm ciphertext between devices in the same org
+  (`/api/v1/keys/*`, `/api/v1/to-device`), and the web app ships the vodozemac crypto core. Messages
+  stay `plain_v1` until the encrypted-rooms phase ships
+  (`docs/superpowers/specs/2026-11-22-e2ee-design.md`).
 - Chat from mail and calendar: `POST /api/suite/chat` (`kypost.chat.open`, `kycalendar.chat.open`)
   answers a same-org colleague's `#dm=<user id>` link, which the PWA opens as a direct message.
   Signed suite requests carry `org_id` only in `KY_TENANCY_MODE=multi`, and every event ID is

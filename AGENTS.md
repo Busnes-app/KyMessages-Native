@@ -222,8 +222,9 @@ The loop closes its `done` channel
 only where it returns, between runs, and `runServer` cancels and waits on that channel after
 `httpServer.Shutdown` and before the store closes, then waits on `api.Server.WaitDetached()` for
 the pair, pin-key, unpair, deposit, export and drill handlers, which detach or run long and can outlive
-`Shutdown`. `maintenanceLoop` sweeps expired device pairings every minute with a 30-second
-deadline; `agentExpiryLoop` revokes idle or inactive-owner bot tokens every hour; `attachmentSweepLoop` expires staged attachments older than `KY_ATTACHMENTS_PENDING_TTL` at start and every 15 minutes. All background loops join the backup scheduler's wait before the same shutdown drain finishes. Nothing writes
+`Shutdown`. `maintenanceLoop` sweeps expired device pairings, expired suite replay IDs
+(`suite_replay_events`) and to-device mail older than `api.E2EEMailboxTTL` (30 days) every
+minute, each with a 30-second deadline; `agentExpiryLoop` revokes idle or inactive-owner bot tokens every hour; `attachmentSweepLoop` expires staged attachments older than `KY_ATTACHMENTS_PENDING_TTL` at start and every 15 minutes. All background loops join the backup scheduler's wait before the same shutdown drain finishes. Nothing writes
 into a closed store. Both waits run under one `backupWaitTimeout`
 context (20m) -- a context, not a timer channel,
 which delivers once and would leave the second wait unbounded; the HTTP drain is `shutdownTimeout`

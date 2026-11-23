@@ -9,7 +9,8 @@ import (
 	"github.com/Busnes-app/ky_server_base/internal/store"
 )
 
-// maintenanceLoop deletes expired QR pairings and suite replay IDs once a minute. done closes between ticks,
+// maintenanceLoop deletes expired QR pairings, suite replay IDs and stale end-to-end encryption
+// mail once a minute. done closes between ticks,
 // so shutdown can wait for it before the store closes.
 func maintenanceLoop(ctx context.Context, st store.Store, done chan<- struct{}) {
 	defer close(done)
