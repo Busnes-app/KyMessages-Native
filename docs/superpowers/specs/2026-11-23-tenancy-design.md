@@ -203,12 +203,17 @@ Multi mode, `origin/main` plus PR #27. Every row has a cross-org test in
    `GET /api/suite/orgs`, as T requires of every app after a restore (T,
    "`GET /api/suite/erased`"). A PostgreSQL restore bypasses the app, so the server cannot know
    one happened. The re-read is therefore not triggered by a restore. It always runs:
-   - on **every start** of every replica in multi mode, before it serves. A replica refuses to
-     serve until both reads succeed. A restore needs every replica restarted anyway, and
-     the `RESTORE.md` multi section (PR 2) must say so;
-   - **daily**, from `since=0`, in the leased reporter job (§8.1), as a backstop for a restore
-     done under running replicas;
-   - **incrementally**, from the last revision applied, on every reporter tick.
+   - **incrementally**, on every reporter tick, from the erased-list revision stored in the
+     database. A restore rewinds that stored revision with everything else, so the next
+     successful tick replays every erasure the restore undid, without detecting the restore;
+   - **daily**, from `since=0`, in the leased reporter job (§8.1), as a backstop;
+   - on **every start** of every replica, before it serves. If KyIdentity cannot be reached,
+     the replica still serves, and keeps retrying, as long as the database records a successful
+     full re-read (`server_settings`, `tenancy.kyidentity_synced_at`) less than 24 hours old. A
+     database with no such record or an older one (a fresh install, or a restore from a backup
+     more than a day old) does not serve until the reads succeed. This bounds the coupling: an
+     ordinary restart or a rolling deploy during a KyIdentity outage stays up. The
+     `RESTORE.md` multi section (PR 2) says to restart every replica after a restore.
 
    Each erased subject is erased again (§7.2), and each org that KyIdentity reports deleted or no
    longer lists is tombstoned and purged (§7.3). Both are idempotent, so a re-read that finds
@@ -227,7 +232,10 @@ Multi mode, `origin/main` plus PR #27. Every row has a cross-org test in
   loop, and re-reads `schema_migrations` under it. SQLite does not change.
 - **Job leases.** One table, `job_leases (name PRIMARY KEY, holder, expires_at)`. A job runs a
   tick only after a conditional upsert wins the lease (`expires_at < now OR holder = me`), and
-  renews it each tick. The lease lasts three ticks, so a dead replica's job moves within three
+  renews it each tick. A run that may outlast a tick (the org purge, the daily re-read) renews
+  the lease from a heartbeat every third of the lease while it runs. Before each batch it
+  checks that it still holds the lease, by a conditional renewal that must update one row. If
+  that fails, it stops, so two replicas never run the same batch. The lease lasts three ticks, so a dead replica's job moves within three
   ticks. Jobs: backup scheduler (single only, §8.4), agent expiry, attachment sweep, pairing and
   replay sweeps, the org purge (§7), the pool reporter (§10). Single mode skips the lease and
   runs as today.
@@ -439,6 +447,9 @@ Tests each PR must add, beyond its own:
 - A stale allowance can let the pool be overshot by other apps' growth for up to 15 minutes.
 - A user's own deleted attachment stays as an old object version for 30 days.
 - Staff see every org's usernames in the install-wide audit (open question 6).
+- A restore to a point less than a day old, made while KyIdentity is unreachable, can serve an
+  erased person's or a deleted org's restored data until KyIdentity answers again. Then the
+  incremental re-read replays the erasures (§7.4).
 
 ## 14. Open questions, each with a default
 

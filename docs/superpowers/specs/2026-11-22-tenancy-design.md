@@ -8,7 +8,8 @@ and KyIdentity as the source of `home_region`.
 
 **Extended 2026-11-23** by `2026-11-23-tenancy-design.md`: every paid plan is an org on the
 shared install, and replica safety, object storage and the org storage pool are specified there.
-Its §8 replaces this spec's §6.1 table and PR C. §4 and §6.2 here stay authoritative.
+Its §8-§10 (replica safety, attachments in S3, the org pool) replace this spec's §6.1 table, the
+`KY_ATTACHMENTS_S3_*` plan in §6.1 and §8, and §8's PR C. §4 and §6.2 here stay authoritative.
 
 This is the authoritative tenancy, suite-peer `org_id`, and multi-region contract for
 KyMessages-Native (`Busnes-app/KyMessages-Native`). It folds in the SaaS tenancy requirements
