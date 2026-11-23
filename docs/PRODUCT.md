@@ -19,7 +19,11 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
     SQLite (zero external dependencies) or PostgreSQL.
   - `KY_TENANCY_MODE=multi`: multi-organization SaaS deployment isolating multiple KyIdentity
     organizations strictly by verified `org_id` inside one deployment. Tenancy mode is locked in
-    the database on first boot and cannot be flipped in place.
+    the database on first boot and cannot be flipped in place. Every paid plan (Personal,
+    Couple, Family, Business) is one org on this shared install. Only Enterprise gets a
+    dedicated install, which runs `single`. The design for running `multi` across several
+    replicas, with object storage and the org storage pool, is
+    [the 2026-11-23 tenancy spec](superpowers/specs/2026-11-23-tenancy-design.md) (not built).
 - **Invite-only:** accounts come from KyIdentity (OIDC + signed directory sync webhooks) or local
   admin provisioning in single-tenant mode. No public sign-up. External guests can join only
   scheduled or instant meeting rooms through time-bounded guest links with host-approved lobby
@@ -93,7 +97,8 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
   administrators), and the console refuses any account bound to another org or to an inactive
   staff org. Local operator accounts, which belong to no org, keep the install-wide console
   (backups, audit, health, settings); per-org pages (Agents, Media policy) need a staff-org
-  administrator and answer 403 to an account with no org.
+  administrator and answer 403 to an account with no org. The audit log is install-wide, so
+  staff can see the usernames of every org's members in it. The console shows no message content.
 - Local operator login remains available for single-tenant recovery/console access, with mandatory
   initial password replacement and optional TOTP MFA with recovery codes.
 
