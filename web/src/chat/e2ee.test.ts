@@ -1,7 +1,7 @@
 import 'fake-indexeddb/auto';
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { abandonDevice, forgetCryptoStore, keyGeneration, NOT_YET, onRoomKeys, openMessage, replaceDevice, RETIRE_MS, retireDevice, retryable, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
+import { abandonDevice, forgetCryptoStore, httpKeyServer, keyGeneration, NOT_YET, onRoomKeys, openMessage, replaceDevice, RETIRE_MS, retireDevice, retryable, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
 import { openCryptoStore } from '../crypto/store';
 import { parseMessage } from './types';
 
@@ -25,10 +25,11 @@ afterEach(async () => {
   await forgetCryptoStore();
   localStorage.clear();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 describe('the signed-in device', () => {
-  it('starts over as a new device when the server no longer knows it', async () => {
+  it('keeps decryptable inbound history, replay records and pins when startup gets a removed-device 404', async () => {
     const known = new Set<string>();
     const uploads: { device_id: string; device_keys?: unknown; one_time_keys: unknown[] }[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -49,12 +50,56 @@ describe('the signed-in device', () => {
     expect(uploads[0].device_keys).toBeTruthy();
     expect(uploads.reduce((n, u) => n + u.one_time_keys.length, 0)).toBe(50);
 
+    vi.spyOn(httpKeyServer, 'roomMembers').mockResolvedValue(['u_alice']);
+    vi.spyOn(httpKeyServer, 'query').mockResolvedValue({});
+    const message = parseMessage({ id: 'old-message', room_id: 'r1', sender_id: 'u_alice', encoding: 'e2ee_room_v1', body: await first.encrypt('r1', { type: 'text', body: 'historical secret' }) });
+    expect((await openMessage(message)).body).toBe('historical secret');
+    const before = await openCryptoStore('u_alice');
+    await before.write([['pin:u_peer\nDEVICE0001', { pinned: true }]]);
+    const replay = await before.list('seen:');
+    expect(replay).toHaveLength(1);
+    before.close();
+
     await startE2EE('u_bob'); // closes alice's device, keeping its store
     known.delete(first.deviceId); // removed from another session
     const again = await startE2EE('u_alice');
     expect(again.deviceId).not.toBe(first.deviceId);
     expect(again.curve25519).not.toBe(first.curve25519);
     expect(known.has(first.deviceId)).toBe(false);
+    expect((await openMessage(message)).body).toBe('historical secret');
+    const after = await openCryptoStore('u_alice');
+    try {
+      expect(await after.list('seen:')).toEqual(replay);
+      expect(await after.get('pin:u_peer\nDEVICE0001')).toEqual({ pinned: true });
+    } finally {
+      after.close();
+    }
+  });
+
+  it('retries a failed startup on concurrent sends after upload service recovery without reconnecting', async () => {
+    let unavailable = true;
+    const uploads: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === '/api/v1/keys/upload') {
+        const req = JSON.parse(String(init?.body)) as { device_id: string; one_time_keys: unknown[] };
+        uploads.push(req.device_id);
+        if (unavailable) return json({ error: 'Try later' }, 503);
+        return json({ one_time_key_count: req.one_time_keys.length });
+      }
+      return json({ messages: [] });
+    }));
+    vi.spyOn(httpKeyServer, 'roomMembers').mockResolvedValue(['u_alice']);
+    vi.spyOn(httpKeyServer, 'query').mockResolvedValue({});
+    await expect(startE2EE('u_alice')).rejects.toThrow('Try later');
+    unavailable = false; // the socket never reconnects; the next sends must restart startup
+    const envelopes = await Promise.all(['one', 'two', 'three'].map((body) => sealRoomMessage('r1', { type: 'text', body })));
+    // One failed upload, then one coalesced startup: identity/fallback and one-time-key uploads.
+    expect(uploads).toHaveLength(3);
+    expect(new Set(uploads).size).toBe(1);
+    for (const [i, body] of envelopes.entries()) {
+      const opened = await openMessage(parseMessage({ id: `sent-${i}`, room_id: 'r1', sender_id: 'u_alice', encoding: 'e2ee_room_v1', body }));
+      expect(opened.body).toBe(['one', 'two', 'three'][i]);
+    }
   });
 
   it('retires a device abandoned by a revoked session after the next sign-in', async () => {

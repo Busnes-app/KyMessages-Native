@@ -54,7 +54,7 @@ class IdbCryptoStore implements CryptoStore {
   private closedFns: (() => void)[] = [];
 
   constructor(private readonly db: IDBDatabase) {
-    // Sign-out or a device reset in any tab deletes this database: let go at once so the delete
+    // Sign-out in any tab deletes this database: let go at once so the delete
     // completes, and tell the owner, which drops this device instead of using a deleted one.
     db.onversionchange = () => {
       this.close();

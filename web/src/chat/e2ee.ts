@@ -5,7 +5,7 @@ import { errorMessage, secureFetch } from '../api';
 import { arr, bool, obj, str } from '../dto';
 import { CryptoEngine, type ClaimedKey, type DeviceKeys, type KeyServer, type Mail, type RoomInner } from '../crypto/engine';
 import { loadCrypto } from '../crypto/index';
-import { type CryptoStore, deleteCryptoStore, deleteCryptoStores, openCryptoStore, storedDevices } from '../crypto/store';
+import { type CryptoStore, deleteCryptoStores, openCryptoStore, storedDevices } from '../crypto/store';
 import { parseRoomDetail, type ChatMessage, type E2EEState } from './types';
 
 export class KeyServerError extends Error {
@@ -96,6 +96,7 @@ interface Entry {
   engine: Promise<CryptoEngine>;
   ready?: CryptoEngine;
   cancelled: boolean;
+  failed: boolean;
   store?: CryptoStore;
 }
 
@@ -112,7 +113,7 @@ function keysArrived(share: boolean): void {
   for (const fn of keyListeners) fn();
 }
 if (keyChannel) keyChannel.onmessage = () => keysArrived(false);
-// Set when another tab deleted this tab's store (a sign-out or a device reset there). This tab may
+// Set when another tab deleted this tab's store (a sign-out). This tab may
 // have missed that sign-out, so it must not create a new device and new private keys on its own:
 // encryption stays off here until this tab signs out (which clears it) or reloads.
 let deletedElsewhere = false;
@@ -121,10 +122,10 @@ class Cancelled extends Error {}
 
 /** Opens (once) the device for userId: loads the crypto core, restores or creates keys, then reads waiting mail. */
 export function startE2EE(userId: string): Promise<CryptoEngine> {
-  if (current?.userId === userId) return current.engine;
+  if (current?.userId === userId && !current.failed) return current.engine;
   if (deletedElsewhere) return Promise.reject(new Error('Encryption was reset in another tab; reload this tab to continue.'));
   stopE2EE();
-  const entry = { userId, cancelled: false } as Entry;
+  const entry = { userId, cancelled: false, failed: false } as Entry;
   const live = () => {
     if (entry.cancelled) throw new Cancelled('Device start-up was cancelled');
   };
@@ -136,7 +137,7 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
       live();
     }
     entry.store = s;
-    // Another tab deleted the store (sign-out, device reset): drop this engine, so the next use
+    // Another tab deleted the store on sign-out: drop this engine, so the next use
     // starts afresh instead of writing to a closed or deleted store.
     s.onClosed(() => {
       if (current === entry) current = undefined;
@@ -155,8 +156,10 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
       // The server no longer knows this device (removed from another session): never revive it,
       // start over as a new device.
       if (entry.cancelled || !(err instanceof KeyServerError && err.status === 404)) throw err;
-      await deleteCryptoStore(userId);
-      e = await CryptoEngine.open(userId, httpKeyServer, await openStore());
+      const replacementStore = await openStore();
+      await resetDevice(replacementStore);
+      live();
+      e = await CryptoEngine.open(userId, httpKeyServer, replacementStore);
     }
     if (entry.cancelled) {
       e.close();
@@ -173,9 +176,11 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
     entry.ready = e;
     if (current === entry) keysArrived(false);
   }, () => undefined);
-  // A failed start (offline, a blocked database) is retried by the next call.
-  entry.engine.then((e) => void e.receive().catch(() => undefined)).catch(() => {
-    if (current === entry) current = undefined;
+  // Keep the user on a failed entry so the next send can retry without a socket reconnect.
+  // Attach failure handling directly: it runs before a caller resumes from the rejected start.
+  void entry.engine.then((e) => void e.receive().catch(() => undefined), () => {
+    entry.failed = true;
+    entry.store?.close();
   });
   return entry.engine;
 }
@@ -191,7 +196,7 @@ function stopE2EE(): void {
 }
 
 function engine(): Promise<CryptoEngine> {
-  return current?.engine ?? Promise.reject(new Error('Encryption is not set up in this browser'));
+  return current ? startE2EE(current.userId) : Promise.reject(new Error('Encryption is not set up in this browser'));
 }
 
 /** Calls fn whenever room keys arrive, so messages waiting for them can be opened again. */
@@ -373,14 +378,17 @@ export async function replaceDevice(): Promise<void> {
   const userId = current?.userId;
   if (!userId) return;
   stopE2EE();
-  // Only this device's identity goes (its account, Olm channels and outbound room sessions). The
-  // room keys it received, their replay log and pinned peer keys stay, so history stays readable.
   const store = await openCryptoStore(userId);
   try {
-    const owned = [...(await store.list('olm:')), ...(await store.list('out:'))].map(([k]) => k);
-    await store.write([], ['device', 'account', 'fallback', ...owned]);
+    await resetDevice(store);
   } finally {
     store.close();
   }
   await startE2EE(userId);
+}
+
+/** Reset only device-owned keys; received sessions, replay records and pins outlive the identity. */
+async function resetDevice(store: CryptoStore): Promise<void> {
+  const owned = [...(await store.list('olm:')), ...(await store.list('out:'))].map(([k]) => k);
+  await store.write([], ['device', 'account', 'fallback', ...owned]);
 }
