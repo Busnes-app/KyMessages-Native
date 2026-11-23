@@ -95,17 +95,17 @@ func TestGuestSessionStore(t *testing.T) {
 	if err != nil || len(r) != 1 || r[0].GuestID != "ga1" {
 		t.Fatalf("replace: %v %v", r, err)
 	}
-	if _, err := gs.BySecret(ctx, "secret-a1", now); !errors.Is(err, store.ErrNotFound) {
+	if _, err := gs.BySecret(ctx, "secret-a1", now, time.Hour); !errors.Is(err, store.ErrNotFound) {
 		t.Fatal("replaced secret still resolves")
 	}
-	if g, err := gs.BySecret(ctx, "secret-b1", now); err != nil || g.TenantID != "org-b" {
+	if g, err := gs.BySecret(ctx, "secret-b1", now, time.Hour); err != nil || g.TenantID != "org-b" {
 		t.Fatalf("org b session: %+v %v", g, err)
 	}
 	// Admission needs the guest's own room.
-	if _, err := gs.Admit(ctx, b.RoomID, "ga2", "host", now); !errors.Is(err, store.ErrNotFound) {
+	if _, err := gs.Admit(ctx, b.RoomID, "ga2", "host", now, time.Hour); !errors.Is(err, store.ErrNotFound) {
 		t.Fatal("admitted through another org's room")
 	}
-	if g, err := gs.Admit(ctx, a.RoomID, "ga2", "host", now); err != nil || g.Status != "admitted" {
+	if g, err := gs.Admit(ctx, a.RoomID, "ga2", "host", now, time.Hour); err != nil || g.Status != "admitted" {
 		t.Fatalf("admit: %+v %v", g, err)
 	}
 	// A session touched within the idle window stays; one left idle goes.
@@ -120,7 +120,7 @@ func TestGuestSessionStore(t *testing.T) {
 		t.Fatal("idle session kept")
 	}
 	// Expired sessions do not resolve, and closing one org's tenant leaves the other.
-	if _, err := gs.BySecret(ctx, "secret-b1", now+60001); !errors.Is(err, store.ErrNotFound) {
+	if _, err := gs.BySecret(ctx, "secret-b1", now+60001, time.Hour); !errors.Is(err, store.ErrNotFound) {
 		t.Fatal("expired session resolves")
 	}
 	if r, _ := gs.DeleteTenant(ctx, "org-a"); len(r) != 0 {

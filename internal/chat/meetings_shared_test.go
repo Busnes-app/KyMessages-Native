@@ -95,3 +95,51 @@ func TestSharedLobbyOverlappingSocketsAcrossReplicas(t *testing.T) {
 		t.Fatal("session outlived its last socket")
 	}
 }
+
+// A replica that exits runs no leave timer. The admission still lapses: every read applies the
+// presence rule on the database clock, so a guest no replica refreshed for longer than the grace
+// must knock and be admitted again.
+func TestSharedLobbyAdmissionLapsesWithoutAnyReplica(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, testdb.Config(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	res, err := st.Chat().UpsertMeeting(ctx, store.UpsertMeetingParams{ID: "m", TenantID: store.DefaultTenantID, OrganizerSub: "s", Title: "T"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := NewLobbyManager(NewHub(&captureBus{}), nil)
+	l.UseShared(st.GuestSessions())
+	l.SetLeaveGrace(40 * time.Millisecond)
+	s, err := l.Knock(ctx, &store.MeetingGuest{MeetingID: "m", GuestKey: "k"}, res.Meeting, nil, "Visitor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Decide(ctx, res.Meeting.RoomID, s.GuestID, "host", true); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := l.GetBySecret(s.SessionSecret); !ok || got.Status != "admitted" {
+		t.Fatalf("fresh admission: %+v %v", got, ok)
+	}
+	// No socket anywhere, no timer: the replica that held it is gone.
+	time.Sleep(80 * time.Millisecond)
+	if _, ok := l.GetBySecret(s.SessionSecret); ok {
+		t.Fatal("an admission nobody refreshed outlived the leave grace")
+	}
+	if len(l.ListWaiting(res.Meeting.RoomID)) != 0 {
+		t.Fatal("lapsed guest still listed")
+	}
+	if _, err := l.Decide(ctx, res.Meeting.RoomID, s.GuestID, "host", true); err != ErrGuestNotFound {
+		t.Fatalf("admitting a lapsed guest: %v", err)
+	}
+	// A fresh knock and admission work again.
+	s2, err := l.Knock(ctx, &store.MeetingGuest{MeetingID: "m", GuestKey: "k"}, res.Meeting, nil, "Visitor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := l.GetBySecret(s2.SessionSecret); !ok {
+		t.Fatal("new knock not found")
+	}
+}

@@ -109,26 +109,33 @@ func (g *GuestSessionStore) create(ctx context.Context, secret string, sess Gues
 }
 
 // BySecret resolves the unexpired session a guest's secret names.
-func (g *GuestSessionStore) BySecret(ctx context.Context, secret string, nowMs int64) (*GuestSession, error) {
-	return scanGuestSession(g.s.db.QueryRowContext(ctx, g.s.rebind(`SELECT `+guestSessionCols+` FROM meeting_guest_sessions WHERE secret_hash = ? AND expires_at > ?`),
-		crypto.SHA256Hex([]byte(secret)), nowMs))
+// present is the presence rule every read and admission applies: a session counts only while
+// some replica refreshed seen_at (database clock) within live. Departure is therefore enforced
+// by the database, not by whichever replica's leave timer happens to run.
+func (g *GuestSessionStore) present() string {
+	return ` AND seen_at > ` + g.s.dbNowMillis() + ` - ?`
+}
+
+func (g *GuestSessionStore) BySecret(ctx context.Context, secret string, nowMs int64, live time.Duration) (*GuestSession, error) {
+	return scanGuestSession(g.s.db.QueryRowContext(ctx, g.s.rebind(`SELECT `+guestSessionCols+` FROM meeting_guest_sessions WHERE secret_hash = ? AND expires_at > ?`+g.present()),
+		crypto.SHA256Hex([]byte(secret)), nowMs, live.Milliseconds()))
 }
 
 // ByID resolves an unexpired session by guest ID.
-func (g *GuestSessionStore) ByID(ctx context.Context, guestID string, nowMs int64) (*GuestSession, error) {
-	return scanGuestSession(g.s.db.QueryRowContext(ctx, g.s.rebind(`SELECT `+guestSessionCols+` FROM meeting_guest_sessions WHERE guest_id = ? AND expires_at > ?`),
-		guestID, nowMs))
+func (g *GuestSessionStore) ByID(ctx context.Context, guestID string, nowMs int64, live time.Duration) (*GuestSession, error) {
+	return scanGuestSession(g.s.db.QueryRowContext(ctx, g.s.rebind(`SELECT `+guestSessionCols+` FROM meeting_guest_sessions WHERE guest_id = ? AND expires_at > ?`+g.present()),
+		guestID, nowMs, live.Milliseconds()))
 }
 
 // InRoom lists the unexpired sessions of roomID.
-func (g *GuestSessionStore) InRoom(ctx context.Context, roomID string, nowMs int64) ([]GuestSession, error) {
-	return g.list(ctx, `SELECT `+guestSessionCols+` FROM meeting_guest_sessions WHERE room_id = ? AND expires_at > ? ORDER BY knocked_at ASC`, roomID, nowMs)
+func (g *GuestSessionStore) InRoom(ctx context.Context, roomID string, nowMs int64, live time.Duration) ([]GuestSession, error) {
+	return g.list(ctx, `SELECT `+guestSessionCols+` FROM meeting_guest_sessions WHERE room_id = ? AND expires_at > ?`+g.present()+` ORDER BY knocked_at ASC`, roomID, nowMs, live.Milliseconds())
 }
 
 // Admit marks guestID in roomID admitted by actorID.
-func (g *GuestSessionStore) Admit(ctx context.Context, roomID, guestID, actorID string, nowMs int64) (*GuestSession, error) {
+func (g *GuestSessionStore) Admit(ctx context.Context, roomID, guestID, actorID string, nowMs int64, live time.Duration) (*GuestSession, error) {
 	return scanGuestSession(g.s.db.QueryRowContext(ctx, g.s.rebind(`UPDATE meeting_guest_sessions SET status = 'admitted', decided_by = ?
-WHERE guest_id = ? AND room_id = ? AND expires_at > ? RETURNING `+guestSessionCols), actorID, guestID, roomID, nowMs))
+WHERE guest_id = ? AND room_id = ? AND expires_at > ?`+g.present()+` RETURNING `+guestSessionCols), actorID, guestID, roomID, nowMs, live.Milliseconds()))
 }
 
 // Touch records, on the database clock, that each guest has a live socket on the caller's

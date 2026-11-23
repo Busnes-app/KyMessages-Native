@@ -191,16 +191,16 @@ func TestRestoreInvalidatesGuestSessions(t *testing.T) {
 		RoomID: res.Meeting.RoomID, GuestKey: "k", DisplayName: "V", Status: "waiting", KnockedAt: now, SeenAt: now, ExpiresAt: now + 3600000}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := gs.Admit(ctx, res.Meeting.RoomID, "g1", "host", now); err != nil {
+	if _, err := gs.Admit(ctx, res.Meeting.RoomID, "g1", "host", now, time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.InvalidateRestoredGrants(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := gs.BySecret(ctx, "restored-secret", now); !errors.Is(err, store.ErrNotFound) {
+	if _, err := gs.BySecret(ctx, "restored-secret", now, time.Hour); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("BySecret after restore: %v", err)
 	}
-	if _, err := gs.ByID(ctx, "g1", now); !errors.Is(err, store.ErrNotFound) {
+	if _, err := gs.ByID(ctx, "g1", now, time.Hour); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("ByID after restore: %v", err)
 	}
 }

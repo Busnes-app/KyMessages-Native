@@ -58,6 +58,7 @@ func (s *SQLStore) PruneShared(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, s.rebind(`DELETE FROM pow_spent WHERE expires_at < ?`), now.Unix()); err != nil {
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, s.rebind(`DELETE FROM meeting_guest_sessions WHERE expires_at < ?`), now.UnixMilli())
+	// Rows no replica refreshed for 10 minutes are long past any leave grace and unusable.
+	_, err := s.db.ExecContext(ctx, s.rebind(`DELETE FROM meeting_guest_sessions WHERE expires_at < ? OR seen_at < `+s.dbNowMillis()+` - 600000`), now.UnixMilli())
 	return err
 }

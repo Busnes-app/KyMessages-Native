@@ -90,7 +90,12 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   (`GuestSessions()`: keyed by the secret's SHA-256, one live session per tenant, meeting and
   guest key, 4 h expiry). `seen_at` is on the database clock: each replica `Touch`es the guests
   it holds sockets for every quarter of the leave grace, and `DeleteIfUnseen` ends a session only
-  when nobody touched it for half the grace (`TestSharedLobbyOverlappingSocketsAcrossReplicas`). `PruneShared` deletes
+  when nobody touched it for half the grace (`TestSharedLobbyOverlappingSocketsAcrossReplicas`).
+  Departure does not depend on that timer: `BySecret`, `ByID`, `InRoom` and `Admit` accept a
+  session only if `seen_at` is within `live` (the lobby passes 1.25 × the leave grace), so a
+  replica that exits or a failed delete cannot keep an admission usable
+  (`TestSharedLobbyAdmissionLapsesWithoutAnyReplica`). `PruneShared` deletes rows nobody touched
+  for 10 minutes. `PruneShared` deletes
   expired rows; the leased maintenance loop runs it in multi mode only.
   `migrations.Run` refuses with `ErrNewerSchema` a database whose `schema_migrations` holds a
   version above this build's newest (image rollback, or a capsule from a newer build), before

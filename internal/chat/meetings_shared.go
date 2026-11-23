@@ -55,7 +55,7 @@ func (l *LobbyManager) knockShared(ctx context.Context, meeting *store.Meeting, 
 func (l *LobbyManager) bySecretShared(secret string) (*GuestSession, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), sharedLobbyTimeout)
 	defer cancel()
-	g, err := l.db.BySecret(ctx, secret, l.now().UnixMilli())
+	g, err := l.db.BySecret(ctx, secret, l.now().UnixMilli(), l.presence())
 	if err != nil {
 		return nil, false
 	}
@@ -65,7 +65,7 @@ func (l *LobbyManager) bySecretShared(secret string) (*GuestSession, bool) {
 func (l *LobbyManager) listShared(roomID string) []LobbyKnockPayload {
 	ctx, cancel := context.WithTimeout(context.Background(), sharedLobbyTimeout)
 	defer cancel()
-	rows, _ := l.db.InRoom(ctx, roomID, l.now().UnixMilli())
+	rows, _ := l.db.InRoom(ctx, roomID, l.now().UnixMilli(), l.presence())
 	out := make([]LobbyKnockPayload, 0, len(rows))
 	for _, s := range rows {
 		out = append(out, LobbyKnockPayload{MeetingID: s.MeetingID, RoomID: s.RoomID, GuestID: s.GuestID,
@@ -77,7 +77,7 @@ func (l *LobbyManager) listShared(roomID string) []LobbyKnockPayload {
 func (l *LobbyManager) decideShared(ctx context.Context, roomID, guestID, actorID string, admit bool) (*GuestSession, error) {
 	var g *store.GuestSession
 	if admit {
-		row, err := l.db.Admit(ctx, roomID, guestID, actorID, l.now().UnixMilli())
+		row, err := l.db.Admit(ctx, roomID, guestID, actorID, l.now().UnixMilli(), l.presence())
 		if err == store.ErrNotFound {
 			return nil, ErrGuestNotFound
 		}
@@ -188,6 +188,14 @@ func (l *LobbyManager) disconnectShared(guestID string) {
 	l.mu.Unlock()
 }
 
+// presence is how long a session stays usable after the last refresh by any replica: the
+// leave grace, plus one heartbeat interval of slack.
+func (l *LobbyManager) presence() time.Duration {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.leaveGrace + l.leaveGrace/4
+}
+
 func (l *LobbyManager) stopTimer(guestID string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -208,7 +216,7 @@ func (l *LobbyManager) evictShared(ctx context.Context, rows []store.GuestSessio
 func (l *LobbyManager) guestValidShared(isActive func(ctx context.Context, tenantID string) (bool, error), guestID string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), sharedLobbyTimeout)
 	defer cancel()
-	g, err := l.db.ByID(ctx, guestID, l.now().UnixMilli())
+	g, err := l.db.ByID(ctx, guestID, l.now().UnixMilli(), l.presence())
 	if err == store.ErrNotFound {
 		return false
 	}
