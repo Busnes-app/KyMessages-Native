@@ -121,8 +121,8 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   removes the rows and returns the blobs of attachment rows it deleted (an upload that committed
   meanwhile) for the caller to delete; it queues them in `pending_blob_deletes` in the same
   transaction, so a delete that fails after commit is retried (`PendingBlobDeletes`,
-  `ClearPendingBlobDeletes`; the multi-mode attachment sweep drains the queue). Both are idempotent and need no account row. The audit row
-  `sso.user_erased` names only `user:<id>`.
+  `ClearPendingBlobDeletes`; the multi-mode attachment sweep drains the queue). Both are idempotent and need no account row. The completion audit
+  `sso.user_erased` names only `user:<id>` and commits once after all queued cleanup succeeds.
 - Migration 60 (`erasure_state`) adds `pending_blob_deletes` and `user_subjects (provider, subject, user_id, org_id)`: `DeleteDirectoryUser`
   and `EraseUser` record an org-bound account's mapping before its row goes, so an erasure after
   `user.deleted`, a repeat, or a recreation under a new ID still finds every account the person had (`ErasureTargets`; the key is provider, subject and user ID). Single-mode
@@ -155,3 +155,4 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
 None.
 
 - Shared leave timers rearm while a disconnected guest keeps polling. The eventual database delete emits one departure and evicts the call seat; deterministic scheduler callbacks cover polling beyond the first timer and later inactivity.
+- `user_erasure_state` tracks pending and completed erasures. `ClearPendingBlobDeletes` commits each completion and its sole `sso.user_erased` audit together, only when all of that user's queued deletes are gone. Replays retain completion; retries read their queued keys through `ErasureBlobs`.

@@ -284,9 +284,6 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 		return s.eraseUser(ctx, user, revokeUser)
 	})
 	chatHub.SetGuestCheck(lobbyMgr.GuestCheck(s.isTenantActive))
-	if cfg.Tenancy.IsMultiTenant() {
-		chatHub.SetUserRevokeHandler(func(userID string) { callMgr.HandleDisconnect(userID, 0) })
-	}
 	chatHub.SetTenantRevokeHandler(func(tenantID string) {
 		lobbyMgr.RevokeTenant(context.Background(), tenantID)
 		callMgr.RevokeTenant(context.Background(), tenantID)

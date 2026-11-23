@@ -21,12 +21,16 @@ import (
 	"github.com/google/uuid"
 )
 
-func postErased(t *testing.T, srv http.Handler, sub, org string) *httptest.ResponseRecorder {
+func postErased(t *testing.T, srv http.Handler, sub, org string, eventIDs ...string) *httptest.ResponseRecorder {
 	t.Helper()
 	body, _ := json.Marshal(map[string]any{"schemas": []string{"urn:ietf:params:scim:schemas:core:2.0:User"}, "id": sub, "externalId": sub, "active": false, "org_id": org})
 	req := httptest.NewRequest(http.MethodPost, "/api/sso/kyidentity/sync", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/scim+json")
-	h, err := syncauth.Sign([]byte(testMultiTenantHMAC), time.Now(), "user.erased", uuid.NewString(), body)
+	eventID := uuid.NewString()
+	if len(eventIDs) > 0 {
+		eventID = eventIDs[0]
+	}
+	h, err := syncauth.Sign([]byte(testMultiTenantHMAC), time.Now(), "user.erased", eventID, body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -410,4 +414,60 @@ func TestQueuedBlobDeletesAreIndependent(t *testing.T) {
 	if len(q) != 1 || q[0].Key != ids[0] {
 		t.Fatalf("queue after a sweep with one failing blob: %v", q)
 	}
+}
+
+type failSecondBlobDelete struct {
+	blobs.Backend
+	calls int
+}
+
+func (b *failSecondBlobDelete) Delete(tenant, key string) error {
+	b.calls++
+	if b.calls == 2 {
+		return errors.New("injected post-commit blob failure")
+	}
+	return b.Backend.Delete(tenant, key)
+}
+
+func TestErasureCompletionAuditSurvivesReplayAndCleanupRetry(t *testing.T) {
+	ctx := context.Background()
+	srv, _, st, _ := newReplicas(t, withPool(t, &fakePool{headroom: 1 << 20}))
+	user, tok := createOrgUser(t, st, "usr_completion", "completion", "user", replicaOrgA)
+	room := roomOf(t, doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", tok, map[string]any{"kind": store.RoomKindChannel, "name": "completion"}, nil))
+	if rec := doMultipartUpload(t, srv, "/api/v1/rooms/"+room+"/attachments", tok, "file", "file.txt", []byte("erase me")); rec.Code != http.StatusCreated {
+		t.Fatalf("upload: %d %s", rec.Code, rec.Body.String())
+	}
+	api.SetBlobsForTest(srv, &failSecondBlobDelete{Backend: api.BlobsForTest(srv)})
+	auditCount := func(want int) {
+		t.Helper()
+		_, n, err := st.Audit().ListAuditRecords(ctx, 0, 100, "sso.user_erased")
+		if err != nil || n != want {
+			t.Fatalf("completed audit count = %d, want %d: %v", n, want, err)
+		}
+	}
+	event := uuid.NewString()
+	if rec := postErased(t, srv, user.SSOSubject, replicaOrgA, event); rec.Code < 500 {
+		t.Fatalf("failed cleanup acknowledged: %d %s", rec.Code, rec.Body.String())
+	}
+	if _, err := st.Users().GetUserByID(ctx, user.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("rows did not commit before failure: %v", err)
+	}
+	auditCount(0)
+	pending, err := st.Chat().PendingBlobDeletes(ctx, 10)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("cleanup lost: %+v %v", pending, err)
+	}
+	for _, id := range []string{event, event, uuid.NewString()} {
+		if rec := postErased(t, srv, user.SSOSubject, replicaOrgA, id); rec.Code != http.StatusOK {
+			t.Fatalf("retry/replay: %d %s", rec.Code, rec.Body.String())
+		}
+		auditCount(1)
+	}
+	if pending, err := st.Chat().PendingBlobDeletes(ctx, 10); err != nil || len(pending) != 0 {
+		t.Fatalf("pending after retry: %+v %v", pending, err)
+	}
+	if _, err := srv.SweepOrphanAttachments(ctx, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	auditCount(1)
 }

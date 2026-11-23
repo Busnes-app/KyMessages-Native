@@ -301,9 +301,15 @@ CREATE TABLE user_subjects (
     PRIMARY KEY (provider, subject, user_id)
 );
 CREATE TABLE pending_blob_deletes (
+    user_id VARCHAR(64) NOT NULL DEFAULT '',
     tenant_id VARCHAR(64) NOT NULL,
     blob_key VARCHAR(512) NOT NULL,
     PRIMARY KEY (tenant_id, blob_key)
+);
+CREATE TABLE user_erasure_state (
+    user_id VARCHAR(64) PRIMARY KEY,
+    tenant_id VARCHAR(64) NOT NULL,
+    completed_at BIGINT
 );
 `
 

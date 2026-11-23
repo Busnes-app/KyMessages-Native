@@ -23,7 +23,7 @@ func (c *chatStore) ErasureBlobs(ctx context.Context, tenantID, userID string) (
 	rows, err := c.store.db.QueryContext(ctx, c.store.rebind(`SELECT a.id, a.tenant_id, a.blob_key FROM attachments a
 WHERE a.tenant_id = ? AND (a.uploader_id = ?
 	OR a.message_id IN (SELECT id FROM messages WHERE tenant_id = ? AND sender_id = ?)
-	OR a.room_id IN (`+goneDMs+`))`), tenantID, userID, tenantID, userID, userID, tenantID, userID)
+	OR a.room_id IN (`+goneDMs+`)) UNION SELECT '', tenant_id, blob_key FROM pending_blob_deletes WHERE tenant_id = ? AND user_id = ?`), tenantID, userID, tenantID, userID, userID, tenantID, userID, tenantID, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -65,7 +65,7 @@ func (c *chatStore) DeactivateForErasure(ctx context.Context, userID string) err
 }
 
 // EraseUser deletes the user's rows in tenantID, keeps the subject mapping so a repeat finds
-// them again, records the erasure under the opaque ID only, and returns the blobs of the
+// them again, starts durable completion tracking, and returns the blobs of the
 // attachment rows it deleted (an upload that committed after ErasureBlobs), for the caller to
 // delete too. It is idempotent and needs no account row.
 func (c *chatStore) EraseUser(ctx context.Context, tenantID string, user *User) ([]BlobRef, error) {
@@ -76,6 +76,9 @@ func (c *chatStore) EraseUser(ctx context.Context, tenantID string, user *User) 
 	}
 	defer func() { _ = tx.Rollback() }()
 	if err := rememberSubject(ctx, c.store, tx, &User{ID: userID, OrgID: tenantID, SSOProvider: user.SSOProvider, SSOSubject: user.SSOSubject}); err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, c.store.rebind(`INSERT INTO user_erasure_state (user_id, tenant_id) VALUES (?, ?) ON CONFLICT (user_id) DO NOTHING`), userID, tenantID); err != nil {
 		return nil, err
 	}
 	var late []BlobRef
@@ -105,7 +108,7 @@ func (c *chatStore) EraseUser(ctx context.Context, tenantID string, user *User) 
 	// Blobs of rows deleted here are queued in the same transaction, so a failed delete after
 	// commit is retried (PendingBlobDeletes) instead of lost with its row.
 	for _, r := range late {
-		if _, err := tx.ExecContext(ctx, c.store.rebind(`INSERT INTO pending_blob_deletes (tenant_id, blob_key) VALUES (?, ?) ON CONFLICT (tenant_id, blob_key) DO NOTHING`), r.TenantID, r.Key); err != nil {
+		if _, err := tx.ExecContext(ctx, c.store.rebind(`INSERT INTO pending_blob_deletes (tenant_id, blob_key, user_id) VALUES (?, ?, ?) ON CONFLICT (tenant_id, blob_key) DO NOTHING`), r.TenantID, r.Key, userID); err != nil {
 			return nil, err
 		}
 	}
@@ -129,7 +132,6 @@ func (c *chatStore) EraseUser(ctx context.Context, tenantID string, user *User) 
 		{`DELETE FROM agents WHERE owner_user_id = ?`, []any{userID}},
 		// The account; sessions, MFA challenges, presence and push subscriptions cascade.
 		{`DELETE FROM users WHERE id = ? AND org_id = ?`, []any{userID, tenantID}},
-		{`INSERT INTO audit_records (action, resource, details, created_at) VALUES ('sso.user_erased', ?, '', ?)`, []any{"user:" + userID, time.Now().UTC()}},
 	}
 	for _, s := range steps {
 		if _, err := tx.ExecContext(ctx, c.store.rebind(s.q), s.args...); err != nil {
@@ -157,12 +159,39 @@ func (c *chatStore) PendingBlobDeletes(ctx context.Context, limit int) ([]BlobRe
 	return out, rows.Err()
 }
 
-// ClearPendingBlobDeletes drops queued deletes whose blobs are gone.
+// ClearPendingBlobDeletes drops successful deletes and records each completed erasure once.
+// The completion transition and audit share the cleanup transaction, on every replica.
 func (c *chatStore) ClearPendingBlobDeletes(ctx context.Context, refs []BlobRef) error {
+	tx, err := c.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
 	for _, r := range refs {
-		if _, err := c.store.db.ExecContext(ctx, c.store.rebind(`DELETE FROM pending_blob_deletes WHERE tenant_id = ? AND blob_key = ?`), r.TenantID, r.Key); err != nil {
+		if _, err := tx.ExecContext(ctx, c.store.rebind(`DELETE FROM pending_blob_deletes WHERE tenant_id = ? AND blob_key = ?`), r.TenantID, r.Key); err != nil {
 			return err
 		}
 	}
-	return nil
+	rows, err := tx.QueryContext(ctx, c.store.rebind(`UPDATE user_erasure_state SET completed_at = ? WHERE completed_at IS NULL AND NOT EXISTS (SELECT 1 FROM pending_blob_deletes p WHERE p.tenant_id = user_erasure_state.tenant_id AND p.user_id = user_erasure_state.user_id) RETURNING user_id`), time.Now().UnixMilli())
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if _, err := tx.ExecContext(ctx, c.store.rebind(`INSERT INTO audit_records (action, resource, details, created_at) VALUES ('sso.user_erased', ?, '', ?)`), "user:"+id, time.Now().UTC()); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }

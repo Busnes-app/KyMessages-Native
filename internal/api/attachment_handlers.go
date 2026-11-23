@@ -533,7 +533,7 @@ func (s *Server) eraseUser(ctx context.Context, user *store.User, revoke func(co
 	if err := s.deleteBlobs(late); err != nil {
 		return err
 	}
-	return s.store.Chat().ClearPendingBlobDeletes(ctx, late)
+	return s.store.Chat().ClearPendingBlobDeletes(ctx, append(refs, late...))
 }
 
 // drainPendingBlobDeletes finishes blob deletes an erasure committed but could not complete.
