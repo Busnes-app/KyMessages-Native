@@ -14,17 +14,18 @@ import (
 
 // SQLStore implements Store on top of database/sql.
 type SQLStore struct {
-	db       *sql.DB
-	readDB   *sql.DB
-	driver   string
-	users    *userStore
-	sessions *sessionStore
-	devices  *deviceStore
-	groups   *groupStore
-	audit    *auditStore
-	settings *settingsStore
-	agents   *agentStore
-	chat     *chatStore
+	db          *sql.DB
+	readDB      *sql.DB
+	driver      string
+	users       *userStore
+	sessions    *sessionStore
+	devices     *deviceStore
+	groups      *groupStore
+	audit       *auditStore
+	settings    *settingsStore
+	agents      *agentStore
+	chat        *chatStore
+	suiteReplay *suiteReplayStore
 }
 
 // newSQLStore creates and initializes a SQLStore, running migrations automatically.
@@ -60,18 +61,20 @@ func newSQLStore(ctx context.Context, db, readDB *sql.DB, driver string) (*SQLSt
 	s.settings = &settingsStore{store: s}
 	s.agents = &agentStore{store: s}
 	s.chat = &chatStore{store: s}
+	s.suiteReplay = &suiteReplayStore{store: s}
 
 	return s, nil
 }
 
-func (s *SQLStore) Users() UserStore        { return s.users }
-func (s *SQLStore) Sessions() SessionStore  { return s.sessions }
-func (s *SQLStore) Devices() DeviceStore    { return s.devices }
-func (s *SQLStore) Groups() GroupStore      { return s.groups }
-func (s *SQLStore) Audit() AuditStore       { return s.audit }
-func (s *SQLStore) Settings() SettingsStore { return s.settings }
-func (s *SQLStore) Agents() AgentStore      { return s.agents }
-func (s *SQLStore) Chat() ChatStore         { return s.chat }
+func (s *SQLStore) Users() UserStore              { return s.users }
+func (s *SQLStore) Sessions() SessionStore        { return s.sessions }
+func (s *SQLStore) Devices() DeviceStore          { return s.devices }
+func (s *SQLStore) Groups() GroupStore            { return s.groups }
+func (s *SQLStore) Audit() AuditStore             { return s.audit }
+func (s *SQLStore) Settings() SettingsStore       { return s.settings }
+func (s *SQLStore) Agents() AgentStore            { return s.agents }
+func (s *SQLStore) Chat() ChatStore               { return s.chat }
+func (s *SQLStore) SuiteReplay() SuiteReplayStore { return s.suiteReplay }
 
 func (s *SQLStore) read() *sql.DB {
 	if s.readDB != nil {

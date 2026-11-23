@@ -39,6 +39,7 @@ type Store interface {
 	Settings() SettingsStore
 	Agents() AgentStore
 	Chat() ChatStore
+	SuiteReplay() SuiteReplayStore
 
 	// Notify emits a PostgreSQL NOTIFY on channel with payload (no-op on SQLite).
 	Notify(ctx context.Context, channel, payload string) error
@@ -49,6 +50,18 @@ type Store interface {
 	Close() error
 }
 
+// SuiteReplayStore tracks verified suite syncauth event IDs in the primary database so
+// replays are rejected across restarts and across replicas.
+type SuiteReplayStore interface {
+	// Record records eventID as seen if it has not been recorded yet. It returns fresh=true
+	// when eventID was inserted for the first time and fresh=false when it already existed.
+	Record(ctx context.Context, eventID string, nowUnix, expiresAtUnix int64) (fresh bool, err error)
+	// Forget removes eventID so a failed transient request (5xx) can be retried.
+	Forget(ctx context.Context, eventID string) error
+	// Prune removes expired replay rows whose expires_at <= beforeUnix.
+	Prune(ctx context.Context, beforeUnix int64) error
+}
+
 // DirectoryEvent identifies one signed directory delivery: the sender's event ID and the
 // per-user revision it carries.
 type DirectoryEvent struct {
@@ -57,8 +70,12 @@ type DirectoryEvent struct {
 }
 
 // TenancyModeSettingKey persists the database's tenancy mode ("single" or "multi") so an
-// instance cannot silently flip modes across restarts.
-const TenancyModeSettingKey = "tenancy.mode"
+// instance cannot silently flip modes across restarts. TenancyStaffOrgSettingKey locks
+// KY_STAFF_ORG_ID once initialized in multi-tenant mode.
+const (
+	TenancyModeSettingKey     = "tenancy.mode"
+	TenancyStaffOrgSettingKey = "tenancy.staff_org_id"
+)
 
 // UserFilter selects users by one exact attribute; the zero value matches everyone.
 // Provider and OrgID, when set, also limit the result to that sso_provider / org_id.

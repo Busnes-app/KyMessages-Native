@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -31,13 +32,37 @@ const (
 // KyCalendar Sync Endpoints: PUT /api/meetings/{id}, DELETE /api/meetings/{id}
 // ---------------------------------------------------------------------
 
-func (s *Server) verifyMeetingSync(r *http.Request, body []byte) bool {
+// verifyMeetingSync verifies a KyCalendar meeting request and records its event ID in the
+// shared replay ledger. It answers the request itself and returns ok false when the handler
+// must stop: 401 for a bad or missing signature, 200 duplicate for a replay, 503 when the
+// ledger is down.
+func (s *Server) verifyMeetingSync(w http.ResponseWriter, r *http.Request, body []byte) (syncauth.Event, bool) {
 	secret := strings.TrimSpace(s.config.RTC.MeetingSyncSecret)
 	if len(secret) < syncauth.MinKeyBytes {
-		return false
+		s.writeError(w, http.StatusUnauthorized, "Meeting sync signature invalid or not configured")
+		return syncauth.Event{}, false
 	}
-	_, err := syncauth.Verify([]byte(secret), syncauth.FromRequest(r), body, syncauth.Options{})
-	return err == nil
+	ev, err := syncauth.Verify([]byte(secret), syncauth.FromRequest(r), body, syncauth.Options{Replay: dbReplay{r.Context(), s.store.SuiteReplay()}})
+	switch {
+	case err == nil:
+		return ev, true
+	case errors.Is(err, syncauth.ErrReplay):
+		s.writeJSON(w, http.StatusOK, map[string]string{"outcome": "duplicate"})
+	case errors.Is(err, errReplayStore):
+		s.writeError(w, http.StatusServiceUnavailable, "Try again later")
+	default:
+		s.writeError(w, http.StatusUnauthorized, "Meeting sync signature invalid or not configured")
+	}
+	return ev, false
+}
+
+// meetingOrgID applies the suite org_id rule to a meeting body; an empty body counts as {}.
+func (s *Server) meetingOrgID(body []byte) (string, error) {
+	if len(bytes.TrimSpace(body)) == 0 {
+		body = []byte("{}")
+	}
+	orgID, _, err := s.suiteOrgID(body)
+	return orgID, err
 }
 
 // PUT /api/meetings/{id}
@@ -53,13 +78,12 @@ func (s *Server) handleKyCalendarUpsertMeeting(w http.ResponseWriter, r *http.Re
 		s.writeError(w, http.StatusBadRequest, "Failed to read request body")
 		return
 	}
-	if !s.verifyMeetingSync(r, body) {
-		s.writeError(w, http.StatusUnauthorized, "Meeting sync signature invalid or not configured")
+	ev, ok := s.verifyMeetingSync(w, r, body)
+	if !ok {
 		return
 	}
 
 	var req struct {
-		OrgID        string   `json:"org_id"`
 		OrganizerSub string   `json:"organizer_sub"`
 		Title        string   `json:"title"`
 		MemberSubs   []string `json:"member_subs"`
@@ -71,20 +95,18 @@ func (s *Server) handleKyCalendarUpsertMeeting(w http.ResponseWriter, r *http.Re
 			End   string `json:"end"`
 		} `json:"windows"`
 	}
-	if err := json.Unmarshal(body, &req); err != nil {
-		s.writeError(w, http.StatusBadRequest, "Invalid JSON payload")
+	orgID, err := s.meetingOrgID(body)
+	if err != nil || json.Unmarshal(body, &req) != nil {
+		s.writeError(w, http.StatusBadRequest, "Invalid JSON payload or org_id")
 		return
 	}
 
 	tenantID := store.DefaultTenantID
 	if s.config.Tenancy.IsMultiTenant() {
-		tenantID = strings.TrimSpace(req.OrgID)
-		if tenantID == "" {
-			s.writeError(w, http.StatusBadRequest, "org_id is required in multi-tenant mode")
-			return
-		}
+		tenantID = orgID
 		tenant, err := s.store.Chat().EnsureTenant(r.Context(), tenantID)
 		if err != nil {
+			s.forgetSuiteEvent(ev)
 			s.writeError(w, http.StatusInternalServerError, "Failed to verify organization")
 			return
 		}
@@ -201,6 +223,7 @@ func (s *Server) handleKyCalendarUpsertMeeting(w http.ResponseWriter, r *http.Re
 		KeepGuestKeys:  keepGuests,
 	})
 	if err != nil {
+		s.forgetSuiteEvent(ev)
 		s.writeError(w, http.StatusInternalServerError, "Failed to sync meeting")
 		return
 	}
@@ -254,24 +277,19 @@ func (s *Server) handleKyCalendarCloseMeeting(w http.ResponseWriter, r *http.Req
 		s.writeError(w, http.StatusBadRequest, "Failed to read request body")
 		return
 	}
-	if !s.verifyMeetingSync(r, body) {
-		s.writeError(w, http.StatusUnauthorized, "Meeting sync signature invalid or not configured")
+	ev, ok := s.verifyMeetingSync(w, r, body)
+	if !ok {
 		return
 	}
 
 	tenantID := store.DefaultTenantID
+	orgID, err := s.meetingOrgID(body)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, "Invalid JSON payload or org_id")
+		return
+	}
 	if s.config.Tenancy.IsMultiTenant() {
-		var req struct {
-			OrgID string `json:"org_id"`
-		}
-		if len(body) > 0 {
-			_ = json.Unmarshal(body, &req)
-		}
-		tenantID = strings.TrimSpace(req.OrgID)
-		if tenantID == "" {
-			s.writeError(w, http.StatusBadRequest, "org_id is required in multi-tenant mode")
-			return
-		}
+		tenantID = orgID
 	}
 
 	closed, err := s.store.Chat().CloseMeeting(r.Context(), tenantID, meetingID)
@@ -280,6 +298,7 @@ func (s *Server) handleKyCalendarCloseMeeting(w http.ResponseWriter, r *http.Req
 		return
 	}
 	if err != nil {
+		s.forgetSuiteEvent(ev)
 		s.writeError(w, http.StatusInternalServerError, "Failed to close meeting")
 		return
 	}

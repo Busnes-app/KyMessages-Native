@@ -161,6 +161,7 @@ func runServer() {
 	}
 	defer closeInstaller()
 
+	srv.StartSuitePairs(ctx)
 	go func() {
 		log.Printf("[KYMESSAGES] %s listening on http://%s (DB: %s)", cfg.Server.AppName, addr, cfg.Database.Driver)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {

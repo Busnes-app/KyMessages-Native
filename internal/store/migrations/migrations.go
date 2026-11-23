@@ -262,6 +262,8 @@ ALTER TABLE mfa_challenges ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';`,
 	{Version: 27, Name: "users_org_id_and_tenant_status", SQLite: multiTenancySchemaSQLite, Postgres: multiTenancySchemaPostgres},
 	// Org lifecycle events apply in KyIdentity's per-org revision order.
 	{Version: 28, Name: "tenant_lifecycle_revision", SQLite: tenantLifecycleRevisionSchema, Postgres: tenantLifecycleRevisionSchema},
+	// Durable replay ledger shared across signed /api/suite/* and /api/meetings/* requests.
+	{Version: 29, Name: "suite_replay_events", SQLite: suiteReplayEventsSchemaSQLite, Postgres: suiteReplayEventsSchemaPostgres},
 }
 
 const multiTenancySchemaSQLite = `
@@ -278,6 +280,24 @@ ALTER TABLE tenants ADD COLUMN status VARCHAR(32) NOT NULL DEFAULT 'active';
 
 const tenantLifecycleRevisionSchema = `
 ALTER TABLE tenants ADD COLUMN lifecycle_revision BIGINT NOT NULL DEFAULT 0;
+`
+
+const suiteReplayEventsSchemaSQLite = `
+CREATE TABLE IF NOT EXISTS suite_replay_events (
+	event_id TEXT PRIMARY KEY,
+	seen_at BIGINT NOT NULL,
+	expires_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_suite_replay_events_expires_at ON suite_replay_events(expires_at);
+`
+
+const suiteReplayEventsSchemaPostgres = `
+CREATE TABLE IF NOT EXISTS suite_replay_events (
+	event_id VARCHAR(255) PRIMARY KEY,
+	seen_at BIGINT NOT NULL,
+	expires_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_suite_replay_events_expires_at ON suite_replay_events(expires_at);
 `
 
 const pushSubscriptionsSchema = `
