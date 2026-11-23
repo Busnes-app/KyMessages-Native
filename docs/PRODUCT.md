@@ -129,7 +129,9 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
   back. An org the list stops naming is held offline with its data kept, never purged, and a
   sanity guard stops a short or empty list from taking many orgs offline.
 - In `KY_TENANCY_MODE=multi`, KyIdentity's `user.erased` (a member used Delete everything) deletes
-  that person's data: account, bots, attachments, and DMs nobody else uses. Their messages in
+  that person's data: account, bots, attachments, and owned rooms or DMs nobody else uses.
+  Shared rooms pass to their longest-standing room admin, else longest-standing member; other
+  members' messages and files stay. Disabled members retain their shared content. Their messages in
   rooms others still use stay as "deleted message" tombstones with no text, name or files.
   An opaque subject tombstone permanently prevents reprovisioning, including a subject this
   install never held. Restore reconciliation applies erasures before admitting listed orgs. A

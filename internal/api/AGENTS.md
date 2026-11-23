@@ -7,6 +7,8 @@ Exposes HTTP REST routes, authentication endpoints, Single Sign-On callbacks, SC
 Owns HTTP routing, request parsing, session cookie validation, CORS headers, and error response formatting.
 
 ## Local Contracts
+- After multi-mode erasure, a surviving shared-room successor immediately has owner permissions; cleanup failure/retry and duplicate deliveries retain that choice and other members' content. Only owned rooms with no remaining member disappear. `erasure_handover_test.go` exercises real signed deliveries, encrypted member messages, attachments and successor API access.
+
 - An erased KyIdentity subject cannot be auto-provisioned by a later multi-mode sign-in; the database fence returns a generic 403 with no session. Erasure of an unknown subject creates the same permanent fence. Wrong-org erasure leaves the account and its grants unchanged.
 
 - Multi-mode sign-in reads an existing authoritative org snapshot; tokens never admit/create a tenant. User routes, guest/call admission and grant issuance refuse an org without an active, enabled, valid directory snapshot. Uploads enforce per-org upload and staged-user limits; text/read/delete behavior does not depend on these byte limits. Admission tests explicitly seed directory snapshots for already-authorized org fixtures.

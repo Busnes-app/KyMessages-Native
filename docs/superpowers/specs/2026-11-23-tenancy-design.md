@@ -521,7 +521,12 @@ reactivation triggers enforce it across sign-in, directory replay and revision r
 PostgreSQL identity lock serializes first provisioning with erasure. Upgrade backfill uses only
 exact retained erasure provenance. Single-mode org-less accounts stay outside this contract.
 Tenancy reconciliation applies the erased feed before org snapshots can restore access.
-Shared-room successor handover and distributed calls remain separate work.
+Shared-room successor handover is implemented: room locks serialize erasure and ordinary
+member departure; surviving ownership passes to the longest-standing room admin, else member
+(the app has no editor role). Existing surviving owners retain ownership. Disabled members
+still count; erased actors and wrong-org accounts cannot inherit. Only owned rooms and DMs
+with no remaining member are deleted. Cleanup failure/replay preserves the committed successor,
+other members' messages/files, and the single completion audit. Distributed calls remain separate work.
 
 ## 12. Phased build plan
 
