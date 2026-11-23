@@ -126,6 +126,9 @@ func (k *KyIdentityClient) applyListedOrg(ctx context.Context, o suitedir.Org) e
 		return nil // never an org of ours
 	}
 	status := listedStatus(o.Status)
+	if !o.Enabled && status == store.TenantStatusActive {
+		status = store.TenantStatusSuspended
+	}
 	chat := k.store.Chat()
 	if status == store.TenantStatusDeleted {
 		if _, err := chat.GetTenant(ctx, o.ID); errors.Is(err, store.ErrNotFound) {

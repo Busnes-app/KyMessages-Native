@@ -140,6 +140,8 @@ Owns HTTP routing, request parsing, session cookie validation, CORS headers, and
   publishes a `to_device` WebSocket event to the recipient. These routes spend their own `e2ee:`
   budget (600 a minute), not chat writes.
 
+- In multi mode, whole-user bus revocations remove call seats on every replica even without a chat socket; session-only revocations leave calls alone. Guest invite replacement, denial and revocation use the same bus path.
+
 ## Verification
 - `go test -v ./internal/api/...` (`authz_test.go` pins the per-role exposure of every privileged route; `backup_test.go` the backup routes, on SQLite only because a run snapshots the database)
 - `console_test.go` covers the console routes, the shared `staleAdmin` step-up helper and the audit outcome parser
@@ -147,5 +149,3 @@ Owns HTTP routing, request parsing, session cookie validation, CORS headers, and
 
 ## Child DOX Index
 None.
-
-- In multi mode, whole-user bus revocations remove call seats on every replica even without a chat socket; session-only revocations leave calls alone. Guest invite replacement, denial and revocation use the same bus path.

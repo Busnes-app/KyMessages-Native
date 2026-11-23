@@ -157,7 +157,7 @@ func listedAll(n int, skip ...int) []listedOrg {
 	var out []listedOrg
 	for i := range n {
 		if !skipped[i] {
-			out = append(out, listedOrg{ID: syncOrgID(i), Status: "active", Revision: int64(10 + i), Enabled: true})
+			out = append(out, listedOrg{ID: syncOrgID(i), Status: "active", Enabled: true, Revision: int64(10 + i)})
 		}
 	}
 	return out
@@ -250,7 +250,7 @@ func TestTenancySyncDeletedOrgIsPurged(t *testing.T) {
 	keepRoom := upload(keep, "keepme")
 	orgDir := func(org string) string { return filepath.Join(e.cfg.Database.DataDir, "attachments", "orgs", org) }
 
-	e.dir.list(listedOrg{ID: gone, Status: "deleted", Revision: 50}, listedOrg{ID: keep, Status: "active", Revision: 51})
+	e.dir.list(listedOrg{ID: gone, Status: "deleted", Revision: 50}, listedOrg{ID: keep, Status: "active", Enabled: true, Revision: 51})
 	if err := e.kyid.SyncTenancy(ctx, false, false); err != nil {
 		t.Fatal(err)
 	}
@@ -305,7 +305,7 @@ func TestTenancySyncErasedList(t *testing.T) {
 	})
 	org := syncOrgID(0)
 	u, _ := createOrgUser(t, e.st, "usr_erlist", "erlist", "user", org)
-	e.dir.list(listedOrg{ID: org, Status: "active", Revision: 1})
+	e.dir.list(listedOrg{ID: org, Status: "active", Enabled: true, Revision: 1})
 	e.dir.mu.Lock()
 	e.dir.erased = []erasedSubject{{Sub: u.SSOSubject, OrgID: org, Revision: 7}}
 	e.dir.mu.Unlock()
@@ -459,7 +459,7 @@ func TestTenancySyncReadsEveryPage(t *testing.T) {
 	subjects = append(subjects, erasedSubject{Sub: last.SSOSubject, OrgID: org, Revision: 101})
 	var orgs []listedOrg
 	for i := range 102 { // suitedir stops after 100 pages; 2 past it fit inside the guard
-		orgs = append(orgs, listedOrg{ID: syncOrgID(i), Status: "active", Revision: int64(i + 1)})
+		orgs = append(orgs, listedOrg{ID: syncOrgID(i), Status: "active", Enabled: true, Revision: int64(i + 1)})
 		if _, err := e.st.Chat().EnsureTenant(ctx, syncOrgID(i)); err != nil {
 			t.Fatal(err)
 		}
@@ -495,7 +495,7 @@ func TestTenancySyncSmallInstallGuard(t *testing.T) {
 	if err := e.kyid.SyncTenancy(ctx, true, false); err != nil || e.activeCount(t) != 3 {
 		t.Fatalf("empty list on a small install: %v, active %d", err, e.activeCount(t))
 	}
-	e.dir.list(listedOrg{ID: syncOrgID(9), Status: "active", Revision: 1}) // names none of ours
+	e.dir.list(listedOrg{ID: syncOrgID(9), Status: "active", Enabled: true, Revision: 1}) // names none of ours
 	if err := e.kyid.SyncTenancy(ctx, true, false); err != nil {
 		t.Fatal(err)
 	}
@@ -586,5 +586,29 @@ func TestTenancySyncRetriesMissingOrgRevocationBeforeRecovery(t *testing.T) {
 	}
 	if rec := doBearerJSON(t, e.srv, http.MethodGet, "/api/v1/rooms", tok, nil, nil); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("surviving session after recovery: %d", rec.Code)
+	}
+}
+
+func TestTenancySyncStopsServingADisabledApp(t *testing.T) {
+	ctx := context.Background()
+	e := newSyncEnv(t)
+	org := syncOrgID(0)
+	_, tok := createOrgUser(t, e.st, "usr_disabled_app", "disabledapp", "user", org)
+	e.dir.list(listedOrg{ID: org, Status: "active", Revision: 10, Enabled: false})
+	if err := e.kyid.SyncTenancy(ctx, true, false); err != nil {
+		t.Fatal(err)
+	}
+	if e.status(t, org) != store.TenantStatusSuspended {
+		t.Fatal("disabled app stayed active")
+	}
+	e.dir.list(listedOrg{ID: org, Status: "active", Revision: 11, Enabled: true})
+	if err := e.kyid.SyncTenancy(ctx, true, false); err != nil {
+		t.Fatal(err)
+	}
+	if e.status(t, org) != store.TenantStatusActive {
+		t.Fatal("re-enabled app did not recover")
+	}
+	if rec := doBearerJSON(t, e.srv, http.MethodGet, "/api/v1/rooms", tok, nil, nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("disabled app revived prior session: %d", rec.Code)
 	}
 }
