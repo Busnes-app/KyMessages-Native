@@ -441,7 +441,7 @@ test proves the answers are byte for byte the same.
 | An object key or URL is guessed or reused | Random IDs, never content hashes. Proxied downloads with a membership check. No presigned URLs. |
 | S3 credentials leak | Environment or file only. Never logged, returned or audited. HTTPS only. |
 | One org fills the pool or the bucket for others | The pool per org, plus the per-user staging cap and the upload limit. Bucket or volume capacity is watched by the operator's alerts. |
-| A forged or replayed usage report | Signed with `syncauth`, absolute totals, monotonic revision. KyIdentity verifies it. |
+| A forged or replayed usage report | Signed with `syncauth`, whose event ID and ±5-minute timestamp window are the replay guard. The revision is wall-clock send time, not a strict order: skew between replicas is bounded by that window, and a report dropped as stale is replaced within 5 minutes (§10.3). Totals are absolute, so order never changes a sum. |
 | Pool overshoot while KyIdentity is down | Bounded to 15 minutes of other apps' growth. Then fail closed for adding writes. |
 | Single-tenant changes by accident | Every change is gated on `IsMultiTenant()`. S3 settings refuse to start in single mode. Golden and upgrade tests. |
 
