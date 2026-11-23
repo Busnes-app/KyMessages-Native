@@ -142,11 +142,9 @@ func (k *KyIdentityClient) applyListedOrg(ctx context.Context, o suitedir.Org) e
 		} else if found {
 			k.auditSync(ctx, "tenancy.org_found", o.ID, "")
 		}
-	} else if missing {
-		if err := chat.ForgetTenantMissing(ctx, o.ID); err != nil {
-			return err
-		}
 	}
+	// A non-active listing leaves the missing flag alone: ApplyTenantLifecycle clears it only if
+	// it applies, so a stale listing can neither drop the flag nor block the later recovery.
 	if _, err := chat.ApplyTenantLifecycle(ctx, o.ID, status, o.Revision); err != nil {
 		return err
 	}
@@ -164,8 +162,9 @@ func (k *KyIdentityClient) applyListedOrg(ctx context.Context, o suitedir.Org) e
 }
 
 // checkMissing holds offline each active org a complete full read did not list, unless more
-// are missing than max(5% of active orgs, 3): then it holds none and audits the abort, since a
-// wrong issuer, a paging bug or an empty answer must not take every org offline.
+// are missing than max(5% of active orgs, 3) or than half the customer orgs: then it holds none
+// and audits the abort, since a wrong issuer, a paging bug or an empty answer must not take
+// orgs offline wholesale.
 func (k *KyIdentityClient) checkMissing(ctx context.Context, listed []suitedir.Org, startup bool) error {
 	active, err := k.store.Chat().ActiveTenantIDs(ctx)
 	if err != nil {
@@ -176,15 +175,22 @@ func (k *KyIdentityClient) checkMissing(ctx context.Context, listed []suitedir.O
 		seen[o.ID] = true
 	}
 	var missing []string
+	customers := 0
 	for _, id := range active {
-		if !seen[id] && id != k.tenancy.StaffOrgID {
+		if id == k.tenancy.StaffOrgID {
+			continue
+		}
+		customers++
+		if !seen[id] {
 			missing = append(missing, id)
 		}
 	}
 	if len(missing) == 0 {
 		return nil
 	}
-	if len(missing) > max(len(active)*5/100, 3) {
+	// The guard also refuses an answer missing more than half the customer orgs (an empty list,
+	// or one naming none of ours): on a small install max(5%, 3) alone would let it through.
+	if len(missing) > max(len(active)*5/100, 3) || 2*len(missing) > customers {
 		log.Printf("[TENANCY] ALERT: %d of %d active orgs missing from KyIdentity's list; holding none offline", len(missing), len(active))
 		k.auditSync(ctx, "tenancy.sync_aborted", "", fmt.Sprintf("missing=%d active=%d", len(missing), len(active)))
 		return nil

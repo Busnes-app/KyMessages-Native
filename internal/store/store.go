@@ -399,7 +399,6 @@ type ChatStore interface {
 	DeletedUnpurgedTenants(ctx context.Context) ([]string, error)
 	MarkTenantMissing(ctx context.Context, tenantID string, nowMs int64) (bool, error)
 	ClearTenantMissing(ctx context.Context, tenantID string, revision int64) (bool, error)
-	ForgetTenantMissing(ctx context.Context, tenantID string) error
 	TenantMissing(ctx context.Context, tenantID string) (bool, error)
 	PurgeAttachmentBatch(ctx context.Context, tenantID string, limit int) ([]BlobRef, error)
 	DeleteAttachmentRows(ctx context.Context, tenantID string, refs []BlobRef) error

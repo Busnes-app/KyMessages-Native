@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"sync"
 	"testing"
@@ -477,5 +478,69 @@ func TestTenancySyncReadsEveryPage(t *testing.T) {
 	}
 	if e.activeCount(t) != 102 {
 		t.Fatalf("orgs past the page bound were taken for missing: %d active", e.activeCount(t))
+	}
+}
+
+// On a small install (three customer orgs) an empty list, or one that names none of them, holds
+// no org offline.
+func TestTenancySyncSmallInstallGuard(t *testing.T) {
+	ctx := context.Background()
+	e := newSyncEnv(t)
+	for i := range 3 {
+		if _, err := e.st.Chat().EnsureTenant(ctx, syncOrgID(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.dir.list()
+	if err := e.kyid.SyncTenancy(ctx, true, false); err != nil || e.activeCount(t) != 3 {
+		t.Fatalf("empty list on a small install: %v, active %d", err, e.activeCount(t))
+	}
+	e.dir.list(listedOrg{ID: syncOrgID(9), Status: "active", Revision: 1}) // names none of ours
+	if err := e.kyid.SyncTenancy(ctx, true, false); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 3 {
+		if e.status(t, syncOrgID(i)) != store.TenantStatusActive {
+			t.Fatalf("a list naming none of ours held org %d offline", i)
+		}
+	}
+	// One of three missing is still held.
+	e.dir.list(listedAll(3, 1)...)
+	if err := e.kyid.SyncTenancy(ctx, true, false); err != nil || e.status(t, syncOrgID(1)) != store.TenantStatusSuspended {
+		t.Fatalf("one of three missing not held: %v", err)
+	}
+}
+
+// A stale non-active listing of a missing org changes nothing; the current active listing
+// still brings it back.
+func TestTenancySyncStaleSuspendedListingKeepsRecovery(t *testing.T) {
+	ctx := context.Background()
+	e := newSyncEnv(t)
+	for i := range 10 {
+		if _, err := e.st.Chat().EnsureTenant(ctx, syncOrgID(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.dir.list(listedAll(10)...) // org 3 active at revision 13
+	if err := e.kyid.SyncTenancy(ctx, true, false); err != nil {
+		t.Fatal(err)
+	}
+	e.dir.list(listedAll(10, 3)...)
+	if err := e.kyid.SyncTenancy(ctx, true, false); err != nil || e.status(t, syncOrgID(3)) != store.TenantStatusSuspended {
+		t.Fatalf("not held: %v", err)
+	}
+	stale := listedAll(10, 3)
+	stale = append(stale, listedOrg{ID: syncOrgID(3), Status: "suspended", Revision: 12})
+	sort.Slice(stale, func(i, j int) bool { return stale[i].Revision < stale[j].Revision })
+	e.dir.list(stale...)
+	if err := e.kyid.SyncTenancy(ctx, true, false); err != nil {
+		t.Fatal(err)
+	}
+	if missing, _ := e.st.Chat().TenantMissing(ctx, syncOrgID(3)); !missing {
+		t.Fatal("a stale suspended listing dropped the missing flag")
+	}
+	e.dir.list(listedAll(10)...)
+	if err := e.kyid.SyncTenancy(ctx, true, false); err != nil || e.status(t, syncOrgID(3)) != store.TenantStatusActive {
+		t.Fatalf("the active listing did not bring it back: %v %q", err, e.status(t, syncOrgID(3)))
 	}
 }

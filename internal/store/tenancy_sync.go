@@ -51,13 +51,6 @@ func (c *chatStore) ClearTenantMissing(ctx context.Context, tenantID string, rev
 	return c.changed(ctx, `UPDATE tenants SET status = 'active', missing_since = NULL WHERE id = ? AND missing_since IS NOT NULL AND status = 'suspended' AND lifecycle_revision <= ?`, tenantID, revision)
 }
 
-// ForgetTenantMissing drops the missing flag when KyIdentity lists the org with another status,
-// which then applies by its own revision.
-func (c *chatStore) ForgetTenantMissing(ctx context.Context, tenantID string) error {
-	_, err := c.store.db.ExecContext(ctx, c.store.rebind(`UPDATE tenants SET missing_since = NULL WHERE id = ?`), tenantID)
-	return err
-}
-
 // TenantMissing reports whether tenantID carries the missing flag.
 func (c *chatStore) TenantMissing(ctx context.Context, tenantID string) (bool, error) {
 	var since sql.NullInt64
