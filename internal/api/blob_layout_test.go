@@ -16,7 +16,7 @@ import (
 // Multi mode stores each org's blobs under orgs/<tenant_id>/att/, moves blobs written flat
 // before that, and refuses a replica whose attachment directory is not the shared volume.
 func TestMultiTenantBlobLayout(t *testing.T) {
-	a, _, st, cfg := newReplicas(t)
+	a, _, st, cfg := newReplicas(t, withPool(t, &fakePool{headroom: 1 << 20}))
 	_, tokA := createOrgUser(t, st, "usr_blob_a", "bloba", "user", replicaOrgA)
 	_, tokB := createOrgUser(t, st, "usr_blob_b", "blobb", "user", replicaOrgB)
 	rec := doBearerJSON(t, a, http.MethodPost, "/api/v1/rooms", tokA, map[string]any{"kind": store.RoomKindChannel, "name": "files"}, nil)

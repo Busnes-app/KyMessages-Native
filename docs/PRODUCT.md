@@ -25,8 +25,9 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
   replica, secrets every replica shares, the capsule scheduler off in `multi` (PostgreSQL tooling
   backs it up), sign-in limits and proof-of-work shared by every replica, a meeting ID space per
   org, and meeting guest sessions in PostgreSQL, and attachments stored per org on one shared
-  volume. Calls still need both peers on one replica. Object storage and the org storage pool are
-  not built.
+  volume. Calls still need both peers on one replica. Each org's attachments count against its
+  KyIdentity storage pool; a full pool refuses new attachments only ("Your plan's storage is
+  full"), never reading, deleting, text or calls. Object storage is not built.
 - **Invite-only:** accounts come from KyIdentity (OIDC + signed directory sync webhooks) or local
   admin provisioning in single-tenant mode. No public sign-up. External guests can join only
   scheduled or instant meeting rooms through time-bounded guest links with host-approved lobby

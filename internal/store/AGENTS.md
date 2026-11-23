@@ -104,6 +104,14 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   running anything. It takes only `sqlite` or `postgres`/`postgresql` and picks its placeholder
   from that.
 - `GetAllSettings` returns any row scan error rather than omitting the row. `SetSettingOnce` stores a value only when the key is unset and returns the stored one, so the first replica wins (`blobs.store_id`).
+- Migration 59 adds the org storage pool to `tenants`: `pool_seq` (each report's sequence,
+  `NextPoolSeq`, so it rises across replicas), and KyIdentity's latest grant
+  (`pool_ceiling_bytes`, `pool_expires_at` in Unix ms, `pool_reported_bytes`). `SetPoolGrant`
+  applies only to the latest numbered report; `RaisePoolSeq` follows a higher stale sequence.
+  With `AttachmentQuotaLimits.Pool`, `ReserveAttachmentQuota` and `CommitAttachmentWithQuota`
+  check the org's usage plus the new bytes against the unexpired ceiling under the tenant lock:
+  `ErrPoolFull`, or `ErrPoolUnavailable` with no grant or an expired one. Single mode never sets
+  `Pool` and never reads the columns.
 - `PurgeOrphanAttachments` returns `BlobRef`s (tenant and key), and `AttachmentTenant` returns a blob key's org, because the multi-mode blob layout needs each blob's org.
 - SQLite runs in WAL mode with foreign keys enabled.
 - PostgreSQL queries are rebound dynamically from standard positional parameters.

@@ -136,6 +136,9 @@ type Attachment struct {
 type AttachmentQuotaLimits struct {
 	MaxTotalBytes       int64
 	MaxPendingUserBytes int64
+	// Pool (multi mode, customer orgs) checks the org's storage-pool grant as well: committed
+	// usage plus the new bytes must fit the ceiling, before the grant expires.
+	Pool bool
 }
 
 // AttachmentQuotaLimitKind identifies which cap constrained a reservation.
@@ -145,6 +148,7 @@ const (
 	AttachmentQuotaLimitUpload  AttachmentQuotaLimitKind = "upload"
 	AttachmentQuotaLimitPending AttachmentQuotaLimitKind = "pending"
 	AttachmentQuotaLimitTenant  AttachmentQuotaLimitKind = "tenant"
+	AttachmentQuotaLimitPool    AttachmentQuotaLimitKind = "pool"
 )
 
 // AttachmentQuotaReservation holds in-flight capacity reserved for a single upload.

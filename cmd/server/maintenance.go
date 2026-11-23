@@ -133,3 +133,26 @@ func attachmentSweepLoop(ctx context.Context, sweep func(context.Context, time.T
 		}
 	}
 }
+
+// poolLoop reports each org's attachment bytes to KyIdentity's storage pool and refreshes its
+// grant once a minute (multi mode; api.Server.RefreshPool). done closes between runs.
+func poolLoop(ctx context.Context, refresh func(context.Context, time.Time) error, gate jobGate, done chan<- struct{}) {
+	defer close(done)
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		if gate(ctx, "pool_report", time.Minute) {
+			run, cancel := context.WithTimeout(ctx, 50*time.Second)
+			err := refresh(run, time.Now())
+			cancel()
+			if err != nil && ctx.Err() == nil {
+				log.Printf("[POOL] storage report incomplete (retrying in a minute): %v", err)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}

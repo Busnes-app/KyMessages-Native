@@ -88,6 +88,9 @@ func runServer() {
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
+	if cfg.Tenancy.IsMultiTenant() && strings.TrimSpace(os.Getenv("KY_ATTACHMENTS_MAX_TOTAL_BYTES")) != "" {
+		log.Printf("[ATTACHMENTS] KY_ATTACHMENTS_MAX_TOTAL_BYTES is ignored in multi-tenant mode: each org's storage pool (KyIdentity) limits its attachments")
+	}
 	if cfg.Backup.AllowPrivateRecovery {
 		log.Printf("[BACKUP] KY_BACKUP_ALLOW_PRIVATE_RECOVERY is on: RFC1918 and CGNAT destinations admitted; loopback, link-local and other reserved addresses remain refused (HTTPS still required)")
 	}
@@ -132,10 +135,17 @@ func runServer() {
 		go agentExpiryLoop(ctx, srv.ExpireIdleAgents, gate, agentsDone)
 		attachmentsDone := make(chan struct{})
 		go attachmentSweepLoop(ctx, srv.SweepOrphanAttachments, gate, attachmentsDone)
+		poolDone := make(chan struct{})
+		if cfg.Tenancy.IsMultiTenant() {
+			go poolLoop(ctx, srv.RefreshPool, gate, poolDone)
+		} else {
+			close(poolDone)
+		}
 		pairingsDone := make(chan struct{})
 		maintenanceLoop(ctx, st, gate, cfg.Tenancy.IsMultiTenant(), pairingsDone)
 		<-agentsDone
 		<-attachmentsDone
+		<-poolDone
 		close(maintenanceDone)
 	}()
 	backgroundDone := make(chan struct{})

@@ -1356,6 +1356,20 @@ func (c *chatStore) ReserveAttachmentQuota(ctx context.Context, tenantID, upload
 			limiting = AttachmentQuotaLimitPending
 		}
 	}
+	if limits.Pool {
+		ceiling, err := c.poolCeilingTx(ctx, tx, tenantID, now)
+		if err != nil {
+			return nil, err
+		}
+		poolRem := ceiling - tenantUsed
+		if poolRem <= 0 {
+			return nil, ErrPoolFull
+		}
+		if poolRem < granted {
+			granted = poolRem
+			limiting = AttachmentQuotaLimitPool
+		}
+	}
 
 	resID := "res_" + uuid.Must(uuid.NewV7()).String()
 	insQ := c.store.rebind(`
@@ -1420,6 +1434,15 @@ func (c *chatStore) CommitAttachmentWithQuota(ctx context.Context, reservationID
 	}
 	if limits.MaxPendingUserBytes > 0 && a.MessageID == "" && pendingUsed+a.SizeBytes > limits.MaxPendingUserBytes {
 		return ErrAttachmentPendingQuotaExceeded
+	}
+	if limits.Pool {
+		ceiling, err := c.poolCeilingTx(ctx, tx, a.TenantID, nowMilli())
+		if err != nil {
+			return err
+		}
+		if tenantUsed+a.SizeBytes > ceiling {
+			return ErrPoolFull
+		}
 	}
 
 	insQ := c.store.rebind(`
