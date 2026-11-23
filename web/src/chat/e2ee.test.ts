@@ -1,7 +1,7 @@
 import 'fake-indexeddb/auto';
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { forgetCryptoStore, startE2EE } from './e2ee';
+import { abandonDevice, forgetCryptoStore, startE2EE } from './e2ee';
 
 // jsdom cannot fetch the module by URL; load it from disk instead.
 vi.mock('../crypto/index', async (importOriginal) => {
@@ -13,6 +13,7 @@ const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { sta
 
 afterEach(async () => {
   await forgetCryptoStore();
+  localStorage.clear();
   vi.unstubAllGlobals();
 });
 
@@ -44,5 +45,29 @@ describe('the signed-in device', () => {
     expect(again.deviceId).not.toBe(first.deviceId);
     expect(again.curve25519).not.toBe(first.curve25519);
     expect(known.has(first.deviceId)).toBe(false);
+  });
+
+  it('retires a device abandoned by a revoked session after the next sign-in', async () => {
+    const deleted: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/v1/keys/upload') {
+        const req = JSON.parse(String(init?.body)) as { one_time_keys: unknown[] };
+        return json({ one_time_key_count: req.one_time_keys.length });
+      }
+      if (url.startsWith('/api/v1/keys/devices/') && init?.method === 'DELETE') {
+        deleted.push(decodeURIComponent(url.slice('/api/v1/keys/devices/'.length)));
+        return new Response(null, { status: 204 });
+      }
+      if (url.startsWith('/api/v1/to-device')) return json({ messages: [] });
+      return json({ error: `unexpected ${url}` }, 404);
+    }));
+    const old = await startE2EE('u_alice');
+    await abandonDevice(); // the session was revoked: nothing can be deleted yet
+    expect(deleted).toEqual([]);
+    const fresh = await startE2EE('u_alice');
+    await vi.waitFor(() => expect(deleted).toEqual([old.deviceId]));
+    expect(fresh.deviceId).not.toBe(old.deviceId);
+    expect(localStorage.getItem('kymessages-e2ee-retire')).toBeNull();
   });
 });

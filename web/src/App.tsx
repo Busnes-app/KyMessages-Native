@@ -21,7 +21,7 @@ import './ky-ui/navigation.css';
 import { errorMessage, secureFetch } from './api';
 import { browserPushEndpoint, unsubscribeBrowserPush } from './chat/push';
 import { announceSignOut, forgetSearchIndex, onSignOutElsewhere } from './chat/searchIndex';
-import { forgetCryptoStore, replaceDevice, retireDevice } from './chat/e2ee';
+import { abandonDevice, forgetCryptoStore, replaceDevice, retireDevice } from './chat/e2ee';
 import { parseSettings, parseUser, type SessionUser, type SiteSettings } from './dto';
 import { ErrorBoundary } from './components/ErrorBoundary';
 
@@ -40,18 +40,20 @@ export const App: React.FC = () => {
 
   // Leaving the signed-in app: unmount it (so nothing reopens the search index), then delete the
   // index and say if that failed, so a shared browser is not left holding readable history.
-  const leave = useCallback(async (message: string) => {
+  // `device` cleans up this browser's encryption device: deleted on sign-out, abandoned (retired
+  // after the next sign-in) when the session was revoked and can no longer delete it.
+  const leave = useCallback(async (message: string, device: () => Promise<void>) => {
     setActiveCallSummary(null);
     setUser(null);
     // Both local stores go: the search index (readable history) and the device's keys.
-    const results = await Promise.allSettled([forgetSearchIndex(), forgetCryptoStore()]);
+    const results = await Promise.allSettled([forgetSearchIndex(), device()]);
     if (results.every((r) => r.status === 'fulfilled')) setNotice(message);
     else setNotice(`${message} This browser could not delete all of its local message data: close every KyMessages tab, then sign in and out again.`.trim());
   }, []);
 
   // A sign-out in another tab signs this one out too, even if its WebSocket missed the revocation.
   useEffect(() => onSignOutElsewhere(() => {
-    if (signedInRef.current) void leave('You signed out in another tab.');
+    if (signedInRef.current) void leave('You signed out in another tab.', forgetCryptoStore);
   }), [leave]);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState<boolean>(!meetToken);
@@ -139,7 +141,7 @@ export const App: React.FC = () => {
       if (pushEndpoint) void unsubscribeBrowserPush();
       signedInRef.current = false;
       announceSignOut();
-      await leave('');
+      await leave('', forgetCryptoStore);
     } catch (err) {
       // Still signed in, but the old device is gone from the server: start a new one.
       if (retired) void replaceDevice().catch(() => undefined);
@@ -228,7 +230,7 @@ export const App: React.FC = () => {
               onOpenSettings={() => setActiveTab('settings')}
               onLogout={handleLogout}
               onActiveCallChange={setActiveCallSummary}
-              onAuthRevoked={() => void leave('Your session ended. Sign in again to continue.')}
+              onAuthRevoked={() => void leave('Your session ended. Sign in again to continue.', abandonDevice)}
             />
           </ErrorBoundary>
         </main>

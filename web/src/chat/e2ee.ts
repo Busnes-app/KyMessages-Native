@@ -109,6 +109,7 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
       e = await CryptoEngine.open(userId, httpKeyServer, await openCryptoStore(userId));
     }
     e.setMembershipLive(membershipLive);
+    void retireAbandoned(userId).catch(() => undefined);
     e.onKeys(() => {
       for (const fn of keyListeners) fn();
     });
@@ -211,6 +212,55 @@ export function openMessages(list: ChatMessage[]): Promise<ChatMessage[]> {
 export async function retireDevice(): Promise<void> {
   const e = await current?.engine.catch(() => undefined);
   if (e) await call(`/api/v1/keys/devices/${encodeURIComponent(e.deviceId)}`, 'DELETE').catch(() => undefined);
+}
+
+// Devices abandoned when a session was revoked: the server no longer accepts that session, so
+// each is removed from the key server the next time its user's device starts here.
+const RETIRE_KEY = 'kymessages-e2ee-retire';
+type Abandoned = { user_id: string; device_id: string };
+
+function abandoned(): Abandoned[] {
+  try {
+    const v: unknown = JSON.parse(localStorage.getItem(RETIRE_KEY) ?? '[]');
+    return Array.isArray(v) ? v.filter((d): d is Abandoned => typeof d?.user_id === 'string' && typeof d?.device_id === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveAbandoned(list: Abandoned[]): void {
+  try {
+    if (list.length === 0) localStorage.removeItem(RETIRE_KEY);
+    else localStorage.setItem(RETIRE_KEY, JSON.stringify(list.slice(-20)));
+  } catch {
+    // No storage: the device stays listed until it is removed by hand.
+  }
+}
+
+async function retireAbandoned(userId: string): Promise<void> {
+  const left: Abandoned[] = [];
+  for (const d of abandoned()) {
+    if (d.user_id !== userId) {
+      left.push(d);
+      continue;
+    }
+    try {
+      await call(`/api/v1/keys/devices/${encodeURIComponent(d.device_id)}`, 'DELETE');
+    } catch (e) {
+      if (!(e instanceof KeyServerError && e.status === 404)) left.push(d);
+    }
+  }
+  saveAbandoned(left);
+}
+
+/**
+ * For a revoked session: deletes the local store now and removes the device from the key server
+ * after its user next signs in here, so members stop sending keys to a device nobody holds.
+ */
+export async function abandonDevice(): Promise<void> {
+  const e = await current?.engine.catch(() => undefined);
+  if (e) saveAbandoned([...abandoned(), { user_id: e.userId, device_id: e.deviceId }]);
+  await forgetCryptoStore();
 }
 
 /** Closes the device and deletes every crypto store in this browser, for sign-out. */

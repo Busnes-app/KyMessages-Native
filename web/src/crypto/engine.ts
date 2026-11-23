@@ -574,7 +574,7 @@ export class CryptoEngine {
           // This device reads its own messages through an inbound copy, like everyone else.
           const own = new InboundGroupSession(session.sessionKey());
           try {
-            await this.store.write([[`in:${session.sessionId}`, {
+            await this.store.write([[inboundKey(this.curve25519, session.sessionId), {
               pickle: own.pickle(this.key),
               room_id: roomId,
               sender_user: this.userId,
@@ -617,7 +617,7 @@ export class CryptoEngine {
   async decrypt(m: SealedMessage): Promise<Opened> {
     const env = parseEnvelope(m.body);
     if (!env) return { state: 'failed', reason: 'This message is damaged.' };
-    const rec = await this.store.get<InboundRecord>(`in:${env.session_id}`);
+    const rec = await this.store.get<InboundRecord>(inboundKey(env.sender_key, env.session_id));
     if (!rec) return { state: 'waiting', sessionId: env.session_id };
     if (rec.sender_key !== env.sender_key || rec.sender_device !== env.device_id || rec.sender_user !== m.sender_id) {
       return { state: 'failed', reason: 'This message did not come from the device it names.' };
@@ -643,7 +643,7 @@ export class CryptoEngine {
     if (!inner) return { state: 'failed', reason: 'This message is damaged.' };
     if (inner.room_id !== m.room_id) return { state: 'failed', reason: 'This message was encrypted for another room.' };
     if (inner.type === 'edit' && inner.message_id !== m.id) return { state: 'failed', reason: 'This edit belongs to another message.' };
-    const owner = await this.store.putIfAbsent(`seen:${env.session_id}:${index}`, m.id);
+    const owner = await this.store.putIfAbsent(seenKey(env.sender_key, env.session_id, index), m.id);
     if (owner !== m.id) return { state: 'failed', reason: 'This message is a replay of another message.' };
     return { state: 'decrypted', inner };
   }
@@ -719,7 +719,7 @@ export class CryptoEngine {
     const session = new InboundGroupSession(k.session_key);
     try {
       if (session.sessionId !== k.session_id) throw new Error('Room key does not match its session');
-      const key = `in:${k.session_id}`;
+      const key = inboundKey(sender.curve25519, k.session_id);
       const known = await this.store.get<InboundRecord>(key);
       if (known) {
         // A session is bound to its first sender and room; a later copy may only reach further back.
@@ -741,6 +741,12 @@ export class CryptoEngine {
     }
   }
 }
+
+// Room sessions and their replay log are keyed by the sender's verified curve25519 key as well
+// as the session ID: a member who re-shares someone else's session as their own gets a separate
+// entry, and can neither displace the real sender's key nor claim its message indexes.
+const inboundKey = (senderKey: string, sessionId: string) => `in:${senderKey}:${sessionId}`;
+const seenKey = (senderKey: string, sessionId: string, index: number) => `seen:${senderKey}:${sessionId}:${index}`;
 
 function lockName(userId: string): string {
   return `kymessages-crypto-${userId}`;

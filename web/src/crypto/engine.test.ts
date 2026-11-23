@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { CryptoEngine, parseEnvelope, ROTATE_AFTER_MESSAGES, ROTATE_AFTER_MS, type SealedMessage } from './engine';
 import { FakeKeyServer } from './fakeKeyServer';
-import { Account, loadCryptoSync } from './index';
+import { Account, GroupSession, loadCryptoSync } from './index';
 import { deleteCryptoStores, openCryptoStore } from './store';
 
 beforeAll(() => {
@@ -300,6 +300,39 @@ describe('encrypted rooms between two client engines', () => {
     server.devices.get('u_bob')!.set(bob.deviceId, { device_id: bob.deviceId, curve25519: fake.curve25519, ed25519: fake.ed25519, signature: fake.sign(signed) });
     fake.free();
     expect(await alice.verifiedDevices(['u_bob'])).toEqual([]);
+  });
+
+  it('keeps the real sender’s session when a member re-shares it as their own first', async () => {
+    const server = new FakeKeyServer();
+    const alice = await device(server, 'u_alice');
+    const bob = await device(server, 'u_bob');
+    const mallory = await device(server, 'u_mallory');
+    server.join('r1', 'u_alice', 'u_bob', 'u_mallory');
+    // Mallory, a member, learns the signed session key Alice shares with everyone.
+    const keys: string[] = [];
+    const real = GroupSession.prototype.sessionKey;
+    vi.spyOn(GroupSession.prototype, 'sessionKey').mockImplementation(function (this: GroupSession) {
+      const k = real.call(this);
+      keys.push(k);
+      return k;
+    });
+    const m1 = await send('r1', alice, 'from alice');
+    const sessionId = parseEnvelope(m1.body)!.session_id;
+    // She forwards it to Bob as her own session, and her mail reaches him before Alice's.
+    const [bobDevice] = await mallory.verifiedDevices(['u_bob']);
+    const forged = { sessionId, sessionKey: () => keys[0] } as unknown as GroupSession;
+    await (mallory as unknown as { shareRoomKey(r: string, g: GroupSession, t: unknown[]): Promise<unknown> }).shareRoomKey('r1', forged, [bobDevice]);
+    const box = server.mail.get(`u_bob\n${bob.deviceId}`)!;
+    box.unshift(box.pop()!);
+    expect(box[0].sender_user_id).toBe('u_mallory');
+    await bob.receive();
+    // Mallory re-posts Alice's ciphertext as hers first, aiming to claim its message index.
+    const asMallory = { ...post('r1', mallory, JSON.stringify({ ...parseEnvelope(m1.body)!, sender_key: mallory.curve25519, device_id: mallory.deviceId })) };
+    expect(await read(bob, asMallory)).toBe('from alice');
+    // Alice's message still opens as hers, and is no replay.
+    expect(await read(bob, m1)).toBe('from alice');
+    const m2 = await send('r1', alice, 'still alice');
+    expect(await read(bob, m2)).toBe('still alice');
   });
 
   it('refuses room keys from a device that is not the sender’s', async () => {

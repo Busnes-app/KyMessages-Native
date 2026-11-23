@@ -31,6 +31,7 @@ export const receiveRoomKeys = () => undefined;
 export const roomMembershipChanged = () => undefined;
 export const setMembershipLive = () => undefined;
 export const retireDevice = async () => undefined;
+export const abandonDevice = async () => undefined;
 export const forgetCryptoStore = async () => undefined;
 export const replaceDevice = async () => undefined;
 
