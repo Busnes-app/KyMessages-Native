@@ -1397,25 +1397,6 @@
   flex-shrink: 0;
 }
 
-.chat-webhook-secret {
-  background: var(--bg);
-  border: 1px solid var(--line);
-  border-radius: 7px;
-  padding: 0.65rem;
-  display: flex;
-  flex-direction: column;
-  gap: 0.45rem;
-  font-size: 0.76rem;
-}
-
-.chat-webhook-secret pre {
-  font-family: var(--font-mono);
-  font-size: 0.7rem;
-  white-space: pre-wrap;
-  word-break: break-all;
-  color: var(--ink-strong);
-}
-
 /* Modals */
 .chat-modal-card {
   width: min(30rem, calc(100vw - 2rem));

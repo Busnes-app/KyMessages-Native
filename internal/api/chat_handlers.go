@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -11,7 +10,6 @@ import (
 	"time"
 
 	"github.com/Busnes-app/ky_server_base/internal/chat"
-	"github.com/Busnes-app/ky_server_base/internal/crypto"
 	"github.com/Busnes-app/ky_server_base/internal/store"
 )
 
@@ -1048,247 +1046,12 @@ func (s *Server) handleChatSearch(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]any{"messages": hits})
 }
 
-type createWebhookRequest struct {
-	Name string `json:"name"`
-}
-
-// POST /api/v1/rooms/{id}/webhooks
-func (s *Server) handleChatCreateWebhook(w http.ResponseWriter, r *http.Request) {
-	user, _, ok := s.currentUser(r)
-	if !ok {
-		s.writeError(w, http.StatusUnauthorized, "Authentication required")
-		return
-	}
-	tenantID, ok := s.requireUserTenant(w, r, user)
-	if !ok {
-		return
-	}
-	if !s.allowChatAction(w, user.ID, chatLimitRooms) {
-		return
-	}
-	roomID := r.PathValue("id")
-
-	member, ok := s.requireRoomMember(w, r, tenantID, roomID, user.ID)
-	if !ok {
-		return
-	}
-	if !isRoomModerator(member, user) {
-		s.writeError(w, http.StatusForbidden, "Room moderator role required")
-		return
-	}
-
-	var req createWebhookRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.writeError(w, http.StatusBadRequest, "Invalid request body")
-		return
-	}
-	name := strings.TrimSpace(req.Name)
-	if name == "" || len(name) > maxRoomNameLen {
-		s.writeError(w, http.StatusBadRequest, "Webhook name must be 1 to 100 characters")
-		return
-	}
-
-	rawToken := "kywh_" + crypto.RandomHex(32)
-	wh := &store.RoomWebhook{
-		TenantID:  tenantID,
-		RoomID:    roomID,
-		Name:      name,
-		Direction: store.WebhookDirectionIncoming,
-		TokenHash: crypto.SHA256Hex([]byte(rawToken)),
-		CreatedBy: user.ID,
-	}
-	if err := s.store.Chat().CreateRoomWebhook(r.Context(), wh); err != nil {
-		s.writeError(w, http.StatusInternalServerError, "Failed to create webhook")
-		return
-	}
-
-	s.writeJSON(w, http.StatusCreated, map[string]any{
-		"webhook": wh,
-		"token":   rawToken,
-		"url":     strings.TrimRight(s.config.Server.AppURL, "/") + "/api/v1/webhooks/in/" + wh.ID,
-	})
-}
-
-// GET /api/v1/rooms/{id}/webhooks
-func (s *Server) handleChatListWebhooks(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Cache-Control", "no-store")
-	user, _, ok := s.currentUser(r)
-	if !ok {
-		s.writeError(w, http.StatusUnauthorized, "Authentication required")
-		return
-	}
-	tenantID, ok := s.requireUserTenant(w, r, user)
-	if !ok {
-		return
-	}
-	roomID := r.PathValue("id")
-
-	member, ok := s.requireRoomMember(w, r, tenantID, roomID, user.ID)
-	if !ok {
-		return
-	}
-	if !isRoomModerator(member, user) {
-		s.writeError(w, http.StatusForbidden, "Room moderator role required")
-		return
-	}
-
-	list, err := s.store.Chat().ListRoomWebhooks(r.Context(), tenantID, roomID)
-	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "Failed to list webhooks")
-		return
-	}
-	s.writeJSON(w, http.StatusOK, map[string]any{"webhooks": list})
-}
-
-// DELETE /api/v1/rooms/{id}/webhooks/{wid}
-func (s *Server) handleChatRevokeWebhook(w http.ResponseWriter, r *http.Request) {
-	user, _, ok := s.currentUser(r)
-	if !ok {
-		s.writeError(w, http.StatusUnauthorized, "Authentication required")
-		return
-	}
-	tenantID, ok := s.requireUserTenant(w, r, user)
-	if !ok {
-		return
-	}
-	roomID := r.PathValue("id")
-	webhookID := r.PathValue("wid")
-
-	member, ok := s.requireRoomMember(w, r, tenantID, roomID, user.ID)
-	if !ok {
-		return
-	}
-	if !isRoomModerator(member, user) {
-		s.writeError(w, http.StatusForbidden, "Room moderator role required")
-		return
-	}
-
-	if err := s.store.Chat().RevokeRoomWebhook(r.Context(), tenantID, roomID, webhookID); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			s.writeError(w, http.StatusNotFound, "Webhook not found")
-			return
-		}
-		s.writeError(w, http.StatusInternalServerError, "Failed to revoke webhook")
-		return
-	}
-	s.writeJSON(w, http.StatusOK, map[string]bool{"revoked": true})
-}
-
-type incomingWebhookPayload struct {
-	Body           string `json:"body"`
-	Text           string `json:"text"` // Slack-compatible alias
-	IdempotencyKey string `json:"idempotency_key"`
-}
-
-// POST /api/v1/webhooks/in/{id}
-// Authenticated strictly by per-webhook Bearer token (never browser cookies).
+// POST /api/v1/webhooks/in/{id}: incoming webhooks were removed so every room can be end-to-end
+// encrypted (docs/superpowers/specs/2026-11-22-e2ee-design.md §8). It answers every sender alike,
+// without looking the ID up, so it says nothing about which webhooks existed.
 func (s *Server) handleChatIncomingWebhook(w http.ResponseWriter, r *http.Request) {
-	webhookID := r.PathValue("id")
-	authHeader := r.Header.Get("Authorization")
-	if !strings.HasPrefix(authHeader, "Bearer ") {
-		s.writeError(w, http.StatusUnauthorized, "Bearer token required")
-		return
-	}
-	rawToken := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
-	if rawToken == "" {
-		s.writeError(w, http.StatusUnauthorized, "Bearer token required")
-		return
-	}
-
-	wh, err := s.store.Chat().GetRoomWebhook(r.Context(), webhookID)
-	if err != nil || wh.RevokedAt != nil || wh.Direction != store.WebhookDirectionIncoming {
-		s.writeError(w, http.StatusUnauthorized, "Invalid webhook token")
-		return
-	}
-	givenHash := crypto.SHA256Hex([]byte(rawToken))
-	if len(givenHash) != len(wh.TokenHash) || subtle.ConstantTimeCompare([]byte(givenHash), []byte(wh.TokenHash)) != 1 {
-		s.writeError(w, http.StatusUnauthorized, "Invalid webhook token")
-		return
-	}
-	active, err := s.isTenantActive(r.Context(), wh.TenantID)
-	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "Failed to verify organization")
-		return
-	}
-	if !active {
-		s.writeError(w, http.StatusForbidden, "Organization is suspended or inactive")
-		return
-	}
-	// A webhook carries its creator's authority: it stops when they are offboarded,
-	// leave the room, or stop moderating it.
-	creator, err := s.store.Users().GetUserByID(r.Context(), wh.CreatedBy)
-	var member *store.RoomMember
-	if err == nil {
-		member, err = s.store.Chat().GetRoomMember(r.Context(), wh.TenantID, wh.RoomID, creator.ID)
-	}
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		s.writeError(w, http.StatusInternalServerError, "Failed to verify webhook creator")
-		return
-	}
-	// Membership comes first, as on every moderator route: no one, a global admin
-	// included, keeps a webhook in a room they have left.
-	if errors.Is(err, store.ErrNotFound) || creator.Status != "active" || !isRoomModerator(member, creator) {
-		s.writeError(w, http.StatusForbidden, "Webhook creator no longer has access to this room")
-		return
-	}
-	if !s.allowAccountAttempt("wh:"+wh.ID, 60, time.Minute) {
-		s.writeError(w, http.StatusTooManyRequests, "Webhook rate limit exceeded")
-		return
-	}
-
-	var req incomingWebhookPayload
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.writeError(w, http.StatusBadRequest, "Invalid request body")
-		return
-	}
-	body := strings.TrimSpace(req.Body)
-	if body == "" {
-		body = strings.TrimSpace(req.Text)
-	}
-	if body == "" || len(body) > maxMessageBodyLen {
-		s.writeError(w, http.StatusBadRequest, "body or text must be 1 to 16384 bytes")
-		return
-	}
-	idemKey := strings.TrimSpace(req.IdempotencyKey)
-	if idemKey == "" {
-		idemKey = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
-	}
-	if len(idemKey) > maxIdempotencyKeyLen {
-		s.writeError(w, http.StatusBadRequest, "idempotency_key too long")
-		return
-	}
-
-	msg, created, err := s.store.Chat().CreateMessage(r.Context(), store.CreateMessageParams{
-		TenantID:        wh.TenantID,
-		RoomID:          wh.RoomID,
-		SenderID:        "webhook:" + wh.ID,
-		SenderName:      wh.Name,
-		Encoding:        store.MessageEncodingPlainV1,
-		Body:            body,
-		IdempotencyKey:  idemKey,
-		SkipMemberCheck: true,
+	s.writeJSON(w, http.StatusGone, map[string]string{
+		"error": "Incoming webhooks were removed because rooms are end-to-end encrypted; post through a bot (Bots & Agents) instead",
+		"code":  "gone",
 	})
-	if errors.Is(err, store.ErrRoomClosed) {
-		s.writeError(w, http.StatusConflict, "Room is closed")
-		return
-	}
-	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "Failed to post webhook message")
-		return
-	}
-
-	if created {
-		_ = s.chatHub.PublishRoom(r.Context(), wh.RoomID, chat.Event{
-			Type:   chat.EventMessageNew,
-			RoomID: wh.RoomID,
-			Seq:    msg.Seq,
-			Data:   chat.MustMarshalData(msg),
-		})
-		s.pushAsync(r.Context(), func(ctx context.Context) { s.dispatchMessagePush(ctx, wh.TenantID, wh.RoomID, msg) })
-	}
-	status := http.StatusOK
-	if created {
-		status = http.StatusCreated
-	}
-	s.writeJSON(w, status, map[string]any{"message": msg})
 }

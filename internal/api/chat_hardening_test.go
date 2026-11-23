@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"strings"
 	"testing"
 
 	"github.com/Busnes-app/ky_server_base/internal/store"
@@ -56,31 +55,14 @@ func TestChatInputHardening(t *testing.T) {
 		t.Fatalf("reply in the same room = %d, want 201", code)
 	}
 
-	// Webhook idempotency keys are capped like member ones: a 500 from Postgres otherwise.
-	rec := doBearerJSON(t, srv, http.MethodPost, roomA+"/webhooks", aliceTok, map[string]any{"name": "CI"}, nil)
-	var hook struct {
-		Webhook store.RoomWebhook `json:"webhook"`
-		Token   string            `json:"token"`
-	}
-	_ = json.Unmarshal(rec.Body.Bytes(), &hook)
-	post := func(key string) int {
-		return doBearerJSON(t, srv, http.MethodPost, "/api/v1/webhooks/in/"+hook.Webhook.ID, hook.Token, map[string]any{"text": "hi", "idempotency_key": key}, nil).Code
-	}
-	if code := post(strings.Repeat("k", 129)); code != http.StatusBadRequest {
-		t.Fatalf("webhook key of 129 bytes = %d, want 400", code)
-	}
-	if code := post(strings.Repeat("k", 128)); code != http.StatusCreated {
-		t.Fatalf("webhook key of 128 bytes = %d, want 201", code)
-	}
-
 	// Suspended accounts cannot be put in rooms or DMs.
-	if rec = doBearerJSON(t, srv, http.MethodPost, roomA+"/members", aliceTok, map[string]any{"user_id": gone.ID}, nil); rec.Code != http.StatusNotFound {
+	if rec := doBearerJSON(t, srv, http.MethodPost, roomA+"/members", aliceTok, map[string]any{"user_id": gone.ID}, nil); rec.Code != http.StatusNotFound {
 		t.Fatalf("add suspended member = %d, want 404", rec.Code)
 	}
-	if rec = doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", aliceTok, map[string]any{"kind": "dm", "dm_user_id": gone.ID}, nil); rec.Code != http.StatusNotFound {
+	if rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", aliceTok, map[string]any{"kind": "dm", "dm_user_id": gone.ID}, nil); rec.Code != http.StatusNotFound {
 		t.Fatalf("DM a suspended user = %d, want 404", rec.Code)
 	}
-	if rec = doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", aliceTok, map[string]any{"name": "c", "member_ids": []string{gone.ID}}, nil); rec.Code != http.StatusBadRequest {
+	if rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", aliceTok, map[string]any{"name": "c", "member_ids": []string{gone.ID}}, nil); rec.Code != http.StatusBadRequest {
 		t.Fatalf("create room with a suspended member = %d, want 400", rec.Code)
 	}
 }

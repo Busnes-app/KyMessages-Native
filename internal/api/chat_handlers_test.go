@@ -237,7 +237,6 @@ func TestChatEndToEndRESTAndWebSocket(t *testing.T) {
 		{http.MethodGet, "/api/v1/rooms/" + roomID + "/messages", nil},
 		{http.MethodPost, "/api/v1/rooms/" + roomID + "/messages", map[string]any{"body": "sneak"}},
 		{http.MethodPost, "/api/v1/rooms/" + roomID + "/read", map[string]any{"seq": 1}},
-		{http.MethodGet, "/api/v1/rooms/" + roomID + "/webhooks", nil},
 	} {
 		r := doBearerJSON(t, srv, check.method, check.path, eveTok, check.body, nil)
 		if r.Code != http.StatusNotFound {
@@ -269,7 +268,7 @@ func TestChatEndToEndRESTAndWebSocket(t *testing.T) {
 	}
 }
 
-func TestChatSecurityCSWSHWebhooksAndInstantRevocation(t *testing.T) {
+func TestChatSecurityCSWSHGoneWebhooksAndInstantRevocation(t *testing.T) {
 	srv, st, cfg := setupTestServer(t)
 	startChatBus(t, srv)
 	defer srv.CloseChat()
@@ -304,29 +303,12 @@ func TestChatSecurityCSWSHWebhooksAndInstantRevocation(t *testing.T) {
 		t.Fatalf("cookie WS without Origin = (err=%v, resp=%+v), want 403 Forbidden", err, resp)
 	}
 
-	// 2. Incoming Webhook lifecycle (Bearer-only, no cookie/CSRF required).
-	rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", aliceTok, map[string]any{
-		"name": "alerts",
-	}, nil)
-	var roomResp struct {
-		Room store.Room `json:"room"`
-	}
-	_ = json.Unmarshal(rec.Body.Bytes(), &roomResp)
-	roomID := roomResp.Room.ID
-
-	rec = doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+roomID+"/webhooks", aliceTok, map[string]any{
-		"name": "GitHub CI",
-	}, nil)
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("create webhook = %d (%s)", rec.Code, rec.Body.String())
-	}
-	var whResp struct {
-		Webhook store.RoomWebhook `json:"webhook"`
-		Token   string            `json:"token"`
-	}
-	_ = json.Unmarshal(rec.Body.Bytes(), &whResp)
-	if !strings.HasPrefix(whResp.Token, "kywh_") {
-		t.Fatalf("unexpected webhook token format: %q", whResp.Token)
+	// 2. Incoming webhooks are gone: every sender gets the same 410, whatever the ID or token.
+	for _, path := range []string{"/api/v1/webhooks/in/whk_anything", "/api/v1/webhooks/in/unknown"} {
+		rec := doBearerJSON(t, srv, http.MethodPost, path, "kywh_any", map[string]any{"text": "hi"}, nil)
+		if rec.Code != http.StatusGone || !strings.Contains(rec.Body.String(), `"code":"gone"`) {
+			t.Fatalf("incoming webhook %s = %d %s, want 410 gone", path, rec.Code, rec.Body.String())
+		}
 	}
 
 	// Connect Alice WS to observe real-time webhook message.
@@ -341,32 +323,6 @@ func TestChatSecurityCSWSHWebhooksAndInstantRevocation(t *testing.T) {
 	}
 	defer func() { _ = aliceWS.CloseNow() }()
 	_ = readWSEvent(t, aliceWS) // hello
-
-	// Bad token rejected with 401.
-	bad := doBearerJSON(t, srv, http.MethodPost, "/api/v1/webhooks/in/"+whResp.Webhook.ID, "wrong-token", map[string]any{"text": "nope"}, nil)
-	if bad.Code != http.StatusUnauthorized {
-		t.Fatalf("bad webhook token = %d, want 401", bad.Code)
-	}
-
-	// Valid token posts Slack-compatible {"text": "..."} and fans out to Alice's WS!
-	ok := doBearerJSON(t, srv, http.MethodPost, "/api/v1/webhooks/in/"+whResp.Webhook.ID, whResp.Token, map[string]any{"text": "Build #42 passed"}, nil)
-	if ok.Code != http.StatusCreated {
-		t.Fatalf("valid webhook post = %d (%s)", ok.Code, ok.Body.String())
-	}
-	ev := readWSEvent(t, aliceWS)
-	if ev.Type != chat.EventMessageNew || !strings.Contains(string(ev.Data), "Build #42 passed") {
-		t.Fatalf("alice did not receive webhook message: %+v", ev)
-	}
-
-	// Revoking webhook immediately invalidates the token.
-	rev := doBearerJSON(t, srv, http.MethodDelete, "/api/v1/rooms/"+roomID+"/webhooks/"+whResp.Webhook.ID, aliceTok, nil, nil)
-	if rev.Code != http.StatusOK {
-		t.Fatalf("revoke webhook = %d", rev.Code)
-	}
-	afterRev := doBearerJSON(t, srv, http.MethodPost, "/api/v1/webhooks/in/"+whResp.Webhook.ID, whResp.Token, map[string]any{"text": "after revoke"}, nil)
-	if afterRev.Code != http.StatusUnauthorized {
-		t.Fatalf("revoked webhook post = %d, want 401", afterRev.Code)
-	}
 
 	// 3. Instant logout disconnects Alice's live WebSocket immediately.
 	logout := doBearerJSON(t, srv, http.MethodPost, "/api/auth/logout", aliceTok, nil, nil)

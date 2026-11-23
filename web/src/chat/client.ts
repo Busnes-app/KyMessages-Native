@@ -14,7 +14,6 @@ import {
   parseRoomDetail,
   parseRoomSummary,
   parseUsersList,
-  parseWebhook,
   parseWsEvent,
   type AdminMediaPolicyResponse,
   type CallJoinResponse,
@@ -27,7 +26,6 @@ import {
   type ChatRoom,
   type ChatRoomDetail,
   type ChatRoomSummary,
-  type ChatRoomWebhook,
   type GuestMeetInfo,
   type LobbyGuest,
   type MediaPolicyConfig,
@@ -320,37 +318,8 @@ export async function searchMessages(query: string, roomId?: string): Promise<Ch
   return arr(data.messages ?? []).map(parseMessage);
 }
 
-export async function fetchRoomWebhooks(roomId: string): Promise<ChatRoomWebhook[]> {
-  const data = obj(
-    await apiJSON(`/api/v1/rooms/${encodeURIComponent(roomId)}/webhooks`, {}, 'Could not load webhooks'),
-  );
-  return arr(data.webhooks ?? []).map(parseWebhook);
-}
 
-export async function createRoomWebhook(
-  roomId: string,
-  name: string,
-): Promise<{ webhook: ChatRoomWebhook; token: string }> {
-  const data = obj(
-    await apiJSON(
-      `/api/v1/rooms/${encodeURIComponent(roomId)}/webhooks`,
-      {
-        method: 'POST',
-        body: JSON.stringify({ name }),
-      },
-      'Could not create webhook',
-    ),
-  );
-  return { webhook: parseWebhook(data.webhook), token: str(data.token, 256) };
-}
 
-export async function revokeRoomWebhook(roomId: string, webhookId: string): Promise<void> {
-  await apiJSON(
-    `/api/v1/rooms/${encodeURIComponent(roomId)}/webhooks/${encodeURIComponent(webhookId)}`,
-    { method: 'DELETE' },
-    'Could not revoke webhook',
-  );
-}
 
 // ---------------------------------------------------------------------
 // Hybrid P2P / SFU Calls, Meeting Waiting Rooms & Admin Media Policy
