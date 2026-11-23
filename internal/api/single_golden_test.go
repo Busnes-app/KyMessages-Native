@@ -170,7 +170,7 @@ func TestSingleTenantGolden(t *testing.T) {
 		g.add("upload over user staging cap", doMultipartUpload(t, srv, up, aliceTok, "file", "b.txt", file))
 		g.add("upload oversize", doMultipartUpload(t, srv, up, aliceTok, "file", "c.txt", bytes.Repeat([]byte("x"), 2049)))
 		g.add("list staged", doBearerJSON(t, srv, http.MethodGet, up, aliceTok, nil, nil))
-		g.add("post message", doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room.Room.ID+"/messages", aliceTok, map[string]any{"body": "file", "attachment_ids": []string{att.Attachment.ID}}, nil))
+		g.add("post message", doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room.Room.ID+"/messages", aliceTok, sealed("file", map[string]any{"attachment_ids": []string{att.Attachment.ID}}), nil))
 		rec = doMultipartUpload(t, srv, up, bobTok, "file", "d.txt", file)
 		g.add("bob upload", rec)
 		var bobAtt struct {

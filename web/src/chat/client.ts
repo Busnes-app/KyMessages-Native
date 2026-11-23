@@ -1,5 +1,6 @@
 import { errorMessage, secureFetch } from '../api';
 import { arr, bool, count, obj, opt, str } from '../dto';
+import { openMessage, openMessages, sealRoomMessage } from './e2ee';
 import type { MessageState } from './searchIndex';
 import {
   parseAdminMediaPolicy,
@@ -147,9 +148,10 @@ export async function fetchMessages(
   if (opts.after && opts.after > 0) qs.set('after', String(opts.after));
   if (opts.limit && opts.limit > 0) qs.set('limit', String(opts.limit));
   const suffix = qs.toString() ? `?${qs.toString()}` : '';
-  return parseMessagesPage(
+  const page = parseMessagesPage(
     await apiJSON(`/api/v1/rooms/${encodeURIComponent(roomId)}/messages${suffix}`, {}, 'Could not load messages'),
   );
+  return { ...page, messages: await openMessages(page.messages) };
 }
 
 export async function uploadAttachment(
@@ -198,6 +200,14 @@ export async function sendMessage(params: {
   attachmentIds?: string[];
   idempotencyKey: string;
 }): Promise<ChatMessage> {
+  const hasFiles = Boolean(params.attachmentIds && params.attachmentIds.length > 0);
+  // Rooms are end-to-end encrypted: the text, its kind and its reply target travel sealed. The
+  // server keeps reply_to_id as a pointer; files stay plaintext until E5.
+  const envelope = await sealRoomMessage(params.roomId, {
+    type: params.replyToId ? 'reply' : hasFiles ? 'attachment' : 'text',
+    body: params.body,
+    ...(params.replyToId ? { reply_to_id: params.replyToId } : {}),
+  });
   const data = obj(
     await apiJSON(
       `/api/v1/rooms/${encodeURIComponent(params.roomId)}/messages`,
@@ -205,7 +215,8 @@ export async function sendMessage(params: {
         method: 'POST',
         headers: { 'Idempotency-Key': params.idempotencyKey },
         body: JSON.stringify({
-          body: params.body,
+          body: envelope,
+          encoding: 'e2ee_room_v1',
           reply_to_id: params.replyToId || undefined,
           attachment_ids:
             params.attachmentIds && params.attachmentIds.length > 0 ? params.attachmentIds : undefined,
@@ -215,21 +226,28 @@ export async function sendMessage(params: {
       'Could not send message',
     ),
   );
-  return parseMessage(data.message);
+  return openMessage(parseMessage(data.message));
 }
 
-export async function editMessage(roomId: string, messageId: string, body: string): Promise<ChatMessage> {
+export async function editMessage(roomId: string, messageId: string, body: string, replyToId?: string): Promise<ChatMessage> {
+  // An edit is sealed too, names the message it replaces and keeps the reply it was.
+  const envelope = await sealRoomMessage(roomId, {
+    type: 'edit',
+    body,
+    message_id: messageId,
+    ...(replyToId ? { reply_to_id: replyToId } : {}),
+  });
   const data = obj(
     await apiJSON(
       `/api/v1/rooms/${encodeURIComponent(roomId)}/messages/${encodeURIComponent(messageId)}`,
       {
         method: 'PATCH',
-        body: JSON.stringify({ body }),
+        body: JSON.stringify({ body: envelope, encoding: 'e2ee_room_v1' }),
       },
       'Could not edit message',
     ),
   );
-  return parseMessage(data.message);
+  return openMessage(parseMessage(data.message));
 }
 
 export async function deleteMessage(roomId: string, messageId: string): Promise<ChatMessage> {
@@ -546,6 +564,8 @@ export class ChatSocket {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private lastTypingAt = new Map<string, number>();
+  // Events are delivered in order, each message decrypted first.
+  private inbound: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly handlers: ChatSocketHandlers,
@@ -601,7 +621,16 @@ export class ChatSocket {
         this.revoked = true;
         this.handlers.onStatus('revoked');
       }
-      this.handlers.onEvent(ev);
+      this.inbound = this.inbound
+        .then(async () => {
+          if ((ev.kind === 'message.new' || ev.kind === 'message.edit') && ev.message) {
+            // openMessage never waits on a device still starting, so no event queues behind it.
+            this.handlers.onEvent({ ...ev, message: await openMessage(ev.message) });
+          } else {
+            this.handlers.onEvent(ev);
+          }
+        })
+        .catch(() => undefined);
     };
 
     socket.onerror = () => {

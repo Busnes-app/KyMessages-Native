@@ -170,17 +170,35 @@ test('new DM and search: arrows move through options from the box and Enter pick
   const created = await page.request.post('/api/v1/rooms', { headers, data: { kind: 'channel', name: `search-${testInfo.project.name}`, topic: '', is_private: false, member_ids: [] } });
   expect(created.ok()).toBe(true);
   const room = (await created.json()).room;
-  for (const [i, body] of [`first ${word} note`, `second ${word} note`].entries()) {
-    const key = `${word}-${i}-${Date.now()}`;
-    expect((await page.request.post(`/api/v1/rooms/${room.id}/messages`, { headers: { ...headers, 'Idempotency-Key': key }, data: { body, idempotency_key: key } })).ok()).toBe(true);
-  }
-  // Search runs on the device, so it finds what this browser has read: open the room first.
+  // Rooms are end-to-end encrypted, so the messages are written through the composer: this
+  // browser's WebAssembly core (allowed by the CSP's 'wasm-unsafe-eval') seals them.
   await page.goto('/');
-  await expect(page.getByRole('region', { name: 'Conversation' })).toBeVisible();
+  const conversation = page.getByRole('region', { name: 'Conversation' });
+  await expect(conversation).toBeVisible();
   const openList = page.getByRole('button', { name: 'Open room list' }).filter({ visible: true });
   if (!(await page.locator('aside.chat-rail.mobile-open').count()) && await openList.count()) await openList.first().click();
   await page.getByRole('complementary', { name: 'Workspace and conversations' }).locator('.chat-room-btn', { hasText: room.name }).first().click();
-  await expect(page.getByRole('region', { name: 'Conversation' }).getByText(`second ${word} note`)).toBeVisible();
+  const composer = page.getByLabel('Message input');
+  await expect(composer).toHaveAttribute('placeholder', `Message #${room.name}`);
+  for (const body of [`first ${word} note`, `second ${word} note`]) {
+    await composer.fill(body);
+    await composer.press('Enter');
+    await expect(conversation.getByText(body)).toBeVisible();
+  }
+  // The server holds envelopes it cannot read; search below finds the text this device decrypted.
+  // Poll: a grouped row shows no "Sending…", so the second send may still be in flight.
+  const listStored = async () => (await (await page.request.get(`/api/v1/rooms/${room.id}/messages`)).json()).messages;
+  await expect.poll(async () => (await listStored()).length).toBe(2);
+  const stored = await listStored();
+  for (const m of stored) {
+    expect(m.encoding).toBe('e2ee_room_v1');
+    expect(m.body).not.toContain(word);
+    expect(JSON.parse(m.body)).toMatchObject({ alg: 'megolm.v1' });
+  }
+  // A member's plaintext is refused with a clear code.
+  const plain = await page.request.post(`/api/v1/rooms/${room.id}/messages`, { headers, data: { body: `plain ${word}` } });
+  expect(plain.status()).toBe(400);
+  expect((await plain.json()).code).toBe('e2ee_required');
 
   await (await railButton(page, 'New direct message')).click();
   const dm = page.getByRole('dialog', { name: 'New direct message' });

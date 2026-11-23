@@ -711,7 +711,7 @@ type sendMessageRequest struct {
 
 // POST /api/v1/rooms/{id}/messages
 func (s *Server) handleChatSendMessage(w http.ResponseWriter, r *http.Request) {
-	user, _, ok := s.currentUser(r)
+	user, sess, ok := s.currentUser(r)
 	if !ok {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
@@ -748,16 +748,12 @@ func (s *Server) handleChatSendMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body := strings.TrimSpace(req.Body)
-	if len(body) > maxMessageBodyLen || (body == "" && len(attIDs) == 0) {
+	if body == "" && len(attIDs) == 0 {
 		s.writeError(w, http.StatusBadRequest, "Message body must be 1 to 16384 bytes (or include at least one attachment)")
 		return
 	}
-	encoding := strings.TrimSpace(req.Encoding)
-	if encoding == "" {
-		encoding = store.MessageEncodingPlainV1
-	}
-	if encoding != store.MessageEncodingPlainV1 && encoding != store.MessageEncodingE2EERoomV1 {
-		s.writeError(w, http.StatusBadRequest, "Unsupported message encoding")
+	encoding, err := s.messageEncoding(w, user, sess, req.Encoding, body)
+	if err != nil {
 		return
 	}
 	idemKey := strings.TrimSpace(req.IdempotencyKey)
@@ -818,12 +814,13 @@ func (s *Server) handleChatSendMessage(w http.ResponseWriter, r *http.Request) {
 }
 
 type editMessageRequest struct {
-	Body string `json:"body"`
+	Body     string `json:"body"`
+	Encoding string `json:"encoding"`
 }
 
 // PATCH /api/v1/rooms/{id}/messages/{mid}
 func (s *Server) handleChatEditMessage(w http.ResponseWriter, r *http.Request) {
-	user, _, ok := s.currentUser(r)
+	user, sess, ok := s.currentUser(r)
 	if !ok {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
@@ -847,12 +844,16 @@ func (s *Server) handleChatEditMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body := strings.TrimSpace(req.Body)
-	if body == "" || len(body) > maxMessageBodyLen {
+	if body == "" {
 		s.writeError(w, http.StatusBadRequest, "Message body must be 1 to 16384 bytes")
 		return
 	}
+	encoding, err := s.messageEncoding(w, user, sess, req.Encoding, body)
+	if err != nil {
+		return
+	}
 
-	msg, err := s.store.Chat().EditMessage(r.Context(), tenantID, roomID, msgID, user.ID, body)
+	msg, err := s.store.Chat().EditMessage(r.Context(), tenantID, roomID, msgID, user.ID, body, encoding)
 	if errors.Is(err, store.ErrNotFound) {
 		s.writeError(w, http.StatusNotFound, "Message not found")
 		return

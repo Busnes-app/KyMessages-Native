@@ -715,6 +715,25 @@
   color: var(--ink);
 }
 
+/* End-to-end encryption: a message this device cannot open yet (or ever), and the quiet note
+   on content that is not encrypted (legacy plaintext, bots, guests and files until E5). */
+.chat-msg-locked {
+  margin: 0;
+  font-size: 0.86rem;
+  font-style: italic;
+  color: var(--ink);
+}
+
+.chat-msg-locked.is-error {
+  color: var(--danger);
+}
+
+.chat-msg-e2ee-note {
+  margin: 0.15rem 0 0;
+  font-size: 0.72rem;
+  color: var(--ink);
+}
+
 .chat-msg-failed {
   display: flex;
   align-items: center;

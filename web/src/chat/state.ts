@@ -163,6 +163,11 @@ export function isWebhookSender(senderId: string): boolean {
   return senderId.startsWith('webhook:');
 }
 
+/** Meeting guests post as guest_ IDs; they have no encryption keys. */
+export function isGuestSender(senderId: string): boolean {
+  return senderId.startsWith('guest_');
+}
+
 /** Native bot accounts have bot_ user IDs; mark their posts and member rows distinctly. */
 export function isBotSender(senderId: string): boolean {
   return senderId.startsWith('bot_');

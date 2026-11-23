@@ -2,8 +2,13 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { App } from './App';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import { retireDevice } from './chat/e2ee';
 import { browserPushEndpoint, unsubscribeBrowserPush } from './chat/push';
 
+vi.mock('./chat/e2ee', async () => ({
+  ...await import('./chat/e2eeFake'),
+  retireDevice: vi.fn(() => ({ wait: Promise.resolve(true), replaceIfRetired: async () => undefined })),
+}));
 vi.mock('./chat/push', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./chat/push')>()),
   browserPushEndpoint: vi.fn(async () => 'https://push.example/ep'),
@@ -40,6 +45,16 @@ it('stays signed in and says so when the server refuses sign-out', async () => {
   fireEvent.click((await screen.findAllByRole('button', { name: 'Sign out' }))[0]);
   expect((await screen.findByRole('alert')).textContent).toContain('You are still signed in: Invalid CSRF token');
   expect(screen.getByText('Bob')).toBeTruthy();
+});
+
+it('follows a timed-out retirement when the server refuses sign-out', async () => {
+  const replaceIfRetired = vi.fn(async () => undefined);
+  vi.mocked(retireDevice).mockReturnValueOnce({ wait: Promise.resolve(false), replaceIfRetired });
+  stubServer(async () => json({ error: 'Invalid CSRF token' }, 403));
+  render(<App />);
+  fireEvent.click((await screen.findAllByRole('button', { name: 'Sign out' }))[0]);
+  expect((await screen.findByRole('alert')).textContent).toContain('You are still signed in');
+  expect(replaceIfRetired).toHaveBeenCalledOnce();
 });
 
 it('stays signed in when sign-out cannot reach the server', async () => {

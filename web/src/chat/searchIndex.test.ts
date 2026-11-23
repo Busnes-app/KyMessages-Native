@@ -50,6 +50,18 @@ describe('on-device search index', () => {
     bob.close();
   });
 
+  it('indexes decrypted text only, never an envelope or a message it could not open', async () => {
+    const index = await searchIndexFor('u-alice');
+    const sealed = { encoding: 'e2ee_room_v1' as const, envelope: '{"alg":"megolm.v1","ciphertext":"budgetAAAA"}' };
+    await index.put([
+      msg('m1', 'r1', 'budget is approved', 1, { ...sealed, e2ee: { kind: 'decrypted' } }),
+      msg('m2', 'r1', '', 2, { ...sealed, e2ee: { kind: 'waiting' } }),
+      // Even a body left behind by mistake is not indexed until the message is decrypted.
+      msg('m3', 'r1', 'budget leak', 3, { ...sealed, e2ee: { kind: 'failed', reason: 'x' } }),
+    ]);
+    expect((await index.search('budget')).map((h) => h.id)).toEqual(['m1']);
+  });
+
   it('is deleted for every user on sign-out', async () => {
     await (await searchIndexFor('u-alice')).put([msg('m1', 'r1', 'keep me private', 1)]);
     const bob = await SearchIndex.open('u-bob');

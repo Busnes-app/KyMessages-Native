@@ -7,9 +7,22 @@ import {
   type ChatAttachment,
   type ChatMessage,
 } from '../../chat/types';
-import { formatTime, initialsFor, isBotSender, isWebhookSender } from '../../chat/state';
+import { formatTime, initialsFor, isBotSender, isGuestSender, isWebhookSender } from '../../chat/state';
+
+const WAITING_TEXT = "Waiting for this message's key";
+
+/** Why a message is not end-to-end encrypted, or nothing when it is (or is a system event). */
+export function plaintextLabel(msg: ChatMessage): string | null {
+  if (msg.encoding !== 'plain_v1') return null;
+  if (isBotSender(msg.sender_id)) return 'Not encrypted (bot)';
+  if (isGuestSender(msg.sender_id)) return 'Not encrypted (guest)';
+  if (isWebhookSender(msg.sender_id)) return 'Not encrypted (webhook)';
+  return 'Sent before encryption';
+}
 
 function messagePreviewText(msg: ChatMessage): string {
+  if (msg.e2ee?.kind === 'waiting') return WAITING_TEXT;
+  if (msg.e2ee?.kind === 'failed') return 'Message could not be decrypted';
   if (msg.body) return msg.body;
   if (msg.attachments.length === 1) return `Attachment: ${msg.attachments[0].filename}`;
   if (msg.attachments.length > 1) return `${msg.attachments.length} attachments`;
@@ -124,7 +137,10 @@ export const MessageRow: React.FC<MessageRowProps> = ({
   const isDeleted = Boolean(message.deleted_at);
   const isSynced = message.delivery.kind === 'synced';
   const isOwn = message.sender_id === currentUserId;
-  const canEdit = isSynced && !isDeleted && isOwn;
+  // A message this device cannot read cannot be edited from it.
+  const sealedShut = message.e2ee !== undefined && message.e2ee.kind !== 'decrypted';
+  const canEdit = isSynced && !isDeleted && isOwn && !sealedShut;
+  const plainNote = plaintextLabel(message);
   const canDelete = isSynced && !isDeleted && (isOwn || canModerate);
   const authorLabel = message.sender_name || 'Unknown';
 
@@ -278,13 +294,23 @@ export const MessageRow: React.FC<MessageRowProps> = ({
           </form>
         ) : (
           <>
-            {(message.body || message.attachments.length === 0) && (
-              <div className="chat-msg-body">
-                {renderFormattedBody(message.body)}
-                {grouped && message.edited_at && <span className="chat-msg-edited"> (edited)</span>}
-              </div>
+            {message.e2ee?.kind === 'waiting' ? (
+              <p className="chat-msg-locked">{WAITING_TEXT}</p>
+            ) : message.e2ee?.kind === 'failed' ? (
+              <p className="chat-msg-locked is-error">Can't decrypt this message. {message.e2ee.reason}</p>
+            ) : (
+              (message.body || message.attachments.length === 0) && (
+                <div className="chat-msg-body">
+                  {renderFormattedBody(message.body)}
+                  {grouped && message.edited_at && <span className="chat-msg-edited"> (edited)</span>}
+                </div>
+              )
             )}
+            {plainNote && <p className="chat-msg-e2ee-note">{plainNote}</p>}
 
+            {message.attachments.length > 0 && (
+              <p className="chat-msg-e2ee-note">{message.attachments.length === 1 ? 'File not encrypted' : 'Files not encrypted'}</p>
+            )}
             {message.attachments.length > 0 && (
               <div className="chat-attachments" aria-label="Attachments">
                 {message.attachments.map((att) =>

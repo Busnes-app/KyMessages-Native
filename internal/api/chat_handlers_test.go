@@ -178,7 +178,7 @@ func TestChatEndToEndRESTAndWebSocket(t *testing.T) {
 
 	// 4. Alice posts a message with Idempotency-Key; Bob receives real-time message.new.
 	rec = doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+roomID+"/messages", aliceTok,
-		map[string]any{"body": "hello native world"},
+		sealed("hello native world", nil),
 		map[string]string{"Idempotency-Key": "idem-1"},
 	)
 	if rec.Code != http.StatusCreated {
@@ -202,7 +202,7 @@ func TestChatEndToEndRESTAndWebSocket(t *testing.T) {
 
 	// Idempotent retry returns 200 and same message ID/seq.
 	rec = doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+roomID+"/messages", aliceTok,
-		map[string]any{"body": "duplicate"},
+		sealed("duplicate", nil),
 		map[string]string{"Idempotency-Key": "idem-1"},
 	)
 	if rec.Code != http.StatusOK {
@@ -235,7 +235,7 @@ func TestChatEndToEndRESTAndWebSocket(t *testing.T) {
 	}{
 		{http.MethodGet, "/api/v1/rooms/" + roomID, nil},
 		{http.MethodGet, "/api/v1/rooms/" + roomID + "/messages", nil},
-		{http.MethodPost, "/api/v1/rooms/" + roomID + "/messages", map[string]any{"body": "sneak"}},
+		{http.MethodPost, "/api/v1/rooms/" + roomID + "/messages", sealed("sneak", nil)},
 		{http.MethodPost, "/api/v1/rooms/" + roomID + "/read", map[string]any{"seq": 1}},
 	} {
 		r := doBearerJSON(t, srv, check.method, check.path, eveTok, check.body, nil)

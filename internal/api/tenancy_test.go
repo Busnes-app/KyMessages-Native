@@ -272,7 +272,8 @@ func TestMultiTenantCrossOrgIsolation(t *testing.T) {
 	roomID := roomResp.Room.ID
 
 	rec = doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+roomID+"/messages", aliceTok, map[string]any{
-		"body": "alpha-launch-code-9981",
+		"body":     testEnvelope("alpha-launch-code-9981"),
+		"encoding": "e2ee_room_v1",
 	}, nil)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("send alpha message = %d: %s", rec.Code, rec.Body.String())
@@ -286,7 +287,7 @@ func TestMultiTenantCrossOrgIsolation(t *testing.T) {
 	}{
 		{http.MethodGet, "/api/v1/rooms/" + roomID, nil},
 		{http.MethodGet, "/api/v1/rooms/" + roomID + "/messages", nil},
-		{http.MethodPost, "/api/v1/rooms/" + roomID + "/messages", map[string]any{"body": "hijack"}},
+		{http.MethodPost, "/api/v1/rooms/" + roomID + "/messages", sealed("hijack", nil)},
 		{http.MethodPost, "/api/v1/rooms/" + roomID + "/members", map[string]any{"user_id": carol.ID}},
 		{http.MethodPost, "/api/v1/rooms/" + roomID + "/calls/join", nil},
 	} {
@@ -772,11 +773,11 @@ func TestMultiTenantCrossOrgUserPaths(t *testing.T) {
 		t.Fatalf("carol first frame = %+v, want hello", ev)
 	}
 	for _, rm := range []string{alphaRoom, alphaDM} {
-		if rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+rm+"/messages", aliceTok, map[string]any{"body": "@carol @all secret"}, nil); rec.Code != http.StatusCreated {
+		if rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+rm+"/messages", aliceTok, sealed("@carol @all secret", nil), nil); rec.Code != http.StatusCreated {
 			t.Fatalf("alice post = %d: %s", rec.Code, rec.Body.String())
 		}
 	}
-	if rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+betaRoom+"/messages", daveTok, map[string]any{"body": "beta"}, nil); rec.Code != http.StatusCreated {
+	if rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+betaRoom+"/messages", daveTok, sealed("beta", nil), nil); rec.Code != http.StatusCreated {
 		t.Fatalf("dave post = %d: %s", rec.Code, rec.Body.String())
 	}
 	if ev := readWSEvent(t, carolWS); ev.RoomID != betaRoom || ev.Type != chat.EventMessageNew {

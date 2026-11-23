@@ -23,7 +23,8 @@ test('production CSP, worker, themes, keyboard, dialog and responsive shell', as
     if (/Content Security Policy|violates.*directive/i.test(message.text())) violations.push(message.text());
   });
   const response = await page.goto('/');
-  expect(response.headers()['content-security-policy']).toContain("script-src 'self'");
+  // WebAssembly compilation (the encryption core) is the only script exception.
+  expect(response.headers()['content-security-policy']).toContain("script-src 'self' 'wasm-unsafe-eval';");
   expect(response.headers()['content-security-policy']).not.toContain("script-src 'self' 'unsafe-inline'");
   await expect.poll(() => page.evaluate(async () => (await navigator.serviceWorker.getRegistration())?.active?.state)).toBe('activated');
   await page.evaluate(async () => {
@@ -87,7 +88,10 @@ test('production CSP, worker, themes, keyboard, dialog and responsive shell', as
   await expect(stagedTray.getByText(txtName)).toBeVisible();
   const sendBtn = page.getByRole('button', { name: 'Send message' });
   await expect(sendBtn).toBeEnabled();
+  // The message is sealed (and its room key shared) before it is posted: wait for the post.
+  const posted = page.waitForResponse((r) => /\/api\/v1\/rooms\/[^/]+\/messages$/.test(new URL(r.url()).pathname) && r.request().method() === 'POST');
   await sendBtn.click();
+  expect((await posted).status()).toBe(201);
 
   const inlineImg = page.getByRole('img', { name: pngName }).last();
   await expect(inlineImg).toBeVisible();

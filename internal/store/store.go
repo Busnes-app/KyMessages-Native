@@ -121,8 +121,11 @@ type E2EEToDevice struct {
 	TenantID                           string
 	RecipientUserID, RecipientDeviceID string
 	SenderUserID, SenderDeviceID       string
-	Type, Content                      string
-	CreatedAt                          time.Time
+	// The sender device's self-signed public keys when it sent the mail.
+	SenderCurve25519, SenderEd25519 string
+	SenderSignature                 string
+	Type, Content                   string
+	CreatedAt                       time.Time
 }
 
 // PresenceStore holds each user's suite status inputs, keyed by (tenant, user).
@@ -369,7 +372,7 @@ type ChatStore interface {
 	// in a room they are a member of. Others are left out. It returns no message content.
 	MessageStates(ctx context.Context, tenantID, userID string, ids []string) ([]MessageState, error)
 	ListMessages(ctx context.Context, q MessagePageQuery) ([]*Message, bool, error)
-	EditMessage(ctx context.Context, tenantID, roomID, messageID, actorID, newBody string) (*Message, error)
+	EditMessage(ctx context.Context, tenantID, roomID, messageID, actorID, newBody, encoding string) (*Message, error)
 	DeleteMessage(ctx context.Context, tenantID, roomID, messageID, actorID string, allowModerator bool) (*Message, error)
 
 	AddReaction(ctx context.Context, tenantID, roomID, messageID, userID, emoji string) error

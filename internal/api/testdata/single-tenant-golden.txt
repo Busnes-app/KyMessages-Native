@@ -93,7 +93,7 @@ Content-Type: application/json
 == post message
 status 201
 Content-Type: application/json
-{"message":{"id":"msg_<uuid>","tenant_id":"default","room_id":"rm_<uuid>","seq":1,"sender_id":"u_g_alice","sender_name":"Galice","encoding":"plain_v1","body":"file","created_at":<num>,"attachments":[{"id":"att_<uuid>","tenant_id":"default","room_id":"rm_<uuid>","message_id":"msg_<uuid>","uploader_id":"u_g_alice","filename":"a.txt","mime_type":"text/plain; charset=utf-8","size_bytes":1700,"sha256_hex":"<token>","created_at":<num>}]}}
+{"message":{"id":"msg_<uuid>","tenant_id":"default","room_id":"rm_<uuid>","seq":1,"sender_id":"u_g_alice","sender_name":"Galice","encoding":"e2ee_room_v1","body":"{\"alg\":\"megolm.v1\",\"ciphertext\":\"bWVnb2xtOmZpbGU\",\"device_id\":\"TESTDEVICE01\",\"sender_key\":\"<token>\",\"session_id\":\"<token>\"}","created_at":<num>,"attachments":[{"id":"att_<uuid>","tenant_id":"default","room_id":"rm_<uuid>","message_id":"msg_<uuid>","uploader_id":"u_g_alice","filename":"a.txt","mime_type":"text/plain; charset=utf-8","size_bytes":1700,"sha256_hex":"<token>","created_at":<num>}]}}
 == bob upload
 status 201
 Content-Type: application/json

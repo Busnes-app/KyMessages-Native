@@ -21,7 +21,7 @@ func TestChatMessageStates(t *testing.T) {
 	_ = json.Unmarshal(rec.Body.Bytes(), &created)
 	room := "/api/v1/rooms/" + created.Room.ID
 	send := func(body string) string {
-		rec := doBearerJSON(t, srv, http.MethodPost, room+"/messages", aliceTok, map[string]any{"body": body}, nil)
+		rec := doBearerJSON(t, srv, http.MethodPost, room+"/messages", aliceTok, sealed(body, nil), nil)
 		var m struct{ Message struct{ ID string } }
 		_ = json.Unmarshal(rec.Body.Bytes(), &m)
 		if m.Message.ID == "" {
@@ -30,7 +30,7 @@ func TestChatMessageStates(t *testing.T) {
 		return m.Message.ID
 	}
 	kept, edited, deleted := send("kept"), send("before edit"), send("to delete")
-	if c := doBearerJSON(t, srv, http.MethodPatch, room+"/messages/"+edited, aliceTok, map[string]any{"body": "after edit"}, nil).Code; c != http.StatusOK {
+	if c := doBearerJSON(t, srv, http.MethodPatch, room+"/messages/"+edited, aliceTok, sealed("after edit", nil), nil).Code; c != http.StatusOK {
 		t.Fatalf("edit = %d", c)
 	}
 	if c := doBearerJSON(t, srv, http.MethodDelete, room+"/messages/"+deleted, aliceTok, nil, nil).Code; c != http.StatusOK {

@@ -19,7 +19,6 @@ import (
 
 const (
 	maxPushSubsPerUser = 20
-	maxPushPreviewLen  = 180
 )
 
 type registerPushRequest struct {
@@ -308,14 +307,13 @@ func (s *Server) dispatchMessagePush(ctx context.Context, tenantID, roomID strin
 		title = senderName + " in #" + roomName
 	}
 
-	bodyPreview := buildPushMessageBody(msg)
 	payload := push.Payload{
 		Kind:       "message",
 		RoomID:     roomID,
 		RoomName:   roomName,
 		SenderName: senderName,
 		Title:      title,
-		Body:       bodyPreview,
+		Body:       pushMessageBody,
 		URL:        "/#room=" + roomID,
 	}
 
@@ -417,28 +415,10 @@ func (s *Server) dispatchCallPush(ctx context.Context, tenantID, roomID, starter
 	}
 }
 
-func buildPushMessageBody(msg *store.Message) string {
-	if msg.Encoding == store.MessageEncodingE2EERoomV1 {
-		return "New encrypted message"
-	}
-	text := strings.TrimSpace(msg.Body)
-	if text == "" {
-		if len(msg.Attachments) == 1 {
-			return "Sent an attachment: " + msg.Attachments[0].Filename
-		}
-		if len(msg.Attachments) > 1 {
-			return "Sent attachments"
-		}
-		return "New message"
-	}
-	// Collapse newlines for single-line notification previews and clamp runes cleanly.
-	text = strings.Join(strings.Fields(text), " ")
-	runes := []rune(text)
-	if len(runes) > maxPushPreviewLen {
-		return string(runes[:maxPushPreviewLen-1]) + "…"
-	}
-	return text
-}
+// pushMessageBody is the notification text for every message: the server cannot read
+// encrypted rooms, and bot plaintext gets no preview either, so a notification never carries
+// message content (docs/superpowers/specs/2026-11-22-e2ee-design.md §6).
+const pushMessageBody = "New message"
 
 // bodyHasMention reports whether body contains an @handle token at word boundaries (case-insensitive).
 func bodyHasMention(body, handle string) bool {

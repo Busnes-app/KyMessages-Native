@@ -925,7 +925,9 @@ func (c *chatStore) ListMessages(ctx context.Context, q MessagePageQuery) ([]*Me
 	return msgs, hasMore, nil
 }
 
-func (c *chatStore) EditMessage(ctx context.Context, tenantID, roomID, messageID, actorID, newBody string) (*Message, error) {
+// EditMessage replaces the sender's message body. An edit may change the encoding: a message
+// sent before encryption is edited into an e2ee_room_v1 envelope.
+func (c *chatStore) EditMessage(ctx context.Context, tenantID, roomID, messageID, actorID, newBody, encoding string) (*Message, error) {
 	tenantID = normalizeTenant(tenantID)
 	tx, err := c.store.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -952,8 +954,8 @@ func (c *chatStore) EditMessage(ctx context.Context, tenantID, roomID, messageID
 
 	editedAt := nowMilli()
 	if _, err := tx.ExecContext(ctx,
-		c.store.rebind(`UPDATE messages SET body = ?, edited_at = ? WHERE tenant_id = ? AND room_id = ? AND id = ?`),
-		newBody, editedAt, tenantID, roomID, messageID,
+		c.store.rebind(`UPDATE messages SET body = ?, encoding = ?, edited_at = ? WHERE tenant_id = ? AND room_id = ? AND id = ?`),
+		newBody, encoding, editedAt, tenantID, roomID, messageID,
 	); err != nil {
 		return nil, err
 	}
@@ -968,6 +970,7 @@ func (c *chatStore) EditMessage(ctx context.Context, tenantID, roomID, messageID
 	}
 
 	m.Body = newBody
+	m.Encoding = encoding
 	m.EditedAt = &editedAt
 	return m, nil
 }
