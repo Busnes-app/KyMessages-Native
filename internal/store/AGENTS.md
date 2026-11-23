@@ -22,8 +22,11 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   fence check. The shared generation orders in-flight callbacks independently of pod clocks.
 - `ResetDirectoryMFA` spends each unseen reset independently of profile revision ordering,
   with a new credential snapshot, subject fence and grant/push deletion. `directory_mfa_resets`
-  deduplicates reset revisions separately (restore -1 uses the event ID). Managed MFA resets
-  share this ledger and do not rewrite a profile or advance its revision. `ApplyInstallerDirectory` requires the narrowed org_id and
+  deduplicates reset revisions per directory restore generation (reset -1 uses the event ID).
+  An accepted profile/deletion resend at revision -1 advances that generation atomically;
+  global event IDs remain spent across generations. Delayed resets for a deletion tombstone
+  are recorded and acknowledged without recreating the user. Managed MFA resets share the
+  ledger and do not rewrite a profile or advance its revision. `ApplyInstallerDirectory` requires the narrowed org_id and
   compares it even on a duplicate before changing authority or accepting the event.
 
 - `AuditStore.ListAuditRecords(offset, limit, prefixes...)` pages newest first by `id`; prefixes match the

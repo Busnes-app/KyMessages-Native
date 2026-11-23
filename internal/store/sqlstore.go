@@ -372,9 +372,14 @@ func (u *userStore) directoryWrite(ctx context.Context, user *User, ev Directory
 	if rows, err := res.RowsAffected(); err != nil || rows == 0 {
 		return false, err
 	}
-	res, err = tx.ExecContext(ctx, u.store.rebind(`INSERT INTO directory_sync_state (provider, subject, revision) VALUES (?, ?, ?)
-ON CONFLICT (provider, subject) DO UPDATE SET revision = excluded.revision
-WHERE directory_sync_state.revision < excluded.revision OR excluded.revision = -1`), user.SSOProvider, user.SSOSubject, ev.Revision)
+	var restoreBump int64
+	if ev.Revision == -1 {
+		restoreBump = 1
+	}
+	res, err = tx.ExecContext(ctx, u.store.rebind(`INSERT INTO directory_sync_state (provider, subject, revision, restore_generation) VALUES (?, ?, ?, ?)
+ON CONFLICT (provider, subject) DO UPDATE SET revision = excluded.revision,
+    restore_generation = directory_sync_state.restore_generation + excluded.restore_generation
+WHERE directory_sync_state.revision < excluded.revision OR excluded.revision = -1`), user.SSOProvider, user.SSOSubject, ev.Revision, restoreBump)
 	if err != nil {
 		return false, err
 	}
@@ -415,6 +420,15 @@ func (u *userStore) ResetDirectoryMFA(ctx context.Context, user *User, ev Direct
 	if managed != 0 {
 		return false, errors.New("managed directory requires installer authority")
 	}
+	if user.ID == "" {
+		var deleted int
+		if err := tx.QueryRowContext(ctx, u.store.rebind(`SELECT COUNT(*) FROM directory_sync_state WHERE provider = ? AND subject = ? AND NOT EXISTS (SELECT 1 FROM users WHERE sso_provider = ? AND sso_subject = ?)`), user.SSOProvider, user.SSOSubject, user.SSOProvider, user.SSOSubject).Scan(&deleted); err != nil {
+			return false, err
+		}
+		if deleted != 1 {
+			return false, ErrNotFound
+		}
+	}
 	res, err := tx.ExecContext(ctx, u.store.rebind(`INSERT INTO directory_sync_events (provider, event_id) VALUES (?, ?) ON CONFLICT (provider, event_id) DO NOTHING`), user.SSOProvider, ev.ID)
 	if err != nil {
 		return false, err
@@ -430,7 +444,8 @@ func (u *userStore) ResetDirectoryMFA(ctx context.Context, user *User, ev Direct
 	if err != nil {
 		return false, err
 	}
-	if !fresh {
+	if !fresh || user.ID == "" {
+		// A known deletion is terminal for this delivery; acknowledge without recreation.
 		return false, tx.Commit()
 	}
 	if err := revokeSSOGrants(ctx, u.store, tx, user.ID); err != nil {

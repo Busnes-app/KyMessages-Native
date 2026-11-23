@@ -12,7 +12,9 @@ Owns the application adapters around KyIdentity OAuth/OIDC login and the HMAC-SH
   Multi mode requires a canonical org_id; the database compares it with the subject's account.
 - `user.mfa_reset` uses `ResetDirectoryMFA`: independent reset replay record, credential fence
   and all grant/push deletion commit together without a profile upsert. Newer profile events
-  cannot suppress an unseen reset; duplicate reset delivery preserves a later sign-in. Both reset and deletion compare the
+  cannot suppress an unseen reset; duplicate reset delivery preserves a later sign-in. Restore
+  generations permit newly reused revisions while keeping old event IDs spent. A delayed reset
+  after recorded deletion is an acknowledged no-op. Both reset and deletion compare an existing
   account's org_id before writing. Managed directory events apply the same binding check.
 
 - `KyIdentityClient.HandleSyncWebhook` implements KyIdentity's suite-webhook contract: a bare SCIM 2.0 User body verified with `ky-primitives/syncauth` (event type and ID are signed headers, ±5 minutes) before any local change. Events: `user.created`, `user.updated` (`active:false` deactivates), `user.mfa_reset` and `user.deleted`; others are ignored with success. The SCIM `id` is the OIDC `sub`. A primary role of `admin` maps to admin, anything else to user. Unauthenticated is 401, a body without `id` or `meta.version` is 400.

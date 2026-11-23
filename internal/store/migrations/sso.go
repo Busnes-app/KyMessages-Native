@@ -3,9 +3,11 @@ package migrations
 const ssoLifecycleSchema = `
 ALTER TABLE push_subscriptions ADD COLUMN sso_sid TEXT NOT NULL DEFAULT '';
 CREATE INDEX idx_push_subs_sso ON push_subscriptions(user_id, sso_sid);
+ALTER TABLE directory_sync_state ADD COLUMN restore_generation BIGINT NOT NULL DEFAULT 0;
 CREATE TABLE directory_mfa_resets (
-    provider TEXT NOT NULL, subject TEXT NOT NULL, reset_key TEXT NOT NULL,
-    PRIMARY KEY (provider, subject, reset_key)
+    provider TEXT NOT NULL, subject TEXT NOT NULL,
+    restore_generation BIGINT NOT NULL, reset_key TEXT NOT NULL,
+    PRIMARY KEY (provider, subject, restore_generation, reset_key)
 );
 ALTER TABLE sessions ADD COLUMN sso_sid TEXT NOT NULL DEFAULT '';
 ALTER TABLE sessions ADD COLUMN sso_issued_at BIGINT NOT NULL DEFAULT 0;

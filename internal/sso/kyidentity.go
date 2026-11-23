@@ -236,10 +236,13 @@ func (k *KyIdentityClient) applySyncWebhook(ctx context.Context, headers syncaut
 		return event.Type, k.upsertDirectoryUser(ctx, user, ev)
 	case "user.mfa_reset":
 		existing, err := k.store.Users().GetUserBySSO(ctx, "kyidentity", user.ID)
+		if errors.Is(err, store.ErrNotFound) {
+			existing, err = &store.User{SSOProvider: "kyidentity", SSOSubject: user.ID}, nil
+		}
 		if err != nil {
 			return event.Type, err
 		}
-		if k.tenancy.IsMultiTenant() && existing.OrgID != orgID {
+		if k.tenancy.IsMultiTenant() && existing.ID != "" && existing.OrgID != orgID {
 			k.auditOrgMismatch(ctx, user.ID, existing.OrgID, orgID)
 			return event.Type, ErrSyncOrgMismatch
 		}

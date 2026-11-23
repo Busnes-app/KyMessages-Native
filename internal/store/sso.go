@@ -46,7 +46,17 @@ func recordSSOFence(ctx context.Context, st *SQLStore, tx *sql.Tx, userID, sid s
 
 // Reset revisions have their own replay set; profile revisions cannot supersede them.
 func recordMFAReset(ctx context.Context, st *SQLStore, tx *sql.Tx, provider, subject, key string) (bool, error) {
-	res, err := tx.ExecContext(ctx, st.rebind(`INSERT INTO directory_mfa_resets (provider, subject, reset_key) VALUES (?, ?, ?) ON CONFLICT (provider, subject, reset_key) DO NOTHING`), provider, subject, key)
+	// Serialize reset admission with a restore resend's generation change. SQLite's
+	// write transaction and PostgreSQL's row lock provide the same ordering.
+	if _, err := tx.ExecContext(ctx, st.rebind(`UPDATE directory_sync_state SET restore_generation = restore_generation WHERE provider = ? AND subject = ?`), provider, subject); err != nil {
+		return false, err
+	}
+	var generation int64
+	err := tx.QueryRowContext(ctx, st.rebind(`SELECT restore_generation FROM directory_sync_state WHERE provider = ? AND subject = ?`), provider, subject).Scan(&generation)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	res, err := tx.ExecContext(ctx, st.rebind(`INSERT INTO directory_mfa_resets (provider, subject, restore_generation, reset_key) VALUES (?, ?, ?, ?) ON CONFLICT (provider, subject, restore_generation, reset_key) DO NOTHING`), provider, subject, generation, key)
 	if err != nil {
 		return false, err
 	}
