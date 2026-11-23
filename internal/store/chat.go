@@ -1454,7 +1454,7 @@ func (c *chatStore) SumPendingAttachmentBytesByUploader(ctx context.Context, ten
 	return total, nil
 }
 
-func (c *chatStore) PurgeOrphanAttachments(ctx context.Context, olderThanMilli int64, limit int) ([]string, error) {
+func (c *chatStore) PurgeOrphanAttachments(ctx context.Context, olderThanMilli int64, limit int) ([]BlobRef, error) {
 	if limit <= 0 {
 		limit = 200
 	}
@@ -1469,7 +1469,7 @@ func (c *chatStore) PurgeOrphanAttachments(ctx context.Context, olderThanMilli i
 	}
 
 	selQ := c.store.rebind(`
-		SELECT id, blob_key FROM attachments
+		SELECT id, tenant_id, blob_key FROM attachments
 		WHERE message_id IS NULL AND created_at < ?
 		ORDER BY created_at ASC, id ASC
 		LIMIT ?`)
@@ -1478,13 +1478,13 @@ func (c *chatStore) PurgeOrphanAttachments(ctx context.Context, olderThanMilli i
 		return nil, err
 	}
 	type candidate struct {
-		id      string
-		blobKey string
+		id string
+		BlobRef
 	}
 	var candidates []candidate
 	for rows.Next() {
 		var item candidate
-		if err := rows.Scan(&item.id, &item.blobKey); err != nil {
+		if err := rows.Scan(&item.id, &item.TenantID, &item.Key); err != nil {
 			_ = rows.Close()
 			return nil, err
 		}
@@ -1503,14 +1503,14 @@ func (c *chatStore) PurgeOrphanAttachments(ctx context.Context, olderThanMilli i
 	}
 
 	delQ := c.store.rebind(`DELETE FROM attachments WHERE id = ? AND message_id IS NULL`)
-	deletedKeys := make([]string, 0, len(candidates))
+	deletedKeys := make([]BlobRef, 0, len(candidates))
 	for _, item := range candidates {
 		res, err := tx.ExecContext(ctx, delQ, item.id)
 		if err != nil {
 			return nil, err
 		}
 		if n, err := res.RowsAffected(); err == nil && n == 1 {
-			deletedKeys = append(deletedKeys, item.blobKey)
+			deletedKeys = append(deletedKeys, item.BlobRef)
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -1552,4 +1552,21 @@ func (c *chatStore) attachAttachments(ctx context.Context, db rowQueryer, msgs [
 		}
 	}
 	return rows.Err()
+}
+
+func (c *chatStore) ListAttachmentBlobs(ctx context.Context, afterID string, limit int) ([]BlobRef, error) {
+	rows, err := c.store.db.QueryContext(ctx, c.store.rebind(`SELECT id, tenant_id, blob_key FROM attachments WHERE id > ? ORDER BY id LIMIT ?`), afterID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []BlobRef
+	for rows.Next() {
+		var r BlobRef
+		if err := rows.Scan(&r.ID, &r.TenantID, &r.Key); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }

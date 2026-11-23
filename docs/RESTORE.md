@@ -122,8 +122,11 @@ Multi mode runs several replicas on one PostgreSQL database. The capsule schedul
   `data/encryption.key`) and `KY_VAPID_PRIVATE_KEY` (or the shared `data/vapid.key`) live in the
   operator's secret store, never next to the database backup. A restored database needs the same
   encryption key, or stored TOTP secrets cannot be read. Multi mode never mints these at start.
-- **Attachments.** `KY_ATTACHMENTS_DIR` is a volume every replica mounts; back it up with the
-  volume's own snapshots or copies. The capsule's attachment mirror is not used in multi mode.
+- **Attachments.** `KY_ATTACHMENTS_DIR` is a volume every replica mounts, with each org's blobs
+  under `orgs/<org_id>/att/`; back it up with the volume's own snapshots or copies. The capsule's
+  attachment mirror is not used in multi mode. Restore the volume's `.store-id` file with it: a
+  replica whose directory holds no ID or another one than the database's `blobs.store_id`
+  refuses to start. For a deliberately new volume, delete that setting before the first start.
 - **Return to service.** Stop every replica before the restore, then start them all. Migrations
   take a PostgreSQL advisory lock, so replicas starting together apply each migration once.
   Restart every replica after any restore, including one made underneath running replicas: the

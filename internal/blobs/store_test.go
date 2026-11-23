@@ -58,7 +58,7 @@ func TestStorePutOpenDeleteAndSHA256(t *testing.T) {
 	payload := makePNG(t)
 	wantHash := sha256.Sum256(payload)
 
-	res, err := st.Put("att_019a0000-0000-7000-8000-000000000001", bytes.NewReader(payload), 1024*1024)
+	res, err := st.Put("default", "att_019a0000-0000-7000-8000-000000000001", bytes.NewReader(payload), 1024*1024)
 	if err != nil {
 		t.Fatalf("Put: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestStorePutOpenDeleteAndSHA256(t *testing.T) {
 		t.Error("image/png should be inline safe")
 	}
 
-	f, size, err := st.Open(res.Key)
+	f, size, err := st.Open("default", res.Key)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -91,13 +91,13 @@ func TestStorePutOpenDeleteAndSHA256(t *testing.T) {
 		t.Error("round-trip bytes mismatch")
 	}
 
-	if err := st.Delete(res.Key); err != nil {
+	if err := st.Delete("default", res.Key); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	if err := st.Delete(res.Key); err != nil {
+	if err := st.Delete("default", res.Key); err != nil {
 		t.Fatalf("idempotent Delete: %v", err)
 	}
-	if _, _, err := st.Open(res.Key); !errors.Is(err, os.ErrNotExist) {
+	if _, _, err := st.Open("default", res.Key); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("Open after Delete = %v, want os.ErrNotExist", err)
 	}
 }
@@ -108,22 +108,22 @@ func TestStoreEnforcesSizeAndKeyBounds(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := st.Put("att_empty_0001", bytes.NewReader(nil), 1024); !errors.Is(err, blobs.ErrEmpty) {
+	if _, err := st.Put("default", "att_empty_0001", bytes.NewReader(nil), 1024); !errors.Is(err, blobs.ErrEmpty) {
 		t.Errorf("empty Put = %v, want ErrEmpty", err)
 	}
-	if _, err := st.Put("att_large_0001", bytes.NewReader(make([]byte, 17)), 16); !errors.Is(err, blobs.ErrTooLarge) {
+	if _, err := st.Put("default", "att_large_0001", bytes.NewReader(make([]byte, 17)), 16); !errors.Is(err, blobs.ErrTooLarge) {
 		t.Errorf("oversized Put = %v, want ErrTooLarge", err)
 	}
 
 	badKeys := []string{"", "../etc/passwd", "a/b/c/d/e/f", "short", "att..evil1234", "att\x00null1234"}
 	for _, k := range badKeys {
-		if _, err := st.Put(k, strings.NewReader("hi"), 64); !errors.Is(err, blobs.ErrInvalidKey) {
+		if _, err := st.Put("default", k, strings.NewReader("hi"), 64); !errors.Is(err, blobs.ErrInvalidKey) {
 			t.Errorf("Put(%q) = %v, want ErrInvalidKey", k, err)
 		}
-		if _, _, err := st.Open(k); !errors.Is(err, blobs.ErrInvalidKey) {
+		if _, _, err := st.Open("default", k); !errors.Is(err, blobs.ErrInvalidKey) {
 			t.Errorf("Open(%q) = %v, want ErrInvalidKey", k, err)
 		}
-		if err := st.Delete(k); !errors.Is(err, blobs.ErrInvalidKey) {
+		if err := st.Delete("default", k); !errors.Is(err, blobs.ErrInvalidKey) {
 			t.Errorf("Delete(%q) = %v, want ErrInvalidKey", k, err)
 		}
 	}
@@ -156,7 +156,7 @@ func TestStoreMIMESniffingAndXSSDowngrade(t *testing.T) {
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			key := "att_mime_test_" + string(rune('a'+i)) + "00001"
-			res, err := st.Put(key, bytes.NewReader(tc.body), 1024*1024)
+			res, err := st.Put("default", key, bytes.NewReader(tc.body), 1024*1024)
 			if err != nil {
 				t.Fatalf("Put: %v", err)
 			}

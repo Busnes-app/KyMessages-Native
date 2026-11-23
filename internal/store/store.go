@@ -291,6 +291,9 @@ type AuditStore interface {
 type SettingsStore interface {
 	GetSetting(ctx context.Context, key string) (string, error)
 	SetSetting(ctx context.Context, key, val string) error
+	// SetSettingOnce stores val only if key is unset, and returns the stored value: the
+	// first writer across replicas wins.
+	SetSettingOnce(ctx context.Context, key, val string) (string, error)
 	DeleteSetting(ctx context.Context, key string) error
 	GetAllSettings(ctx context.Context) (map[string]string, error)
 }
@@ -380,7 +383,9 @@ type ChatStore interface {
 	DeleteStagedAttachment(ctx context.Context, tenantID, attachmentID, uploaderID string) (string, error)
 	SumAttachmentBytesByTenant(ctx context.Context, tenantID string) (int64, error)
 	SumPendingAttachmentBytesByUploader(ctx context.Context, tenantID, uploaderID string) (int64, error)
-	PurgeOrphanAttachments(ctx context.Context, olderThanMilli int64, limit int) ([]string, error)
+	PurgeOrphanAttachments(ctx context.Context, olderThanMilli int64, limit int) ([]BlobRef, error)
+	// ListAttachmentBlobs pages every attachment's blob by row ID, after afterID.
+	ListAttachmentBlobs(ctx context.Context, afterID string, limit int) ([]BlobRef, error)
 
 	// Call Sessions
 	CreateCallSession(ctx context.Context, cs *CallSession) error

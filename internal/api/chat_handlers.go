@@ -915,7 +915,7 @@ func (s *Server) handleChatDeleteMessage(w http.ResponseWriter, r *http.Request)
 
 	if s.blobs != nil {
 		for _, att := range linkedAttachments {
-			_ = s.blobs.Delete(att.BlobKey)
+			_ = s.blobs.Delete(att.TenantID, att.BlobKey)
 		}
 	}
 
