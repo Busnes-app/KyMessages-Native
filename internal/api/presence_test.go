@@ -174,7 +174,7 @@ func TestSuitePresenceSingleTenantAndPrivacy(t *testing.T) {
 		subs[i] = "sub-x"
 	}
 	wantCode(t, e.presence("kypost.presence.lookup", pbody(alice.SSOSubject, "", "subs", subs)), http.StatusBadRequest, "too_many", "51 people")
-	me := e.presence("kycalendar.presence.me", pbody(bob.SSOSubject, "", "share", false))
+	me := e.presence("kycalendar.presence.me", pbody(bob.SSOSubject, "", "share", false, "manual", nil))
 	if me.Code != http.StatusOK || me.Body.String() != `{"manual":null,"share":false}`+"\n" {
 		t.Fatalf("sharing off = %d %s", me.Code, me.Body.String())
 	}
