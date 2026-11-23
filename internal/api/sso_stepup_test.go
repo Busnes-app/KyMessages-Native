@@ -89,6 +89,7 @@ type fakeIdP struct {
 	key        *rsa.PrivateKey
 	mu         sync.Mutex
 	tokens     map[string]string
+	onToken    func()
 }
 
 // newFakeIdP starts the issuer and points cfg's KyIdentity settings at it.
@@ -111,7 +112,11 @@ func makeFakeIdP(t *testing.T, cfg *config.Config, tls bool) *fakeIdP {
 			_ = r.ParseForm()
 			f.mu.Lock()
 			token := f.tokens[r.Form.Get("code")]
+			hook := f.onToken
 			f.mu.Unlock()
+			if hook != nil {
+				hook()
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "unused", "token_type": "Bearer", "id_token": token})
 		default:
 			http.NotFound(w, r)

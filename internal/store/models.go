@@ -28,7 +28,16 @@ type User struct {
 }
 
 // Session represents an active authenticated user session.
+// SSOSession is the verified IdP binding, inherited unchanged by paired devices.
+// Generation is the shared revocation generation read before code exchange.
+type SSOSession struct {
+	SID        string `json:"-"`
+	IssuedAt   int64  `json:"-"`
+	Generation int64  `json:"-"`
+}
+
 type Session struct {
+	SSOSession
 	TokenHash string `json:"token_hash"`
 	UserID    string `json:"user_id"`
 	UserAgent string `json:"user_agent"`
@@ -47,6 +56,7 @@ type MFAChallenge struct {
 
 // DevicePairing represents a 90-second ephemeral session to link mobile/PWA wrappers.
 type DevicePairing struct {
+	SSOSession
 	// Secret and PushToken never serialise: this record is reached by unauthenticated
 	// pair/verify and pair/poll callers. A handler that must return one needs its own type.
 	Secret     string    `json:"-"` // Ephemeral secret for exchange

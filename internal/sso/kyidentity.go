@@ -222,14 +222,32 @@ func (k *KyIdentityClient) applySyncWebhook(ctx context.Context, headers syncaut
 	if match == nil {
 		return "", ErrSyncMalformed
 	}
+	orgID, err := DirectoryOrg(body, k.tenancy)
+	if err != nil {
+		return event.Type, err
+	}
 	revision, _ := strconv.ParseInt(match[1], 10, 64)
 	ev := store.DirectoryEvent{ID: event.ID, Revision: revision}
 
 	k.syncMu.Lock()
 	defer k.syncMu.Unlock()
 	switch event.Type {
-	case "user.created", "user.updated", "user.mfa_reset":
+	case "user.created", "user.updated":
 		return event.Type, k.upsertDirectoryUser(ctx, user, ev)
+	case "user.mfa_reset":
+		existing, err := k.store.Users().GetUserBySSO(ctx, "kyidentity", user.ID)
+		if err != nil {
+			return event.Type, err
+		}
+		if k.tenancy.IsMultiTenant() && existing.OrgID != orgID {
+			k.auditOrgMismatch(ctx, user.ID, existing.OrgID, orgID)
+			return event.Type, ErrSyncOrgMismatch
+		}
+		applied, err := k.store.Users().ResetDirectoryMFA(ctx, existing, ev)
+		if err == nil && applied && k.onUserRevoked != nil {
+			k.onUserRevoked(ctx, existing.ID)
+		}
+		return event.Type, err
 	case "user.deleted":
 		existing, err := k.store.Users().GetUserBySSO(ctx, "kyidentity", user.ID)
 		if errors.Is(err, store.ErrNotFound) {
@@ -239,6 +257,10 @@ func (k *KyIdentityClient) applySyncWebhook(ctx context.Context, headers syncaut
 		}
 		if err != nil {
 			return event.Type, err
+		}
+		if k.tenancy.IsMultiTenant() && existing.ID != "" && existing.OrgID != orgID {
+			k.auditOrgMismatch(ctx, user.ID, existing.OrgID, orgID)
+			return event.Type, ErrSyncOrgMismatch
 		}
 		applied, err := k.store.Users().DeleteDirectoryUser(ctx, existing, ev)
 		if err == nil && applied && existing.ID != "" && k.onUserRevoked != nil {

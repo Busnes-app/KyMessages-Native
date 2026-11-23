@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -17,7 +16,7 @@ import (
 // It updates only an owned subject and preserves role, local credentials and tickets.
 // It returns the user ID whose access the event revokes, so callers can end live
 // connections; "" when access stays, including a replayed MFA reset.
-func (s *SQLStore) ApplyInstallerDirectory(ctx context.Context, issuer, subject, event, version, digest string, active, administrator bool) (string, error) {
+func (s *SQLStore) ApplyInstallerDirectory(ctx context.Context, issuer, subject, event, version, digest string, active, administrator bool, orgID string) (string, error) {
 	revision, err := strconv.ParseUint(version, 10, 64)
 	if err != nil || revision == 0 || strconv.FormatUint(revision, 10) != version {
 		return "", errors.New("invalid directory revision")
@@ -62,6 +61,14 @@ func (s *SQLStore) ApplyInstallerDirectory(ctx context.Context, issuer, subject,
 		return "", err
 	}
 	defer tx.Rollback()
+	// Check binding inside the write transaction, before even accepting a duplicate.
+	var storedOrg string
+	if err := tx.QueryRowContext(ctx, s.rebind("SELECT org_id FROM users WHERE id=? AND sso_provider='kyidentity' AND sso_subject=?"), owned.UserID, subject).Scan(&storedOrg); err != nil {
+		return "", err
+	}
+	if storedOrg != orgID {
+		return "", ErrForbidden
+	}
 	stateKey := "installer.directory." + hex.EncodeToString(hash[:])
 	var prior string
 	err = tx.QueryRowContext(ctx, s.rebind("SELECT value FROM server_settings WHERE key=?"), stateKey).Scan(&prior)
@@ -110,14 +117,8 @@ func (s *SQLStore) ApplyInstallerDirectory(ctx context.Context, issuer, subject,
 		return "", errors.New("directory identity drifted")
 	}
 	if revoked != "" {
-		// Managed rows hold no password; a fresh snapshot fails grants fenced on the old one.
-		if _, err = tx.ExecContext(ctx, s.rebind("UPDATE users SET password_hash=? WHERE id=?"), "revoked:"+rand.Text(), owned.UserID); err != nil {
+		if err = revokeSSOGrants(ctx, s, tx, owned.UserID); err != nil {
 			return "", err
-		}
-		for _, table := range []string{"sessions", "device_pairings", "mfa_challenges", "push_subscriptions"} {
-			if _, err = tx.ExecContext(ctx, s.rebind("DELETE FROM "+table+" WHERE user_id=?"), owned.UserID); err != nil {
-				return "", err
-			}
 		}
 	}
 	next, _ := json.Marshal(struct {

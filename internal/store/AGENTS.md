@@ -8,6 +8,18 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
 
 ## Local Contracts
 - Web Push endpoint ownership changes require both stored subscription keys to match (decoded base64url); comparison and transfer commit in one transaction, with a PostgreSQL row lock. A mismatch returns `ErrInvalidInput` without changing the subscription. Same-owner registration may refresh keys.
+- Migration 50 adds IdP sid/issuance/generation to sessions and device pairings, permanent
+  `sso_logout_events` replay IDs and `sso_revocations` fences. Existing KyIdentity sessions,
+  pairings and push subscriptions are cleared once because their IdP binding is unknown.
+- `SSOGeneration` reads the primary before code exchange. `ApplySSOLogout` locks the matching
+  subject/org account, spends the issuer/jti, records the scope's fence and revokes matching
+  sessions/pairings in one transaction. A sid targets only that IdP session; a subject logout
+  revokes every grant and push subscription. Issuance holds the same user row through its
+  fence check. The shared generation orders in-flight callbacks independently of pod clocks.
+- `ResetDirectoryMFA` commits the directory revision with a new credential snapshot, a subject
+  fence and grant/push deletion. `ApplyInstallerDirectory` requires the narrowed org_id and
+  compares it even on a duplicate before changing authority or accepting the event.
+
 - `AuditStore.ListAuditRecords(offset, limit, prefixes...)` pages newest first by `id`; prefixes match the
   literal action start (`substr`, not LIKE) and the count covers only matching rows.
 - `AuditStore.LatestAuditRecord(action)` reads the latest inserted row for one

@@ -7,6 +7,13 @@ Provides KyIdentity sign-in (OpenID Connect) and KyIdentity's signed directory s
 Owns the application adapters around KyIdentity OAuth/OIDC login and the HMAC-SHA256 signed directory sync webhooks. `syncstatus.go` owns the webhook record and the rejection counters.
 
 ## Local Contracts
+- `VerifyLogout` accepts only RS256 `logout+jwt` for the configured issuer/client, with a
+  two-minute iat/exp window, jti, subject, back-channel event and no nonce/token_use.
+  Multi mode requires a canonical org_id; the database compares it with the subject's account.
+- `user.mfa_reset` uses `ResetDirectoryMFA`: ordered event, credential fence and all grant/push
+  deletion commit together without a profile upsert. Both reset and deletion compare the
+  account's org_id before writing. Managed directory events apply the same binding check.
+
 - `KyIdentityClient.HandleSyncWebhook` implements KyIdentity's suite-webhook contract: a bare SCIM 2.0 User body verified with `ky-primitives/syncauth` (event type and ID are signed headers, ±5 minutes) before any local change. Events: `user.created`, `user.updated` (`active:false` deactivates), `user.mfa_reset` and `user.deleted`; others are ignored with success. The SCIM `id` is the OIDC `sub`. A primary role of `admin` maps to admin, anything else to user. Unauthenticated is 401, a body without `id` or `meta.version` is 400.
 - An acknowledged delivery (applied, superseded or duplicate; the same set that wakes the sweep) writes `kyidentity_webhook_last` (`WebhookRecordKey`, `WebhookRecord{at, kind}`) on a detached 5 s context. `syncstatus.go` is its only writer; a failed write is logged, never a failed delivery. Refused deliveries (`ErrSyncUnauthorized`, `ErrSyncMalformed`, `ErrSyncUsernameConflict`) are counted in memory only (`Rejections()`: count since start, last time, last reason); bodies are never kept. Reasons: `not_configured` (secret unset or shorter than `syncauth.MinKeyBytes`), `bad_signature` (missing or not matching), `stale` (outside ±5 minutes), `bad_headers` (event type, ID or timestamp missing or unparseable), `malformed` (signed, but not a usable SCIM user), `username_conflict` (signed, but a `user.created` whose username another account holds).
 - A username another account holds (`store.ErrUsernameTaken`, exact case, including a write that lost a race) is never merged into or alters that account, and is logged once and audited `sso.sync_conflict` (resource the username, details `subject="..."`, plus `kept="..."` on an update). Other refusals reach neither the database nor the audit log.

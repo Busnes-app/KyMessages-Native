@@ -268,6 +268,7 @@ ALTER TABLE mfa_challenges ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';`,
 	{Version: 30, Name: "suite_presence", SQLite: presenceSchema, Postgres: presenceSchema},
 	// End-to-end encryption key server: public device keys, one-time keys, to-device mailbox.
 	{Version: 31, Name: "e2ee_keys", SQLite: e2eeSchema + e2eeToDeviceSQLite, Postgres: e2eeSchema + e2eeToDevicePostgres},
+	{Version: 50, Name: "sso_session_lifecycle", SQLite: ssoLifecycleSchema, Postgres: ssoLifecycleSchema},
 }
 
 const multiTenancySchemaSQLite = `

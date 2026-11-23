@@ -11,6 +11,7 @@ import (
 	"github.com/Busnes-app/ky-primitives/applysetup"
 	"github.com/Busnes-app/ky-primitives/syncauth"
 	"github.com/Busnes-app/ky_server_base/internal/auth"
+	"github.com/Busnes-app/ky_server_base/internal/sso"
 	protocol "github.com/elimity-com/scim"
 )
 
@@ -38,6 +39,11 @@ func (s *Server) handleInstallerDirectory(w http.ResponseWriter, r *http.Request
 		s.writeError(w, 401, "Invalid directory signature")
 		return
 	}
+	orgID, err := sso.DirectoryOrg(raw, s.config.Tenancy)
+	if err != nil {
+		s.writeError(w, 400, "Invalid directory organization")
+		return
+	}
 	var attrs protocol.ResourceAttributes
 	if json.Unmarshal(raw, &attrs) != nil {
 		s.writeError(w, 400, "Invalid directory resource")
@@ -63,7 +69,7 @@ func (s *Server) handleInstallerDirectory(w http.ResponseWriter, r *http.Request
 	}
 	sum := sha256.Sum256(append([]byte(event.Type+"\x00"), raw...))
 	digest := hex.EncodeToString(sum[:])
-	revoked, err := s.store.ApplyInstallerDirectory(r.Context(), s.config.SSO.KyIdentityIssuer, subject, event.Type, revision, digest, active, admin)
+	revoked, err := s.store.ApplyInstallerDirectory(r.Context(), s.config.SSO.KyIdentityIssuer, subject, event.Type, revision, digest, active, admin, orgID)
 	if err != nil {
 		s.writeError(w, 422, "Directory revision or assigned identity refused")
 		return

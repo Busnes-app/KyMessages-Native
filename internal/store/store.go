@@ -34,7 +34,7 @@ type Store interface {
 	ApplyInstaller(context.Context, applysetup.Common, bool) (applysetup.Report, error)
 	InstallerIdentity(context.Context, string, string) (bool, bool, error)
 	InstallerUserAllowed(context.Context, *User) (bool, error)
-	ApplyInstallerDirectory(context.Context, string, string, string, string, string, bool, bool) (string, error)
+	ApplyInstallerDirectory(context.Context, string, string, string, string, string, bool, bool, string) (string, error)
 
 	Users() UserStore
 	Sessions() SessionStore
@@ -211,6 +211,7 @@ type UserStore interface {
 	// when its revision is newer than the last applied one or is -1 (the sender's
 	// post-restore resend), atomically with its write, and reports whether it applied.
 	ApplyDirectoryProfile(ctx context.Context, u *User, ev DirectoryEvent) (bool, error)
+	ResetDirectoryMFA(ctx context.Context, u *User, ev DirectoryEvent) (bool, error)
 	CreateDirectoryUser(ctx context.Context, u *User, ev DirectoryEvent) (bool, error)
 	DeleteDirectoryUser(ctx context.Context, u *User, ev DirectoryEvent) (bool, error)
 	// DirectoryStatuses maps each subject of provider to its user's status, or to "deleted"
@@ -236,6 +237,8 @@ type UserStore interface {
 
 // SessionStore defines repository operations for active login sessions.
 type SessionStore interface {
+	SSOGeneration(ctx context.Context) (int64, error)
+	ApplySSOLogout(ctx context.Context, issuer, subject, orgID, sid, jti string, issuedAt int64) (string, []string, error)
 	CreateSession(ctx context.Context, s *Session, expectedPasswordHash string) error
 	GetSession(ctx context.Context, tokenHash string) (*Session, error)
 	DeleteSession(ctx context.Context, tokenHash string) error

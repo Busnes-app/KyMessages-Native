@@ -104,6 +104,7 @@ func (f *oauthFlow) exchangeIDToken(ctx context.Context, code, verifier, redirec
 func claimsFromIDToken(idToken *oidc.IDToken) (*IdentityClaims, error) {
 	var raw struct {
 		Sub               string `json:"sub"`
+		SID               string `json:"sid"`
 		OrgID             string `json:"org_id"`
 		Email             string `json:"email"`
 		Name              string `json:"name"`
@@ -123,6 +124,8 @@ func claimsFromIDToken(idToken *oidc.IDToken) (*IdentityClaims, error) {
 	}
 	claims := &IdentityClaims{
 		Issuer:            idToken.Issuer,
+		SessionID:         raw.SID,
+		IssuedAt:          idToken.IssuedAt.Unix(),
 		Subject:           raw.Sub,
 		OrgID:             strings.TrimSpace(raw.OrgID),
 		Email:             raw.Email,
