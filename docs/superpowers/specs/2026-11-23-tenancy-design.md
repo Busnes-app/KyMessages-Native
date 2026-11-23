@@ -191,12 +191,16 @@ Multi mode, `origin/main` plus PR #27. Every row has a cross-org test in
    deletes only themselves", step 3). **Fix:** delete the user row and everything derived from
    it: sessions, pairings, push subscriptions, agents, staged attachments, and DM rooms whose
    other member is gone too. Their messages in shared rooms become tombstones (body and
-   attachments removed, the row kept so the thread's order holds; open question 4). Audit rows
-   name the opaque ID only. Acknowledge with 200 once done, and make it idempotent.
+   attachments removed, the row kept so the thread's order holds; open question 4). Blobs are
+   deleted before their rows, as in the purge (§7.3). Audit rows name the opaque ID only. Acknowledge with 200 once done, and make it idempotent.
 3. **`org.deleted` purges nothing.** `ApplyTenantLifecycle` sets `status` only
    (`internal/store/chat.go:188-200`). **Fix:** after the status write commits, a leased job
-   (§8.1) deletes the org's rows in batches, child tables first, then deletes its blobs (prefix
-   `orgs/<org_id>/` in S3, or the listed keys on disk). The `tenants` row stays as a tombstone, so
+   (§8.1) purges the org in batches. For each batch of `attachments` rows it deletes the blobs
+   first, then the rows, so an interrupted run leaves rows that still point at every remaining
+   blob, and the next run finishes them. A missing blob counts as deleted. When no attachment
+   rows remain, it deletes the other tables, child tables first. In S3 a final
+   `DeletePrefix("orgs/<org_id>/")` catches any object without a row, such as one whose upload
+   died between `PUT` and commit. The `tenants` row stays as a tombstone, so
    a late event cannot revive it.
 4. **A restore must not bring back a deleted org or an erased person.** A backup taken before
    the deletion has no tombstone, so the restored database cannot be the authority. KyIdentity
@@ -384,9 +388,12 @@ rows. A message body is bounded per message and refusing text would break chat.
   passes.
 - A write that leaves less than a tenth of the allowance sets `pool_low`, and the reporter
   refreshes that org at once.
-- Today's limits stay as safety limits: `KY_MAX_UPLOAD_BYTES`, the per-user staging cap, and
-  `KY_ATTACHMENTS_MAX_TOTAL_BYTES` per tenant. The smaller limit wins. A hosted install sets the
-  tenant cap at or above the largest pool sold.
+- Two of today's limits stay in multi mode as safety limits: `KY_MAX_UPLOAD_BYTES` and the
+  per-user staging cap (`KY_ATTACHMENTS_MAX_PENDING_USER_BYTES`). The per-tenant cap
+  `KY_ATTACHMENTS_MAX_TOTAL_BYTES` does **not** apply in multi mode, because the pool replaces
+  it. It is one install-wide value, so it could never fit Business (30 GB per seat) and Personal
+  at once. Setting it in multi mode fails startup, so it cannot cap an org below what its plan
+  sells. Single mode keeps it unchanged (§10.4).
 - **If KyIdentity is unreachable,** writes keep checking the last allowance for 15 minutes
   after `pool_checked_at`. After that, a write that adds bytes is refused with `503
   pool_unavailable`, and shrinking writes still pass. The 15 minutes match KyCalendar (its open
@@ -433,7 +440,7 @@ test proves the answers are byte for byte the same.
 | The object store provider reads files | §9.3: E5 ciphertext, and server sealing until then. |
 | An object key or URL is guessed or reused | Random IDs, never content hashes. Proxied downloads with a membership check. No presigned URLs. |
 | S3 credentials leak | Environment or file only. Never logged, returned or audited. HTTPS only. |
-| One org fills the pool or the bucket for others | The pool per org, plus the per-tenant safety cap, per-user staging cap and upload limit. |
+| One org fills the pool or the bucket for others | The pool per org, plus the per-user staging cap and the upload limit. Bucket or volume capacity is watched by the operator's alerts. |
 | A forged or replayed usage report | Signed with `syncauth`, absolute totals, monotonic revision. KyIdentity verifies it. |
 | Pool overshoot while KyIdentity is down | Bounded to 15 minutes of other apps' growth. Then fail closed for adding writes. |
 | Single-tenant changes by accident | Every change is gated on `IsMultiTenant()`. S3 settings refuse to start in single mode. Golden and upgrade tests. |
