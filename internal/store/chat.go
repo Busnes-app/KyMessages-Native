@@ -115,7 +115,9 @@ func (c *chatStore) EnsureTenant(ctx context.Context, tenantID string) (*Tenant,
 func (c *chatStore) GetTenant(ctx context.Context, tenantID string) (*Tenant, error) {
 	tenantID = normalizeTenant(tenantID)
 	q := c.store.rebind(`
-		SELECT id, slug, display_name, plan, status, p2p_policy, p2p_max_video, p2p_max_audio, guest_force_sfu, created_at
+		SELECT id, slug, display_name, plan,
+ CASE WHEN status = 'active' AND EXISTS (SELECT 1 FROM tenant_pending_revocations p WHERE p.tenant_id = tenants.id) THEN 'suspended' ELSE status END,
+ p2p_policy, p2p_max_video, p2p_max_audio, guest_force_sfu, created_at
 		FROM tenants WHERE id = ?`)
 	var t Tenant
 	var guestForce int
@@ -190,10 +192,10 @@ func (c *chatStore) ApplyTenantLifecycle(ctx context.Context, tenantID, status s
 	var args []any
 	switch status {
 	case TenantStatusActive, TenantStatusSuspended:
-		q = `UPDATE tenants SET status = ?, lifecycle_revision = ? WHERE id = ? AND lifecycle_revision < ? AND status <> ?`
+		q = `UPDATE tenants SET status = ?, lifecycle_revision = ?, missing_since = NULL WHERE id = ? AND lifecycle_revision < ? AND status <> ?`
 		args = []any{status, revision, strings.TrimSpace(tenantID), revision, TenantStatusDeleted}
 	case TenantStatusDeleted:
-		q = `UPDATE tenants SET status = ?, lifecycle_revision = CASE WHEN lifecycle_revision < ? THEN ? ELSE lifecycle_revision END WHERE id = ? AND status <> ?`
+		q = `UPDATE tenants SET status = ?, lifecycle_revision = CASE WHEN lifecycle_revision < ? THEN ? ELSE lifecycle_revision END, missing_since = NULL WHERE id = ? AND status <> ?`
 		args = []any{status, revision, revision, strings.TrimSpace(tenantID), TenantStatusDeleted}
 	default:
 		return false, fmt.Errorf("invalid tenant status %q", status)
@@ -1439,8 +1441,10 @@ func (c *chatStore) CommitAttachmentWithQuota(ctx context.Context, reservationID
 		return ErrAttachmentPendingQuotaExceeded
 	}
 	if limits.ActiveUploader {
-		var status string
-		if err := tx.QueryRowContext(ctx, c.store.rebind(`SELECT status FROM users WHERE id = ?`), a.UploaderID).Scan(&status); err != nil || status != "active" {
+		// Under the tenant lock the org purge also takes: an upload whose person was erased or
+		// whose org was deleted while it was in flight commits nothing.
+		var status, tenant string
+		if err := tx.QueryRowContext(ctx, c.store.rebind(`SELECT u.status, t.status FROM users u JOIN tenants t ON t.id = ? WHERE u.id = ? AND NOT EXISTS (SELECT 1 FROM tenant_pending_revocations p WHERE p.tenant_id = t.id)`), a.TenantID, a.UploaderID).Scan(&status, &tenant); err != nil || status != "active" || tenant != TenantStatusActive {
 			return ErrForbidden
 		}
 	}

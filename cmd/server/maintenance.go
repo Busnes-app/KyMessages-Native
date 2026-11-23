@@ -156,3 +156,26 @@ func poolLoop(ctx context.Context, refresh func(context.Context, time.Time) erro
 		}
 	}
 }
+
+// leasedLoop runs job every interval on the replica holding its lease (multi mode). run gets a
+// held func that renews the lease, for jobs that must stop between batches once it is lost.
+func leasedLoop(ctx context.Context, job string, every time.Duration, gate jobGate, run func(ctx context.Context, held func() bool) error, done chan<- struct{}) {
+	defer close(done)
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		if gate(ctx, job, every) {
+			rctx, cancel := context.WithTimeout(ctx, every)
+			err := run(rctx, func() bool { return rctx.Err() == nil && gate(rctx, job, every) })
+			cancel()
+			if err != nil && ctx.Err() == nil {
+				log.Printf("[JOBS] %s incomplete (retrying): %v", job, err)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}

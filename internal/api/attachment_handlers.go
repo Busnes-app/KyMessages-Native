@@ -567,3 +567,72 @@ func (s *Server) deleteBlobs(refs []store.BlobRef) error {
 	}
 	return nil
 }
+
+// PurgeDeletedOrgs deletes the data of every deleted org not purged yet (multi mode): attachment
+// blobs then their rows, in batches, then the org's prefix (orphans included), then every other
+// row. held re-checks the job's lease before each batch; when it fails the purge stops, so two
+// replicas never purge the same batch. An interrupted purge resumes on the next run.
+func (s *Server) PurgeDeletedOrgs(ctx context.Context, held func() bool) error {
+	if !s.config.Tenancy.IsMultiTenant() || s.store == nil {
+		return nil
+	}
+	chat := s.store.Chat()
+	ids, err := chat.DeletedUnpurgedTenants(ctx)
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		for {
+			if !held() {
+				return nil
+			}
+			refs, err := chat.PurgeAttachmentBatch(ctx, id, 200)
+			if err != nil {
+				return err
+			}
+			if len(refs) == 0 {
+				break
+			}
+			if s.blobs != nil {
+				for _, ref := range refs {
+					if err := s.blobs.Delete(ref.TenantID, ref.Key); err != nil && !errors.Is(err, blobs.ErrInvalidKey) {
+						return err
+					}
+				}
+			}
+			if err := chat.DeleteAttachmentRows(ctx, id, refs); err != nil {
+				return err
+			}
+		}
+		if !held() {
+			return nil
+		}
+		// Rows first (under the upload commit's lock, so no commit lands after), then the whole
+		// prefix, which also takes any blob an in-flight upload wrote, then the purged mark.
+		if err := chat.PurgeTenantRows(ctx, id); err != nil {
+			return err
+		}
+		if s.blobs != nil {
+			if err := s.blobs.DeletePrefix(id); err != nil && !errors.Is(err, blobs.ErrInvalidKey) {
+				return err
+			}
+		}
+		if err := chat.MarkTenantPurged(ctx, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SyncTenancy is the leased tenancy-sync job's tick: incremental, or full once a day.
+func (s *Server) SyncTenancy(ctx context.Context, _ time.Time) error {
+	if !s.config.Tenancy.IsMultiTenant() {
+		return nil
+	}
+	return s.kyidentity.SyncTenancy(ctx, s.kyidentity.FullSyncDue(ctx), false)
+}
+
+// StartupTenancySync is the full read every multi-mode replica makes before it serves.
+func (s *Server) StartupTenancySync(ctx context.Context) error {
+	return s.kyidentity.StartupSync(ctx)
+}

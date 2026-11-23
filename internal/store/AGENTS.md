@@ -112,6 +112,17 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   check the org's usage plus the new bytes against the unexpired ceiling under the tenant lock:
   `ErrPoolFull`, or `ErrPoolUnavailable` with no grant or an expired one. Single mode never sets
   `Pool` and never reads the columns.
+- Migration 61 adds `tenants.missing_since` and `tenants.purged_at` (`tenancy_sync.go`). The org
+  purge deletes a deleted org's attachments in batches (`PurgeAttachmentBatch`, the caller deletes
+  the blobs, then `DeleteAttachmentRows`), then every other row child first (`PurgeTenantRows`,
+  under the upload commit's tenant lock), and after the caller deletes the org's blob prefix it
+  removes every per-person erasure workflow row (`user_subjects`, `pending_blob_deletes`,
+  `user_erasure_state`, `user_erasure_actors`) in the row transaction, then marks the org purged
+  (`MarkTenantPurged`, audited `tenancy.org_purged`). The `tenants` row stays
+  as a tombstone. With `ActiveUploader`, a commit also needs its org active, so an upload in
+  flight when its org is deleted commits nothing. `ApplyTenantLifecycle` clears `missing_since`.
+  Room webhooks go by the `rooms` cascade (the E2EE build drops that table); a new table with
+  `tenant_id` must join `PurgeTenantRows`.
 - `ErasureBlobs` and `EraseUser` (`erase.go`, multi mode `user.erased`) delete one person's data:
   account (sessions, MFA, presence and push cascade), pairings, reservations, reactions,
   memberships, owned bots and their content/accounts, staged and posted attachments, and every DM whose
@@ -146,6 +157,11 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   sessions require the exact retained issuer/subject/user/role binding. Directory deletion
   retains the row as `deleted`; it cannot be reactivated.
 
+- Shared leave timers rearm while a disconnected guest keeps polling. The eventual database delete emits one departure and evicts the call seat; deterministic scheduler callbacks cover polling beyond the first timer and later inactivity.
+- `user_erasure_state` tracks pending and completed erasures. `ClearPendingBlobDeletes` commits each completion and its sole `sso.user_erased` audit together, only when all of that user's queued deletes are gone. Replays retain completion; retries read their queued keys through `ErasureBlobs`.
+
+- Migration 61 atomically queues missing-org grant revocation with suspension in `tenant_pending_revocations`. Pending cleanup fences primary tenant reads, grant issuance and upload commits even if a lifecycle event resumes the org; only successful revocation removes the fence. Purge also deletes `user_erasure_state`.
+
 ## Verification
 - `go test -v ./internal/store/...`
 - `migrations/migrations_test.go` builds a v16 database through the test-only
@@ -154,6 +170,3 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
 
 ## Child DOX Index
 None.
-
-- Shared leave timers rearm while a disconnected guest keeps polling. The eventual database delete emits one departure and evicts the call seat; deterministic scheduler callbacks cover polling beyond the first timer and later inactivity.
-- `user_erasure_state` tracks pending and completed erasures. `ClearPendingBlobDeletes` commits each completion and its sole `sso.user_erased` audit together, only when all of that user's queued deletes are gone. Replays retain completion; retries read their queued keys through `ErasureBlobs`.

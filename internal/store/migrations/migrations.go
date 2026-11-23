@@ -292,6 +292,9 @@ ALTER TABLE mfa_challenges ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';`,
 	// goes (so an erasure after user.deleted, or a repeat, still finds the data), and blob
 	// deletes an erasure committed but has not finished.
 	{Version: 60, Name: "erasure_state", SQLite: userSubjectsSchema, Postgres: userSubjectsSchema},
+	// Tenancy sync and purge (multi mode): an org a full KyIdentity read did not list, and when
+	// a deleted org's data was purged.
+	{Version: 61, Name: "tenant_missing_and_purge", SQLite: tenantMissingSchema, Postgres: tenantMissingSchema},
 }
 
 const userSubjectsSchema = `
@@ -318,6 +321,14 @@ CREATE TABLE user_erasure_actors (
  tenant_id VARCHAR(64) NOT NULL,
  user_id VARCHAR(64) NOT NULL,
  PRIMARY KEY (owner_user_id, tenant_id, user_id)
+);
+`
+
+const tenantMissingSchema = `
+ALTER TABLE tenants ADD COLUMN missing_since BIGINT;
+ALTER TABLE tenants ADD COLUMN purged_at BIGINT;
+CREATE TABLE tenant_pending_revocations (
+    tenant_id VARCHAR(64) PRIMARY KEY REFERENCES tenants(id)
 );
 `
 

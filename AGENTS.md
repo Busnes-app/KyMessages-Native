@@ -166,8 +166,10 @@ When the user requests a durable behavior change, record it here or in the relev
   shared secrets, capsule scheduler off) PR 3 (shared sign-in limits and proof-of-work,
   per-org meeting IDs, guest sessions in PostgreSQL) PR 5 (the blob interface, the org
   layout on a shared volume, its store-ID check and the flat-blob relocation) PR 7 (the org
-  storage pool, to KyIdentity's `POST /api/suite/storage` grant contract) and PR 1a (`export_only`
-  tokens refused, `user.erased` deletes a person's data) are built; the rest is not. It extends the 2026-11-22
+  storage pool, to KyIdentity's `POST /api/suite/storage` grant contract) PR 1a (`export_only`
+  tokens refused, `user.erased` deletes a person's data) and PR 1b (tenancy sync from KyIdentity's
+  org and erased lists, the start-up check, the leased org purge) are built. Not built: PR 4
+  (calls across replicas), PR 6 (S3), PR 8 (multi-region). It extends the 2026-11-22
   spec, whose §4 wire contract stays authoritative.
 - Single mode must not change: `TestSingleTenantGolden` replays a fixed single-mode script and
   compares it with `internal/api/testdata/single-tenant-golden.txt`, recorded before the tenancy
@@ -240,7 +242,7 @@ The loop closes its `done` channel
 only where it returns, between runs, and `runServer` cancels and waits on that channel after
 `httpServer.Shutdown` and before the store closes, then waits on `api.Server.WaitDetached()` for
 the pair, pin-key, unpair, deposit, export and drill handlers, which detach or run long and can outlive
-`Shutdown`. In `KY_TENANCY_MODE=multi` (refused at startup in this release; `internal/config`) the capsule scheduler returns at once (`backup.MultiTenantOff`, which backup status reports as `scheduler_error`; no audit row), and each other loop runs a tick only while it holds that job's `job_leases` row (`leasedJobs`: jobs `maintenance`, `agent_expiry`, `attachment_sweep`; lease three ticks, renewed each tick; `maintenance` also runs `PruneShared` in multi mode; `poolLoop` runs `pool_report` in multi mode only). Single mode passes `everyReplica` and runs every tick as before. `kymessages invalidate-grants` runs `InvalidateRestoredGrants` on the configured database, for a PostgreSQL restore (docs/RESTORE.md, multi section).
+`Shutdown`. In `KY_TENANCY_MODE=multi` (refused at startup in this release; `internal/config`) the capsule scheduler returns at once (`backup.MultiTenantOff`, which backup status reports as `scheduler_error`; no audit row), and each other loop runs a tick only while it holds that job's `job_leases` row (`leasedJobs`: jobs `maintenance`, `agent_expiry`, `attachment_sweep`; lease three ticks, renewed each tick; `maintenance` also runs `PruneShared` in multi mode; `poolLoop` runs `pool_report`, and `leasedLoop` runs `tenancy_sync` and `org_purge` every 5 minutes, in multi mode only). A multi-mode start runs `StartupTenancySync` before serving and fails startup when KyIdentity cannot answer and the last recorded sync is older than 24 h. Single mode passes `everyReplica` and runs every tick as before. `kymessages invalidate-grants` runs `InvalidateRestoredGrants` on the configured database, for a PostgreSQL restore (docs/RESTORE.md, multi section).
 `maintenanceLoop` sweeps expired device pairings, expired suite replay IDs
 (`suite_replay_events`) and to-device mail older than `api.E2EEMailboxTTL` (30 days) every
 minute, each with a 30-second deadline; `agentExpiryLoop` revokes idle or inactive-owner bot tokens every hour; `attachmentSweepLoop` expires staged attachments older than `KY_ATTACHMENTS_PENDING_TTL` at start and every 15 minutes. All background loops join the backup scheduler's wait before the same shutdown drain finishes. Nothing writes

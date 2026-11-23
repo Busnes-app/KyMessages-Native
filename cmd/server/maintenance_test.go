@@ -147,3 +147,24 @@ func TestPoolLoopRunsUnderItsLease(t *testing.T) {
 	cancel()
 	<-done
 }
+
+// leasedLoop runs only under its lease, and the held func it passes renews that lease.
+func TestLeasedLoopHeldRenewsTheLease(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := make(chan string, 4)
+	gate := func(_ context.Context, job string, _ time.Duration) bool { calls <- job; return true }
+	done := make(chan struct{})
+	ran := make(chan bool, 1)
+	go leasedLoop(ctx, "org_purge", time.Hour, gate, func(ctx context.Context, held func() bool) error {
+		ran <- held()
+		return nil
+	}, done)
+	if !<-ran {
+		t.Fatal("held reported a lost lease")
+	}
+	if a, b := <-calls, <-calls; a != "org_purge" || b != "org_purge" {
+		t.Fatalf("lease calls %q %q", a, b)
+	}
+	cancel()
+	<-done
+}

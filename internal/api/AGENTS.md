@@ -69,6 +69,11 @@ Owns HTTP routing, request parsing, session cookie validation, CORS headers, and
   mode every replica drops a whole-user `auth.revoked` user's call seats (`Hub.SetUserRevokeHandler`),
   and call reconciliation removes member peers whose account no longer serves
   (`CallManager.SetUserCheck`, `TestUserRevocationDropsRemoteCallSeats`).
+- `PurgeDeletedOrgs` is the leased `org_purge` job: per deleted org, attachment blobs then rows in
+  batches of 200, re-checking the lease before each batch, then `store.PurgeTenantRows`, then
+  `DeletePrefix` (which takes any blob an in-flight upload wrote), then `MarkTenantPurged`
+  (`TestTenancySyncDeletedOrgIsPurged`). `SyncTenancy` is the leased
+  `tenancy_sync` job (incremental, full once a day); `StartupTenancySync` runs before serving.
 - The org storage pool (`pool.go`, multi mode, customer orgs only; the staff org and org-less
   operators are exempt). Uploads check KyIdentity's grant (`AttachmentQuotaLimits.Pool`), and
   `KY_ATTACHMENTS_MAX_TOTAL_BYTES` does not apply (startup warns when it is set). An upload with
@@ -136,6 +141,8 @@ Owns HTTP routing, request parsing, session cookie validation, CORS headers, and
   publishes a `to_device` WebSocket event to the recipient. These routes spend their own `e2ee:`
   budget (600 a minute), not chat writes.
 
+- In multi mode, whole-user bus revocations remove call seats on every replica even without a chat socket; session-only revocations leave calls alone. Guest invite replacement, denial and revocation use the same bus path.
+
 ## Verification
 - `go test -v ./internal/api/...` (`authz_test.go` pins the per-role exposure of every privileged route; `backup_test.go` the backup routes, on SQLite only because a run snapshots the database)
 - `console_test.go` covers the console routes, the shared `staleAdmin` step-up helper and the audit outcome parser
@@ -143,5 +150,3 @@ Owns HTTP routing, request parsing, session cookie validation, CORS headers, and
 
 ## Child DOX Index
 None.
-
-- In multi mode, whole-user bus revocations remove call seats on every replica even without a chat socket; session-only revocations leave calls alone. Guest invite replacement, denial and revocation use the same bus path.
