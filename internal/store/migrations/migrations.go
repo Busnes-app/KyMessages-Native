@@ -334,6 +334,8 @@ CREATE TABLE IF NOT EXISTS e2ee_one_time_keys (
 	key_value VARCHAR(64) NOT NULL,
 	signature VARCHAR(128) NOT NULL,
 	fallback INTEGER NOT NULL DEFAULT 0,
+	-- A claimed key stays as a tombstone, so a retried upload cannot publish it again.
+	claimed INTEGER NOT NULL DEFAULT 0,
 	-- vodozemac numbers one-time and fallback keys with separate counters, so IDs collide.
 	PRIMARY KEY (user_id, device_id, fallback, key_id),
 	FOREIGN KEY (user_id, device_id) REFERENCES e2ee_devices(user_id, device_id) ON DELETE CASCADE

@@ -84,6 +84,10 @@ func TestRestoreInvalidatesGrants(t *testing.T) {
 	if n, _ := st.E2EE().CountOneTimeKeys(ctx, "u", "D1"); n != 0 {
 		t.Fatalf("%d restored one-time keys survived", n)
 	}
+	// A device retrying its pre-backup upload must not revive the key either.
+	if err := st.E2EE().AddOneTimeKeys(ctx, "u", "D1", []store.E2EEOneTimeKey{{KeyID: "k1", Key: "spent-after-backup", Signature: "s"}}, 100); err != nil {
+		t.Fatal(err)
+	}
 	if k, err := st.E2EE().ClaimOneTimeKey(ctx, "u", "D1"); err != nil || !k.Fallback {
 		t.Fatalf("after restore the claim = %+v %v, want the kept fallback key", k, err)
 	}

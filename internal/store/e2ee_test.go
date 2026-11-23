@@ -65,6 +65,34 @@ func TestE2EEDevices(t *testing.T) {
 	}
 }
 
+// An upload retried after its response was lost must not publish a key claimed in between:
+// its device spends the private half on the first session, so a second claimant would fail.
+func TestE2EERetriedUploadCannotRepublishAClaimedKey(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	e2eeUser(t, st, "u-a")
+	k := st.E2EE()
+	if err := k.UpsertDevice(ctx, device("u-a", "D1", "t1")); err != nil {
+		t.Fatal(err)
+	}
+	upload := []store.E2EEOneTimeKey{{KeyID: "k1", Key: "v1", Signature: "s"}, {KeyID: "fb", Key: "f", Signature: "s", Fallback: true}}
+	if err := k.AddOneTimeKeys(ctx, "u-a", "D1", upload, 100); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := k.ClaimOneTimeKey(ctx, "u-a", "D1"); err != nil || got.KeyID != "k1" || got.Fallback {
+		t.Fatalf("first claim = %+v %v", got, err)
+	}
+	if err := k.AddOneTimeKeys(ctx, "u-a", "D1", upload, 100); err != nil {
+		t.Fatalf("retried upload: %v", err)
+	}
+	if n, err := k.CountOneTimeKeys(ctx, "u-a", "D1"); err != nil || n != 0 {
+		t.Fatalf("count after retry = %d %v, want 0", n, err)
+	}
+	if got, err := k.ClaimOneTimeKey(ctx, "u-a", "D1"); err != nil || !got.Fallback {
+		t.Fatalf("second claim = %+v %v, want the fallback key, not k1 again", got, err)
+	}
+}
+
 // One-time keys are claimed at most once, even when several replicas claim at the same time.
 func TestE2EEOneTimeKeysClaimOnceAcrossReplicas(t *testing.T) {
 	ctx := context.Background()

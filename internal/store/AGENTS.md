@@ -39,7 +39,8 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   (identity keys never change; a different upload is `ErrE2EEKeyMismatch`), `e2ee_one_time_keys`
   keyed by `(user_id, device_id, fallback, key_id)` because vodozemac numbers one-time and
   fallback keys with separate counters, and the `e2ee_to_device` mailbox. `ClaimOneTimeKey`
-  deletes one key per call, never the same key twice (`FOR UPDATE SKIP LOCKED` on PostgreSQL);
+  marks one key per call `claimed` (a tombstone, so a retried upload cannot republish it; the
+  rows go with the device), never the same key twice (`FOR UPDATE SKIP LOCKED` on PostgreSQL);
   while keys remain but are all locked by other claims it retries with a short backoff (2 s
   budget), and only with none left does it return the fallback key, without deleting it. `AddOneTimeKeys` enforces its cap
   after the insert inside the transaction, so a retried upload never trips it; on PostgreSQL it

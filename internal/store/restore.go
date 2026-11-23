@@ -24,9 +24,10 @@ func (s *SQLStore) InvalidateRestoredGrants(ctx context.Context) error {
 		`DELETE FROM push_subscriptions`,
 		`DELETE FROM attachment_upload_reservations`,
 		// A one-time key claimed after the backup would be handed out again, but its device already
-		// spent the private half; restored mail was already read. Devices re-upload one-time keys
+		// spent the private half; restored mail was already read. Every one-time key becomes a
+		// claimed tombstone, so a retried upload cannot revive it either; devices upload new keys
 		// when their count runs low. Fallback keys are never consumed, so they stay.
-		`DELETE FROM e2ee_one_time_keys WHERE fallback = 0`,
+		`UPDATE e2ee_one_time_keys SET claimed = 1 WHERE fallback = 0`,
 		`DELETE FROM e2ee_to_device`,
 	} {
 		if _, err := tx.ExecContext(ctx, query); err != nil {

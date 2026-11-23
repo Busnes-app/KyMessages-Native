@@ -116,7 +116,8 @@ func (s *e2eeStore) AddOneTimeKeys(ctx context.Context, userID, deviceID string,
 			fallback = 1
 		}
 		// A key ID already uploaded keeps its first value, so a retried upload is harmless and
-		// an upload cannot swap a key someone may already be using.
+		// an upload cannot swap a key someone may already be using. Claimed keys stay as
+		// tombstones, so a retry whose first response was lost cannot publish a spent key again.
 		if _, err := tx.ExecContext(ctx, s.store.rebind(`INSERT INTO e2ee_one_time_keys (user_id, device_id, key_id, key_value, signature, fallback) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (user_id, device_id, fallback, key_id) DO NOTHING`),
 			userID, deviceID, k.KeyID, k.Key, k.Signature, fallback); err != nil {
 			return err
@@ -124,7 +125,7 @@ func (s *e2eeStore) AddOneTimeKeys(ctx context.Context, userID, deviceID string,
 	}
 	// The cap counts what is stored after the upload, so keys already present cost nothing.
 	var n int
-	if err := tx.QueryRowContext(ctx, s.store.rebind(`SELECT COUNT(*) FROM e2ee_one_time_keys WHERE user_id = ? AND device_id = ? AND fallback = 0`), userID, deviceID).Scan(&n); err != nil {
+	if err := tx.QueryRowContext(ctx, s.store.rebind(`SELECT COUNT(*) FROM e2ee_one_time_keys WHERE user_id = ? AND device_id = ? AND fallback = 0 AND claimed = 0`), userID, deviceID).Scan(&n); err != nil {
 		return err
 	}
 	if n > max {
@@ -135,7 +136,7 @@ func (s *e2eeStore) AddOneTimeKeys(ctx context.Context, userID, deviceID string,
 
 func (s *e2eeStore) CountOneTimeKeys(ctx context.Context, userID, deviceID string) (int, error) {
 	var n int
-	err := s.store.db.QueryRowContext(ctx, s.store.rebind(`SELECT COUNT(*) FROM e2ee_one_time_keys WHERE user_id = ? AND device_id = ? AND fallback = 0`), userID, deviceID).Scan(&n)
+	err := s.store.db.QueryRowContext(ctx, s.store.rebind(`SELECT COUNT(*) FROM e2ee_one_time_keys WHERE user_id = ? AND device_id = ? AND fallback = 0 AND claimed = 0`), userID, deviceID).Scan(&n)
 	return n, err
 }
 
@@ -146,9 +147,9 @@ func (s *e2eeStore) ClaimOneTimeKey(ctx context.Context, userID, deviceID string
 		lock = " FOR UPDATE SKIP LOCKED"
 	}
 	claim := s.store.rebind(`
-		DELETE FROM e2ee_one_time_keys
-		WHERE user_id = ? AND device_id = ? AND fallback = 0 AND key_id = (
-			SELECT key_id FROM e2ee_one_time_keys WHERE user_id = ? AND device_id = ? AND fallback = 0 ORDER BY key_id LIMIT 1` + lock + `)
+		UPDATE e2ee_one_time_keys SET claimed = 1
+		WHERE user_id = ? AND device_id = ? AND fallback = 0 AND claimed = 0 AND key_id = (
+			SELECT key_id FROM e2ee_one_time_keys WHERE user_id = ? AND device_id = ? AND fallback = 0 AND claimed = 0 ORDER BY key_id LIMIT 1` + lock + `)
 		RETURNING key_id, key_value, signature`)
 	deadline := time.Now().Add(claimBudget)
 	for round := 0; ; round++ {
