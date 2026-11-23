@@ -104,7 +104,7 @@ func TestDirectoryQuotasApplyAcrossReplicas(t *testing.T) {
 		t.Fatalf("upload quota: %d %s", r.Code, r.Body.String())
 	}
 	// Sending text remains possible at the pending attachment limit.
-	if r := doBearerJSON(t, first, http.MethodPost, "/api/v1/rooms/"+room+"/messages", token, map[string]any{"body": "still here"}, nil); r.Code != http.StatusCreated {
+	if r := doBearerJSON(t, first, http.MethodPost, "/api/v1/rooms/"+room+"/messages", token, sealed("still here", nil), nil); r.Code != http.StatusCreated {
 		t.Fatalf("text blocked by attachment limit for %s: %d", user.ID, r.Code)
 	}
 }

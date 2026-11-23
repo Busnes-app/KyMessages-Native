@@ -633,6 +633,7 @@ func TestTenancyStartupDoesNotDeferMissingReconciliation(t *testing.T) {
 		if _, err := e.st.Chat().EnsureTenant(ctx, syncOrgID(i)); err != nil {
 			t.Fatal(err)
 		}
+		admitOrg(t, e.st, syncOrgID(i))
 	}
 	e.dir.list(listedAll(10, 3)...)
 	if err := e.st.Settings().SetSetting(ctx, sso.SettingFullSyncAt, "1"); err != nil {
