@@ -14,6 +14,8 @@ var (
 	ErrSharingOff = errors.New("status sharing is off")
 	// ErrE2EEKeyMismatch: an upload names an existing device with different identity keys.
 	ErrE2EEKeyMismatch = errors.New("device keys do not match the registered device")
+	// ErrE2EETooManyKeys: an upload would leave a device holding more one-time keys than allowed.
+	ErrE2EETooManyKeys = errors.New("too many one-time keys for this device")
 	ErrAlreadyExists   = errors.New("record already exists")
 	// ErrUsernameTaken: another account holds the username (exact case, as the column is unique).
 	ErrUsernameTaken                  = fmt.Errorf("username is taken: %w", ErrAlreadyExists)
@@ -67,8 +69,10 @@ type E2EEStore interface {
 	// DeleteDevice removes the device with its one-time keys and mail. ErrNotFound if absent.
 	DeleteDevice(ctx context.Context, userID, deviceID string) error
 	// AddOneTimeKeys stores keys; a fallback key replaces the device's previous one, and a key
-	// ID already stored keeps its first value.
-	AddOneTimeKeys(ctx context.Context, userID, deviceID string, keys []E2EEOneTimeKey) error
+	// ID already stored keeps its first value. If the device would then hold more than max
+	// one-time keys it stores nothing and returns ErrE2EETooManyKeys; a retried upload of keys
+	// already stored adds none, so it never trips the cap.
+	AddOneTimeKeys(ctx context.Context, userID, deviceID string, keys []E2EEOneTimeKey, max int) error
 	CountOneTimeKeys(ctx context.Context, userID, deviceID string) (int, error)
 	// ClaimOneTimeKey removes and returns one one-time key, never the same key twice across
 	// replicas; with none left it returns the fallback key without removing it, or ErrNotFound.

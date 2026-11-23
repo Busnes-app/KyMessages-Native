@@ -89,7 +89,7 @@ func (s *e2eeStore) DeleteDevice(ctx context.Context, userID, deviceID string) e
 	return oneRow(s.store.db.ExecContext(ctx, s.store.rebind(`DELETE FROM e2ee_devices WHERE user_id = ? AND device_id = ?`), userID, deviceID))
 }
 
-func (s *e2eeStore) AddOneTimeKeys(ctx context.Context, userID, deviceID string, keys []E2EEOneTimeKey) error {
+func (s *e2eeStore) AddOneTimeKeys(ctx context.Context, userID, deviceID string, keys []E2EEOneTimeKey, max int) error {
 	tx, err := s.store.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -112,6 +112,14 @@ func (s *e2eeStore) AddOneTimeKeys(ctx context.Context, userID, deviceID string,
 			userID, deviceID, k.KeyID, k.Key, k.Signature, fallback); err != nil {
 			return err
 		}
+	}
+	// The cap counts what is stored after the upload, so keys already present cost nothing.
+	var n int
+	if err := tx.QueryRowContext(ctx, s.store.rebind(`SELECT COUNT(*) FROM e2ee_one_time_keys WHERE user_id = ? AND device_id = ? AND fallback = 0`), userID, deviceID).Scan(&n); err != nil {
+		return err
+	}
+	if n > max {
+		return ErrE2EETooManyKeys
 	}
 	return tx.Commit()
 }

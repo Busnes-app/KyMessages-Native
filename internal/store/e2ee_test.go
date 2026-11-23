@@ -88,11 +88,11 @@ func TestE2EEOneTimeKeysClaimOnceAcrossReplicas(t *testing.T) {
 		keys = append(keys, store.E2EEOneTimeKey{KeyID: fmt.Sprintf("k%02d", i), Key: fmt.Sprintf("v%02d", i), Signature: "sig"})
 	}
 	keys = append(keys, store.E2EEOneTimeKey{KeyID: "fb1", Key: "fallback-1", Signature: "sig", Fallback: true})
-	if err := a.E2EE().AddOneTimeKeys(ctx, "u-a", "D1", keys); err != nil {
+	if err := a.E2EE().AddOneTimeKeys(ctx, "u-a", "D1", keys, 100); err != nil {
 		t.Fatal(err)
 	}
 	// A re-upload of a claimed-or-not key ID never changes its value.
-	if err := a.E2EE().AddOneTimeKeys(ctx, "u-a", "D1", []store.E2EEOneTimeKey{{KeyID: "k00", Key: "swapped", Signature: "sig"}}); err != nil {
+	if err := a.E2EE().AddOneTimeKeys(ctx, "u-a", "D1", []store.E2EEOneTimeKey{{KeyID: "k00", Key: "swapped", Signature: "sig"}}, 100); err != nil {
 		t.Fatal(err)
 	}
 
@@ -132,7 +132,7 @@ func TestE2EEOneTimeKeysClaimOnceAcrossReplicas(t *testing.T) {
 		t.Fatalf("%d one-time keys left", n)
 	}
 	// A new fallback key replaces the old one.
-	if err := a.E2EE().AddOneTimeKeys(ctx, "u-a", "D1", []store.E2EEOneTimeKey{{KeyID: "fb2", Key: "fallback-2", Signature: "sig", Fallback: true}}); err != nil {
+	if err := a.E2EE().AddOneTimeKeys(ctx, "u-a", "D1", []store.E2EEOneTimeKey{{KeyID: "fb2", Key: "fallback-2", Signature: "sig", Fallback: true}}, 100); err != nil {
 		t.Fatal(err)
 	}
 	if k, err := a.E2EE().ClaimOneTimeKey(ctx, "u-a", "D1"); err != nil || k.Key != "fallback-2" {

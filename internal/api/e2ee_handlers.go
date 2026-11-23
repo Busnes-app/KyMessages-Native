@@ -156,14 +156,12 @@ func (s *Server) handleE2EEUpload(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "The fallback key must be validly signed by the device")
 		return
 	}
-	count, err := s.store.E2EE().CountOneTimeKeys(ctx, user.ID, dev.DeviceID)
-	if err == nil && count+len(req.OneTimeKeys) > e2eeMaxStoredKeys {
+	err := s.store.E2EE().AddOneTimeKeys(ctx, user.ID, dev.DeviceID, keys, e2eeMaxStoredKeys)
+	if errors.Is(err, store.ErrE2EETooManyKeys) {
 		s.writeError(w, http.StatusBadRequest, "Too many one-time keys stored for this device")
 		return
 	}
-	if err == nil {
-		err = s.store.E2EE().AddOneTimeKeys(ctx, user.ID, dev.DeviceID, keys)
-	}
+	var count int
 	if err == nil {
 		count, err = s.store.E2EE().CountOneTimeKeys(ctx, user.ID, dev.DeviceID)
 	}

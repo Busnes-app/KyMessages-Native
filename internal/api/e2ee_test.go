@@ -106,6 +106,31 @@ func TestE2EEKeyUpload(t *testing.T) {
 	if c := doBearerJSON(t, srv, http.MethodPost, "/api/v1/keys/upload", "", map[string]any{"device_id": dev.id}, nil).Code; c != http.StatusUnauthorized {
 		t.Fatalf("anonymous upload = %d", c)
 	}
+
+	// A retried upload whose response was lost is accepted: stored key IDs do not count twice.
+	capped := newTestDevice(t, alice.ID, "DEVICE_ALICE_CAP")
+	sixty := make([]map[string]string, 60)
+	for i := range sixty {
+		sixty[i] = capped.otk(fmt.Sprintf("C%05d", i))
+	}
+	for i := range 2 {
+		rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/keys/upload", tok, map[string]any{"device_id": capped.id, "device_keys": capped.keys(), "one_time_keys": sixty}, nil)
+		if rec.Code != http.StatusOK || rec.Body.String() != `{"one_time_key_count":60}`+"\n" {
+			t.Fatalf("upload %d of the same 60 keys = %d %s", i+1, rec.Code, rec.Body.String())
+		}
+	}
+	// 41 new keys would make 101: refused, and none of them is stored.
+	more := make([]map[string]string, 41)
+	for i := range more {
+		more[i] = capped.otk(fmt.Sprintf("N%05d", i))
+	}
+	if c := upload(map[string]any{"device_id": capped.id, "one_time_keys": more}); c != http.StatusBadRequest {
+		t.Fatalf("upload past the cap = %d", c)
+	}
+	rec = doBearerJSON(t, srv, http.MethodPost, "/api/v1/keys/upload", tok, map[string]any{"device_id": capped.id, "one_time_keys": more[:40]}, nil)
+	if rec.Code != http.StatusOK || rec.Body.String() != `{"one_time_key_count":100}`+"\n" {
+		t.Fatalf("upload up to the cap = %d %s (a refused upload must store nothing)", rec.Code, rec.Body.String())
+	}
 }
 
 func TestE2EEQueryClaimAndMailStayInTheOrg(t *testing.T) {
