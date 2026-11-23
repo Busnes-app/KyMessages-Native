@@ -210,3 +210,41 @@ func TestSharedLobbyPollingAfterDisconnect(t *testing.T) {
 		t.Fatal("an idle guest kept the session")
 	}
 }
+
+// After an outage longer than the presence window (no heartbeat landed), a guest whose socket
+// is still open on this replica passes the socket check: the check itself is presence.
+func TestSharedLobbyConnectedGuestSurvivesAnOutage(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, testdb.Config(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	res, err := st.Chat().UpsertMeeting(ctx, store.UpsertMeetingParams{ID: "m", TenantID: store.DefaultTenantID, OrganizerSub: "s", Title: "T"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := NewLobbyManager(NewHub(&captureBus{}), nil)
+	l.UseShared(st.GuestSessions())
+	l.SetLeaveGrace(time.Hour) // no heartbeat runs during the test
+	s, err := l.Knock(ctx, &store.MeetingGuest{MeetingID: "m", GuestKey: "k"}, res.Meeting, nil, "Visitor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.MarkConnected(s.GuestID)
+	l.SetLeaveGrace(400 * time.Millisecond) // presence window 500 ms
+	time.Sleep(700 * time.Millisecond)      // the "outage": nothing refreshed the row
+	active := func(context.Context, string) (bool, error) { return true, nil }
+	if !l.GuestCheck(active)(s.GuestID) {
+		t.Fatal("a guest still connected here was dropped after the outage")
+	}
+	// A guest with no socket here gets no such refresh.
+	s2, err := l.Knock(ctx, &store.MeetingGuest{MeetingID: "m", GuestKey: "k2"}, res.Meeting, nil, "Other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(700 * time.Millisecond)
+	if l.GuestCheck(active)(s2.GuestID) {
+		t.Fatal("a guest with no socket here was kept alive by the check")
+	}
+}

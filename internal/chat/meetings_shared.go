@@ -220,6 +220,15 @@ func (l *LobbyManager) evictShared(ctx context.Context, rows []store.GuestSessio
 func (l *LobbyManager) guestValidShared(isActive func(ctx context.Context, tenantID string) (bool, error), guestID string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), sharedLobbyTimeout)
 	defer cancel()
+	// This check runs for a socket open on this replica, which is presence: refresh first, so a
+	// database outage longer than the window does not end a connected guest's session once the
+	// database is back. (If the refresh fails, the lookup fails too and the socket stays open.)
+	l.mu.Lock()
+	_, local := l.live[guestID]
+	l.mu.Unlock()
+	if local {
+		_ = l.db.Touch(ctx, guestID)
+	}
 	g, err := l.db.ByID(ctx, guestID, l.now().UnixMilli(), l.presence())
 	if err == store.ErrNotFound {
 		return false

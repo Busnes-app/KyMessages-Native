@@ -96,7 +96,7 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   session only if `seen_at` is within `live` (the lobby passes 1.25 × the leave grace), so a
   replica that exits or a failed delete cannot keep an admission usable. Every authenticated
   guest request also `Touch`es the session, so a waiting guest who only polls stays listed
-  (`TestSharedLobbyAdmissionLapsesWithoutAnyReplica`). `PruneShared` deletes rows nobody touched
+  (`TestSharedLobbyAdmissionLapsesWithoutAnyReplica`). The socket check for a guest connected to this replica refreshes the session before reading it, so a database outage longer than the window does not drop a connected guest (`TestSharedLobbyConnectedGuestSurvivesAnOutage`). `PruneShared` deletes rows nobody touched
   for 10 minutes. `PruneShared` deletes
   expired rows; the leased maintenance loop runs it in multi mode only.
   `migrations.Run` refuses with `ErrNewerSchema` a database whose `schema_migrations` holds a
