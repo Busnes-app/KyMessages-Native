@@ -16,6 +16,8 @@ const (
 	EventTyping        = "typing"
 	EventReadSync      = "read.sync"
 	EventAuthRevoked   = "auth.revoked"
+	// EventToDevice tells a user's sockets that end-to-end encryption mail is waiting.
+	EventToDevice = "to_device"
 	// EventTenantRevoked travels only on the bus: every pod drops that tenant's guests.
 	EventTenantRevoked = "tenant.revoked"
 

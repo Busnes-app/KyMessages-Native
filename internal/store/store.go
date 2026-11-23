@@ -10,9 +10,11 @@ import (
 )
 
 var (
-	ErrNotFound      = errors.New("record not found")
-	ErrSharingOff    = errors.New("status sharing is off")
-	ErrAlreadyExists = errors.New("record already exists")
+	ErrNotFound   = errors.New("record not found")
+	ErrSharingOff = errors.New("status sharing is off")
+	// ErrE2EEKeyMismatch: an upload names an existing device with different identity keys.
+	ErrE2EEKeyMismatch = errors.New("device keys do not match the registered device")
+	ErrAlreadyExists   = errors.New("record already exists")
 	// ErrUsernameTaken: another account holds the username (exact case, as the column is unique).
 	ErrUsernameTaken                  = fmt.Errorf("username is taken: %w", ErrAlreadyExists)
 	ErrSessionExpired                 = errors.New("session expired")
@@ -42,6 +44,7 @@ type Store interface {
 	Chat() ChatStore
 	SuiteReplay() SuiteReplayStore
 	Presence() PresenceStore
+	E2EE() E2EEStore
 
 	// Notify emits a PostgreSQL NOTIFY on channel with payload (no-op on SQLite).
 	Notify(ctx context.Context, channel, payload string) error
@@ -50,6 +53,56 @@ type Store interface {
 	Driver() string
 	Ping(ctx context.Context) error
 	Close() error
+}
+
+// E2EEStore is the end-to-end encryption key server: public device keys, claim-once one-time
+// keys and the to-device mailbox. It holds no private key and no plaintext.
+type E2EEStore interface {
+	// UpsertDevice registers a device, or accepts an identical re-upload; ErrE2EEKeyMismatch
+	// when the device exists with other keys or in another tenant.
+	UpsertDevice(ctx context.Context, d *E2EEDevice) error
+	GetDevice(ctx context.Context, userID, deviceID string) (*E2EEDevice, error)
+	// ListDevices returns userIDs' devices in tenantID only.
+	ListDevices(ctx context.Context, tenantID string, userIDs []string) ([]E2EEDevice, error)
+	// DeleteDevice removes the device with its one-time keys and mail. ErrNotFound if absent.
+	DeleteDevice(ctx context.Context, userID, deviceID string) error
+	// AddOneTimeKeys stores keys; a fallback key replaces the device's previous one, and a key
+	// ID already stored keeps its first value.
+	AddOneTimeKeys(ctx context.Context, userID, deviceID string, keys []E2EEOneTimeKey) error
+	CountOneTimeKeys(ctx context.Context, userID, deviceID string) (int, error)
+	// ClaimOneTimeKey removes and returns one one-time key, never the same key twice across
+	// replicas; with none left it returns the fallback key without removing it, or ErrNotFound.
+	ClaimOneTimeKey(ctx context.Context, userID, deviceID string) (*E2EEOneTimeKey, error)
+	SendToDevice(ctx context.Context, msgs []E2EEToDevice) error
+	// ToDevice reads a device's mail after afterID, oldest first.
+	ToDevice(ctx context.Context, userID, deviceID string, afterID int64, limit int) ([]E2EEToDevice, error)
+	// AckToDevice deletes a device's mail up to and including uptoID.
+	AckToDevice(ctx context.Context, userID, deviceID string, uptoID int64) error
+	PruneToDevice(ctx context.Context, before time.Time) error
+}
+
+// E2EEDevice is one device's public identity keys and its self-signature over them.
+type E2EEDevice struct {
+	TenantID, UserID, DeviceID string
+	Curve25519, Ed25519        string
+	Signature                  string
+	CreatedAt                  time.Time
+}
+
+// E2EEOneTimeKey is one public Curve25519 key the device signed.
+type E2EEOneTimeKey struct {
+	KeyID, Key, Signature string
+	Fallback              bool
+}
+
+// E2EEToDevice is one opaque message (an Olm ciphertext) for one device.
+type E2EEToDevice struct {
+	ID                                 int64
+	TenantID                           string
+	RecipientUserID, RecipientDeviceID string
+	SenderUserID, SenderDeviceID       string
+	Type, Content                      string
+	CreatedAt                          time.Time
 }
 
 // PresenceStore holds each user's suite status inputs, keyed by (tenant, user).

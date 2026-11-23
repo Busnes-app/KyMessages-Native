@@ -5,6 +5,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/Busnes-app/ky_server_base/internal/api"
 	"github.com/Busnes-app/ky_server_base/internal/store"
 )
 
@@ -21,6 +22,7 @@ func maintenanceLoop(ctx context.Context, st store.Store, done chan<- struct{}) 
 		case <-ticker.C:
 			sweepPairings(ctx, st)
 			sweepSuiteReplay(ctx, st)
+			sweepE2EEMailbox(ctx, st)
 		}
 	}
 }
@@ -38,6 +40,14 @@ func sweepSuiteReplay(ctx context.Context, st store.Store) {
 	defer cancel()
 	if err := st.SuiteReplay().Prune(run, time.Now().Unix()); err != nil && ctx.Err() == nil {
 		log.Printf("[SUITE] replay ledger sweep failed: %v", err)
+	}
+}
+
+func sweepE2EEMailbox(ctx context.Context, st store.Store) {
+	run, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := st.E2EE().PruneToDevice(run, time.Now().Add(-api.E2EEMailboxTTL)); err != nil && ctx.Err() == nil {
+		log.Printf("[E2EE] to-device mailbox sweep failed: %v", err)
 	}
 }
 
