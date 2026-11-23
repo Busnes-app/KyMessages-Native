@@ -1,16 +1,10 @@
 package api
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
 	"log"
 	"net/http"
-	"net/url"
-	"strings"
 	"time"
 
 	"github.com/Busnes-app/ky_server_base/internal/config"
@@ -36,8 +30,6 @@ const (
 	maxPoolTTL = 15 * time.Minute
 )
 
-var errPoolOff = errors.New("pool: KyIdentity suite directory not configured")
-
 type poolReport struct {
 	OrgID     string `json:"org_id"`
 	UsedBytes int64  `json:"used_bytes"`
@@ -62,52 +54,11 @@ func (s *Server) poolActive(tenantID string) bool {
 
 // postPoolReports sends one batch to KyIdentity and returns the results by org.
 func (s *Server) postPoolReports(ctx context.Context, reports []poolReport) (map[string]poolResult, error) {
-	dir, err := s.kyidentity.SuiteDirectory()
-	if err != nil {
-		return nil, err
-	}
-	if dir == nil {
-		return nil, errPoolOff
-	}
-	base, err := url.Parse(strings.TrimRight(dir.Issuer, "/"))
-	if err != nil || base.Host == "" || base.User != nil || base.Scheme != "https" && !(base.Scheme == "http" && isLoopbackHost(base.Hostname())) {
-		return nil, errors.New("pool: KyIdentity issuer must be https")
-	}
-	body, err := json.Marshal(map[string]any{"reports": reports})
-	if err != nil {
-		return nil, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base.JoinPath("api", "suite", "storage").String(), bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.SetBasicAuth(dir.ClientID, dir.ClientSecret)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	client := http.Client{Timeout: 10 * time.Second,
-		// Basic credentials must never follow a redirect.
-		CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("redirects are refused") }}
-	resp, err := client.Do(req)
-	if err != nil {
-		var uerr *url.Error
-		if errors.As(err, &uerr) {
-			err = uerr.Err
-		}
-		return nil, fmt.Errorf("pool: report: %w", err)
-	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, fmt.Errorf("pool: report: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("pool: report: status %d", resp.StatusCode)
-	}
 	var out struct {
 		Results []poolResult `json:"results"`
 	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, fmt.Errorf("pool: report: %w", err)
+	if err := s.kyidentity.SuiteRequest(ctx, http.MethodPost, "storage", nil, map[string]any{"reports": reports}, &out, 1<<20); err != nil {
+		return nil, err
 	}
 	sent := make(map[string]bool, len(reports))
 	for _, r := range reports {
@@ -121,8 +72,6 @@ func (s *Server) postPoolReports(ctx context.Context, reports []poolReport) (map
 	}
 	return byOrg, nil
 }
-
-func isLoopbackHost(h string) bool { return h == "127.0.0.1" || h == "::1" || h == "localhost" }
 
 // reportPool sends usages and stores each org's answer. sentAt starts every grant's lifetime,
 // as KyIdentity requires.

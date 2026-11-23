@@ -112,6 +112,12 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   check the org's usage plus the new bytes against the unexpired ceiling under the tenant lock:
   `ErrPoolFull`, or `ErrPoolUnavailable` with no grant or an expired one. Single mode never sets
   `Pool` and never reads the columns.
+- Migration 61 adds `tenants.missing_since` and `tenants.purged_at` (`tenancy_sync.go`). The org
+  purge deletes a deleted org's attachments in batches (`PurgeAttachmentBatch`, the caller deletes
+  the blobs, then `DeleteAttachmentRows`), then every other row child first and marks it purged
+  (`PurgeTenantRows`, audited `tenancy.org_purged`). The `tenants` row stays as a tombstone.
+  Room webhooks go by the `rooms` cascade (the E2EE build drops that table); a new table with
+  `tenant_id` must join `PurgeTenantRows`.
 - `ErasureBlobs` and `EraseUser` (`erase.go`, multi mode `user.erased`) delete one person's data:
   account (sessions, MFA, presence and push cascade), pairings, reservations, reactions,
   memberships, owned bots and their content/accounts, staged and posted attachments, and every DM whose

@@ -113,6 +113,11 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
   No new session, MFA challenge or pairing is issued to an inactive org, including one in flight
   when the suspension lands. Org suspension or deletion also ejects that org's meeting guests, waiting or admitted, from the
   lobby, their sockets and their calls on every server instance.
+- In `KY_TENANCY_MODE=multi`, KyIdentity's org list is the authority for each org's status: every
+  replica re-reads it in full at start and daily, and incrementally every 5 minutes. An org listed
+  as `deleted` has all its data purged (blobs, then rows); the org record stays so it cannot come
+  back. An org the list stops naming is held offline with its data kept, never purged, and a
+  sanity guard stops a short or empty list from taking many orgs offline.
 - In `KY_TENANCY_MODE=multi`, KyIdentity's `user.erased` (a member used Delete everything) deletes
   that person's data: account, bots, attachments, and DMs nobody else uses. Their messages in
   rooms others still use stay as "deleted message" tombstones with no text, name or files. A

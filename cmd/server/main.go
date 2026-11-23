@@ -118,6 +118,16 @@ func runServer() {
 	if err := srv.BlobsError(); err != nil {
 		log.Fatalf("Failed to initialize attachment storage: %v", err)
 	}
+	if cfg.Tenancy.IsMultiTenant() {
+		// Before serving: re-read KyIdentity's org and erased lists (a restore may have undone
+		// deletions), or serve only on a sync the database records from the last 24 hours.
+		sctx, scancel := context.WithTimeout(ctx, time.Minute)
+		err := srv.StartupTenancySync(sctx)
+		scancel()
+		if err != nil {
+			log.Fatalf("Tenancy sync failed: %v", err)
+		}
+	}
 	chatBusDone := make(chan struct{})
 	go func() {
 		defer close(chatBusDone)
@@ -135,17 +145,25 @@ func runServer() {
 		go agentExpiryLoop(ctx, srv.ExpireIdleAgents, gate, agentsDone)
 		attachmentsDone := make(chan struct{})
 		go attachmentSweepLoop(ctx, srv.SweepOrphanAttachments, gate, attachmentsDone)
-		poolDone := make(chan struct{})
+		poolDone, syncDone, purgeDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
 		if cfg.Tenancy.IsMultiTenant() {
 			go poolLoop(ctx, srv.RefreshPool, gate, poolDone)
+			go leasedLoop(ctx, "tenancy_sync", 5*time.Minute, gate, func(ctx context.Context, _ func() bool) error {
+				return srv.SyncTenancy(ctx, time.Now())
+			}, syncDone)
+			go leasedLoop(ctx, "org_purge", 5*time.Minute, gate, srv.PurgeDeletedOrgs, purgeDone)
 		} else {
 			close(poolDone)
+			close(syncDone)
+			close(purgeDone)
 		}
 		pairingsDone := make(chan struct{})
 		maintenanceLoop(ctx, st, gate, cfg.Tenancy.IsMultiTenant(), pairingsDone)
 		<-agentsDone
 		<-attachmentsDone
 		<-poolDone
+		<-syncDone
+		<-purgeDone
 		close(maintenanceDone)
 	}()
 	backgroundDone := make(chan struct{})

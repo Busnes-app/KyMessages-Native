@@ -394,6 +394,16 @@ type ChatStore interface {
 	SetPoolGrant(ctx context.Context, tenantID string, seq, reportedBytes, ceilingBytes, expiresAtMs int64) error
 	RecordStalePoolReport(ctx context.Context, tenantID string, sentSeq, heldSeq int64) error
 	RaisePoolSeq(ctx context.Context, tenantID string, seq int64) error
+	// Tenancy sync and the org purge (multi mode, tenancy_sync.go).
+	ActiveTenantIDs(ctx context.Context) ([]string, error)
+	DeletedUnpurgedTenants(ctx context.Context) ([]string, error)
+	MarkTenantMissing(ctx context.Context, tenantID string, nowMs int64) (bool, error)
+	ClearTenantMissing(ctx context.Context, tenantID string) (bool, error)
+	ForgetTenantMissing(ctx context.Context, tenantID string) error
+	TenantMissing(ctx context.Context, tenantID string) (bool, error)
+	PurgeAttachmentBatch(ctx context.Context, tenantID string, limit int) ([]BlobRef, error)
+	DeleteAttachmentRows(ctx context.Context, tenantID string, refs []BlobRef) error
+	PurgeTenantRows(ctx context.Context, tenantID string) error
 	// Erasure of one person (multi mode, erase.go): blobs first, then rows.
 	ErasureBlobs(ctx context.Context, tenantID, userID string) ([]BlobRef, error)
 	ErasureTargets(ctx context.Context, provider, subject string) ([]*User, error)

@@ -299,18 +299,24 @@ func (k *KyIdentityClient) applyErasure(ctx context.Context, body []byte) error 
 	if err := json.Unmarshal(body, &in); err != nil || in.ID == "" || !config.IsCanonicalUUID(strings.TrimSpace(in.OrgID)) {
 		return ErrSyncMalformed
 	}
+	return k.eraseSubject(ctx, in.ID, strings.TrimSpace(in.OrgID))
+}
+
+// eraseSubject erases sub's data if this install holds sub in orgID (user.erased, and the
+// erased list re-read by tenancy sync).
+func (k *KyIdentityClient) eraseSubject(ctx context.Context, sub, orgID string) error {
 	k.syncMu.Lock()
 	defer k.syncMu.Unlock()
 	// Every local account the subject ever had: the current row, and any whose row went
 	// (user.deleted first, a repeat, or a recreation under a new ID).
 	var targets []*store.User
-	user, err := k.store.Users().GetUserBySSO(ctx, "kyidentity", in.ID)
+	user, err := k.store.Users().GetUserBySSO(ctx, "kyidentity", sub)
 	if err == nil {
 		targets = append(targets, user)
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return err
 	}
-	past, err := k.store.Chat().ErasureTargets(ctx, "kyidentity", in.ID)
+	past, err := k.store.Chat().ErasureTargets(ctx, "kyidentity", sub)
 	if err != nil {
 		return err
 	}
@@ -323,8 +329,8 @@ func (k *KyIdentityClient) applyErasure(ctx context.Context, body []byte) error 
 		return errors.New("sso: user.erased has no handler")
 	}
 	for _, t := range targets {
-		if t.OrgID != strings.TrimSpace(in.OrgID) {
-			k.auditOrgMismatch(ctx, in.ID, t.OrgID, in.OrgID)
+		if t.OrgID != orgID {
+			k.auditOrgMismatch(ctx, sub, t.OrgID, orgID)
 			continue
 		}
 		if err := k.onUserErased(ctx, t); err != nil {
