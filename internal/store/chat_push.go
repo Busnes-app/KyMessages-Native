@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/hmac"
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"strings"
 	"unicode/utf8"
@@ -46,6 +48,7 @@ func (c *chatStore) UpdateRoomNotifyMode(ctx context.Context, tenantID, roomID, 
 
 // UpsertPushSubscription stores or updates a Web Push subscription owned by (sub.TenantID, sub.UserID),
 // enforcing maxPerUser by evicting the oldest subscriptions for that user when the cap is exceeded.
+// Ownership changes require the existing subscription keys; mismatches return ErrInvalidInput.
 // It first locks the caller's session row (sessionHash), so it serializes with grant revocation:
 // a session revoked first gets ErrNotFound, and a revocation that comes after deletes the row.
 func (c *chatStore) UpsertPushSubscription(ctx context.Context, sessionHash string, sub *PushSubscription, maxPerUser int) (*PushSubscription, error) {
@@ -82,13 +85,18 @@ func (c *chatStore) UpsertPushSubscription(ctx context.Context, sessionHash stri
 		return nil, ErrNotFound
 	}
 
-	var existingID, existingTenant, existingUser string
-	var existingCreated, existingUsed int64
-	err = tx.QueryRowContext(ctx, c.store.rebind(`
-		SELECT id, tenant_id, user_id, created_at, last_used_at
+	var existingID, existingTenant, existingUser, existingP256DH, existingAuth string
+	var existingUsed int64
+	lookup := `
+		SELECT id, tenant_id, user_id, p256dh, auth_secret, last_used_at
 		FROM push_subscriptions
 		WHERE endpoint = ?
-	`), sub.Endpoint).Scan(&existingID, &existingTenant, &existingUser, &existingCreated, &existingUsed)
+	`
+	if c.store.driver == "postgres" {
+		lookup += ` FOR UPDATE`
+	}
+	err = tx.QueryRowContext(ctx, c.store.rebind(lookup), sub.Endpoint).Scan(
+		&existingID, &existingTenant, &existingUser, &existingP256DH, &existingAuth, &existingUsed)
 
 	out := &PushSubscription{
 		TenantID:   tenantID,
@@ -118,9 +126,12 @@ func (c *chatStore) UpsertPushSubscription(ctx context.Context, sessionHash stri
 		// delete the prior owner's row and insert a fresh ID so in-flight delivery handles
 		// for the previous owner cannot touch the new owner's subscription.
 		if err == nil {
+			if !samePushKey(existingAuth, sub.AuthSecret) || !samePushKey(existingP256DH, sub.P256DH) {
+				return nil, ErrInvalidInput
+			}
 			if _, err := tx.ExecContext(ctx, c.store.rebind(`
-				DELETE FROM push_subscriptions WHERE endpoint = ?
-			`), sub.Endpoint); err != nil {
+				DELETE FROM push_subscriptions WHERE id = ?
+			`), existingID); err != nil {
 				return nil, err
 			}
 		}
@@ -173,6 +184,16 @@ func (c *chatStore) UpsertPushSubscription(ctx context.Context, sessionHash stri
 		return nil, err
 	}
 	return out, nil
+}
+
+// Compare decoded keys so padded and unpadded browser encodings are equivalent.
+func samePushKey(a, b string) bool {
+	x, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(strings.TrimSpace(a), "="))
+	if err != nil {
+		return false
+	}
+	y, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(strings.TrimSpace(b), "="))
+	return err == nil && hmac.Equal(x, y)
 }
 
 // ListPushSubscriptions returns all push subscriptions owned by (tenantID, userID).

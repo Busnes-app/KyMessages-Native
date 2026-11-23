@@ -131,6 +131,10 @@ func (s *Server) handleRegisterPushSubscription(w http.ResponseWriter, r *http.R
 		AuthSecret: authSecret,
 		UserAgent:  strings.TrimSpace(r.UserAgent()),
 	}, maxPushSubsPerUser)
+	if errors.Is(err, store.ErrInvalidInput) {
+		s.writeError(w, http.StatusBadRequest, "Invalid push subscription")
+		return
+	}
 	if errors.Is(err, store.ErrNotFound) {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return

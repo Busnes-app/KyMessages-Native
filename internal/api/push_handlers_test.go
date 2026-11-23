@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -509,8 +510,8 @@ func TestPushEndpointOwnershipTransfersOnAccountSwitch(t *testing.T) {
 	}
 	oldID := subsA[0].ID
 
-	// User B logs into the same browser and registers the same endpoint.
-	p256dhB, authB := newTestPushKeys(t)
+	// The browser retains its subscription keys when switching accounts.
+	p256dhB, authB := p256dhA, authA
 	rec = doBearerJSON(t, srv, http.MethodPost, "/api/v1/push/subscriptions", tokB, map[string]any{
 		"endpoint": sharedEndpoint,
 		"keys":     map[string]string{"p256dh": p256dhB, "auth": authB},
@@ -587,5 +588,77 @@ func TestLogoutDropsTheNamedPushSubscription(t *testing.T) {
 	}
 	if len(subs) != 1 || subs[0].Endpoint != "https://push.example/other-device" {
 		t.Fatalf("subscriptions after logout = %+v, want only the other device", subs)
+	}
+}
+
+func TestPushEndpointTransferRequiresBothKeys(t *testing.T) {
+	for _, multi := range []bool{false, true} {
+		name := "single"
+		if multi {
+			name = "multi"
+		}
+		t.Run(name, func(t *testing.T) {
+			var srv *api.Server
+			var st store.Store
+			var owner, next *store.User
+			var ownerToken, nextToken string
+			ownerTenant, nextTenant := store.DefaultTenantID, store.DefaultTenantID
+			if multi {
+				srv, st, _ = newMultiTenantTestServer(t)
+				ownerTenant = "00000000-0000-4000-8000-00000000000b"
+				nextTenant = "00000000-0000-4000-8000-00000000000a"
+				owner, ownerToken = createOrgUser(t, st, "push_owner", "push-owner", "user", ownerTenant)
+				next, nextToken = createOrgUser(t, st, "push_next", "push-next", "user", nextTenant)
+			} else {
+				srv, st = newPushTestServer(t, false)
+				owner, ownerToken = createChatTestUser(t, st, "push_owner", "push-owner", "user")
+				next, nextToken = createChatTestUser(t, st, "push_next", "push-next", "user")
+			}
+			ctx := context.Background()
+			endpoint := "https://push.example/shared-browser"
+			p256dh, authSecret := newTestPushKeys(t)
+			register := func(token, key, secret string) *httptest.ResponseRecorder {
+				t.Helper()
+				return doBearerJSON(t, srv, http.MethodPost, "/api/v1/push/subscriptions", token, map[string]any{
+					"endpoint": endpoint, "keys": map[string]string{"p256dh": key, "auth": secret},
+				}, nil)
+			}
+			if rec := register(ownerToken, p256dh, authSecret); rec.Code != http.StatusCreated {
+				t.Fatalf("register owner: %d %s", rec.Code, rec.Body.String())
+			}
+			before, err := st.Chat().ListPushSubscriptions(ctx, ownerTenant, owner.ID)
+			if err != nil || len(before) != 1 {
+				t.Fatalf("owner subscriptions: %v %v", before, err)
+			}
+			otherKey, otherSecret := newTestPushKeys(t)
+			for _, keys := range [][2]string{{otherKey, otherSecret}, {p256dh, otherSecret}, {otherKey, authSecret}} {
+				rec := register(nextToken, keys[0], keys[1])
+				if rec.Code != http.StatusBadRequest || rec.Body.String() != "{\"error\":\"Invalid push subscription\"}\n" {
+					t.Fatalf("refusal: %d %s", rec.Code, rec.Body.String())
+				}
+				after, err := st.Chat().ListPushSubscriptions(ctx, ownerTenant, owner.ID)
+				if err != nil || !reflect.DeepEqual(before, after) {
+					t.Fatalf("owner subscription changed: before=%+v after=%+v err=%v", before, after, err)
+				}
+				if subs, err := st.Chat().ListPushSubscriptions(ctx, nextTenant, next.ID); err != nil || len(subs) != 0 {
+					t.Fatalf("refused registration created a row: %+v %v", subs, err)
+				}
+			}
+			// A sign-in to another account on this browser retains the same keys.
+			// Padded base64url represents the same subscription as the original encoding.
+			if rec := register(nextToken, p256dh+"=", authSecret+"=="); rec.Code != http.StatusCreated {
+				t.Fatalf("same-key account switch: %d %s", rec.Code, rec.Body.String())
+			}
+			if subs, err := st.Chat().ListPushSubscriptions(ctx, ownerTenant, owner.ID); err != nil || len(subs) != 0 {
+				t.Fatalf("previous owner retains subscription: %+v %v", subs, err)
+			}
+			subs, err := st.Chat().ListPushSubscriptions(ctx, nextTenant, next.ID)
+			if err != nil || len(subs) != 1 {
+				t.Fatalf("new owner subscriptions: %+v %v", subs, err)
+			}
+			if subs[0].ID == before[0].ID || subs[0].UserID != next.ID || subs[0].TenantID != nextTenant || subs[0].P256DH != p256dh+"=" || subs[0].AuthSecret != authSecret+"==" {
+				t.Fatalf("unexpected transferred subscription: %+v", subs[0])
+			}
+		})
 	}
 }
