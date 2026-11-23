@@ -1,0 +1,207 @@
+== login wrong 1
+status 401
+Content-Type: application/json
+{"error":"Invalid credentials"}
+== login wrong 2
+status 401
+Content-Type: application/json
+{"error":"Invalid credentials"}
+== login wrong 3
+status 401
+Content-Type: application/json
+{"error":"Invalid credentials"}
+== login wrong 4
+status 401
+Content-Type: application/json
+{"error":"Invalid credentials"}
+== login wrong 5
+status 401
+Content-Type: application/json
+{"error":"Invalid credentials"}
+== login wrong 6
+status 401
+Content-Type: application/json
+{"error":"Invalid credentials"}
+== login wrong 7
+status 401
+Content-Type: application/json
+{"error":"Invalid credentials"}
+== login wrong 8
+status 401
+Content-Type: application/json
+{"error":"Invalid credentials"}
+== login wrong 9
+status 401
+Content-Type: application/json
+{"error":"Invalid credentials"}
+== login wrong 10
+status 401
+Content-Type: application/json
+{"error":"Invalid credentials"}
+== login wrong 11
+status 429
+Content-Type: application/json
+{"error":"Too many login attempts for this account"}
+== login wrong 12
+status 429
+Content-Type: application/json
+{"error":"Too many login attempts for this account"}
+== login right after limit
+status 429
+Content-Type: application/json
+{"error":"Too many login attempts for this account"}
+== login right other peer
+status 200
+Content-Type: application/json
+{"authenticated":true,"user":{"id":"usr_gold","username":"gold","email":"","display_name":"","role":"admin","status":"active","sso_provider":"local","totp_enabled":false,"must_change_password":false,"created_at":"<time>","updated_at":"<time>"}}
+== pow first use
+status 200
+Content-Type: application/json
+{"authenticated":true,"user":{"id":"usr_pow","username":"powgold","email":"","display_name":"","role":"user","status":"active","sso_provider":"local","totp_enabled":false,"must_change_password":false,"created_at":"<time>","updated_at":"<time>"}}
+== pow replay
+status 403
+Content-Type: application/json
+{"error":"Security check failed. Please complete the CAPTCHA puzzle."}
+== pow missing
+status 403
+Content-Type: application/json
+{"error":"Security check failed. Please complete the CAPTCHA puzzle."}
+== pow challenge
+status 200
+Content-Type: application/json
+{"algorithm":"SHA-256","salt":"<token>","challenge":"<token>","maxnumber":50000,"expires_at":<num>,"signature":"<token>"}
+== create room
+status 201
+Content-Type: application/json
+{"room":{"id":"rm_<uuid>","tenant_id":"default","kind":"channel","name":"gold-room","topic":"","is_private":false,"last_seq":0,"created_by":"u_g_alice","created_at":<num>}}
+== upload a
+status 201
+Content-Type: application/json
+{"attachment":{"id":"att_<uuid>","tenant_id":"default","room_id":"rm_<uuid>","uploader_id":"u_g_alice","filename":"a.txt","mime_type":"text/plain; charset=utf-8","size_bytes":1700,"sha256_hex":"<token>","created_at":<num>}}
+== upload over user staging cap
+status 413
+Content-Type: application/json
+{"error":"Pending attachment quota exceeded; send or remove staged uploads first"}
+== upload oversize
+status 413
+Content-Type: application/json
+{"error":"Pending attachment quota exceeded; send or remove staged uploads first"}
+== list staged
+status 200
+Content-Type: application/json
+{"attachments":[{"id":"att_<uuid>","tenant_id":"default","room_id":"rm_<uuid>","uploader_id":"u_g_alice","filename":"a.txt","mime_type":"text/plain; charset=utf-8","size_bytes":1700,"sha256_hex":"<token>","created_at":<num>}]}
+== post message
+status 201
+Content-Type: application/json
+{"message":{"id":"msg_<uuid>","tenant_id":"default","room_id":"rm_<uuid>","seq":1,"sender_id":"u_g_alice","sender_name":"Galice","encoding":"plain_v1","body":"file","created_at":<num>,"attachments":[{"id":"att_<uuid>","tenant_id":"default","room_id":"rm_<uuid>","message_id":"msg_<uuid>","uploader_id":"u_g_alice","filename":"a.txt","mime_type":"text/plain; charset=utf-8","size_bytes":1700,"sha256_hex":"<token>","created_at":<num>}]}}
+== bob upload
+status 201
+Content-Type: application/json
+{"attachment":{"id":"att_<uuid>","tenant_id":"default","room_id":"rm_<uuid>","uploader_id":"u_g_bob","filename":"d.txt","mime_type":"text/plain; charset=utf-8","size_bytes":1700,"sha256_hex":"<token>","created_at":<num>}}
+== bob upload over install cap
+status 413
+Content-Type: application/json
+{"error":"Workspace attachment storage quota exceeded"}
+== download
+status 200
+Content-Type: text/plain; charset=utf-8
+Content-Length: 1700
+sha256 098230e31a14b0105c570ee8e4de14f841da1aff1d84f3e92bbbd1a1660557de
+== download range
+status 206
+Content-Type: text/plain; charset=utf-8
+Content-Range: bytes 10-19/1700
+Content-Length: 10
+sha256 848b3d144b177e262a328fb477798cc39cedf8ce617043d231665fdf67516771
+== download unknown
+status 404
+Content-Type: application/json
+{"error":"Attachment not found"}
+== delete by non-owner
+status 404
+Content-Type: application/json
+{"error":"Attachment not found"}
+== delete by owner
+status 409
+Content-Type: application/json
+{"error":"Attachment is already attached to a message"}
+== delete staged by owner
+status 204
+== download staged deleted
+status 404
+Content-Type: application/json
+{"error":"Attachment not found"}
+== upload after delete
+status 201
+Content-Type: application/json
+{"attachment":{"id":"att_<uuid>","tenant_id":"default","room_id":"rm_<uuid>","uploader_id":"u_g_bob","filename":"f.txt","mime_type":"text/plain; charset=utf-8","size_bytes":1700,"sha256_hex":"<token>","created_at":<num>}}
+== download posted
+status 200
+Content-Type: text/plain; charset=utf-8
+Content-Length: 1700
+sha256 098230e31a14b0105c570ee8e4de14f841da1aff1d84f3e92bbbd1a1660557de
+== meeting create
+status 200
+Content-Type: application/json
+{"guest_urls":{"ext-gold":"http://localhost:8080/meet/<token>"},"meeting_id":"gold-1","member_url":"http://localhost:8080/chat/rm_<uuid>","room_id":"rm_<uuid>"}
+== meeting update
+status 200
+Content-Type: application/json
+{"guest_urls":{},"meeting_id":"gold-1","member_url":"http://localhost:8080/chat/rm_<uuid>","room_id":"rm_<uuid>"}
+== meeting bad signature
+status 401
+Content-Type: application/json
+{"error":"Meeting sync signature invalid or not configured"}
+== meeting with org_id in single
+status 400
+Content-Type: application/json
+{"error":"Invalid JSON payload or org_id"}
+== guest info
+status 200
+Content-Type: application/json
+{"closed":false,"in_window":true,"meeting_title":"Gold 2","pow_required":false,"sfu_available":false}
+== guest info unknown
+status 404
+Content-Type: application/json
+{"error":"Meeting link is invalid or revoked"}
+== guest knock
+status 200
+Content-Type: application/json
+{"display_name":"Gold Guest","guest_id":"guest_<uuid>","meeting_title":"Gold 2","room_id":"rm_<uuid>","status":"waiting"}
+== guest messages before admit
+status 403
+Content-Type: application/json
+{"error":"Waiting for a meeting participant to admit you"}
+== guest messages no cookie
+status 401
+Content-Type: application/json
+{"error":"Guest session expired — please knock again"}
+== lobby list
+status 200
+Content-Type: application/json
+{"guests":[{"meeting_id":"gold-1","room_id":"rm_<uuid>","guest_id":"guest_<uuid>","display_name":"Gold Guest","knocked_at":<num>,"status":"waiting"}]}
+== admit
+status 200
+Content-Type: application/json
+{"guest":{"guest_id":"guest_<uuid>","meeting_id":"gold-1","tenant_id":"default","room_id":"rm_<uuid>","guest_key":"ext-gold","display_name":"Gold Guest","status":"admitted","knocked_at":<num>,"decided_by":"u_g_host"}}
+== guest post
+status 201
+Content-Type: application/json
+{"message":{"id":"msg_<uuid>","tenant_id":"default","room_id":"rm_<uuid>","seq":1,"sender_id":"guest_<uuid>","sender_name":"Gold Guest (Guest)","encoding":"plain_v1","body":"hello","created_at":<num>}}
+== guest messages
+status 200
+Content-Type: application/json
+{"has_more":false,"messages":[{"id":"msg_<uuid>","tenant_id":"default","room_id":"rm_<uuid>","seq":1,"sender_id":"guest_<uuid>","sender_name":"Gold Guest (Guest)","encoding":"plain_v1","body":"hello","created_at":<num>}]}
+== meeting close
+status 200
+Content-Type: application/json
+{"closed":true}
+== guest after close
+status 404
+Content-Type: application/json
+{"error":"Meeting link is invalid or has ended"}
+== backup status
+status 200
+scheduler_error present false
+== single config without shared secrets
+error false

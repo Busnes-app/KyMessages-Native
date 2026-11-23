@@ -3,6 +3,8 @@ package config_test
 import (
 	"bytes"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -378,7 +380,68 @@ func TestTenancyModeFromEnv(t *testing.T) {
 		t.Setenv("KY_DB_DRIVER", "postgres")
 		t.Setenv("KY_DB_DSN", "postgres://user:pass@localhost:5432/testdb")
 		t.Setenv("KY_STAFF_ORG_ID", "00000000-0000-4000-8000-000000000001")
+		t.Setenv("KY_SESSION_SECRET", "multi-session-secret-0123456789abcdef")
+		t.Setenv("KY_ENCRYPTION_KEY", strings.Repeat("ab", 32))
+		t.Setenv("KY_VAPID_PRIVATE_KEY", "unchecked-here")
 	}
+
+	// Replicas must share every secret: none may be minted per process or per data directory.
+	t.Run("multi_requires_shared_secrets", func(t *testing.T) {
+		for _, tc := range []struct{ unset, want string }{
+			{"KY_SESSION_SECRET", "KY_SESSION_SECRET"},
+			{"KY_ENCRYPTION_KEY", "KY_ENCRYPTION_KEY"},
+			{"KY_VAPID_PRIVATE_KEY", "KY_VAPID_PRIVATE_KEY"},
+		} {
+			multiEnv(t)
+			dir := os.Getenv("KY_DATA_DIR")
+			t.Setenv(tc.unset, "")
+			if _, err := config.LoadForTenancy(config.TenancyMulti); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("multi without %s: %v", tc.unset, err)
+			}
+			for _, f := range []string{"encryption.key", "vapid.key"} {
+				if _, err := os.Stat(filepath.Join(dir, f)); err == nil {
+					t.Errorf("multi mode minted %s", f)
+				}
+			}
+		}
+	})
+
+	t.Run("multi_accepts_shared_files", func(t *testing.T) {
+		multiEnv(t)
+		dir := os.Getenv("KY_DATA_DIR")
+		t.Setenv("KY_ENCRYPTION_KEY", "")
+		t.Setenv("KY_VAPID_PRIVATE_KEY", "")
+		if err := os.WriteFile(filepath.Join(dir, "encryption.key"), []byte(strings.Repeat("cd", 32)+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "vapid.key"), []byte("x\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := config.LoadForTenancy(config.TenancyMulti); err != nil {
+			t.Fatalf("shared files: %v", err)
+		}
+		t.Setenv("KY_PUSH_ENABLED", "false")
+		if err := os.Remove(filepath.Join(dir, "vapid.key")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := config.LoadForTenancy(config.TenancyMulti); err != nil {
+			t.Fatalf("push off needs no VAPID key: %v", err)
+		}
+	})
+
+	t.Run("single_still_mints_keys", func(t *testing.T) {
+		dir := t.TempDir()
+		t.Setenv("KY_DATA_DIR", dir)
+		t.Setenv("KY_TENANCY_MODE", "")
+		t.Setenv("KY_SESSION_SECRET", "")
+		t.Setenv("KY_ENCRYPTION_KEY", "")
+		if _, err := config.LoadFromEnv(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "encryption.key")); err != nil {
+			t.Fatalf("single mode must keep minting its key file: %v", err)
+		}
+	})
 
 	t.Run("multi_requires_postgres", func(t *testing.T) {
 		multiEnv(t)
@@ -439,4 +502,25 @@ func TestTenancyModeFromEnv(t *testing.T) {
 			t.Fatalf("want KY_TENANCY_MODE error, got %v", err)
 		}
 	})
+}
+
+func TestMaintenanceLoaderKeepsServerGate(t *testing.T) {
+	t.Setenv("KY_DATA_DIR", t.TempDir())
+	t.Setenv("KY_TENANCY_MODE", "multi")
+	t.Setenv("KY_DB_DRIVER", "postgres")
+	t.Setenv("KY_DB_DSN", "postgres://unused/maintenance")
+	t.Setenv("KY_STAFF_ORG_ID", "00000000-0000-4000-8000-000000000001")
+	t.Setenv("KY_SESSION_SECRET", "maintenance-session-secret-0123456789")
+	t.Setenv("KY_ENCRYPTION_KEY", strings.Repeat("ab", 32))
+	t.Setenv("KY_PUSH_ENABLED", "false")
+	if cfg, err := config.LoadForMaintenance(); err != nil || !cfg.Tenancy.IsMultiTenant() {
+		t.Fatalf("offline multi config: %+v %v", cfg, err)
+	}
+	if _, err := config.LoadFromEnv(); err == nil || !strings.Contains(err.Error(), "unavailable in this release") {
+		t.Fatalf("server gate lost: %v", err)
+	}
+	t.Setenv("KY_TENANCY_MODE", "invalid")
+	if _, err := config.LoadForMaintenance(); err == nil {
+		t.Fatal("maintenance accepted invalid tenancy mode")
+	}
 }

@@ -239,6 +239,12 @@ func LoadFromEnv() (*Config, error) {
 	}
 }
 
+// LoadForMaintenance reads deployment configuration for offline grant invalidation only.
+// Server startup must use LoadFromEnv, which retains the multi-tenant release gate.
+func LoadForMaintenance() (*Config, error) {
+	return loadFromEnv(strings.ToLower(getEnv("KY_TENANCY_MODE", TenancySingle)))
+}
+
 func loadFromEnv(tenancyMode string) (*Config, error) {
 	if err := rejectLegacyEnvironment(); err != nil {
 		return nil, err
@@ -260,9 +266,19 @@ func loadFromEnv(tenancyMode string) (*Config, error) {
 		}
 	}
 
+	if tenancyMode != TenancySingle && tenancyMode != TenancyMulti {
+		return nil, fmt.Errorf("KY_TENANCY_MODE: must be %q or %q, got %q", TenancySingle, TenancyMulti, tenancyMode)
+	}
+	multi := tenancyMode == TenancyMulti
+
+	// Multi mode runs several replicas: each secret below must be the same on all of them, so
+	// none may be minted per process or per data directory.
 	sessionSecret := getEnv("KY_SESSION_SECRET", "")
 	if env == "production" && sessionSecret == "" {
 		return nil, fmt.Errorf("KY_SESSION_SECRET is required in production")
+	}
+	if multi && sessionSecret == "" {
+		return nil, errors.New("KY_SESSION_SECRET is required when KY_TENANCY_MODE=multi (every replica must verify the others' challenges)")
 	}
 	if sessionSecret == "" {
 		sessionSecret = generateRandomHex(32)
@@ -272,7 +288,12 @@ func loadFromEnv(tenancyMode string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("KY_ENCRYPTION_KEY: %w", err)
 	}
-	if !ok {
+	if !ok && multi {
+		// A shared file is fine; a key minted here would differ from the other replicas'.
+		if encryptionKey, err = keyfile.Load(filepath.Join(dataDir, "encryption.key"), 32); err != nil {
+			return nil, fmt.Errorf("KY_TENANCY_MODE=multi requires KY_ENCRYPTION_KEY or a shared %s: %w", filepath.Join(dataDir, "encryption.key"), err)
+		}
+	} else if !ok {
 		encryptionKey, err = keyfile.LoadOrCreate(filepath.Join(dataDir, "encryption.key"), 32)
 		if err != nil {
 			return nil, fmt.Errorf("encryption key: %w", err)
@@ -326,6 +347,12 @@ func loadFromEnv(tenancyMode string) (*Config, error) {
 			return nil, errors.New("KY_STAFF_ORG_ID is required and must be a canonical lowercase UUID when KY_TENANCY_MODE=multi")
 		}
 		scimEnabled = false
+		if getEnvBool("KY_PUSH_ENABLED", true) && strings.TrimSpace(os.Getenv("KY_VAPID_PRIVATE_KEY")) == "" {
+			// A shared file is fine; push.LoadOrCreateVAPIDKey must never mint one per replica.
+			if _, err := os.Stat(filepath.Join(dataDir, "vapid.key")); err != nil {
+				return nil, fmt.Errorf("KY_TENANCY_MODE=multi requires KY_VAPID_PRIVATE_KEY or a shared %s (or KY_PUSH_ENABLED=false)", filepath.Join(dataDir, "vapid.key"))
+			}
+		}
 	}
 
 	kypostPair, err := pairFromEnv("KY_KYPOST")

@@ -72,7 +72,14 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   first locks the device row (`FOR UPDATE`) so concurrent uploads cannot both pass the cap. Mail has no
   cursor: `ToDevice` returns the oldest unacknowledged rows and `AckToDevice` deletes exactly the
   IDs named, because PostgreSQL IDs commit out of order. Only public keys and ciphertext are stored.
-- `store.Open(ctx, cfg)` initializes and auto-migrates the configured database backend.
+- `store.Open(ctx, cfg)` initializes and auto-migrates the configured database backend. On
+  PostgreSQL `migrations.Run` holds `pg_advisory_lock(hashtext('kymessages:migrate'))` on one
+  connection for the whole run and reads `schema_migrations` under it, so replicas starting
+  together apply each migration once (`TestConcurrentRunsAllSucceed`). SQLite takes no lock.
+- E2EE owns migrations 53–54 after merged webhook removal 52; tenancy starts at 55.
+  Migration 55 adds `job_leases (name, holder, expires_at)`. `AcquireLease(name, holder, ttl)`
+  is one conditional upsert that wins only when the lease is free, expired or already the
+  holder's; it reads the database clock (Unix ms), never a replica's (`TestJobLeaseHandover`).
   `migrations.Run` refuses with `ErrNewerSchema` a database whose `schema_migrations` holds a
   version above this build's newest (image rollback, or a capsule from a newer build), before
   running anything. It takes only `sqlite` or `postgres`/`postgresql` and picks its placeholder

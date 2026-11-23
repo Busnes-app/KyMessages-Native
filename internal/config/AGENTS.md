@@ -28,6 +28,7 @@ Owns environment variable parsing, configuration validation, default fallbacks, 
 - `KY_ADMIN_USERNAME` (default `admin`) is `Security.AdminUsername`: the local admin `cmd/server` creates on an empty database and `init-admin`'s `-username` default. It must pass `ValidUsername` (3-64 of `[A-Za-z0-9._-]`, the rule `auth.ValidateUsername` shares), else startup fails.
 - `KY_SCIM_TOKEN` is `SCIM.BearerToken`; unset, it is random per start and `SCIM.TokenSet` (`json:"-"`) is false, which the console reports without the token. The installer clears both.
 - `LoadFromEnv` accepts `KY_TENANCY_MODE` unset or `single`. It refuses `multi` before key creation until the tenancy build is complete. Internal config tests still exercise the PostgreSQL, staff-org and SCIM requirements for multi mode.
+- The gated multi configuration (`LoadForTenancy`, tests only) forces `SCIM.Enabled` off and requires `KY_DB_DRIVER=postgres` plus `KY_STAFF_ORG_ID` (`Tenancy.StaffOrgID`) as a canonical lowercase UUID (`IsCanonicalUUID`); `Tenancy.MayAdminister` allows the admin role only for that org. It also requires secrets every replica shares and never mints one: `KY_SESSION_SECRET`, `KY_ENCRYPTION_KEY` or an existing `<KY_DATA_DIR>/encryption.key` (`keyfile.Load`, not `LoadOrCreate`), and, unless `KY_PUSH_ENABLED=false`, `KY_VAPID_PRIVATE_KEY` or an existing `<KY_DATA_DIR>/vapid.key` (`multi_requires_shared_secrets`). Single mode keeps minting its files.
 - `KY_KYPOST_URL`/`KY_KYPOST_SECRET_FILE` and `KY_KYCALENDAR_URL`/`KY_KYCALENDAR_SECRET_FILE` fill `Config.KyPost`/`Config.KyCalendar` (`PairConfig`; both or neither, `PeerOrigin` https origin, secret ≥ 32 bytes, `json:"-"`). Unset, the pair comes from KyIdentity's suite directory.
 - Web Push fills `Config.Push`: `KY_PUSH_ENABLED` (default true; false means no dispatcher and bootstrap reports push unavailable), `KY_VAPID_PRIVATE_KEY` (overrides `<KY_DATA_DIR>/vapid.key`) and `KY_VAPID_SUBJECT` (else derived from `KY_APP_URL`). `Push.AllowPrivate` is tests only.
 - `KY_CAPTCHA_PROVIDER` is `pow` (default) or `none`; anything else fails startup, because login verifies nothing else. `KY_CAPTCHA_POW_DIFFICULTY` defaults to 50000.
@@ -38,6 +39,8 @@ Owns environment variable parsing, configuration validation, default fallbacks, 
   snapshot with protected OIDC/directory file references. Explicit conflicting SSO, SCIM,
   automatic provisioning and unsupported recovery pairing are refused before writes.
   Restart applies committed config through the existing graceful shutdown/drain path.
+
+- `LoadForMaintenance` is the offline `invalidate-grants` loader: it validates the full deployment configuration while accepting multi mode. Server startup exclusively uses the gated `LoadFromEnv`.
 
 ## Verification
 - `go test -v ./internal/config/...`

@@ -6,13 +6,33 @@ import (
 	"time"
 
 	"github.com/Busnes-app/ky_server_base/internal/api"
+	"github.com/Busnes-app/ky_server_base/internal/crypto"
 	"github.com/Busnes-app/ky_server_base/internal/store"
 )
+
+// jobGate reports whether this replica runs one tick of job, which runs every interval.
+type jobGate func(ctx context.Context, job string, every time.Duration) bool
+
+// everyReplica is single mode: every job runs in the one process, as it always has.
+func everyReplica(context.Context, string, time.Duration) bool { return true }
+
+// leasedJobs is multi mode: a tick runs only on the replica holding the job's lease. The lease
+// lasts three ticks and each tick renews it, so a dead replica's jobs move within three ticks.
+func leasedJobs(st store.Store) jobGate {
+	holder := crypto.RandomHex(16)
+	return func(ctx context.Context, job string, every time.Duration) bool {
+		ok, err := st.AcquireLease(ctx, job, holder, 3*every)
+		if err != nil && ctx.Err() == nil {
+			log.Printf("[JOBS] %s lease unavailable: %v", job, err)
+		}
+		return ok
+	}
+}
 
 // maintenanceLoop deletes expired QR pairings, suite replay IDs and stale end-to-end encryption
 // mail once a minute. done closes between ticks,
 // so shutdown can wait for it before the store closes.
-func maintenanceLoop(ctx context.Context, st store.Store, done chan<- struct{}) {
+func maintenanceLoop(ctx context.Context, st store.Store, gate jobGate, done chan<- struct{}) {
 	defer close(done)
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
@@ -21,9 +41,11 @@ func maintenanceLoop(ctx context.Context, st store.Store, done chan<- struct{}) 
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			sweepPairings(ctx, st)
-			sweepSuiteReplay(ctx, st)
-			sweepE2EEMailbox(ctx, st)
+			if gate(ctx, "maintenance", time.Minute) {
+				sweepPairings(ctx, st)
+				sweepSuiteReplay(ctx, st)
+				sweepE2EEMailbox(ctx, st)
+			}
 		}
 	}
 }
@@ -54,16 +76,18 @@ func sweepE2EEMailbox(ctx context.Context, st store.Store) {
 
 // agentExpiryLoop revokes idle (90d) and inactive-owner bot tokens (api.Server.ExpireIdleAgents)
 // at its start and hourly. done closes between runs, so shutdown can wait before the store closes.
-func agentExpiryLoop(ctx context.Context, expire func(context.Context, time.Time) error, done chan<- struct{}) {
+func agentExpiryLoop(ctx context.Context, expire func(context.Context, time.Time) error, gate jobGate, done chan<- struct{}) {
 	defer close(done)
 	ticker := time.NewTicker(time.Hour)
 	defer ticker.Stop()
 	for {
-		run, cancel := context.WithTimeout(ctx, 2*time.Minute)
-		err := expire(run, time.Now())
-		cancel()
-		if err != nil && ctx.Err() == nil {
-			log.Printf("[AGENTS] idle token expiry incomplete (retrying hourly): %v", err)
+		if gate(ctx, "agent_expiry", time.Hour) {
+			run, cancel := context.WithTimeout(ctx, 2*time.Minute)
+			err := expire(run, time.Now())
+			cancel()
+			if err != nil && ctx.Err() == nil {
+				log.Printf("[AGENTS] idle token expiry incomplete (retrying hourly): %v", err)
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -75,18 +99,20 @@ func agentExpiryLoop(ctx context.Context, expire func(context.Context, time.Time
 
 // attachmentSweepLoop expires abandoned unposted (staged) attachments at start and every
 // 15 minutes. done closes between runs so shutdown waits cleanly before the store closes.
-func attachmentSweepLoop(ctx context.Context, sweep func(context.Context, time.Time) (int, error), done chan<- struct{}) {
+func attachmentSweepLoop(ctx context.Context, sweep func(context.Context, time.Time) (int, error), gate jobGate, done chan<- struct{}) {
 	defer close(done)
 	ticker := time.NewTicker(15 * time.Minute)
 	defer ticker.Stop()
 	for {
-		run, cancel := context.WithTimeout(ctx, 2*time.Minute)
-		removed, err := sweep(run, time.Now())
-		cancel()
-		if err != nil && ctx.Err() == nil {
-			log.Printf("[ATTACHMENTS] orphan sweep failed: %v", err)
-		} else if removed > 0 {
-			log.Printf("[ATTACHMENTS] purged %d expired staged attachment(s)", removed)
+		if gate(ctx, "attachment_sweep", 15*time.Minute) {
+			run, cancel := context.WithTimeout(ctx, 2*time.Minute)
+			removed, err := sweep(run, time.Now())
+			cancel()
+			if err != nil && ctx.Err() == nil {
+				log.Printf("[ATTACHMENTS] orphan sweep failed: %v", err)
+			} else if removed > 0 {
+				log.Printf("[ATTACHMENTS] purged %d expired staged attachment(s)", removed)
+			}
 		}
 		select {
 		case <-ctx.Done():

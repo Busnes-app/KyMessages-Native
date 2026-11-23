@@ -167,6 +167,10 @@ LOGIN_BODY="$(curl -s -c "$WORK/cookies" -H 'Content-Type: application/json' \
   -d '{"username":"admin","password":"FinalSmokePassword123!"}' "$BASE/api/auth/login")"
 contains "reset replacement signs in" "$LOGIN_BODY" '"authenticated":true'
 contains "admin settings include db_driver" "$(curl -s -b "$WORK/cookies" "$BASE/api/settings")" '"db_driver"'
+check "invalidate-grants takes no arguments" \
+  "$(KY_DATA_DIR="$WORK/cli" KY_DB_DRIVER=sqlite "$BIN" invalidate-grants now >/dev/null 2>&1; echo $?)" "2"
+check "invalidate-grants succeeds" \
+  "$(KY_DATA_DIR="$WORK/cli" KY_DB_DRIVER=sqlite "$BIN" invalidate-grants >/dev/null 2>&1 && echo 0 || echo 1)" "0"
 check "deposit CLI refuses without a key" \
   "$(KY_DATA_DIR="$WORK/cli" KY_DB_DRIVER=sqlite "$BIN" deposit >/dev/null 2>&1 && echo 0 || echo 1)" "1"
 CSRF="$(awk '$6 == "ky_csrf" { print $7 }' "$WORK/cookies")"

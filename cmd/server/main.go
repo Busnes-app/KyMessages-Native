@@ -54,6 +54,9 @@ func main() {
 		case "restore":
 			runRestore(os.Args[2:])
 			return
+		case "invalidate-grants":
+			runInvalidateGrants(os.Args[2:])
+			return
 		case "restore-attachments":
 			runRestoreAttachments(os.Args[2:])
 			return
@@ -119,14 +122,18 @@ func runServer() {
 	}()
 	backupDone := make(chan struct{})
 	go backupLoop(ctx, cfg, st, backupDone)
+	gate := jobGate(everyReplica)
+	if cfg.Tenancy.IsMultiTenant() {
+		gate = leasedJobs(st)
+	}
 	maintenanceDone := make(chan struct{})
 	go func() {
 		agentsDone := make(chan struct{})
-		go agentExpiryLoop(ctx, srv.ExpireIdleAgents, agentsDone)
+		go agentExpiryLoop(ctx, srv.ExpireIdleAgents, gate, agentsDone)
 		attachmentsDone := make(chan struct{})
-		go attachmentSweepLoop(ctx, srv.SweepOrphanAttachments, attachmentsDone)
+		go attachmentSweepLoop(ctx, srv.SweepOrphanAttachments, gate, attachmentsDone)
 		pairingsDone := make(chan struct{})
-		maintenanceLoop(ctx, st, pairingsDone)
+		maintenanceLoop(ctx, st, gate, pairingsDone)
 		<-agentsDone
 		<-attachmentsDone
 		close(maintenanceDone)
@@ -233,6 +240,10 @@ var runBackup = func(ctx context.Context, cfg *config.Config, rc recoveryclient.
 // SIGTERM cannot land between KyRecovery storing a capsule and the receipt being written.
 func backupLoop(ctx context.Context, cfg *config.Config, st store.Store, done chan<- struct{}) {
 	defer close(done)
+	if cfg.Tenancy.IsMultiTenant() {
+		log.Printf("[BACKUP] scheduler off: %s", backup.MultiTenantOff)
+		return
+	}
 	// Run never gets far enough to stamp the attempt on a RunConfig failure, so retrying
 	// would log and audit it every tick forever.
 	// The status route reports the same failure as scheduler_error; this row is the trail.
@@ -411,6 +422,29 @@ func bootstrapAdmin(ctx context.Context, st store.Store, username, adminPass str
 		SSOProvider:        "local",
 		MustChangePassword: true,
 	})
+}
+
+// runInvalidateGrants is the multi-mode restore step `restore` runs for a capsule: a database
+// restored by PostgreSQL tooling still holds grants revoked after its restore point. Run it with
+// every replica stopped.
+func runInvalidateGrants(args []string) {
+	if len(args) > 0 {
+		fmt.Fprintln(os.Stderr, "Usage: kymessages invalidate-grants (with every replica stopped)")
+		os.Exit(2)
+	}
+	cfg, err := config.LoadForMaintenance()
+	if err != nil {
+		log.Fatalf("Failed to load configuration: %v", err)
+	}
+	ctx := context.Background()
+	st, err := store.Open(ctx, cfg.Database)
+	if err != nil {
+		log.Fatalf("DB error: %v", err)
+	}
+	if err := errors.Join(st.InvalidateRestoredGrants(ctx), st.Close()); err != nil {
+		log.Fatalf("Invalidating restored grants: %v", err)
+	}
+	fmt.Println("Sessions, challenges, pairings, push subscriptions, active calls and bot tokens invalidated.")
 }
 
 func runInitAdmin(args []string) {

@@ -988,3 +988,13 @@ func TestBackupRoutesOverTheExpandedLimitAre413WithTheSize(t *testing.T) {
 		}
 	}
 }
+
+// In multi mode the capsule scheduler is off; status says why instead of a config fault.
+func TestBackupStatusSaysWhyInMultiTenantMode(t *testing.T) {
+	srv, st, _ := newMultiTenantTestServer(t)
+	admin := loginAs(t, srv, st, "opsadmin", "admin")
+	status := statusOf(t, srv, admin)
+	if status["scheduler_error"] != backup.MultiTenantOff {
+		t.Fatalf("scheduler_error = %v", status["scheduler_error"])
+	}
+}
