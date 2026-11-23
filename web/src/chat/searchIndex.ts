@@ -126,12 +126,13 @@ export class SearchIndex {
   private async write(messages: ChatMessage[]): Promise<void> {
     this.live();
     const keep: Entry[] = [];
-    const drop: string[] = [];
+    // A deletion always drops the copy; other unindexable states only drop a copy no newer than them.
+    const drop: { id: string; edited_at?: number }[] = [];
     for (const m of messages) {
       // Anything no longer indexable (deleted, emptied, unreadable, not yet stored) also loses an
       // earlier copy, so the device never keeps old text it would not index now.
       if (m.deleted_at || !m.body.trim() || m.encoding === 'system_v1' || m.delivery.kind !== 'synced') {
-        drop.push(m.id);
+        drop.push(m.deleted_at ? { id: m.id } : { id: m.id, edited_at: m.edited_at ?? 0 });
         continue;
       }
       const plain: SearchHit = { id: m.id, room_id: m.room_id, seq: m.seq, sender_id: m.sender_id, sender_name: m.sender_name, body: m.body, created_at: m.created_at, edited_at: m.edited_at };
@@ -151,7 +152,18 @@ export class SearchIndex {
         if (!old || (old.edited_at ?? 0) <= e.edited_at) store.put(e);
       };
     }
-    for (const id of drop) store.delete(id);
+    for (const d of drop) {
+      if (d.edited_at === undefined) {
+        store.delete(d.id);
+        continue;
+      }
+      const v = d.edited_at;
+      const get = store.get(d.id);
+      get.onsuccess = () => {
+        const old = get.result as Entry | undefined;
+        if (old && (old.edited_at ?? 0) <= v) store.delete(d.id);
+      };
+    }
     await done(tx);
     await this.prune();
   }
