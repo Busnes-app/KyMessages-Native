@@ -7,6 +7,8 @@ Exposes HTTP REST routes, authentication endpoints, Single Sign-On callbacks, SC
 Owns HTTP routing, request parsing, session cookie validation, CORS headers, and error response formatting.
 
 ## Local Contracts
+- Multi-mode sign-in reads an existing authoritative org snapshot; tokens never admit/create a tenant. User routes, guest/call admission and grant issuance refuse an org without an active, enabled, valid directory snapshot. Uploads enforce per-org upload and staged-user limits; text/read/delete behavior does not depend on these byte limits. Admission tests explicitly seed directory snapshots for already-authorized org fixtures.
+
 - `POST /api/sso/kyidentity/logout` is public and CSRF-exempt: its credential is the verified
   logout_token form field (64 KiB maximum, exactly one). Refused tokens/replays return 400;
   unavailable storage returns 503. Accepted logout publishes session-specific WS revocations

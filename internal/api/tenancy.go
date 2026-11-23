@@ -101,7 +101,7 @@ func (s *Server) requireUserTenant(w http.ResponseWriter, r *http.Request, user 
 		s.writeError(w, http.StatusInternalServerError, "Failed to verify organization")
 		return "", false
 	}
-	if tenant.Status != store.TenantStatusActive {
+	if tenant.Status != store.TenantStatusActive || !tenant.DirectoryReady {
 		s.writeError(w, http.StatusForbidden, "Organization is suspended or inactive")
 		return "", false
 	}
@@ -124,5 +124,5 @@ func (s *Server) isTenantActive(ctx context.Context, tenantID string) (bool, err
 	if err != nil {
 		return false, err
 	}
-	return tenant.Status == store.TenantStatusActive, nil
+	return tenant.Status == store.TenantStatusActive && tenant.DirectoryReady, nil
 }

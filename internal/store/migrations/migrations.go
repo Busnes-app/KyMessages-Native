@@ -295,7 +295,20 @@ ALTER TABLE mfa_challenges ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';`,
 	// Tenancy sync and purge (multi mode): an org a full KyIdentity read did not list, and when
 	// a deleted org's data was purged.
 	{Version: 61, Name: "tenant_missing_and_purge", SQLite: tenantMissingSchema, Postgres: tenantMissingSchema},
+	{Version: 62, Name: "tenant_directory", SQLite: tenantDirectorySchema, Postgres: tenantDirectorySchema},
 }
+
+const tenantDirectorySchema = `
+CREATE TABLE tenant_directory (
+ tenant_id VARCHAR(64) PRIMARY KEY REFERENCES tenants(id),
+ revision BIGINT NOT NULL,
+ status VARCHAR(32) NOT NULL,
+ enabled INTEGER NOT NULL,
+ valid INTEGER NOT NULL,
+ max_upload_bytes BIGINT NOT NULL DEFAULT 0,
+ max_pending_user_bytes BIGINT NOT NULL DEFAULT 0
+);
+`
 
 const userSubjectsSchema = `
 CREATE TABLE user_subjects (

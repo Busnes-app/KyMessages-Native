@@ -171,6 +171,7 @@ When the user requests a durable behavior change, record it here or in the relev
   org and erased lists, the start-up check, the leased org purge) are built. Not built: PR 4
   (calls across replicas), PR 6 (S3), PR 8 (multi-region). It extends the 2026-11-22
   spec, whose §4 wire contract stays authoritative.
+- Multi-mode org admission requires an authoritative, active/enabled KyIdentity directory snapshot. Verified ID tokens and user events never admit an org; stale/conflicting snapshots cannot widen access. Per-app upload and staged-user safety limits narrow install bounds independently of the shared pool. A non-active snapshot persists pending revocation before any newer snapshot can restore access (`internal/store/tenant_directory.go`, migration 62).
 - Single mode must not change: `TestSingleTenantGolden` replays a fixed single-mode script and
   compares it with `internal/api/testdata/single-tenant-golden.txt`, recorded before the tenancy
   build. Regenerate (`-update-golden`) only for an intended single-mode change.

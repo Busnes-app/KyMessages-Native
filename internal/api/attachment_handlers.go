@@ -117,6 +117,7 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 
 	maxBytes := s.maxUploadBytes()
 	limits := store.AttachmentQuotaLimits{
+		MaxUploadBytes:      maxBytes,
 		MaxTotalBytes:       s.maxTotalAttachmentBytes(),
 		MaxPendingUserBytes: s.maxPendingUserBytes(),
 		Pool:                s.poolActive(tenantID),
@@ -191,6 +192,8 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		switch {
+		case errors.Is(err, store.ErrAttachmentUploadQuotaExceeded):
+			s.writeError(w, http.StatusRequestEntityTooLarge, "File exceeds organization upload limit")
 		case errors.Is(err, store.ErrAttachmentTenantQuotaExceeded):
 			s.writeError(w, http.StatusRequestEntityTooLarge, "Workspace attachment storage quota exceeded")
 		case errors.Is(err, store.ErrAttachmentPendingQuotaExceeded):
@@ -211,6 +214,9 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 	}()
 
 	quotaErrMsg := fmt.Sprintf("File exceeds maximum size of %d bytes", maxBytes)
+	if s.config.Tenancy.IsMultiTenant() && res.LimitingKind == store.AttachmentQuotaLimitUpload {
+		quotaErrMsg = fmt.Sprintf("File exceeds maximum size of %d bytes", res.ReservedBytes)
+	}
 	switch res.LimitingKind {
 	case store.AttachmentQuotaLimitPending:
 		quotaErrMsg = "Pending attachment quota exceeded; send or remove staged uploads first"
@@ -252,6 +258,8 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		switch {
+		case errors.Is(err, store.ErrAttachmentUploadQuotaExceeded):
+			s.writeError(w, http.StatusRequestEntityTooLarge, "File exceeds organization upload limit")
 		case errors.Is(err, store.ErrAttachmentTenantQuotaExceeded):
 			s.writeError(w, http.StatusRequestEntityTooLarge, "Workspace attachment storage quota exceeded")
 		case errors.Is(err, store.ErrAttachmentPendingQuotaExceeded):

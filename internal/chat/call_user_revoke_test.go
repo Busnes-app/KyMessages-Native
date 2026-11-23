@@ -36,7 +36,11 @@ func TestUserRevocationDropsRemoteCallSeats(t *testing.T) {
 	defer lk.Close()
 	hub := NewHub(&captureBus{})
 	mgr := NewCallManager(st.Chat(), hub, rtc.NewClient(lk.URL, "testkey", "testsecret1234567890"), nil)
-	hub.SetUserRevokeHandler(func(uid string) { mgr.HandleDisconnect(uid, 0) })
+	revoked := make(chan struct{}, 1)
+	hub.SetUserRevokeHandler(func(uid string) {
+		mgr.HandleDisconnect(uid, 0)
+		revoked <- struct{}{}
+	})
 	for _, u := range []string{"u1", "u2"} {
 		if _, err := mgr.Join(ctx, JoinCallRequest{TenantID: "org-a", RoomID: room.ID, UserID: u, DisplayName: u, Audio: true, ProtectIP: true}); err != nil {
 			t.Fatal(err)
@@ -61,9 +65,12 @@ func TestUserRevocationDropsRemoteCallSeats(t *testing.T) {
 		t.Fatal("a one-session revocation ended the call seat")
 	}
 	hub.Dispatch(Event{Type: EventAuthRevoked, UserID: "u1"}) // as delivered by the bus
-	deadline := time.Now().Add(2 * time.Second)
-	for seated("u1") && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
+	// Seat removal precedes the LiveKit request. Wait for the whole asynchronous handler,
+	// otherwise a fast local state read can race the fake SFU and falsely report no removal.
+	select {
+	case <-revoked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("whole-user revocation did not complete")
 	}
 	if seated("u1") || removed.Load() == 0 {
 		t.Fatalf("revoked user still seated=%v, LiveKit removals %d", seated("u1"), removed.Load())

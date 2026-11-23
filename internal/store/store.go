@@ -24,6 +24,7 @@ var (
 	ErrRoomClosed                     = errors.New("room is closed")
 	ErrReplyNotFound                  = errors.New("reply target is not a message in this room")
 	ErrAttachmentInvalid              = errors.New("attachment not found, not owned by sender, or already attached")
+	ErrAttachmentUploadQuotaExceeded  = errors.New("organization upload quota exceeded")
 	ErrAttachmentTenantQuotaExceeded  = errors.New("workspace attachment storage quota exceeded")
 	ErrAttachmentPendingQuotaExceeded = errors.New("pending attachment quota exceeded")
 	// ErrPoolFull: the write would pass the org's storage-pool grant.
@@ -327,6 +328,7 @@ type AgentStore interface {
 
 // ChatStore handles multi-tenant native KyMessages tenants, rooms, messages and reactions.
 type ChatStore interface {
+	ApplyTenantDirectory(ctx context.Context, entry TenantDirectoryEntry) error
 	// Tenants
 	CreateTenant(ctx context.Context, t *Tenant) error
 	EnsureTenant(ctx context.Context, tenantID string) (*Tenant, error)

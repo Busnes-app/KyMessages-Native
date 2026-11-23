@@ -109,12 +109,16 @@ func (s *Server) handleKyIdentityCallback(w http.ResponseWriter, r *http.Request
 			s.writeError(w, http.StatusForbidden, "Organization is suspended or inactive")
 			return
 		}
-		tenant, err := s.store.Chat().EnsureTenant(r.Context(), orgID)
+		tenant, err := s.store.Chat().GetTenant(r.Context(), orgID)
+		if errors.Is(err, store.ErrNotFound) {
+			s.writeError(w, http.StatusForbidden, "Organization is suspended or inactive")
+			return
+		}
 		if err != nil {
 			s.writeError(w, http.StatusInternalServerError, "Failed to verify organization")
 			return
 		}
-		if tenant.Status != store.TenantStatusActive {
+		if tenant.Status != store.TenantStatusActive || !tenant.DirectoryReady {
 			s.audit(r.Context(), "", r, "sso.tenant_inactive", "tenant:"+orgID, fmt.Sprintf("status=%q", tenant.Status))
 			s.writeError(w, http.StatusForbidden, "Organization is suspended or inactive")
 			return

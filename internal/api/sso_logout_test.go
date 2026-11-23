@@ -70,6 +70,7 @@ func TestSSOLogoutContractAcrossReplicas(t *testing.T) {
 	if _, err := st.Chat().EnsureTenant(ctx, testStaffOrg); err != nil {
 		t.Fatal(err)
 	}
+	admitOrg(t, st, testStaffOrg)
 	u := &store.User{ID: "logout-user", Username: "logout-user", SSOProvider: "kyidentity", SSOSubject: "logout-sub", OrgID: testStaffOrg, Status: "active", Role: "user"}
 	if err := st.Users().CreateUser(ctx, u); err != nil {
 		t.Fatal(err)
@@ -196,6 +197,7 @@ func TestSSOLogoutFencesInFlightCallback(t *testing.T) {
 				if fixture.multi {
 					cfg.Tenancy = config.TenancyConfig{Mode: config.TenancyMulti, StaffOrgID: testStaffOrg}
 					orgID = testStaffOrg
+					admitOrg(t, st, orgID)
 				}
 				idp := makeFakeIdP(t, cfg, true)
 				if fixture.provisioned {

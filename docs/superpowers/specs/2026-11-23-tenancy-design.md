@@ -489,6 +489,29 @@ test proves the answers are byte for byte the same.
 | Pool overshoot while KyIdentity is down | Bounded to 15 minutes of other apps' growth. Then fail closed for adding writes. |
 | Single-tenant changes by accident | Every change is gated on `IsMultiTenant()`. S3 settings refuse to start in single mode. Golden and upgrade tests. |
 
+### Authoritative admission and per-app quota acceptance (implemented, startup still gated)
+
+`tenant_directory` (migration 62) records each verified org-list entry's revision, status,
+app enablement and narrowed quotas. A token or user event cannot admit an org. All multi-mode
+access and org-bound grant issuance require an active/enabled valid snapshot at least as new
+as the lifecycle revision. A newer webhook therefore cannot resume access on older quotas.
+Deletion is terminal; stale entries cannot widen access, and conflicting equal revisions are
+refused. Non-active entries persist revocation work; access stays fenced until it succeeds.
+
+KyMessages accepts these optional keys in this app's `quotas` object:
+
+| Key | Accepted bytes | Default |
+|---|---|---|
+| `max_upload_bytes` | Integer 1,024–104,857,600 | Install upload cap |
+| `max_pending_user_bytes` | Integer 1,024–9,007,199,254,740,992 | Install per-user staging cap |
+
+Values only narrow the configured install safety limits. Unknown keys, nulls, nonintegers
+and invalid bounds hold the org offline; a newer valid snapshot recovers it after pending
+revocation completes. The shared org storage pool remains a separate admission check.
+Reservation and commit both check the current quotas under the same tenant quota lock, so
+parallel replicas cannot overspend staging capacity and an in-flight upload cannot bypass a
+new lower upload limit. Single mode keeps its existing limits and wire responses.
+
 ## 12. Phased build plan
 
 Each PR is gated on the tenancy mode, carries its negative tests (wrong org, single mode,

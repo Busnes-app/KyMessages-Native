@@ -24,6 +24,9 @@ func TestCommitRefusesAnInactiveUploader(t *testing.T) {
 	if err := st.Chat().CreateRoom(ctx, room, []string{"u_up"}); err != nil {
 		t.Fatal(err)
 	}
+	if err := st.Chat().ApplyTenantDirectory(ctx, store.TenantDirectoryEntry{TenantID: org, Status: store.TenantStatusActive, Enabled: true, Valid: true}); err != nil {
+		t.Fatal(err)
+	}
 	limits := store.AttachmentQuotaLimits{ActiveUploader: true}
 	commit := func(id string) error {
 		return st.Chat().CommitAttachmentWithQuota(ctx, "", &store.Attachment{ID: id, TenantID: org, RoomID: room.ID, UploaderID: "u_up", Filename: "f", MimeType: "text/plain", SizeBytes: 1, SHA256Hex: "h"}, limits)

@@ -75,6 +75,9 @@ func createOrgUser(t *testing.T, st store.Store, id, username, role, orgID strin
 	if _, err := st.Chat().EnsureTenant(ctx, orgID); err != nil {
 		t.Fatalf("EnsureTenant(%s): %v", orgID, err)
 	}
+	if err := st.Chat().ApplyTenantDirectory(ctx, store.TenantDirectoryEntry{TenantID: orgID, Status: store.TenantStatusActive, Enabled: true, Valid: true}); err != nil {
+		t.Fatal(err)
+	}
 	u := &store.User{
 		ID:          id,
 		Username:    username,
@@ -527,7 +530,9 @@ func TestMultiTenantDirectoryWebhookAndOrgLifecycle(t *testing.T) {
 		t.Fatalf("expected sso.org_mismatch audit log, got len=%d err=%v", len(logs), err)
 	}
 
-	// 4. Create session, room, and guest link in org-alpha; also a user in org-beta.
+	// 4. The directory admits org-alpha before it can issue sessions.
+	admitOrg(t, st, eva.OrgID)
+	// Create session, room, and guest link in org-alpha; also a user in org-beta.
 	evaTok := "tok_eva_" + uuid.NewString()
 	if err := st.Sessions().CreateSession(context.Background(), &store.Session{
 		UserID:    eva.ID,
@@ -654,6 +659,10 @@ func TestMultiTenantDirectoryWebhookAndOrgLifecycle(t *testing.T) {
 	if rec := postSync("org.unsuspended", []byte(`{"org_id":"00000000-0000-4000-8000-00000000000a","revision":2}`)); rec.Code != http.StatusOK {
 		t.Fatalf("org.unsuspended = %d: %s", rec.Code, rec.Body.String())
 	}
+	if err := mint(); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("unmirrored resume issued session: %v", err)
+	}
+	admitOrg(t, st, eva.OrgID, 2)
 	if err := mint(); err != nil {
 		t.Fatalf("session after org.unsuspended: %v", err)
 	}
@@ -820,11 +829,16 @@ func TestMultiTenantOrgResumed(t *testing.T) {
 		t.Fatalf("org.resumed at the suspension's revision applied: %q", status())
 	}
 	post("org.resumed", `{"org_id":"`+org+`","revision":2}`)
+	if status() != store.TenantStatusSuspended {
+		t.Fatal("unmirrored resume admitted org")
+	}
+	admitOrg(t, st, org, 2)
 	if status() != store.TenantStatusActive {
 		t.Fatalf("org.resumed rev 2 left status %q, want active", status())
 	}
 	post("org.suspended", `{"org_id":"`+org+`","revision":3}`)
 	post("org.unsuspended", `{"org_id":"`+org+`","revision":4}`)
+	admitOrg(t, st, org, 4)
 	if status() != store.TenantStatusActive {
 		t.Fatalf("legacy org.unsuspended left status %q, want active", status())
 	}
@@ -871,8 +885,12 @@ func TestMultiTenantStaleOrgLifecycleIsIgnored(t *testing.T) {
 	if code := post(restarted, "org.unsuspended", `{"org_id":"00000000-0000-4000-8000-00000000000c","revision":5}`); code != http.StatusOK || status() != store.TenantStatusSuspended {
 		t.Fatalf("replayed rev 5 after restart = %d, status %q, want suspended", code, status())
 	}
-	if code := post(restarted, "org.unsuspended", `{"org_id":"00000000-0000-4000-8000-00000000000c","revision":6}`); code != http.StatusOK || status() != store.TenantStatusActive {
-		t.Fatalf("newer unsuspend rev 6 = %d, status %q, want active", code, status())
+	if code := post(restarted, "org.unsuspended", `{"org_id":"00000000-0000-4000-8000-00000000000c","revision":6}`); code != http.StatusOK || status() != store.TenantStatusSuspended {
+		t.Fatalf("unmirrored unsuspend rev 6 = %d, status %q, want suspended", code, status())
+	}
+	admitOrg(t, st, "00000000-0000-4000-8000-00000000000c", 6)
+	if status() != store.TenantStatusActive {
+		t.Fatal("mirrored resume did not recover")
 	}
 	if code := post(restarted, "org.deleted", `{"org_id":"00000000-0000-4000-8000-00000000000c","revision":2}`); code != http.StatusOK || status() != store.TenantStatusDeleted {
 		t.Fatalf("delete = %d, status %q, want deleted", code, status())
@@ -931,5 +949,22 @@ func TestEnsureTenancyModeCountsDirectoryAccounts(t *testing.T) {
 	}
 	if err := api.EnsureTenancyMode(ctx, open(), config.TenancyConfig{Mode: config.TenancyMulti, StaffOrgID: testStaffOrg}); err != nil {
 		t.Fatalf("a fresh database with only the bootstrap admin: %v", err)
+	}
+}
+
+// admitOrg installs a verified directory snapshot for fixtures that already know the org.
+// Admission regressions deliberately omit it until they exercise the suite listing.
+func admitOrg(t *testing.T, st store.Store, orgID string, revisions ...int64) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := st.Chat().EnsureTenant(ctx, orgID); err != nil {
+		t.Fatal(err)
+	}
+	var revision int64
+	if len(revisions) > 0 {
+		revision = revisions[0]
+	}
+	if err := st.Chat().ApplyTenantDirectory(ctx, store.TenantDirectoryEntry{TenantID: orgID, Revision: revision, Status: store.TenantStatusActive, Enabled: true, Valid: true}); err != nil {
+		t.Fatal(err)
 	}
 }

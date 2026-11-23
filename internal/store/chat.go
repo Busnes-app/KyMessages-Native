@@ -116,15 +116,15 @@ func (c *chatStore) GetTenant(ctx context.Context, tenantID string) (*Tenant, er
 	tenantID = normalizeTenant(tenantID)
 	q := c.store.rebind(`
 		SELECT id, slug, display_name, plan,
- CASE WHEN status = 'active' AND EXISTS (SELECT 1 FROM tenant_pending_revocations p WHERE p.tenant_id = tenants.id) THEN 'suspended' ELSE status END,
- p2p_policy, p2p_max_video, p2p_max_audio, guest_force_sfu, created_at
+ CASE WHEN status = 'active' AND (EXISTS (SELECT 1 FROM tenant_pending_revocations p WHERE p.tenant_id = tenants.id) OR (EXISTS (SELECT 1 FROM server_settings WHERE key = 'tenancy.mode' AND value = 'multi') AND NOT ` + directoryReadySQL + `)) THEN 'suspended' ELSE status END,
+ p2p_policy, p2p_max_video, p2p_max_audio, guest_force_sfu, created_at, ` + directoryReadySQL + `
 		FROM tenants WHERE id = ?`)
 	var t Tenant
 	var guestForce int
 	// Tenant status gates access, so it is read from the primary, never a lagging replica.
 	err := c.store.db.QueryRowContext(ctx, q, tenantID).Scan(
 		&t.ID, &t.Slug, &t.DisplayName, &t.Plan, &t.Status, &t.P2PPolicy,
-		&t.P2PMaxVideo, &t.P2PMaxAudio, &guestForce, &t.CreatedAt,
+		&t.P2PMaxVideo, &t.P2PMaxAudio, &guestForce, &t.CreatedAt, &t.DirectoryReady,
 	)
 	if errorsIs(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -1278,7 +1278,10 @@ func (c *chatStore) lockAttachmentQuotaTx(ctx context.Context, tx *sql.Tx, tenan
 		)
 		return err
 	}
-	return nil
+	// Acquire SQLite's writer before any quota reads. Deferred read-to-write upgrades from
+	// separate replica connections otherwise fail immediately with SQLITE_BUSY.
+	_, err := tx.ExecContext(ctx, `UPDATE tenants SET id = id WHERE id = ?`, tenantID)
+	return err
 }
 
 func (c *chatStore) attachmentQuotaUsageTx(ctx context.Context, tx *sql.Tx, tenantID, uploaderID string, nowMs int64) (tenantUsed, pendingUsed int64, err error) {
@@ -1331,6 +1334,15 @@ func (c *chatStore) ReserveAttachmentQuota(ctx context.Context, tenantID, upload
 
 	if err := c.lockAttachmentQuotaTx(ctx, tx, tenantID); err != nil {
 		return nil, err
+	}
+	if limits.ActiveUploader {
+		limits, err = c.directoryQuotaTx(ctx, tx, tenantID, limits)
+		if err != nil {
+			return nil, err
+		}
+		if limits.MaxUploadBytes > 0 {
+			requestedBytes = min(requestedBytes, limits.MaxUploadBytes)
+		}
 	}
 	now := nowMilli()
 	tenantUsed, pendingUsed, err := c.attachmentQuotaUsageTx(ctx, tx, tenantID, uploaderID, now)
@@ -1424,6 +1436,15 @@ func (c *chatStore) CommitAttachmentWithQuota(ctx context.Context, reservationID
 	if err := c.lockAttachmentQuotaTx(ctx, tx, a.TenantID); err != nil {
 		return err
 	}
+	if limits.ActiveUploader {
+		limits, err = c.directoryQuotaTx(ctx, tx, a.TenantID, limits)
+		if err != nil {
+			return err
+		}
+		if limits.MaxUploadBytes > 0 && a.SizeBytes > limits.MaxUploadBytes {
+			return ErrAttachmentUploadQuotaExceeded
+		}
+	}
 	if reservationID != "" {
 		delResQ := c.store.rebind(`DELETE FROM attachment_upload_reservations WHERE tenant_id = ? AND id = ?`)
 		if _, err := tx.ExecContext(ctx, delResQ, a.TenantID, reservationID); err != nil {
@@ -1444,7 +1465,7 @@ func (c *chatStore) CommitAttachmentWithQuota(ctx context.Context, reservationID
 		// Under the tenant lock the org purge also takes: an upload whose person was erased or
 		// whose org was deleted while it was in flight commits nothing.
 		var status, tenant string
-		if err := tx.QueryRowContext(ctx, c.store.rebind(`SELECT u.status, t.status FROM users u JOIN tenants t ON t.id = ? WHERE u.id = ? AND NOT EXISTS (SELECT 1 FROM tenant_pending_revocations p WHERE p.tenant_id = t.id)`), a.TenantID, a.UploaderID).Scan(&status, &tenant); err != nil || status != "active" || tenant != TenantStatusActive {
+		if err := tx.QueryRowContext(ctx, c.store.rebind(`SELECT u.status, t.status FROM users u JOIN tenants t ON t.id = ? WHERE u.id = ? AND u.org_id = t.id AND NOT EXISTS (SELECT 1 FROM tenant_pending_revocations p WHERE p.tenant_id = t.id)`), a.TenantID, a.UploaderID).Scan(&status, &tenant); err != nil || status != "active" || tenant != TenantStatusActive {
 			return ErrForbidden
 		}
 	}
