@@ -101,6 +101,17 @@ interface Entry {
 
 let current: Entry | undefined;
 const keyListeners = new Set<() => void>();
+// Bumped whenever room keys may have arrived. Tabs share one device and its store, so a tab that
+// stores keys tells the others, which reopen what they show as waiting.
+let keyGen = 0;
+export const keyGeneration = () => keyGen;
+const keyChannel = typeof BroadcastChannel === 'undefined' ? undefined : new BroadcastChannel('kymessages-room-keys');
+function keysArrived(share: boolean): void {
+  keyGen++;
+  if (share) keyChannel?.postMessage(null);
+  for (const fn of keyListeners) fn();
+}
+if (keyChannel) keyChannel.onmessage = () => keysArrived(false);
 // Set when another tab deleted this tab's store (a sign-out or a device reset there). This tab may
 // have missed that sign-out, so it must not create a new device and new private keys on its own:
 // encryption stays off here until this tab signs out (which clears it) or reloads.
@@ -152,9 +163,7 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
       live();
     }
     void retireAbandoned(userId).catch(() => undefined);
-    e.onKeys(() => {
-      for (const fn of keyListeners) fn();
-    });
+    e.onKeys(() => keysArrived(true));
     return e;
   })();
   current = entry;
@@ -162,7 +171,7 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
   // unavailable meanwhile).
   void entry.engine.then((e) => {
     entry.ready = e;
-    if (current === entry) for (const fn of keyListeners) fn();
+    if (current === entry) keysArrived(false);
   }, () => undefined);
   // A failed start (offline, a blocked database) is retried by the next call.
   entry.engine.then((e) => void e.receive().catch(() => undefined)).catch(() => {
@@ -239,11 +248,12 @@ export async function sealRoomMessage(roomId: string, inner: Omit<RoomInner, 'ro
 export async function openMessage(m: ChatMessage): Promise<ChatMessage> {
   if (m.encoding !== 'e2ee_room_v1' || !m.envelope || m.deleted_at) return m;
   const shut = (e2ee: E2EEState): ChatMessage => ({ ...m, body: '', e2ee });
+  const gen = keyGen;
   const e = current?.ready;
   if (!e) return shut({ kind: 'failed', reason: UNAVAILABLE });
   try {
     const r = await e.decrypt({ id: m.id, room_id: m.room_id, sender_id: m.sender_id, body: m.envelope });
-    if (r.state === 'waiting') return shut({ kind: 'waiting' });
+    if (r.state === 'waiting') return shut({ kind: 'waiting', gen });
     if (r.state === 'failed') return shut({ kind: 'failed', reason: r.reason });
     // The encrypted reply target is the true one; the server's copy is only a hint.
     return { ...m, body: r.inner.body, reply_to_id: r.inner.reply_to_id, e2ee: { kind: 'decrypted' } };

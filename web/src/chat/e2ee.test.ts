@@ -1,7 +1,7 @@
 import 'fake-indexeddb/auto';
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { abandonDevice, forgetCryptoStore, NOT_YET, onRoomKeys, openMessage, RETIRE_MS, retireDevice, retryable, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
+import { abandonDevice, forgetCryptoStore, keyGeneration, NOT_YET, onRoomKeys, openMessage, RETIRE_MS, retireDevice, retryable, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
 import { parseMessage } from './types';
 
 // Tests may replace the device read; everything else is the real store.
@@ -167,6 +167,18 @@ describe('the signed-in device', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('reopens waiting messages when another tab stores room keys', async () => {
+    const heard = vi.fn();
+    const off = onRoomKeys(heard);
+    const before = keyGeneration();
+    const otherTab = new BroadcastChannel('kymessages-room-keys');
+    otherTab.postMessage(null);
+    await vi.waitFor(() => expect(heard).toHaveBeenCalledTimes(1));
+    expect(keyGeneration()).toBe(before + 1);
+    otherTab.close();
+    off();
   });
 
   it('marks a message whose open threw as worth trying again', async () => {

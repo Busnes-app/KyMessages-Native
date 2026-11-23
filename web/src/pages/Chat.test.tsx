@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { Chat } from './Chat';
-import { deliverKey, fakeEnvelope, holdFakeOpens, resetFakeE2EE, setFakeUnavailable } from '../chat/e2eeFake';
+import { deliverKey, fakeEnvelope, heldOpenCount, holdFakeOpens, resetFakeE2EE, setFakeUnavailable, storeKeySilently } from '../chat/e2eeFake';
 
 // Pages run without the WebAssembly core; crypto/engine.test.ts covers the real one.
 vi.mock('../chat/e2ee', () => import('../chat/e2eeFake'));
@@ -253,6 +253,29 @@ describe('Native Chat page', () => {
     });
     expect(screen.queryByText('removed by a moderator')).toBeNull();
     expect(screen.getByText('Message deleted')).toBeTruthy();
+
+    // A key that lands after a message was opened but before it is shown still opens it.
+    const releaseRace = holdFakeOpens();
+    act(() => {
+      ws.emit({
+        t: 'message.new',
+        room: 'rm_gen',
+        seq: 7,
+        d: {
+          id: 'msg_7', tenant_id: 'default', room_id: 'rm_gen', seq: 7, sender_id: 'u_bob', sender_name: 'Bob',
+          encoding: 'e2ee_room_v1', body: fakeEnvelope({ room_id: 'rm_gen', type: 'text', body: 'raced its key' }, 's_race'),
+          created_at: 1_700_000_060_000, reactions: [],
+        },
+      });
+    });
+    // The open has read the store (no key yet) and is still in flight: no row exists to retry.
+    await waitFor(() => expect(heldOpenCount()).toBe(1));
+    await act(async () => {
+      storeKeySilently('s_race');
+      releaseRace();
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(await screen.findByText('raced its key')).toBeTruthy();
 
     // Instant auth revocation notifies parent shell.
     act(() => {

@@ -126,7 +126,9 @@ export type MessageDeliveryState =
  * What this device could do with an e2ee_room_v1 message: read it, not yet (its key has not
  * arrived), or never (with the reason shown in its place).
  */
-export type E2EEState = { kind: 'decrypted' } | { kind: 'waiting' } | { kind: 'failed'; reason: string };
+// `gen` on waiting is the key generation (keyGeneration) the open saw: a newer one means keys
+// arrived since, so the message is worth opening again.
+export type E2EEState = { kind: 'decrypted' } | { kind: 'waiting'; gen?: number } | { kind: 'failed'; reason: string };
 
 export interface ChatMessage {
   id: string;

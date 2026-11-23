@@ -19,9 +19,19 @@ export function fakeEnvelope(inner: RoomInner, session = 's_own'): string {
 }
 
 /** Lets messages in session open, and wakes whoever waits for keys. */
+let keyGen = 0;
+export const keyGeneration = () => keyGen;
+
 export function deliverKey(session: string): void {
   keys.add(session);
+  keyGen++;
   for (const fn of listeners) fn();
+}
+
+/** Stores a key without telling listeners, as when keys land between an open and its display. */
+export function storeKeySilently(session: string): void {
+  keys.add(session);
+  keyGen++;
 }
 
 let unavailable = false;
@@ -55,28 +65,41 @@ export async function sealRoomMessage(roomId: string, inner: Omit<RoomInner, 'ro
 }
 
 export async function openMessage(m: ChatMessage): Promise<ChatMessage> {
+  const out = openNow(m);
+  // A held open has already read the key store, as a slow decrypt would have.
+  if (held) {
+    heldOpens++;
+    await held;
+  }
+  return out;
+}
+
+function openNow(m: ChatMessage): ChatMessage {
   if (m.encoding !== 'e2ee_room_v1' || !m.envelope || m.deleted_at) return m;
   if (unavailable) return { ...m, body: '', e2ee: { kind: 'failed', reason: UNAVAILABLE } };
   const env = JSON.parse(m.envelope) as { session_id: string; ciphertext: string };
-  if (!keys.has(env.session_id)) return { ...m, body: '', e2ee: { kind: 'waiting' } };
+  if (!keys.has(env.session_id)) return { ...m, body: '', e2ee: { kind: 'waiting', gen: keyGen } };
   const inner = JSON.parse(atob(env.ciphertext)) as RoomInner;
   if (inner.room_id !== m.room_id) return { ...m, body: '', e2ee: { kind: 'failed', reason: 'This message was encrypted for another room.' } };
   return { ...m, body: inner.body, reply_to_id: inner.reply_to_id, e2ee: { kind: 'decrypted' } };
 }
 
 let held: Promise<void> | undefined;
+let heldOpens = 0;
+/** How many opens have paused on holdFakeOpens since it was last called. */
+export const heldOpenCount = () => heldOpens;
 
-/** Holds openMessages (as a slow decrypt would) until the returned release is called. */
+/** Holds opens after they read the key store (as a slow decrypt would) until release is called. */
 export function holdFakeOpens(): () => void {
   let release = () => undefined as void;
   held = new Promise((r) => (release = r));
+  heldOpens = 0;
   return () => {
     held = undefined;
     release();
   };
 }
 
-export async function openMessages(list: ChatMessage[]): Promise<ChatMessage[]> {
-  if (held) await held;
+export function openMessages(list: ChatMessage[]): Promise<ChatMessage[]> {
   return Promise.all(list.map(openMessage));
 }

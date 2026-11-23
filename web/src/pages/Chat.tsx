@@ -87,7 +87,7 @@ import { MessageRow } from '../components/chat/MessageRow';
 import { RoomDetailsDrawer, type DrawerTab } from '../components/chat/RoomDetailsDrawer';
 import { CreateChannelModal, SearchModal, StartDMModal } from '../components/chat/ChatModals';
 import { searchIndexFor } from '../chat/searchIndex';
-import { onRoomKeys, openMessages, receiveRoomKeys, retryable, roomMemberLeft, startE2EE } from '../chat/e2ee';
+import { keyGeneration, onRoomKeys, openMessages, receiveRoomKeys, retryable, roomMemberLeft, startE2EE } from '../chat/e2ee';
 import { CallAudioLayer, CallStage } from '../components/chat/CallStage';
 import { HybridCallController, type HybridCallSnapshot } from '../rtc/hybridCall';
 
@@ -249,39 +249,49 @@ export const Chat: React.FC<ChatProps> = ({
   }, [buckets, currentUser]);
   // A message whose key had not arrived (or whose device had not started) is opened again
   // when keys arrive.
+  const reopen = useCallback((retry: ChatMessage[]) => {
+    void openMessages(retry).then((list) => {
+      const opened = new Map(list.map((m) => [m.id, m]));
+      setBuckets((prev) => {
+        let changed = false;
+        const next: Record<string, RoomMessageBucket> = {};
+        for (const [rid, b] of Object.entries(prev)) {
+          next[rid] = {
+            ...b,
+            // Only fill in what is still unopened and not deleted: an edit or a deletion may
+            // have landed meanwhile. Merge just what opening sets, so the row keeps its later
+            // state (deletion, reactions, pins). A row still waiting takes the newer generation.
+            messages: b.messages.map((m) => {
+              const o = opened.get(m.id);
+              if (!o || m.deleted_at || m.envelope !== o.envelope || m.e2ee?.kind === 'decrypted') return m;
+              const gen = (e: ChatMessage['e2ee']) => (e?.kind === 'waiting' ? e.gen : undefined);
+              if (e2eeLabel(m) === e2eeLabel(o) && gen(m.e2ee) === gen(o.e2ee)) return m;
+              changed = true;
+              return { ...m, body: o.body, reply_to_id: o.reply_to_id, e2ee: o.e2ee };
+            }),
+          };
+        }
+        return changed ? next : prev;
+      });
+    });
+  }, []);
   useEffect(
     () =>
       onRoomKeys(() => {
         const retry = Object.values(bucketsRef.current).flatMap((b) =>
           b.messages.filter((m) => m.e2ee?.kind === 'waiting' || (m.e2ee?.kind === 'failed' && retryable(m.e2ee.reason))),
         );
-        if (retry.length === 0) return;
-        void openMessages(retry).then((list) => {
-          // A row that said encryption was unavailable becomes "waiting" if its key is still missing.
-          const wasUnavailable = new Set(retry.filter((m) => m.e2ee?.kind === 'failed').map((m) => m.id));
-          const opened = new Map(list.filter((m) => m.e2ee?.kind !== 'waiting' || wasUnavailable.has(m.id)).map((m) => [m.id, m]));
-          if (opened.size === 0) return;
-          setBuckets((prev) => {
-            const next: Record<string, RoomMessageBucket> = {};
-            for (const [rid, b] of Object.entries(prev)) {
-              next[rid] = {
-                ...b,
-                // Only fill in what is still unopened and not deleted: an edit or a deletion may
-                // have landed meanwhile. Merge just what opening sets, so the row keeps its later
-                // state (deletion, reactions, pins).
-                messages: b.messages.map((m) => {
-                  const o = opened.get(m.id);
-                  if (!o || m.deleted_at || m.envelope !== o.envelope || m.e2ee?.kind === 'decrypted' || e2eeLabel(m) === e2eeLabel(o)) return m;
-                  return { ...m, body: o.body, reply_to_id: o.reply_to_id, e2ee: o.e2ee };
-                }),
-              };
-            }
-            return next;
-          });
-        });
+        if (retry.length > 0) reopen(retry);
       }),
-    [],
+    [reopen],
   );
+  // Keys can land between a message's open and its display, when no row was there to retry:
+  // a waiting row opened before the latest key generation is opened again.
+  useEffect(() => {
+    const now = keyGeneration();
+    const stale = Object.values(buckets).flatMap((b) => b.messages.filter((m) => m.e2ee?.kind === 'waiting' && m.e2ee.gen !== undefined && m.e2ee.gen < now));
+    if (stale.length > 0) reopen(stale);
+  }, [buckets, reopen]);
   bucketsRef.current = buckets;
   roomsRef.current = rooms;
   stagedByRoomRef.current = stagedByRoom;
