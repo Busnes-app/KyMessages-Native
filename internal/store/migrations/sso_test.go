@@ -21,7 +21,7 @@ func TestSSOLifecycleUpgradePreservesExistingGrants(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if err := migrations.RunThrough(ctx, db, cfg.Driver, 30); err != nil {
+	if err := migrations.RunThrough(ctx, db, cfg.Driver, 31); err != nil {
 		t.Fatal(err)
 	}
 	// SQL literals keep the exact same upgrade fixture on both engines.

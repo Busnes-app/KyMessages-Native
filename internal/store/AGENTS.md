@@ -8,7 +8,7 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
 
 ## Local Contracts
 - Web Push endpoint ownership changes require both stored subscription keys to match (decoded base64url); comparison and transfer commit in one transaction, with a PostgreSQL row lock. A mismatch returns `ErrInvalidInput` without changing the subscription. Same-owner registration may refresh keys.
-- Migration 50 adds IdP issuer/sid/issuance/generation to sessions and device pairings, permanent
+- Migration 51 adds IdP issuer/sid/issuance/generation to sessions and device pairings, permanent
   `sso_logout_events` replay IDs and `sso_revocations` fences. Preserve existing sessions,
   pairings and push subscriptions on upgrade; the new binding columns default to unbound.
   Changing this upgrade policy requires owner approval. Push registrations retain the verified

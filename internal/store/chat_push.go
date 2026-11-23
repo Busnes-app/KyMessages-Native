@@ -92,7 +92,7 @@ func (c *chatStore) UpsertPushSubscription(ctx context.Context, sessionHash stri
 	var existingID, existingTenant, existingUser, existingP256DH, existingAuth string
 	var existingUsed int64
 	lookup := `
-        SELECT id, tenant_id, user_id, p256dh, auth_secret, last_used_at
+		SELECT id, tenant_id, user_id, p256dh, auth_secret, last_used_at
 		FROM push_subscriptions
 		WHERE endpoint = ?
 	`
