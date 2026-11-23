@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/Busnes-app/ky_server_base/internal/testdb"
 )
@@ -58,5 +59,48 @@ func TestE2EEMailCommittedOutOfIDOrderIsDelivered(t *testing.T) {
 	late, err := st.E2EE().ToDevice(ctx, "u-b", "B1", 10)
 	if err != nil || len(late) != 1 || late[0].Content != "pre-key from A" || late[0].ID >= seen[0].ID {
 		t.Fatalf("the lower-ID message committed late was lost: %+v %v", late, err)
+	}
+}
+
+// A claim that finds every one-time key locked by another in-flight claim waits for it, rather
+// than handing out the fallback key while a one-time key may still be free.
+func TestE2EEClaimWaitsOutLockedKeysInsteadOfFallingBack(t *testing.T) {
+	ctx := context.Background()
+	cfg := testdb.Config(t)
+	if cfg.Driver != "postgres" {
+		t.Skip("SQLite serializes writers; no claim ever sees a locked key")
+	}
+	opened, err := Open(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = opened.Close() })
+	st := opened.(*SQLStore)
+	if err := st.Users().CreateUser(ctx, &User{ID: "u-a", Username: "u-a", Role: "user", Status: "active", SSOProvider: "local"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.E2EE().UpsertDevice(ctx, &E2EEDevice{TenantID: "t1", UserID: "u-a", DeviceID: "D1", Curve25519: "c", Ed25519: "e", Signature: "s"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.E2EE().AddOneTimeKeys(ctx, "u-a", "D1", []E2EEOneTimeKey{
+		{KeyID: "k1", Key: "otk", Signature: "s"}, {KeyID: "fb", Key: "fallback", Signature: "s", Fallback: true},
+	}, 100); err != nil {
+		t.Fatal(err)
+	}
+	// Another claim holds the only one-time key's row lock for 100 ms, then gives up.
+	holder, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := holder.ExecContext(ctx, `SELECT 1 FROM e2ee_one_time_keys WHERE fallback = 0 FOR UPDATE`); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		_ = holder.Rollback()
+	}()
+	k, err := st.E2EE().ClaimOneTimeKey(ctx, "u-a", "D1")
+	if err != nil || k.Fallback || k.Key != "otk" {
+		t.Fatalf("claim during a held lock = %+v %v, want the one-time key once the lock is gone", k, err)
 	}
 }

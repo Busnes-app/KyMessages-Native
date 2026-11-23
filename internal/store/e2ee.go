@@ -12,10 +12,11 @@ type e2eeStore struct {
 	store *SQLStore
 }
 
-// claimRetries bounds the rounds a claim waits while every remaining one-time key is locked by
-// other in-flight claims. On PostgreSQL SKIP LOCKED gives concurrent claims different keys, so a
-// round fails only when all remaining keys are being claimed at that moment.
-const claimRetries = 8
+// claimBudget bounds how long a claim keeps retrying while every remaining one-time key is
+// locked by other in-flight claims (SKIP LOCKED on PostgreSQL). A round fails only then, and
+// those claims finish within a statement, so a claim retries, with a short backoff, until it
+// wins a key or none remain; the fallback key is handed out only when one-time keys are gone.
+const claimBudget = 2 * time.Second
 
 func (s *e2eeStore) UpsertDevice(ctx context.Context, d *E2EEDevice) error {
 	now := time.Now().Unix()
@@ -149,7 +150,8 @@ func (s *e2eeStore) ClaimOneTimeKey(ctx context.Context, userID, deviceID string
 		WHERE user_id = ? AND device_id = ? AND fallback = 0 AND key_id = (
 			SELECT key_id FROM e2ee_one_time_keys WHERE user_id = ? AND device_id = ? AND fallback = 0 ORDER BY key_id LIMIT 1` + lock + `)
 		RETURNING key_id, key_value, signature`)
-	for range claimRetries {
+	deadline := time.Now().Add(claimBudget)
+	for round := 0; ; round++ {
 		var k E2EEOneTimeKey
 		err := s.store.db.QueryRowContext(ctx, claim, userID, deviceID, userID, deviceID).Scan(&k.KeyID, &k.Key, &k.Signature)
 		if err == nil {
@@ -162,8 +164,13 @@ func (s *e2eeStore) ClaimOneTimeKey(ctx context.Context, userID, deviceID string
 		if err != nil {
 			return nil, err
 		}
-		if n == 0 {
-			break // none left: the fallback key, which is never deleted by a claim
+		if n == 0 || time.Now().After(deadline) {
+			break // none left (or still contended past the budget): the fallback key
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Duration(min(round+1, 20)) * time.Millisecond):
 		}
 	}
 	k := E2EEOneTimeKey{Fallback: true}
