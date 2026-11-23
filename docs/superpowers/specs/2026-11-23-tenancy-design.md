@@ -528,6 +528,16 @@ still count; erased actors and wrong-org accounts cannot inherit. Only owned roo
 with no remaining member are deleted. Cleanup failure/replay preserves the committed successor,
 other members' messages/files, and the single completion audit. Distributed calls remain separate work.
 
+### Full call notifications (transport prerequisite implemented, startup still gated)
+
+In multi mode, PostgreSQL `call.signal`, `call.migrate` and `call.state` events up to 128 KiB
+are carried whole in 2 KiB notification parts. A bounded decoder keeps at most 128 incomplete
+events (16 MiB of content), expires them after 10 seconds, and verifies the complete event
+before delivery. User targeting remains unchanged; corrupt/incomplete parts are never client
+frames. Single-mode notification bytes and ordinary message refetch behavior are unchanged.
+This does not provide room-owner routing, call-seat ownership or failover reconstruction;
+PR 4 remains unbuilt until those and the room-scoped WebSocket path are implemented.
+
 ## 12. Phased build plan
 
 Each PR is gated on the tenancy mode, carries its negative tests (wrong org, single mode,

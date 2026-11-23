@@ -188,7 +188,11 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 
 	var bus chat.EventBus = chat.NewMemoryBus()
 	if st != nil && st.Driver() == "postgres" && cfg.Database.DSN != "" {
-		bus = chat.NewPostgresBus(cfg.Database.DSN, st)
+		pgBus := chat.NewPostgresBus(cfg.Database.DSN, st)
+		if cfg.Tenancy.IsMultiTenant() {
+			pgBus.EnableCallFragments()
+		}
+		bus = pgBus
 	}
 	chatHub := chat.NewHub(bus)
 	if st != nil {
