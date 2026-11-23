@@ -153,3 +153,31 @@ func TestStoreIDNamesTheSharedVolume(t *testing.T) {
 		t.Fatalf("replica on a private disk: %v", err)
 	}
 }
+
+// A delete and the relocation, in either order, leave no copy of the blob behind.
+func TestDeleteDuringRelocationLeavesNothing(t *testing.T) {
+	for _, relocateFirst := range []bool{true, false} {
+		dir := t.TempDir()
+		flat, _ := blobs.NewStore(dir)
+		if _, err := flat.Put(orgA, key, strings.NewReader("x"), 64); err != nil {
+			t.Fatal(err)
+		}
+		st, _ := blobs.NewOrgStore(dir)
+		if relocateFirst {
+			if err := st.Relocate(orgA, key); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := st.Delete(orgA, key); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.Relocate(orgA, key); err != nil {
+			t.Fatalf("relocating a deleted blob: %v", err)
+		}
+		for _, p := range []string{filepath.Join(dir, key), filepath.Join(dir, "orgs", orgA, "att", key)} {
+			if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("relocateFirst=%v: %s survived", relocateFirst, p)
+			}
+		}
+	}
+}

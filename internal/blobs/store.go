@@ -264,10 +264,14 @@ func (s *Store) Delete(tenantID, key string) error {
 	}
 	defer root.Close()
 
-	err = root.Remove(rel)
-	if s.orgs && s.flatFallback.Load() && (err == nil || errors.Is(err, os.ErrNotExist)) {
-		err = root.Remove(key) // not relocated yet
+	if s.orgs && s.flatFallback.Load() {
+		// Flat copy first: a relocation that moves the blob between the two removes then finds
+		// no source, and one that moved it earlier left it at rel, which is removed next.
+		if err := root.Remove(key); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 	}
+	err = root.Remove(rel)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -306,7 +310,10 @@ func (s *Store) Relocate(tenantID, key string) error {
 	if err := root.MkdirAll(filepath.Dir(rel), 0o700); err != nil {
 		return err
 	}
-	return root.Rename(key, rel)
+	if err := root.Rename(key, rel); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err // gone meanwhile: deleted, nothing to move
+	}
+	return nil
 }
 
 // SweepStaleTemps removes crashed .upload-* temp files older than olderThan inside the store.
