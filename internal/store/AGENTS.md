@@ -112,6 +112,13 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   check the org's usage plus the new bytes against the unexpired ceiling under the tenant lock:
   `ErrPoolFull`, or `ErrPoolUnavailable` with no grant or an expired one. Single mode never sets
   `Pool` and never reads the columns.
+- `ErasureBlobs` and `EraseUser` (`erase.go`, multi mode `user.erased`) delete one person's data:
+  account (sessions, MFA, presence and push cascade), pairings, reservations, reactions,
+  memberships, owned bots and their accounts, staged and posted attachments, and every DM whose
+  other members are all gone; their messages elsewhere become tombstones (`body`, `sender_name`
+  emptied, `deleted_at` set, row kept). The caller deletes the blobs `ErasureBlobs` lists before
+  `EraseUser` removes the rows; both are idempotent. The audit row `sso.user_erased` names only
+  `user:<id>`.
 - `PurgeOrphanAttachments` returns `BlobRef`s (tenant and key), and `AttachmentTenant` returns a blob key's org, because the multi-mode blob layout needs each blob's org.
 - SQLite runs in WAL mode with foreign keys enabled.
 - PostgreSQL queries are rebound dynamically from standard positional parameters.

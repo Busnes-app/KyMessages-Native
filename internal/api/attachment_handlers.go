@@ -494,3 +494,22 @@ func (s *Server) relocateFlatBlobs(ctx context.Context) error {
 	}
 	return nil
 }
+
+// eraseUser deletes one person's data for user.erased: their blobs first, then their rows
+// (store.EraseUser), so a failure part way leaves rows naming every blob still there and the
+// retried delivery finishes the job.
+func (s *Server) eraseUser(ctx context.Context, user *store.User) error {
+	refs, err := s.store.Chat().ErasureBlobs(ctx, user.OrgID, user.ID)
+	if err != nil {
+		return err
+	}
+	if s.blobs != nil {
+		for _, ref := range refs {
+			if err := s.blobs.Delete(ref.TenantID, ref.Key); err != nil && !errors.Is(err, blobs.ErrInvalidKey) {
+				return err
+			}
+		}
+	}
+	_, err = s.store.Chat().EraseUser(ctx, user.OrgID, user.ID)
+	return err
+}

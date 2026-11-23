@@ -111,6 +111,7 @@ func claimsFromIDToken(idToken *oidc.IDToken) (*IdentityClaims, error) {
 		PreferredUsername string `json:"preferred_username"`
 		Role              string `json:"role"`
 		AuthTime          int64  `json:"auth_time"`
+		ExportOnly        bool   `json:"export_only"`
 	}
 	if err := idToken.Claims(&raw); err != nil || raw.Sub == "" || raw.SID == "" || len(raw.SID) > 256 || idToken.IssuedAt.IsZero() {
 		return nil, ErrInvalidIDToken
@@ -132,6 +133,7 @@ func claimsFromIDToken(idToken *oidc.IDToken) (*IdentityClaims, error) {
 		Name:              raw.Name,
 		PreferredUsername: username,
 		Role:              raw.Role,
+		ExportOnly:        raw.ExportOnly,
 	}
 	if raw.AuthTime > 0 && raw.AuthTime <= idToken.IssuedAt.Unix() && raw.AuthTime <= time.Now().Unix() {
 		claims.AuthenticatedAt = time.Unix(raw.AuthTime, 0).UTC()

@@ -113,6 +113,11 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
   No new session, MFA challenge or pairing is issued to an inactive org, including one in flight
   when the suspension lands. Org suspension or deletion also ejects that org's meeting guests, waiting or admitted, from the
   lobby, their sockets and their calls on every server instance.
+- In `KY_TENANCY_MODE=multi`, KyIdentity's `user.erased` (a member used Delete everything) deletes
+  that person's data: account, bots, attachments, and DMs nobody else uses. Their messages in
+  rooms others still use stay as "deleted message" tombstones with no text, name or files. A
+  sign-in with an `export_only` token (the org is scheduled for deletion) is refused like a
+  suspended org's: KyMessages has no export, and encrypted rooms are exported on the device.
 - In `KY_TENANCY_MODE=multi`, every user account is bound immutably to `(sub, org_id)`, tokens or
   webhooks without `org_id` are refused, cross-org `org_id` reassignment is rejected with HTTP 409
   and audited (`sso.org_mismatch`), and inbound SCIM (`/scim/v2/*`) is forced off (404).

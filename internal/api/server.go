@@ -280,6 +280,10 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 		s.revokeAgentsForOwner(ctx, userID)
 	}
 	kyidentity.OnUserRevoked(revokeUser)
+	kyidentity.OnUserErased(func(ctx context.Context, user *store.User) error {
+		revokeUser(ctx, user.ID)
+		return s.eraseUser(ctx, user)
+	})
 	chatHub.SetGuestCheck(lobbyMgr.GuestCheck(s.isTenantActive))
 	if cfg.Tenancy.IsMultiTenant() {
 		chatHub.SetUserRevokeHandler(func(userID string) { callMgr.HandleDisconnect(userID, 0) })

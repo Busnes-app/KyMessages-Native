@@ -161,9 +161,9 @@ When the user requests a durable behavior change, record it here or in the relev
   `docs/superpowers/specs/2026-11-23-tenancy-design.md`. Its PR 2 (migration lock, job leases,
   shared secrets, capsule scheduler off) PR 3 (shared sign-in limits and proof-of-work,
   per-org meeting IDs, guest sessions in PostgreSQL) PR 5 (the blob interface, the org
-  layout on a shared volume, its store-ID check and the flat-blob relocation) and PR 7 (the org
-  storage pool, to KyIdentity's `POST /api/suite/storage` grant contract) are built; the rest is
-  not. It extends the 2026-11-22
+  layout on a shared volume, its store-ID check and the flat-blob relocation) PR 7 (the org
+  storage pool, to KyIdentity's `POST /api/suite/storage` grant contract) and PR 1a (`export_only`
+  tokens refused, `user.erased` deletes a person's data) are built; the rest is not. It extends the 2026-11-22
   spec, whose §4 wire contract stays authoritative.
 - Single mode must not change: `TestSingleTenantGolden` replays a fixed single-mode script and
   compares it with `internal/api/testdata/single-tenant-golden.txt`, recorded before the tenancy

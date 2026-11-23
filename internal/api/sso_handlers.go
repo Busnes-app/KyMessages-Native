@@ -101,6 +101,14 @@ func (s *Server) handleKyIdentityCallback(w http.ResponseWriter, r *http.Request
 			s.writeError(w, http.StatusForbidden, "Valid organization claim (org_id) is required")
 			return
 		}
+		// An export-only token (the org is deletion_scheduled) gets no session: KyMessages has no
+		// export route, and the server holds only ciphertext of encrypted rooms. Same answer as
+		// a suspended org; the audit row names the org, never the person.
+		if claims.ExportOnly {
+			s.audit(r.Context(), "", r, "sso.export_only_refused", "tenant:"+orgID, "")
+			s.writeError(w, http.StatusForbidden, "Organization is suspended or inactive")
+			return
+		}
 		tenant, err := s.store.Chat().EnsureTenant(r.Context(), orgID)
 		if err != nil {
 			s.writeError(w, http.StatusInternalServerError, "Failed to verify organization")
