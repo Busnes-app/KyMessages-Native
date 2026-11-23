@@ -42,7 +42,7 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   marks one key per call `claimed` (a tombstone, so a retried upload cannot republish it; the
   rows go with the device), never the same key twice (`FOR UPDATE SKIP LOCKED` on PostgreSQL);
   while keys remain but are all locked by other claims it retries with a short backoff (2 s
-  budget), and only with none left does it return the fallback key, without deleting it. `AddOneTimeKeys` enforces its cap
+  budget), and only with none left does it return the live fallback key, without deleting it. A new fallback key retires the old one as a tombstone, so a stale retry cannot restore a retired fallback. `AddOneTimeKeys` enforces its cap
   after the insert inside the transaction, so a retried upload never trips it; on PostgreSQL it
   first locks the device row (`FOR UPDATE`) so concurrent uploads cannot both pass the cap. Mail has no
   cursor: `ToDevice` returns the oldest unacknowledged rows and `AckToDevice` deletes exactly the

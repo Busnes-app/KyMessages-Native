@@ -106,8 +106,16 @@ func (s *e2eeStore) AddOneTimeKeys(ctx context.Context, userID, deviceID string,
 	}
 	for _, k := range keys {
 		if k.Fallback {
-			// One fallback key per device: a new one replaces the old.
-			if _, err := tx.ExecContext(ctx, s.store.rebind(`DELETE FROM e2ee_one_time_keys WHERE user_id = ? AND device_id = ? AND fallback = 1`), userID, deviceID); err != nil {
+			// One live fallback key per device: a new one retires the old, which stays as a
+			// tombstone so a stale retry of an older upload cannot bring it back.
+			var seen int
+			if err := tx.QueryRowContext(ctx, s.store.rebind(`SELECT COUNT(*) FROM e2ee_one_time_keys WHERE user_id = ? AND device_id = ? AND fallback = 1 AND key_id = ?`), userID, deviceID, k.KeyID).Scan(&seen); err != nil {
+				return err
+			}
+			if seen > 0 {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, s.store.rebind(`UPDATE e2ee_one_time_keys SET claimed = 1 WHERE user_id = ? AND device_id = ? AND fallback = 1 AND claimed = 0`), userID, deviceID); err != nil {
 				return err
 			}
 		}
@@ -175,7 +183,7 @@ func (s *e2eeStore) ClaimOneTimeKey(ctx context.Context, userID, deviceID string
 		}
 	}
 	k := E2EEOneTimeKey{Fallback: true}
-	err := s.store.db.QueryRowContext(ctx, s.store.rebind(`SELECT key_id, key_value, signature FROM e2ee_one_time_keys WHERE user_id = ? AND device_id = ? AND fallback = 1`), userID, deviceID).Scan(&k.KeyID, &k.Key, &k.Signature)
+	err := s.store.db.QueryRowContext(ctx, s.store.rebind(`SELECT key_id, key_value, signature FROM e2ee_one_time_keys WHERE user_id = ? AND device_id = ? AND fallback = 1 AND claimed = 0`), userID, deviceID).Scan(&k.KeyID, &k.Key, &k.Signature)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}

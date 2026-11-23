@@ -93,6 +93,27 @@ func TestE2EERetriedUploadCannotRepublishAClaimedKey(t *testing.T) {
 	}
 }
 
+// A device rotates its fallback key and then an older upload is retried: the retired key must
+// not come back, because the device may no longer hold its private half.
+func TestE2EEStaleFallbackRetryCannotRestoreARetiredKey(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	e2eeUser(t, st, "u-a")
+	k := st.E2EE()
+	if err := k.UpsertDevice(ctx, device("u-a", "D1", "t1")); err != nil {
+		t.Fatal(err)
+	}
+	old := []store.E2EEOneTimeKey{{KeyID: "fb1", Key: "old", Signature: "s", Fallback: true}}
+	for _, up := range [][]store.E2EEOneTimeKey{old, {{KeyID: "fb2", Key: "new", Signature: "s", Fallback: true}}, old} {
+		if err := k.AddOneTimeKeys(ctx, "u-a", "D1", up, 100); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, err := k.ClaimOneTimeKey(ctx, "u-a", "D1"); err != nil || !got.Fallback || got.KeyID != "fb2" {
+		t.Fatalf("claim after a stale retry = %+v %v, want the rotated fallback fb2", got, err)
+	}
+}
+
 // One-time keys are claimed at most once, even when several replicas claim at the same time.
 func TestE2EEOneTimeKeysClaimOnceAcrossReplicas(t *testing.T) {
 	ctx := context.Background()
