@@ -6,6 +6,7 @@ import type { ChatMessage } from './types';
 
 export const UNAVAILABLE = 'Encryption is not available in this browser yet.';
 export const MAX_MESSAGE_BYTES = 16 << 10;
+export const MAX_INNER_BYTES = 32 << 10;
 
 const keys = new Set<string>(['s_own']);
 const listeners = new Set<() => void>();

@@ -207,6 +207,16 @@ describe('encrypted rooms between two client engines', () => {
     expect(await read(carol, after)).toBe('waiting');
   });
 
+  it('keeps the largest allowed message under the server envelope limit', async () => {
+    const server = new FakeKeyServer();
+    const alice = await device(server, 'u_alice');
+    server.join('r1', 'u_alice');
+    // MAX_INNER_BYTES (32 KiB) of sealed JSON must fit maxEnvelopeLen (48 KiB) on the server.
+    const overhead = JSON.stringify({ type: 'text', body: '', room_id: 'r1' }).length;
+    const envelope = await alice.encrypt('r1', { type: 'text', body: 'x'.repeat((32 << 10) - overhead) });
+    expect(envelope.length).toBeLessThan(48 << 10);
+  });
+
   it('rotates after 100 messages and after 7 days', async () => {
     const server = new FakeKeyServer();
     const alice = await device(server, 'u_alice');

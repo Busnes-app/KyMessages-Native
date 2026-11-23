@@ -115,14 +115,13 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
     });
     return e;
   })();
-  // Messages that arrived while the device was starting are opened again once it is up.
-  void engine.then(() => {
-    for (const fn of keyListeners) fn();
-  }, () => undefined);
   const entry: NonNullable<typeof current> = { userId, engine };
   current = entry;
+  // Ready first, then reopen what arrived while the device was starting (those messages read as
+  // unavailable meanwhile).
   void engine.then((e) => {
     entry.ready = e;
+    if (current === entry) for (const fn of keyListeners) fn();
   }, () => undefined);
   // A failed start (offline, a blocked database) is retried by the next call.
   engine.then((e) => void e.receive().catch(() => undefined)).catch(() => {
@@ -170,10 +169,18 @@ export const UNAVAILABLE = 'Encryption is not available in this browser yet.';
 
 // The plaintext limit members had before encryption; the envelope may be larger.
 export const MAX_MESSAGE_BYTES = 16 << 10;
+// Sealed JSON at most 32 KiB: base64 of that plus the Megolm header, MAC and signature and the
+// envelope's fields stays under the server's 48 KiB envelope limit (maxEnvelopeLen).
+export const MAX_INNER_BYTES = 32 << 10;
 
 /** Encrypts a room message into an e2ee_room_v1 envelope. */
 export async function sealRoomMessage(roomId: string, inner: Omit<RoomInner, 'room_id'>): Promise<string> {
-  if (new TextEncoder().encode(inner.body).length > MAX_MESSAGE_BYTES) throw new Error('Message is too long (16 KiB at most)');
+  const bytes = (s: string) => new TextEncoder().encode(s).length;
+  // The server takes envelopes up to 48 KiB. JSON escaping can grow text sixfold (control
+  // characters), so the sealed JSON is bounded too, before a ratchet index is spent on it.
+  if (bytes(inner.body) > MAX_MESSAGE_BYTES || bytes(JSON.stringify({ ...inner, room_id: roomId })) > MAX_INNER_BYTES) {
+    throw new Error('Message is too long (16 KiB at most)');
+  }
   let e: CryptoEngine;
   try {
     e = await engine();
@@ -184,20 +191,15 @@ export async function sealRoomMessage(roomId: string, inner: Omit<RoomInner, 'ro
 }
 
 /**
- * Decrypts an e2ee_room_v1 message; any other message is returned as it is. With `wait: false`
- * (live events, which must not queue behind start-up) a device still starting is not awaited:
- * the message reads as unavailable and is opened again once the device is up.
+ * Decrypts an e2ee_room_v1 message; any other message is returned as it is. A device that is
+ * still starting is never awaited, so neither live events nor history wait on key uploads: the
+ * message reads as unavailable and is opened again once the device is up (onRoomKeys).
  */
-export async function openMessage(m: ChatMessage, opts: { wait?: boolean } = {}): Promise<ChatMessage> {
+export async function openMessage(m: ChatMessage): Promise<ChatMessage> {
   if (m.encoding !== 'e2ee_room_v1' || !m.envelope || m.deleted_at) return m;
   const shut = (e2ee: E2EEState): ChatMessage => ({ ...m, body: '', e2ee });
-  let e: CryptoEngine;
-  try {
-    if (opts.wait === false && !current?.ready) throw new Error('starting');
-    e = await engine();
-  } catch {
-    return shut({ kind: 'failed', reason: UNAVAILABLE });
-  }
+  const e = current?.ready;
+  if (!e) return shut({ kind: 'failed', reason: UNAVAILABLE });
   try {
     const r = await e.decrypt({ id: m.id, room_id: m.room_id, sender_id: m.sender_id, body: m.envelope });
     if (r.state === 'waiting') return shut({ kind: 'waiting' });
@@ -210,7 +212,7 @@ export async function openMessage(m: ChatMessage, opts: { wait?: boolean } = {})
 }
 
 export function openMessages(list: ChatMessage[]): Promise<ChatMessage[]> {
-  return Promise.all(list.map((m) => openMessage(m)));
+  return Promise.all(list.map(openMessage));
 }
 
 /**

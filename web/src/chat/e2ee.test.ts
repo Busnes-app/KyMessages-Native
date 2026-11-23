@@ -1,7 +1,7 @@
 import 'fake-indexeddb/auto';
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { abandonDevice, forgetCryptoStore, openMessage, retireDevice, startE2EE, UNAVAILABLE } from './e2ee';
+import { abandonDevice, forgetCryptoStore, onRoomKeys, openMessage, retireDevice, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
 import { parseMessage } from './types';
 
 // jsdom cannot fetch the module by URL; load it from disk instead.
@@ -94,7 +94,7 @@ describe('the signed-in device', () => {
     expect(await retireDevice()).toBe(true);
   });
 
-  it('does not hold live messages behind a device that is still starting', async () => {
+  it('does not hold messages behind a device that is still starting', async () => {
     let release: ((r: Response) => void) | undefined;
     vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) =>
       String(input) === '/api/v1/keys/upload'
@@ -106,9 +106,38 @@ describe('the signed-in device', () => {
       body: '{"alg":"megolm.v1","sender_key":"k","device_id":"DEVICE0001","session_id":"s","ciphertext":"AAAA"}',
     });
     await vi.waitFor(() => expect(release).toBeDefined()); // the upload is in flight
-    const live = await openMessage(m, { wait: false });
-    expect(live.e2ee).toEqual({ kind: 'failed', reason: UNAVAILABLE });
+    const reopened = vi.fn();
+    const stop = onRoomKeys(reopened);
+    expect((await openMessage(m)).e2ee).toEqual({ kind: 'failed', reason: UNAVAILABLE });
+    stop();
     release!(json({ error: 'stop' }, 500));
     await starting.catch(() => undefined);
+  });
+
+  it('reopens what arrived during start-up only once the device is ready', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === '/api/v1/keys/upload') {
+        const req = JSON.parse(String(init?.body)) as { one_time_keys: unknown[] };
+        return json({ one_time_key_count: req.one_time_keys.length });
+      }
+      return json({ messages: [] });
+    }));
+    const m = parseMessage({
+      id: 'm1', room_id: 'r1', sender_id: 'u_bob', encoding: 'e2ee_room_v1',
+      body: '{"alg":"megolm.v1","sender_key":"k","device_id":"DEVICE0001","session_id":"s","ciphertext":"AAAA"}',
+    });
+    const seen: string[] = [];
+    const stop = onRoomKeys(() => void openMessage(m).then((o) => seen.push(o.e2ee?.kind === 'failed' ? o.e2ee.reason : o.e2ee!.kind)));
+    await startE2EE('u_alice');
+    await vi.waitFor(() => expect(seen.length).toBeGreaterThan(0));
+    stop();
+    // The retry ran against the ready device: no longer "unavailable" (no key here, so waiting).
+    expect(seen[0]).toBe('waiting');
+  });
+
+  it('refuses text whose sealed form would exceed the server envelope limit, before sealing', async () => {
+    // 10 KiB of control characters is under the 16 KiB text limit but escapes to 60 KiB of JSON.
+    await expect(sealRoomMessage('r1', { type: 'text', body: '\u0001'.repeat(10 << 10) })).rejects.toThrow('Message is too long');
+    await expect(sealRoomMessage('r1', { type: 'text', body: 'x'.repeat((16 << 10) + 1) })).rejects.toThrow('Message is too long');
   });
 });

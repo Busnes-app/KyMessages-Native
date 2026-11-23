@@ -624,8 +624,8 @@ export class ChatSocket {
       this.inbound = this.inbound
         .then(async () => {
           if ((ev.kind === 'message.new' || ev.kind === 'message.edit') && ev.message) {
-            // Never wait on a device still starting: that would hold every later event.
-            this.handlers.onEvent({ ...ev, message: await openMessage(ev.message, { wait: false }) });
+            // openMessage never waits on a device still starting, so no event queues behind it.
+            this.handlers.onEvent({ ...ev, message: await openMessage(ev.message) });
           } else {
             this.handlers.onEvent(ev);
           }
