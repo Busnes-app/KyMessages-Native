@@ -299,8 +299,12 @@ KyIdentity's erased and org lists before serving (§7.4).
 maxBytes)`, `Open(key)`, `Delete(key)`, `SweepStaleTemps` (`internal/blobs/store.go:83`, `:148`,
 `:175`, `:196`; called from `internal/api/attachment_handlers.go:197`, `:223`, `:299`, `:398`,
 `:416`, `:423` and `internal/api/chat_handlers.go:891`), plus `DeletePrefix` for the purge and `Erase` (every version; PR 6). Like `Erase`, `DeletePrefix`
-removes **every version** of every object under the prefix (on `disk`, the listed files), so the
-purge's final orphan sweep leaves no old versions behind (§9.4).
+removes **every version** of every object under the prefix, so the purge's final orphan sweep
+leaves no old versions behind (§9.4). On `disk` in multi mode, each blob is stored at
+`orgs/<tenant_id>/<blob_key>` under `KY_ATTACHMENTS_DIR`, mirroring the S3 key. `ValidKey`
+still checks the bare key, and the backend adds the prefix itself, through the same
+`os.OpenRoot`. `DeletePrefix` there removes the org's directory, orphans included, and it is the
+same call on both backends. Single mode keeps today's flat layout, unchanged.
 `Open` returns an `io.ReadSeekCloser` and the size, so downloads keep range requests
 (`http.ServeContent`, `internal/api/attachment_handlers.go:329`).
 
