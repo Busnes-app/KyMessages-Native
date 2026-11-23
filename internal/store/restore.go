@@ -7,7 +7,8 @@ import (
 
 // InvalidateRestoredGrants is an offline restore operation, before accepting any
 // traffic. It clears ephemeral sessions/challenges/pairings and push subscriptions (a
-// snapshot cannot prove which were revoked after backup), closes any active calls
+// snapshot cannot prove which were revoked after backup) and meeting guest sessions (a
+// restored admission would let a removed guest back in), closes any active calls
 // from snapshot time, and revokes active bot tokens (since a snapshot cannot prove
 // which tokens were revoked after backup).
 func (s *SQLStore) InvalidateRestoredGrants(ctx context.Context) error {
@@ -29,6 +30,7 @@ func (s *SQLStore) InvalidateRestoredGrants(ctx context.Context) error {
 		// revive it either. Devices upload new keys when the upload response shows none.
 		`UPDATE e2ee_one_time_keys SET claimed = 1`,
 		`DELETE FROM e2ee_to_device`,
+		`DELETE FROM meeting_guest_sessions`,
 	} {
 		if _, err := tx.ExecContext(ctx, query); err != nil {
 			return err

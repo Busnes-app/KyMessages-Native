@@ -176,3 +176,31 @@ func TestRestoreGrantInvalidationRollsBackWhenAuditFails(t *testing.T) {
 		t.Fatalf("call_sessions.ended_at stored as %s (%d), want positive integer", endedType, endedAt)
 	}
 }
+
+// A restored admitted guest session would let a guest removed after the backup back in.
+func TestRestoreInvalidatesGuestSessions(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	res, err := st.Chat().UpsertMeeting(ctx, store.UpsertMeetingParams{ID: "m", TenantID: store.DefaultTenantID, OrganizerSub: "s", Title: "T"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UnixMilli()
+	gs := st.GuestSessions()
+	if _, err := gs.Create(ctx, "restored-secret", store.GuestSession{GuestID: "g1", TenantID: store.DefaultTenantID, MeetingID: "m",
+		RoomID: res.Meeting.RoomID, GuestKey: "k", DisplayName: "V", Status: "waiting", KnockedAt: now, SeenAt: now, ExpiresAt: now + 3600000}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gs.Admit(ctx, res.Meeting.RoomID, "g1", "host", now, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.InvalidateRestoredGrants(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gs.BySecret(ctx, "restored-secret", now, time.Hour); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("BySecret after restore: %v", err)
+	}
+	if _, err := gs.ByID(ctx, "g1", now, time.Hour); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("ByID after restore: %v", err)
+	}
+}

@@ -133,7 +133,7 @@ func runServer() {
 		attachmentsDone := make(chan struct{})
 		go attachmentSweepLoop(ctx, srv.SweepOrphanAttachments, gate, attachmentsDone)
 		pairingsDone := make(chan struct{})
-		maintenanceLoop(ctx, st, gate, pairingsDone)
+		maintenanceLoop(ctx, st, gate, cfg.Tenancy.IsMultiTenant(), pairingsDone)
 		<-agentsDone
 		<-attachmentsDone
 		close(maintenanceDone)
@@ -444,7 +444,7 @@ func runInvalidateGrants(args []string) {
 	if err := errors.Join(st.InvalidateRestoredGrants(ctx), st.Close()); err != nil {
 		log.Fatalf("Invalidating restored grants: %v", err)
 	}
-	fmt.Println("Sessions, challenges, pairings, push subscriptions, active calls and bot tokens invalidated.")
+	fmt.Println("Sessions, challenges, pairings, push subscriptions, guest sessions, active calls and bot tokens invalidated.")
 }
 
 func runInitAdmin(args []string) {

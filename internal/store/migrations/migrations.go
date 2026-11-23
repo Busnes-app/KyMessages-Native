@@ -277,7 +277,94 @@ ALTER TABLE mfa_challenges ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';`,
 
 	// Tenancy migrations follow the merged webhook removal and E2EE slots 53–54.
 	{Version: 55, Name: "job_leases", SQLite: jobLeasesSchema, Postgres: jobLeasesSchema},
+	// Each org has its own meeting ID space: meetings key on (tenant_id, id), and their
+	// windows and guests carry tenant_id. Rebuilt and renamed, which works on both engines.
+	{Version: 56, Name: "meetings_per_tenant_key", SQLite: meetingsPerTenantKey, Postgres: meetingsPerTenantKey},
+	// Sign-in limits and spent proof-of-work challenges shared by every replica (multi mode).
+	{Version: 57, Name: "shared_limits", SQLite: sharedLimitsSchema, Postgres: sharedLimitsSchema},
+	// Meeting guest lobby sessions shared by every replica (multi mode).
+	{Version: 58, Name: "meeting_guest_sessions", SQLite: guestSessionsSchema, Postgres: guestSessionsSchema},
 }
+
+const sharedLimitsSchema = `
+CREATE TABLE attempt_counters (
+    key_hash VARCHAR(64) PRIMARY KEY,
+    count BIGINT NOT NULL,
+    reset_at BIGINT NOT NULL
+);
+CREATE INDEX idx_attempt_counters_reset ON attempt_counters(reset_at);
+CREATE TABLE pow_spent (
+    sig_hash VARCHAR(64) PRIMARY KEY,
+    expires_at BIGINT NOT NULL
+);
+CREATE INDEX idx_pow_spent_expires ON pow_spent(expires_at);
+`
+
+const guestSessionsSchema = `
+CREATE TABLE meeting_guest_sessions (
+    secret_hash VARCHAR(64) PRIMARY KEY,
+    guest_id VARCHAR(64) NOT NULL UNIQUE,
+    tenant_id VARCHAR(64) NOT NULL,
+    meeting_id VARCHAR(128) NOT NULL,
+    room_id VARCHAR(64) NOT NULL,
+    guest_key VARCHAR(255) NOT NULL,
+    display_name VARCHAR(255) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    knocked_at BIGINT NOT NULL,
+    decided_by VARCHAR(64) NOT NULL DEFAULT '',
+    seen_at BIGINT NOT NULL,
+    expires_at BIGINT NOT NULL,
+    UNIQUE (tenant_id, meeting_id, guest_key),
+    FOREIGN KEY (tenant_id, meeting_id) REFERENCES meetings(tenant_id, id) ON DELETE CASCADE
+);
+CREATE INDEX idx_guest_sessions_room ON meeting_guest_sessions(room_id);
+CREATE INDEX idx_guest_sessions_tenant ON meeting_guest_sessions(tenant_id);
+CREATE INDEX idx_guest_sessions_expires ON meeting_guest_sessions(expires_at);
+`
+
+const meetingsPerTenantKey = `
+CREATE TABLE meetings_v41 (
+    id VARCHAR(128) NOT NULL,
+    tenant_id VARCHAR(64) NOT NULL REFERENCES tenants(id),
+    room_id VARCHAR(64) NOT NULL UNIQUE REFERENCES rooms(id) ON DELETE CASCADE,
+    organizer_sub VARCHAR(255) NOT NULL,
+    title VARCHAR(255) NOT NULL,
+    closed_at BIGINT,
+    updated_at BIGINT NOT NULL,
+    PRIMARY KEY (tenant_id, id)
+);
+CREATE TABLE meeting_windows_v41 (
+    tenant_id VARCHAR(64) NOT NULL,
+    meeting_id VARCHAR(128) NOT NULL,
+    starts_at BIGINT NOT NULL,
+    ends_at BIGINT NOT NULL,
+    PRIMARY KEY (tenant_id, meeting_id, starts_at, ends_at),
+    FOREIGN KEY (tenant_id, meeting_id) REFERENCES meetings_v41(tenant_id, id) ON DELETE CASCADE
+);
+CREATE TABLE meeting_guests_v41 (
+    id VARCHAR(64) PRIMARY KEY,
+    tenant_id VARCHAR(64) NOT NULL,
+    meeting_id VARCHAR(128) NOT NULL,
+    guest_key VARCHAR(255) NOT NULL,
+    token_hash VARCHAR(64) NOT NULL UNIQUE,
+    revoked_at BIGINT,
+    created_at BIGINT NOT NULL,
+    UNIQUE (tenant_id, meeting_id, guest_key),
+    FOREIGN KEY (tenant_id, meeting_id) REFERENCES meetings_v41(tenant_id, id) ON DELETE CASCADE
+);
+INSERT INTO meetings_v41 (id, tenant_id, room_id, organizer_sub, title, closed_at, updated_at)
+    SELECT id, tenant_id, room_id, organizer_sub, title, closed_at, updated_at FROM meetings;
+INSERT INTO meeting_windows_v41 (tenant_id, meeting_id, starts_at, ends_at)
+    SELECT m.tenant_id, w.meeting_id, w.starts_at, w.ends_at FROM meeting_windows w JOIN meetings m ON m.id = w.meeting_id;
+INSERT INTO meeting_guests_v41 (id, tenant_id, meeting_id, guest_key, token_hash, revoked_at, created_at)
+    SELECT g.id, m.tenant_id, g.meeting_id, g.guest_key, g.token_hash, g.revoked_at, g.created_at FROM meeting_guests g JOIN meetings m ON m.id = g.meeting_id;
+DROP TABLE meeting_guests;
+DROP TABLE meeting_windows;
+DROP TABLE meetings;
+ALTER TABLE meetings_v41 RENAME TO meetings;
+ALTER TABLE meeting_windows_v41 RENAME TO meeting_windows;
+ALTER TABLE meeting_guests_v41 RENAME TO meeting_guests;
+`
 
 const jobLeasesSchema = `
 CREATE TABLE IF NOT EXISTS job_leases (

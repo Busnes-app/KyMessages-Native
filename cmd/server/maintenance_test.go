@@ -42,7 +42,7 @@ func TestMaintenanceLoopClosesDoneOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	done := make(chan struct{})
-	go maintenanceLoop(ctx, nil, everyReplica, done)
+	go maintenanceLoop(ctx, nil, everyReplica, false, done)
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):

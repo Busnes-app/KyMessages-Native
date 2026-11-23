@@ -146,8 +146,11 @@ type attemptWindow struct {
 }
 
 type attemptLimiter struct {
-	mu sync.Mutex
-	m  map[string]attemptWindow
+	// shared, set in multi mode, counts in the database so every replica spends one budget.
+	// A database error refuses: no limit may lapse during an outage.
+	shared store.Store
+	mu     sync.Mutex
+	m      map[string]attemptWindow
 	// cap bounds the map when callers influence the keys; zero means unbounded.
 	cap int
 }
@@ -167,6 +170,9 @@ type attemptLimiter struct {
 // is therefore equally likely to go. No key carries caller-supplied bytes, and IPv6 clients
 // share one key per /64, so filling the map costs an attacker a distinct IPv4 address or /64.
 const attemptsCap = 10000
+
+// sharedLimitTimeout bounds one shared-limit database call.
+const sharedLimitTimeout = 2 * time.Second
 
 // OnDirectoryChange registers fn to run after each applied-or-acknowledged directory event.
 // fn must not block: the webhook's sender is waiting.
@@ -247,6 +253,18 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 		accountAttempts: attemptLimiter{m: make(map[string]attemptWindow)},
 	}
 
+	if cfg.Tenancy.IsMultiTenant() && st != nil {
+		// Several replicas: limits, spent challenges and lobby sessions live in the database.
+		s.clientAttempts.shared = st
+		s.accountAttempts.shared = st
+		s.pow.Shared = func(sig string, expiresAt int64) (bool, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), sharedLimitTimeout)
+			defer cancel()
+			return st.SpendPoW(ctx, sig, expiresAt)
+		}
+		lobbyMgr.UseShared(st.GuestSessions())
+	}
+
 	revokeUser := func(ctx context.Context, userID string) {
 		callMgr.HandleDisconnect(userID, 0)
 		_ = chatHub.RevokeUser(ctx, userID)
@@ -254,6 +272,9 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 	}
 	kyidentity.OnUserRevoked(revokeUser)
 	chatHub.SetGuestCheck(lobbyMgr.GuestCheck(s.isTenantActive))
+	if cfg.Tenancy.IsMultiTenant() {
+		chatHub.SetUserRevokeHandler(func(userID string) { callMgr.HandleDisconnect(userID, 0) })
+	}
 	chatHub.SetTenantRevokeHandler(func(tenantID string) {
 		lobbyMgr.RevokeTenant(context.Background(), tenantID)
 		callMgr.RevokeTenant(context.Background(), tenantID)
@@ -280,6 +301,12 @@ func buildCSP(cfg *config.Config) string {
 }
 
 func (l *attemptLimiter) allow(key string, limit int, window time.Duration) bool {
+	if l.shared != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), sharedLimitTimeout)
+		defer cancel()
+		n, err := l.shared.BumpAttempt(ctx, key, window)
+		return err == nil && n <= int64(limit)
+	}
 	now := time.Now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -312,6 +339,14 @@ func (l *attemptLimiter) makeRoom(now time.Time) {
 
 // resetIn is how long until key's current window ends.
 func (l *attemptLimiter) resetIn(key string) time.Duration {
+	if l.shared != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), sharedLimitTimeout)
+		defer cancel()
+		if _, left, err := l.shared.AttemptState(ctx, key); err == nil {
+			return left
+		}
+		return time.Minute
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return max(time.Until(l.m[key].reset), 0)
@@ -319,6 +354,12 @@ func (l *attemptLimiter) resetIn(key string) time.Duration {
 
 // blocked reports whether key has used up limit in its current window, without counting.
 func (l *attemptLimiter) blocked(key string, limit int) bool {
+	if l.shared != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), sharedLimitTimeout)
+		defer cancel()
+		n, left, err := l.shared.AttemptState(ctx, key)
+		return err != nil || (left > 0 && n >= int64(limit))
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	entry, ok := l.m[key]

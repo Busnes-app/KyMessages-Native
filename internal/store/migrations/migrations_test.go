@@ -429,3 +429,70 @@ func TestConcurrentRunsAllSucceed(t *testing.T) {
 		}
 	}
 }
+
+// Migration 56 rekeys meetings by (tenant_id, id): existing meetings, windows and guests keep
+// their data and gain their meeting's tenant, and a second org may then reuse a meeting ID.
+func TestMeetingsPerTenantKeyKeepsData(t *testing.T) {
+	ctx := context.Background()
+	cfg := testdb.Config(t)
+	driver, dsn := "sqlite", cfg.DSN+"?_pragma=foreign_keys(1)"
+	if cfg.Driver == "postgres" {
+		driver, dsn = "pgx", cfg.DSN
+	}
+	db, err := sql.Open(driver, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := migrations.RunThrough(ctx, db, cfg.Driver, 55); err != nil {
+		t.Fatal(err)
+	}
+	ph := func(q string) string {
+		if driver != "pgx" {
+			return q
+		}
+		n := 0
+		var b strings.Builder
+		for _, r := range q {
+			if r == '?' {
+				n++
+				fmt.Fprintf(&b, "$%d", n)
+				continue
+			}
+			b.WriteRune(r)
+		}
+		return b.String()
+	}
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx, ph(q), args...); err != nil {
+			t.Fatal(q, err)
+		}
+	}
+	exec(`INSERT INTO tenants (id, slug, display_name, created_at) VALUES ('org-a', 'org-a', 'A', 1), ('org-b', 'org-b', 'B', 1)`)
+	exec(`INSERT INTO rooms (id, tenant_id, kind, name, topic, is_private, last_seq, created_by, created_at) VALUES ('rm-a', 'org-a', 'meeting', 'A', '', 1, 0, 'u', 1), ('rm-b', 'org-b', 'meeting', 'B', '', 1, 0, 'u', 1)`)
+	exec(`INSERT INTO meetings (id, tenant_id, room_id, organizer_sub, title, updated_at) VALUES ('m1', 'org-a', 'rm-a', 's', 'T', 1)`)
+	exec(`INSERT INTO meeting_windows (meeting_id, starts_at, ends_at) VALUES ('m1', 10, 20)`)
+	exec(`INSERT INTO meeting_guests (id, meeting_id, guest_key, token_hash, created_at) VALUES ('g1', 'm1', 'k', 'h1', 1)`)
+	if err := migrations.Run(ctx, db, cfg.Driver); err != nil {
+		t.Fatal(err)
+	}
+	var tw, tg string
+	if err := db.QueryRowContext(ctx, `SELECT w.tenant_id, g.tenant_id FROM meeting_windows w JOIN meeting_guests g ON g.meeting_id = w.meeting_id WHERE w.meeting_id = 'm1'`).Scan(&tw, &tg); err != nil || tw != "org-a" || tg != "org-a" {
+		t.Fatalf("children after migration: %q %q %v", tw, tg, err)
+	}
+	// Another org may now hold the same meeting ID, with its own windows and guest key.
+	exec(`INSERT INTO meetings (id, tenant_id, room_id, organizer_sub, title, updated_at) VALUES ('m1', 'org-b', 'rm-b', 's', 'T', 1)`)
+	exec(`INSERT INTO meeting_windows (tenant_id, meeting_id, starts_at, ends_at) VALUES ('org-b', 'm1', 10, 20)`)
+	exec(`INSERT INTO meeting_guests (id, tenant_id, meeting_id, guest_key, token_hash, created_at) VALUES ('g2', 'org-b', 'm1', 'k', 'h2', 1)`)
+	// A child naming a meeting its org does not hold is refused.
+	if _, err := db.ExecContext(ctx, ph(`INSERT INTO meeting_windows (tenant_id, meeting_id, starts_at, ends_at) VALUES ('org-c', 'm1', 1, 2)`)); err == nil {
+		t.Fatal("window for another org's meeting was accepted")
+	}
+	// Deleting one org's meeting cascades to its children only.
+	exec(`DELETE FROM meetings WHERE tenant_id = 'org-a' AND id = 'm1'`)
+	var n int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM meeting_guests`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("guests after deleting org-a's meeting: %d %v", n, err)
+	}
+}

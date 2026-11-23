@@ -42,7 +42,8 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
 - `CompletePasswordChange` atomically compares the old password, updates a flagged local account, clears the flag, deletes sessions/MFA challenges/device pairings and records `auth.password_changed`. Session/MFA/pairing issuance locks the same user row against the verified hash and, for an org-bound account, the `tenants` row while it is active, so a suspension either refuses the grant or sweeps it; MFA challenges persist the creation-time password hash, and consumption returns that snapshot to reject stale completions. Migration 4 discards preexisting challenges because their credential snapshot is unknown.
 - `ResetAdminPassword` reactivates a local administrator with the replacement flag set and shares the atomic grant purge and audit path with `CompletePasswordChange`; it also works for disabled accounts.
 - `InvalidateRestoredGrants` runs only on an offline restored database: atomically
-  delete sessions, MFA challenges, device pairings and push subscriptions, revoke active agent
+  delete sessions, MFA challenges, device pairings, push subscriptions and meeting guest
+  sessions (a restored admission would readmit a removed guest), revoke active agent
   tokens, and audit `restore.grants_invalidated`. Users sign in again.
 - Migrations 5–12 and 17–19 built the retired messaging stack; migration 21 drops its tables
   (children first), `messaging.*` audit rows and the three `messages_*` backup settings, and
@@ -80,6 +81,24 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   Migration 55 adds `job_leases (name, holder, expires_at)`. `AcquireLease(name, holder, ttl)`
   is one conditional upsert that wins only when the lease is free, expired or already the
   holder's; it reads the database clock (Unix ms), never a replica's (`TestJobLeaseHandover`).
+- Migration 56 rekeys `meetings` by `(tenant_id, id)`; `meeting_windows` and `meeting_guests`
+  gain `tenant_id` and reference `meetings (tenant_id, id)`. It rebuilds and renames the three
+  tables, one SQL for both engines (`TestMeetingsPerTenantKeyKeepsData`). Every meeting query
+  matches `tenant_id`, and `UpsertMeeting` takes `pg_advisory_xact_lock` on the pair first.
+- Migrations 42-43 add multi mode's shared state: `attempt_counters` (`BumpAttempt`,
+  `AttemptState`), `pow_spent` (`SpendPoW`) and `meeting_guest_sessions`
+  (`GuestSessions()`: keyed by the secret's SHA-256, one live session per tenant, meeting and
+  guest key, 4 h expiry). `seen_at` is on the database clock: each replica `Touch`es the guests
+  it holds sockets for every quarter of the leave grace, and a leave timer (`DeleteIfUnseen`) ends a
+  session only when nobody touched it for the same window reads use, 1.25 × the grace
+  (`TestSharedLobbyOverlappingSocketsAcrossReplicas`, `TestSharedLobbyPollingAfterDisconnect`).
+  Departure does not depend on that timer: `BySecret`, `ByID`, `InRoom` and `Admit` accept a
+  session only if `seen_at` is within `live` (the lobby passes 1.25 × the leave grace), so a
+  replica that exits or a failed delete cannot keep an admission usable. Every authenticated
+  guest request atomically validates and refreshes the session with `BySecret`, so a waiting guest who only polls stays listed
+  (`TestSharedLobbyAdmissionLapsesWithoutAnyReplica`). The socket check for a guest connected to this replica refreshes the session before reading it, so a database outage longer than the window does not drop a connected guest (`TestSharedLobbyConnectedGuestSurvivesAnOutage`). `PruneShared` deletes rows nobody touched
+  for 10 minutes. `PruneShared` deletes
+  expired rows; the leased maintenance loop runs it in multi mode only.
   `migrations.Run` refuses with `ErrNewerSchema` a database whose `schema_migrations` holds a
   version above this build's newest (image rollback, or a capsule from a newer build), before
   running anything. It takes only `sqlite` or `postgres`/`postgresql` and picks its placeholder
@@ -108,3 +127,5 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
 
 ## Child DOX Index
 None.
+
+- Shared leave timers rearm while a disconnected guest keeps polling. The eventual database delete emits one departure and evicts the call seat; deterministic scheduler callbacks cover polling beyond the first timer and later inactivity.

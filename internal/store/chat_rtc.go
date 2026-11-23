@@ -146,6 +146,13 @@ func (c *chatStore) UpsertMeeting(ctx context.Context, p UpsertMeetingParams) (*
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if c.store.driver == "postgres" {
+		// Serialise writers of one org's meeting across replicas, keyed like the row, before the
+		// read below: two creates would otherwise both insert, and two updates both apply.
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext('kymessages:meeting:' || current_schema() || ':' || $1), hashtext($2))`, tenantID, p.ID); err != nil {
+			return nil, err
+		}
+	}
 
 	res := &UpsertMeetingResult{}
 
@@ -271,15 +278,15 @@ func (c *chatStore) UpsertMeeting(ctx context.Context, p UpsertMeetingParams) (*
 	}
 
 	// Replace meeting windows.
-	if _, err := tx.ExecContext(ctx, c.store.rebind(`DELETE FROM meeting_windows WHERE meeting_id = ?`), p.ID); err != nil {
+	if _, err := tx.ExecContext(ctx, c.store.rebind(`DELETE FROM meeting_windows WHERE tenant_id = ? AND meeting_id = ?`), tenantID, p.ID); err != nil {
 		return nil, err
 	}
 	for _, w := range p.Windows {
 		if _, err := tx.ExecContext(ctx, c.store.rebind(`
-			INSERT INTO meeting_windows (meeting_id, starts_at, ends_at)
-			VALUES (?, ?, ?)
-			ON CONFLICT (meeting_id, starts_at, ends_at) DO NOTHING`),
-			p.ID, w.StartsAt, w.EndsAt,
+			INSERT INTO meeting_windows (tenant_id, meeting_id, starts_at, ends_at)
+			VALUES (?, ?, ?, ?)
+			ON CONFLICT (tenant_id, meeting_id, starts_at, ends_at) DO NOTHING`),
+			tenantID, p.ID, w.StartsAt, w.EndsAt,
 		); err != nil {
 			return nil, err
 		}
@@ -290,8 +297,8 @@ func (c *chatStore) UpsertMeeting(ctx context.Context, p UpsertMeetingParams) (*
 	gRows, err := tx.QueryContext(ctx, c.store.rebind(`
 		SELECT id, meeting_id, guest_key, token_hash, revoked_at, created_at
 		FROM meeting_guests
-		WHERE meeting_id = ?`),
-		p.ID,
+		WHERE tenant_id = ? AND meeting_id = ?`),
+		tenantID, p.ID,
 	)
 	if err != nil {
 		return nil, err
@@ -333,9 +340,9 @@ func (c *chatStore) UpsertMeeting(ctx context.Context, p UpsertMeetingParams) (*
 				cand.CreatedAt = now
 			}
 			if _, err := tx.ExecContext(ctx, c.store.rebind(`
-				INSERT INTO meeting_guests (id, meeting_id, guest_key, token_hash, revoked_at, created_at)
-				VALUES (?, ?, ?, ?, NULL, ?)`),
-				cand.ID, p.ID, key, cand.TokenHash, cand.CreatedAt,
+				INSERT INTO meeting_guests (id, tenant_id, meeting_id, guest_key, token_hash, revoked_at, created_at)
+				VALUES (?, ?, ?, ?, ?, NULL, ?)`),
+				cand.ID, tenantID, p.ID, key, cand.TokenHash, cand.CreatedAt,
 			); err != nil {
 				return nil, err
 			}
@@ -389,11 +396,11 @@ func (c *chatStore) GetMeeting(ctx context.Context, tenantID, meetingID string) 
 		m.ClosedAt = &v
 	}
 
-	windows, err := c.listMeetingWindows(ctx, m.ID)
+	windows, err := c.listMeetingWindows(ctx, m.TenantID, m.ID)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	guests, err := c.listMeetingGuests(ctx, m.ID)
+	guests, err := c.listMeetingGuests(ctx, m.TenantID, m.ID)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -419,7 +426,7 @@ func (c *chatStore) GetMeetingByRoomID(ctx context.Context, tenantID, roomID str
 		v := closedAt.Int64
 		m.ClosedAt = &v
 	}
-	windows, err := c.listMeetingWindows(ctx, m.ID)
+	windows, err := c.listMeetingWindows(ctx, m.TenantID, m.ID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -434,9 +441,9 @@ func (c *chatStore) CreateMeetingGuest(ctx context.Context, g *MeetingGuest) err
 		g.CreatedAt = nowMilli()
 	}
 	_, err := c.store.db.ExecContext(ctx, c.store.rebind(`
-		INSERT INTO meeting_guests (id, meeting_id, guest_key, token_hash, revoked_at, created_at)
-		VALUES (?, ?, ?, ?, NULL, ?)`),
-		g.ID, g.MeetingID, g.GuestKey, g.TokenHash, g.CreatedAt,
+		INSERT INTO meeting_guests (id, tenant_id, meeting_id, guest_key, token_hash, revoked_at, created_at)
+		VALUES (?, ?, ?, ?, ?, NULL, ?)`),
+		g.ID, normalizeTenant(g.TenantID), g.MeetingID, g.GuestKey, g.TokenHash, g.CreatedAt,
 	)
 	return err
 }
@@ -445,10 +452,10 @@ func (c *chatStore) GetMeetingGuestByTokenHash(ctx context.Context, tokenHash st
 	var g MeetingGuest
 	var rev sql.NullInt64
 	err := c.store.db.QueryRowContext(ctx, c.store.rebind(`
-		SELECT id, meeting_id, guest_key, token_hash, revoked_at, created_at
+		SELECT id, tenant_id, meeting_id, guest_key, token_hash, revoked_at, created_at
 		FROM meeting_guests WHERE token_hash = ?`),
 		tokenHash,
-	).Scan(&g.ID, &g.MeetingID, &g.GuestKey, &g.TokenHash, &rev, &g.CreatedAt)
+	).Scan(&g.ID, &g.TenantID, &g.MeetingID, &g.GuestKey, &g.TokenHash, &rev, &g.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil, nil, ErrNotFound
 	}
@@ -464,8 +471,8 @@ func (c *chatStore) GetMeetingGuestByTokenHash(ctx context.Context, tokenHash st
 	var closedAt sql.NullInt64
 	err = c.store.db.QueryRowContext(ctx, c.store.rebind(`
 		SELECT id, tenant_id, room_id, organizer_sub, title, closed_at, updated_at
-		FROM meetings WHERE id = ?`),
-		g.MeetingID,
+		FROM meetings WHERE tenant_id = ? AND id = ?`),
+		g.TenantID, g.MeetingID,
 	).Scan(&m.ID, &m.TenantID, &m.RoomID, &m.OrganizerSub, &m.Title, &closedAt, &m.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil, nil, ErrNotFound
@@ -478,7 +485,7 @@ func (c *chatStore) GetMeetingGuestByTokenHash(ctx context.Context, tokenHash st
 		m.ClosedAt = &v
 	}
 
-	windows, err := c.listMeetingWindows(ctx, m.ID)
+	windows, err := c.listMeetingWindows(ctx, m.TenantID, m.ID)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -522,8 +529,8 @@ func (c *chatStore) CloseMeeting(ctx context.Context, tenantID, meetingID string
 		return nil, err
 	}
 	if _, err := tx.ExecContext(ctx, c.store.rebind(`
-		UPDATE meeting_guests SET revoked_at = COALESCE(revoked_at, ?) WHERE meeting_id = ?`),
-		now, meetingID,
+		UPDATE meeting_guests SET revoked_at = COALESCE(revoked_at, ?) WHERE tenant_id = ? AND meeting_id = ?`),
+		now, tenantID, meetingID,
 	); err != nil {
 		return nil, err
 	}
@@ -535,10 +542,10 @@ func (c *chatStore) CloseMeeting(ctx context.Context, tenantID, meetingID string
 	return &m, nil
 }
 
-func (c *chatStore) listMeetingWindows(ctx context.Context, meetingID string) ([]MeetingWindow, error) {
+func (c *chatStore) listMeetingWindows(ctx context.Context, tenantID, meetingID string) ([]MeetingWindow, error) {
 	rows, err := c.store.db.QueryContext(ctx, c.store.rebind(`
-		SELECT meeting_id, starts_at, ends_at FROM meeting_windows WHERE meeting_id = ? ORDER BY starts_at ASC`),
-		meetingID,
+		SELECT meeting_id, starts_at, ends_at FROM meeting_windows WHERE tenant_id = ? AND meeting_id = ? ORDER BY starts_at ASC`),
+		tenantID, meetingID,
 	)
 	if err != nil {
 		return nil, err
@@ -555,11 +562,11 @@ func (c *chatStore) listMeetingWindows(ctx context.Context, meetingID string) ([
 	return out, rows.Err()
 }
 
-func (c *chatStore) listMeetingGuests(ctx context.Context, meetingID string) ([]MeetingGuest, error) {
+func (c *chatStore) listMeetingGuests(ctx context.Context, tenantID, meetingID string) ([]MeetingGuest, error) {
 	rows, err := c.store.db.QueryContext(ctx, c.store.rebind(`
 		SELECT id, meeting_id, guest_key, token_hash, revoked_at, created_at
-		FROM meeting_guests WHERE meeting_id = ? ORDER BY created_at ASC`),
-		meetingID,
+		FROM meeting_guests WHERE tenant_id = ? AND meeting_id = ? ORDER BY created_at ASC`),
+		tenantID, meetingID,
 	)
 	if err != nil {
 		return nil, err

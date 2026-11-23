@@ -55,12 +55,25 @@ type LobbyManager struct {
 	calls      *CallManager
 	leaveGrace time.Duration
 	now        func() time.Time
+	afterFunc  func(time.Duration, func()) *time.Timer
 
 	mu           sync.Mutex
 	bySecret     map[string]*GuestSession            // sessionSecret -> session
 	byGuestID    map[string]*GuestSession            // guestID -> session
 	byRoom       map[string]map[string]*GuestSession // roomID -> guestID -> session
-	byMeetingKey map[string]string                   // meetingID+"|"+guestKey -> guestID (1 live session per token)
+	byMeetingKey map[string]string                   // inviteKey -> guestID (1 live session per token)
+
+	// db, set by UseShared in multi mode, holds every session instead of the maps above;
+	// timers then holds only this replica's leave timers (meetings_shared.go).
+	db      *store.GuestSessionStore
+	timers  map[string]*time.Timer
+	live    map[string]struct{} // guests with a socket on this replica
+	beating bool                // heartbeat goroutine running
+}
+
+// inviteKey names one invite: its org, meeting and guest key. Orgs share no meeting IDs.
+func inviteKey(tenantID, meetingID, guestKey string) string {
+	return tenantID + "|" + meetingID + "|" + guestKey
 }
 
 // NewLobbyManager constructs a LobbyManager wired to Hub and CallManager.
@@ -70,6 +83,7 @@ func NewLobbyManager(hub *Hub, calls *CallManager) *LobbyManager {
 		calls:        calls,
 		leaveGrace:   DefaultGuestLeaveGrace,
 		now:          time.Now,
+		afterFunc:    time.AfterFunc,
 		bySecret:     make(map[string]*GuestSession),
 		byGuestID:    make(map[string]*GuestSession),
 		byRoom:       make(map[string]map[string]*GuestSession),
@@ -143,7 +157,15 @@ func (l *LobbyManager) Knock(ctx context.Context, guest *store.MeetingGuest, mee
 	}
 	guestID := "guest_" + uuid.Must(uuid.NewV7()).String()
 	nowMs := l.now().UTC().UnixMilli()
-	mk := meeting.ID + "|" + guest.GuestKey
+	if l.db != nil {
+		sess, err := l.knockShared(ctx, meeting, guest.GuestKey, displayName, secret, guestID, nowMs)
+		if err != nil {
+			return nil, err
+		}
+		l.publishKnock(ctx, meeting, guestID, displayName, nowMs)
+		return sess, nil
+	}
+	mk := inviteKey(meeting.TenantID, meeting.ID, guest.GuestKey)
 
 	var evictedGuestID string
 	var evictedRoomID string
@@ -182,6 +204,11 @@ func (l *LobbyManager) Knock(ctx context.Context, guest *store.MeetingGuest, mee
 		l.evictLiveGuest(ctx, evictedRoomID, evictedGuestID)
 	}
 
+	l.publishKnock(ctx, meeting, guestID, displayName, nowMs)
+	return &sessCopy, nil
+}
+
+func (l *LobbyManager) publishKnock(ctx context.Context, meeting *store.Meeting, guestID, displayName string, nowMs int64) {
 	if l.hub != nil {
 		_ = l.hub.PublishRoom(ctx, meeting.RoomID, Event{
 			Type:   EventLobbyKnock,
@@ -196,13 +223,15 @@ func (l *LobbyManager) Knock(ctx context.Context, guest *store.MeetingGuest, mee
 			}),
 		})
 	}
-	return &sessCopy, nil
 }
 
 // GetBySecret resolves an active guest session from its bearer/cookie secret.
 func (l *LobbyManager) GetBySecret(secret string) (*GuestSession, bool) {
 	if secret == "" {
 		return nil, false
+	}
+	if l.db != nil {
+		return l.bySecretShared(secret)
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -216,6 +245,9 @@ func (l *LobbyManager) GetBySecret(secret string) (*GuestSession, bool) {
 
 // ListWaiting returns all currently waiting (and admitted) guests for roomID.
 func (l *LobbyManager) ListWaiting(roomID string) []LobbyKnockPayload {
+	if l.db != nil {
+		return l.listShared(roomID)
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	m := l.byRoom[roomID]
@@ -240,6 +272,9 @@ func (l *LobbyManager) ListWaiting(roomID string) []LobbyKnockPayload {
 
 // Decide admits or denies a waiting guest in roomID.
 func (l *LobbyManager) Decide(ctx context.Context, roomID, guestID, actorID string, admit bool) (*GuestSession, error) {
+	if l.db != nil {
+		return l.decideShared(ctx, roomID, guestID, actorID, admit)
+	}
 	l.mu.Lock()
 	s := l.byGuestID[guestID]
 	if s == nil || s.RoomID != roomID {
@@ -302,6 +337,10 @@ func (l *LobbyManager) Decide(ctx context.Context, roomID, guestID, actorID stri
 
 // MarkConnected cancels any pending 20s leave timer if the guest reconnected in time.
 func (l *LobbyManager) MarkConnected(guestID string) {
+	if l.db != nil {
+		l.markConnectedShared(guestID)
+		return
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if s := l.byGuestID[guestID]; s != nil && s.leaveTimer != nil {
@@ -313,6 +352,10 @@ func (l *LobbyManager) MarkConnected(guestID string) {
 // HandleDisconnect starts the 20s leave-means-wait-again grace timer when a guest disconnects.
 func (l *LobbyManager) HandleDisconnect(guestID string, remainingConns int) {
 	if remainingConns > 0 {
+		return
+	}
+	if l.db != nil {
+		l.disconnectShared(guestID)
 		return
 	}
 	l.mu.Lock()
@@ -366,6 +409,11 @@ func (l *LobbyManager) expireGuest(guestID, roomID, meetingID, displayName strin
 
 // RevokeMeeting evicts every guest currently waiting in or admitted to roomID.
 func (l *LobbyManager) RevokeMeeting(ctx context.Context, roomID string) {
+	if l.db != nil {
+		rows, _ := l.db.DeleteRoom(ctx, roomID)
+		l.evictShared(ctx, rows)
+		return
+	}
 	l.mu.Lock()
 	m := l.byRoom[roomID]
 	var guestIDs []string
@@ -385,6 +433,9 @@ func (l *LobbyManager) RevokeMeeting(ctx context.Context, roomID string) {
 // closes it on the next ping. A lookup error keeps it open: an outage must not eject everyone.
 func (l *LobbyManager) GuestCheck(isActive func(ctx context.Context, tenantID string) (bool, error)) func(guestID string) bool {
 	return func(guestID string) bool {
+		if l.db != nil {
+			return l.guestValidShared(isActive, guestID)
+		}
 		l.mu.Lock()
 		s := l.byGuestID[guestID]
 		l.mu.Unlock()
@@ -401,6 +452,11 @@ func (l *LobbyManager) GuestCheck(isActive func(ctx context.Context, tenantID st
 // RevokeTenant evicts every guest of tenantID this pod holds, waiting or admitted, and takes
 // them out of their calls.
 func (l *LobbyManager) RevokeTenant(ctx context.Context, tenantID string) {
+	if l.db != nil {
+		rows, _ := l.db.DeleteTenant(ctx, tenantID)
+		l.evictShared(ctx, rows)
+		return
+	}
 	type gone struct{ roomID, guestID string }
 	var evict []gone
 	l.mu.Lock()
@@ -416,9 +472,14 @@ func (l *LobbyManager) RevokeTenant(ctx context.Context, tenantID string) {
 	}
 }
 
-// RevokeGuestKey evicts the live session for one revoked guest_key in meetingID.
-func (l *LobbyManager) RevokeGuestKey(ctx context.Context, meetingID, guestKey string) {
-	mk := meetingID + "|" + guestKey
+// RevokeGuestKey evicts the live session for one revoked guest_key in tenantID's meetingID.
+func (l *LobbyManager) RevokeGuestKey(ctx context.Context, tenantID, meetingID, guestKey string) {
+	if l.db != nil {
+		rows, _ := l.db.DeleteKey(ctx, tenantID, meetingID, guestKey)
+		l.evictShared(ctx, rows)
+		return
+	}
+	mk := inviteKey(tenantID, meetingID, guestKey)
 	l.mu.Lock()
 	gid := l.byMeetingKey[mk]
 	if gid == "" {
@@ -463,7 +524,7 @@ func (l *LobbyManager) deleteSessionLocked(s *GuestSession) {
 			delete(l.byRoom, s.RoomID)
 		}
 	}
-	mk := s.MeetingID + "|" + s.GuestKey
+	mk := inviteKey(s.TenantID, s.MeetingID, s.GuestKey)
 	if l.byMeetingKey[mk] == s.GuestID {
 		delete(l.byMeetingKey, mk)
 	}

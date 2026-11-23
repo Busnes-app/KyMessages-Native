@@ -245,7 +245,7 @@ func (s *Server) handleKyCalendarUpsertMeeting(w http.ResponseWriter, r *http.Re
 	}
 	// Evict any live guests whose invite keys were removed.
 	for _, gk := range res.RevokedGuestKeys {
-		s.lobby.RevokeGuestKey(r.Context(), meetingID, gk)
+		s.lobby.RevokeGuestKey(r.Context(), res.Meeting.TenantID, meetingID, gk)
 	}
 
 	baseURL := strings.TrimRight(s.config.Server.AppURL, "/")
@@ -500,6 +500,7 @@ func (s *Server) handleCreateRoomGuestLink(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	guest := &store.MeetingGuest{
+		TenantID:  meeting.TenantID,
 		MeetingID: meeting.ID,
 		GuestKey:  "invite-" + uuid.Must(uuid.NewV7()).String()[:8],
 		TokenHash: chat.HashMeetingToken(rawTok),
@@ -560,7 +561,7 @@ func (s *Server) authenticateGuestRequest(w http.ResponseWriter, r *http.Request
 		}
 	}
 	sess, ok := s.lobby.GetBySecret(secret)
-	if !ok || sess.MeetingID != meeting.ID || subtle.ConstantTimeCompare([]byte(sess.GuestKey), []byte(guestRow.GuestKey)) != 1 {
+	if !ok || sess.TenantID != meeting.TenantID || sess.MeetingID != meeting.ID || subtle.ConstantTimeCompare([]byte(sess.GuestKey), []byte(guestRow.GuestKey)) != 1 {
 		s.writeError(w, http.StatusUnauthorized, "Guest session expired — please knock again")
 		return nil, nil, false
 	}
@@ -598,7 +599,7 @@ func (s *Server) handleGuestMeetInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	// If guest already has a valid session cookie for this link, report their current status.
 	if c, err := r.Cookie(guestSessionCookieName); err == nil {
-		if sess, ok := s.lobby.GetBySecret(c.Value); ok && sess.MeetingID == meeting.ID && sess.GuestKey == guestRow.GuestKey {
+		if sess, ok := s.lobby.GetBySecret(c.Value); ok && sess.TenantID == meeting.TenantID && sess.MeetingID == meeting.ID && sess.GuestKey == guestRow.GuestKey {
 			resp["session"] = map[string]any{
 				"guest_id":     sess.GuestID,
 				"display_name": sess.DisplayName,

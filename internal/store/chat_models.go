@@ -245,6 +245,7 @@ type MeetingWindow struct {
 // MeetingGuest binds one hashed external guest invite token to a meeting.
 type MeetingGuest struct {
 	ID        string `json:"id"`
+	TenantID  string `json:"-"`
 	MeetingID string `json:"meeting_id"`
 	GuestKey  string `json:"guest_key"`
 	TokenHash string `json:"-"`
