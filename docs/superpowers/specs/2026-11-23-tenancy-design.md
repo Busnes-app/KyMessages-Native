@@ -232,7 +232,8 @@ Multi mode, `origin/main` plus PR #27. Every row has a cross-org test in
      serving, and its data is kept), audited as `tenancy.org_missing`, and raised to the
      operator's alerts.
    - A read that is not complete (a page error, a short page without `next`) changes nothing.
-   - **Sanity guard on missing orgs:** if one read finds more than 5% of active orgs missing,
+   - **Sanity guard on missing orgs:** if one read finds more than max(5% of active orgs, 3)
+     orgs missing,
      the sync suspends none of them, audits `tenancy.sync_aborted`, and alerts. A start-up read
      never suspends a missing org; it only alerts. A wrong issuer, a paging bug or an empty
      answer during an incident therefore cannot take every org offline, and none of them can
@@ -455,11 +456,13 @@ The leased reporter job (§8.1) does two separate things:
   the server cannot detect (§7.4): the next report carries the restored database's true total.
   It sends an absolute total, not a delta, so a retry or a lost report cannot drift. The report
   is signed with `syncauth` under KyIdentity's pair secret, carries `org_id`, and contains no
-  names, file names or room IDs. Its revision is the send time in Unix milliseconds, not a
-  stored counter. A restore therefore cannot rewind it, and KyIdentity keeps the newest report
-  per org and app. Clock skew between replicas is bounded by `syncauth`'s ±5-minute window, and
-  a report up to that much older than the stored one is dropped as stale. The next report
-  replaces it within 5 minutes.
+  names, file names or room IDs. Its revision is `max(now_ms, last_sent + 1)`.
+  `last_sent` is stored per org in `tenants` and updated in the same step as the send. A lease
+  handover to a replica with a slower clock therefore never sends a lower revision, and
+  KyIdentity keeps the newest report per org and app. A restore rewinds `last_sent`, but
+  `now_ms` has moved past every revision sent before the restore, unless a clock jumped back.
+  Then reports pause until that clock passes the old revision, and the first one after it
+  repairs the total.
 - **Refresh.** It reads every active org's allowance from KyIdentity's headroom answer at least
   every 5 minutes, and sets `pool_allowance_bytes` and `pool_checked_at`. This read does not
   depend on a report being accepted, so a refused or stale report never ages an org's
@@ -480,7 +483,7 @@ test proves the answers are byte for byte the same.
 | A user-targeted event reaches room members | PR #27: `Dispatch` sends `user_id` events to that user only. |
 | A member signs in with full access during `deletion_scheduled` | M9: refuse `export_only` tokens. |
 | An erased person's or deleted org's data stays, or a restore brings it back | §7.2, §7.3, §7.4: purge every object version, tombstone, and re-read KyIdentity's erased and org lists after a restore. |
-| A short or wrong org list from KyIdentity purges or suspends live orgs | §7.4: purge only on an explicit `deleted` status or `org.deleted`. A missing org is suspended, never purged, never on a start-up read, and not at all past a 5% guard. Incomplete reads change nothing. |
+| A short or wrong org list from KyIdentity purges or suspends live orgs | §7.4: purge only on an explicit `deleted` status or `org.deleted`. A missing org is suspended, never purged, never on a start-up read, and not at all past the guard (more than max(5%, 3) orgs missing). Incomplete reads change nothing. |
 | N replicas give an attacker N sign-in budgets, or N uses of one PoW | §8.2: shared counters and a shared spent table. |
 | Two replicas migrate at once and one stops | §8.1: advisory lock. |
 | A guest is lost, or let in twice, across replicas | §8.3: guest sessions in PostgreSQL, keyed by a hash of the secret. |
@@ -488,7 +491,7 @@ test proves the answers are byte for byte the same.
 | An object key or URL is guessed or reused | Random IDs, never content hashes. Proxied downloads with a membership check. No presigned URLs. |
 | S3 credentials leak | Environment or file only. Never logged, returned or audited. HTTPS only. |
 | One org fills the pool or the bucket for others | The pool per org, plus the per-user staging cap and the upload limit. Bucket or volume capacity is watched by the operator's alerts. |
-| A forged or replayed usage report | Signed with `syncauth`, whose event ID and ±5-minute timestamp window are the replay guard. The revision is wall-clock send time, not a strict order: skew between replicas is bounded by that window, and a report dropped as stale is replaced within 5 minutes (§10.3). Totals are absolute, so order never changes a sum. |
+| A forged or replayed usage report | Signed with `syncauth`, whose event ID and ±5-minute timestamp window are the replay guard. The revision is `max(now_ms, last_sent + 1)`, stored per org, so it only grows across replicas and lease handovers (§10.3). Totals are absolute, so order never changes a sum. |
 | Pool overshoot while KyIdentity is down | Bounded to 15 minutes of other apps' growth. Then fail closed for adding writes. |
 | Single-tenant changes by accident | Every change is gated on `IsMultiTenant()`. S3 settings refuse to start in single mode. Golden and upgrade tests. |
 
@@ -519,7 +522,8 @@ Tests each PR must add, beyond its own:
   other, a guest admitted on one and recognised on the other.
 - **Tenancy sync:** a fake KyIdentity returns an empty `/api/suite/orgs`, then a partial one, with
   no tombstones. Every tenant stays non-deleted, with its attachment rows and blobs. Missing orgs
-  are not suspended on a start-up read or past the 5% guard. A `deleted` entry purges exactly
+  are not suspended on a start-up read or past the guard. On a small install (10 active orgs),
+  one missing org is suspended, and four missing are not. A `deleted` entry purges exactly
   that org. Run on SQLite and PostgreSQL.
 - **Pool:** a new org's first upload (allowance unknown: fetched and then admitted, or `503`
   with KyIdentity down), at the allowance, one byte over, a stale allowance before and after 15 minutes,
