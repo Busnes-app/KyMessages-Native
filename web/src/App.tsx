@@ -130,8 +130,7 @@ export const App: React.FC = () => {
       // sign-out leaves notifications as they were.
       const pushEndpoint = await browserPushEndpoint();
       // The device's keys go before the session does; its local store goes either way below.
-      await retireDevice();
-      retired = true;
+      retired = await retireDevice();
       const res = await secureFetch('/api/auth/logout', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -141,9 +140,11 @@ export const App: React.FC = () => {
       if (pushEndpoint) void unsubscribeBrowserPush();
       signedInRef.current = false;
       announceSignOut();
-      await leave('', forgetCryptoStore);
+      // A device the server still lists is retired after the next sign-in here.
+      await leave('', retired ? forgetCryptoStore : abandonDevice);
     } catch (err) {
-      // Still signed in, but the old device is gone from the server: start a new one.
+      // Still signed in, but the old device is gone from the server: start a new one. (If the
+      // delete failed, the device and its store are still intact and stay in use.)
       if (retired) void replaceDevice().catch(() => undefined);
       setError(`You are still signed in: ${err instanceof Error ? err.message : 'sign-out failed'}`);
     }

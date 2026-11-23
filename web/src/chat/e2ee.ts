@@ -207,11 +207,18 @@ export function openMessages(list: ChatMessage[]): Promise<ChatMessage[]> {
 
 /**
  * Removes this browser's device from the key server, for sign-out: members stop sending it keys
- * and rotate their sessions. Best effort; call it while the session is still valid.
+ * and rotate their sessions. Call it while the session is still valid; it answers whether the
+ * server no longer lists the device. When it does not, use abandonDevice so a later sign-in retires it.
  */
-export async function retireDevice(): Promise<void> {
+export async function retireDevice(): Promise<boolean> {
   const e = await current?.engine.catch(() => undefined);
-  if (e) await call(`/api/v1/keys/devices/${encodeURIComponent(e.deviceId)}`, 'DELETE').catch(() => undefined);
+  if (!e) return false;
+  try {
+    await call(`/api/v1/keys/devices/${encodeURIComponent(e.deviceId)}`, 'DELETE');
+    return true;
+  } catch (err) {
+    return err instanceof KeyServerError && err.status === 404;
+  }
 }
 
 // Devices abandoned when a session was revoked: the server no longer accepts that session, so

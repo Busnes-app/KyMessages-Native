@@ -1,7 +1,7 @@
 import 'fake-indexeddb/auto';
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { abandonDevice, forgetCryptoStore, startE2EE } from './e2ee';
+import { abandonDevice, forgetCryptoStore, retireDevice, startE2EE } from './e2ee';
 
 // jsdom cannot fetch the module by URL; load it from disk instead.
 vi.mock('../crypto/index', async (importOriginal) => {
@@ -69,5 +69,27 @@ describe('the signed-in device', () => {
     await vi.waitFor(() => expect(deleted).toEqual([old.deviceId]));
     expect(fresh.deviceId).not.toBe(old.deviceId);
     expect(localStorage.getItem('kymessages-e2ee-retire')).toBeNull();
+  });
+
+  it('reports whether sign-out removed the device from the server', async () => {
+    let deleteStatus = 500;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/v1/keys/upload') {
+        const req = JSON.parse(String(init?.body)) as { one_time_keys: unknown[] };
+        return json({ one_time_key_count: req.one_time_keys.length });
+      }
+      if (url.startsWith('/api/v1/keys/devices/') && init?.method === 'DELETE') {
+        return deleteStatus === 204 ? new Response(null, { status: 204 }) : json({ error: 'x' }, deleteStatus);
+      }
+      if (url.startsWith('/api/v1/to-device')) return json({ messages: [] });
+      return json({ error: `unexpected ${url}` }, 404);
+    }));
+    await startE2EE('u_alice');
+    expect(await retireDevice()).toBe(false); // a 5xx: the device is still listed
+    deleteStatus = 404;
+    expect(await retireDevice()).toBe(true); // already gone
+    deleteStatus = 204;
+    expect(await retireDevice()).toBe(true);
   });
 });
