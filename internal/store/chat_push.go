@@ -85,10 +85,14 @@ func (c *chatStore) UpsertPushSubscription(ctx context.Context, sessionHash stri
 		return nil, ErrNotFound
 	}
 
+	var sid string
+	if err := tx.QueryRowContext(ctx, c.store.rebind("SELECT sso_sid FROM sessions WHERE token_hash = ?"), sessionHash).Scan(&sid); err != nil {
+		return nil, err
+	}
 	var existingID, existingTenant, existingUser, existingP256DH, existingAuth string
 	var existingUsed int64
 	lookup := `
-		SELECT id, tenant_id, user_id, p256dh, auth_secret, last_used_at
+        SELECT id, tenant_id, user_id, p256dh, auth_secret, last_used_at
 		FROM push_subscriptions
 		WHERE endpoint = ?
 	`
@@ -116,9 +120,9 @@ func (c *chatStore) UpsertPushSubscription(ctx context.Context, sessionHash stri
 		out.LastUsedAt = existingUsed
 		if _, err := tx.ExecContext(ctx, c.store.rebind(`
 			UPDATE push_subscriptions
-			SET p256dh = ?, auth_secret = ?, user_agent = ?, created_at = ?
+			SET p256dh = ?, auth_secret = ?, user_agent = ?, created_at = ?, sso_sid = ?
 			WHERE id = ?
-		`), out.P256DH, out.AuthSecret, out.UserAgent, out.CreatedAt, out.ID); err != nil {
+		`), out.P256DH, out.AuthSecret, out.UserAgent, out.CreatedAt, sid, out.ID); err != nil {
 			return nil, err
 		}
 	case err == nil || errors.Is(err, sql.ErrNoRows):
@@ -140,9 +144,9 @@ func (c *chatStore) UpsertPushSubscription(ctx context.Context, sessionHash stri
 		out.LastUsedAt = 0
 		if _, err := tx.ExecContext(ctx, c.store.rebind(`
 			INSERT INTO push_subscriptions
-				(id, tenant_id, user_id, endpoint, p256dh, auth_secret, user_agent, created_at, last_used_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
-		`), out.ID, out.TenantID, out.UserID, out.Endpoint, out.P256DH, out.AuthSecret, out.UserAgent, out.CreatedAt); err != nil {
+				(id, tenant_id, user_id, endpoint, p256dh, auth_secret, user_agent, created_at, last_used_at, sso_sid)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+		`), out.ID, out.TenantID, out.UserID, out.Endpoint, out.P256DH, out.AuthSecret, out.UserAgent, out.CreatedAt, sid); err != nil {
 			return nil, err
 		}
 	default:

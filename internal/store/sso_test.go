@@ -175,3 +175,82 @@ func TestSSOSIDLogoutCoversUnboundSessionsOnlyForSubjectAndOrg(t *testing.T) {
 		t.Fatal("subject logout retained legacy push", err)
 	}
 }
+
+func TestSSOSIDLogoutRemovesOnlyItsPushRecipients(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	u := &store.User{ID: "sid-push", Username: "sid-push", SSOProvider: "kyidentity", SSOSubject: "sid-push", Role: "user", Status: "active"}
+	if err := st.Users().CreateUser(ctx, u); err != nil {
+		t.Fatal(err)
+	}
+	room := &store.Room{Kind: store.RoomKindChannel, Name: "push-sids", CreatedBy: u.ID}
+	if err := st.Chat().CreateRoom(ctx, room, []string{u.ID}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for _, sid := range []string{"sid-a", "sid-b"} {
+		if err := st.Sessions().CreateSession(ctx, &store.Session{SSOSession: store.SSOSession{SID: sid, IssuedAt: now.Unix()}, TokenHash: sid, UserID: u.ID, CreatedAt: now, ExpiresAt: now.Add(time.Hour)}, ""); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.Chat().UpsertPushSubscription(ctx, sid, &store.PushSubscription{TenantID: store.DefaultTenantID, UserID: u.ID, Endpoint: "https://push.example/" + sid, P256DH: "key", AuthSecret: "secret"}, 20); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := st.Sessions().ApplySSOLogout(ctx, "https://identity.example", u.SSOSubject, "", "sid-a", "push-logout", now.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	subs, err := st.Chat().ListPushRecipients(ctx, store.DefaultTenantID, room.ID, []string{u.ID})
+	if err != nil || len(subs) != 1 || subs[0].Endpoint != "https://push.example/sid-b" {
+		t.Fatalf("push recipients after sid logout: %+v (%v)", subs, err)
+	}
+}
+
+func TestSSOPushRegistrationSerializesWithSIDLogout(t *testing.T) {
+	ctx := context.Background()
+	cfg := testdb.Config(t)
+	first, err := store.Open(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := store.Open(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	u := &store.User{ID: "push-race", Username: "push-race", SSOProvider: "kyidentity", SSOSubject: "push-race", Role: "user", Status: "active"}
+	if err := first.Users().CreateUser(ctx, u); err != nil {
+		t.Fatal(err)
+	}
+	for _, sid := range []string{"race-1", "race-2", "race-3", "race-4", "race-5"} {
+		now := time.Now().UTC()
+		if err := first.Sessions().CreateSession(ctx, &store.Session{SSOSession: store.SSOSession{SID: sid, IssuedAt: now.Unix()}, TokenHash: sid, UserID: u.ID, CreatedAt: now, ExpiresAt: now.Add(time.Hour)}, ""); err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		var registerErr, logoutErr error
+		start := make(chan struct{})
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, registerErr = first.Chat().UpsertPushSubscription(ctx, sid, &store.PushSubscription{TenantID: store.DefaultTenantID, UserID: u.ID, Endpoint: "https://push.example/" + sid, P256DH: "key", AuthSecret: "secret"}, 20)
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			_, _, logoutErr = second.Sessions().ApplySSOLogout(ctx, "https://identity.example", u.SSOSubject, "", sid, sid, now.Unix())
+		}()
+		close(start)
+		wg.Wait()
+		if logoutErr != nil {
+			t.Fatal(logoutErr)
+		}
+		if registerErr != nil && !errors.Is(registerErr, store.ErrNotFound) {
+			t.Fatal(registerErr)
+		}
+		if subs, err := first.Chat().ListPushSubscriptions(ctx, store.DefaultTenantID, u.ID); err != nil || len(subs) != 0 {
+			t.Fatalf("registration retained after sid logout: %+v (%v)", subs, err)
+		}
+	}
+}

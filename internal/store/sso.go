@@ -44,6 +44,16 @@ func recordSSOFence(ctx context.Context, st *SQLStore, tx *sql.Tx, userID, sid s
 	return err
 }
 
+// Reset revisions have their own replay set; profile revisions cannot supersede them.
+func recordMFAReset(ctx context.Context, st *SQLStore, tx *sql.Tx, provider, subject, key string) (bool, error) {
+	res, err := tx.ExecContext(ctx, st.rebind(`INSERT INTO directory_mfa_resets (provider, subject, reset_key) VALUES (?, ?, ?) ON CONFLICT (provider, subject, reset_key) DO NOTHING`), provider, subject, key)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
 // revokeSSOGrants runs inside the directory revision transaction, including its fence.
 func revokeSSOGrants(ctx context.Context, st *SQLStore, tx *sql.Tx, userID string) error {
 	if _, err := tx.ExecContext(ctx, st.rebind("UPDATE users SET password_hash = ? WHERE id = ?"), "revoked:"+rand.Text(), userID); err != nil {
@@ -121,6 +131,13 @@ func (s *sessionStore) ApplySSOLogout(ctx context.Context, issuer, subject, orgI
 	}
 	if sid != "" {
 		if _, err := tx.ExecContext(ctx, s.store.rebind("DELETE FROM device_pairings WHERE user_id = ? AND sso_sid = ?"), userID, sid); err != nil {
+			return "", nil, err
+		}
+	}
+	if sid != "" {
+		// Delete after sessions: registration locks its session through commit, so a
+		// concurrent registration is either refused or included in this sweep.
+		if _, err := tx.ExecContext(ctx, s.store.rebind("DELETE FROM push_subscriptions WHERE user_id = ? AND sso_sid = ?"), userID, sid); err != nil {
 			return "", nil, err
 		}
 	}

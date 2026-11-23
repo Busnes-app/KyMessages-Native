@@ -79,13 +79,15 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
 
 **Sign-in, tenancy & offboarding.**
 - KyIdentity back-channel logout (`POST /api/sso/kyidentity/logout`) ends one IdP session
-  and its paired-device sessions by `sid`, or all of a subject's sessions when `sid` is omitted.
+  and its paired-device sessions and bound notification registrations by `sid`, or all of a
+  subject's sessions when `sid` is omitted.
   Shared replay records and issuance fences work across replicas. Configure this URI on the
   OAuth client. Existing sessions, pairings and notification registrations stay on upgrade.
   Legacy sessions have no IdP sid: a sid logout also ends every unbound session for its verified
   subject and org. New suite sign-ins require and retain the IdP sid.
 - Signed `user.mfa_reset` revokes sessions, MFA challenges, device pairings and push
-  subscriptions even when role/status are unchanged. Reset, deletion and installer-managed
+  subscriptions even when role/status are unchanged or a newer profile event arrived first.
+  Reset replay is tracked independently so a duplicate preserves subsequent sign-ins. Reset, deletion and installer-managed
   directory events compare the account's org binding before acting.
 - Primary sign-in via KyIdentity OIDC (`KY_KYIDENTITY_*`) with PKCE and step-up freshness checks
   for privileged console actions.

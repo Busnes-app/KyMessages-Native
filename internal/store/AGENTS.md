@@ -11,7 +11,8 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
 - Migration 50 adds IdP sid/issuance/generation to sessions and device pairings, permanent
   `sso_logout_events` replay IDs and `sso_revocations` fences. Preserve existing sessions,
   pairings and push subscriptions on upgrade; the new binding columns default to unbound.
-  Changing this upgrade policy requires owner approval.
+  Changing this upgrade policy requires owner approval. Push registrations retain the verified
+  originating session's sid; a sid logout removes matching bound registrations atomically.
 - `SSOGeneration` reads the primary before code exchange. `ApplySSOLogout` locks the matching
   subject/org account, spends the issuer/jti, records the scope's fence and revokes matching
   sessions/pairings in one transaction. A sid targets that IdP session plus every unbound
@@ -19,8 +20,10 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   remain until subject logout/MFA reset, but cannot mint a session past a sid fence.
   A subject logout revokes every grant and push subscription. Issuance holds the same user row through its
   fence check. The shared generation orders in-flight callbacks independently of pod clocks.
-- `ResetDirectoryMFA` commits the directory revision with a new credential snapshot, a subject
-  fence and grant/push deletion. `ApplyInstallerDirectory` requires the narrowed org_id and
+- `ResetDirectoryMFA` spends each unseen reset independently of profile revision ordering,
+  with a new credential snapshot, subject fence and grant/push deletion. `directory_mfa_resets`
+  deduplicates reset revisions separately (restore -1 uses the event ID). Managed MFA resets
+  share this ledger and do not rewrite a profile or advance its revision. `ApplyInstallerDirectory` requires the narrowed org_id and
   compares it even on a duplicate before changing authority or accepting the event.
 
 - `AuditStore.ListAuditRecords(offset, limit, prefixes...)` pages newest first by `id`; prefixes match the

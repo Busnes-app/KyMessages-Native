@@ -56,6 +56,8 @@ func TestDirectoryResetAndDeleteOrgBinding(t *testing.T) {
 			t.Fatal("wrong org deleted user")
 		}
 	}
+	// A newer ordinary profile delivery must not consume an unseen reset.
+	d.must("user.updated", body(org, 3))
 	called := 0
 	d.client.OnUserRevoked(func(context.Context, string) { called++ })
 	d.must("user.mfa_reset", body(org, 2))
@@ -93,7 +95,7 @@ func TestDirectoryResetAndDeleteOrgBinding(t *testing.T) {
 	if _, err := d.st.Sessions().GetSession(ctx, "fresh"); err != nil {
 		t.Fatal("duplicate reset revoked new session", err)
 	}
-	d.must("user.deleted", body(org, 3))
+	d.must("user.deleted", body(org, 4))
 	if d.user("reset-sub") != nil {
 		t.Fatal("correct-org deletion failed")
 	}

@@ -10,8 +10,9 @@ Owns the application adapters around KyIdentity OAuth/OIDC login and the HMAC-SH
 - `VerifyLogout` accepts only RS256 `logout+jwt` for the configured issuer/client, with a
   two-minute iat/exp window, jti, subject, back-channel event and no nonce/token_use.
   Multi mode requires a canonical org_id; the database compares it with the subject's account.
-- `user.mfa_reset` uses `ResetDirectoryMFA`: ordered event, credential fence and all grant/push
-  deletion commit together without a profile upsert. Both reset and deletion compare the
+- `user.mfa_reset` uses `ResetDirectoryMFA`: independent reset replay record, credential fence
+  and all grant/push deletion commit together without a profile upsert. Newer profile events
+  cannot suppress an unseen reset; duplicate reset delivery preserves a later sign-in. Both reset and deletion compare the
   account's org_id before writing. Managed directory events apply the same binding check.
 
 - `KyIdentityClient.HandleSyncWebhook` implements KyIdentity's suite-webhook contract: a bare SCIM 2.0 User body verified with `ky-primitives/syncauth` (event type and ID are signed headers, ±5 minutes) before any local change. Events: `user.created`, `user.updated` (`active:false` deactivates), `user.mfa_reset` and `user.deleted`; others are ignored with success. The SCIM `id` is the OIDC `sub`. A primary role of `admin` maps to admin, anything else to user. Unauthenticated is 401, a body without `id` or `meta.version` is 400.
@@ -28,7 +29,7 @@ Owns the application adapters around KyIdentity OAuth/OIDC login and the HMAC-SH
   step-up; the callback time never stands in for it. `BuildAuthURL(..., fresh)` adds
   `prompt=login` and `max_age=0`.
 - Every IdP call (discovery, keys, code exchange) uses a client with `idpTimeout` (10 s) unless the caller's context carries one (`oidc.ClientContext`, tests); discovery also runs under that deadline, so a hung IdP cannot queue sign-ins behind the flow's discovery mutex (`TestDiscoveryAgainstAHungIdPTimesOut`).
-- Directory events are ordered by KyIdentity's per-user revision (`meta.version` `W/"n"`), never by timestamp or arrival. Updates apply one at a time and only through `ApplyDirectoryProfile`/`CreateDirectoryUser`/`DeleteDirectoryUser`, which apply only a revision newer than the subject's persisted one; equal or older revisions (outbox retries, delayed deliveries) succeed without effect, across restarts and after deletion. Deletions of subjects with no local account still record their revision. `-1` is KyIdentity's post-restore resend and resets the order. Because a reset lowers the stored revision, every delivered event ID is also spent permanently in `directory_sync_events`, applied or refused, atomically with the write; a redelivered event is acknowledged without effect even across a reset. Status or role changes revoke the user's sessions.
+- Profile and deletion events are ordered by KyIdentity's per-user revision (`meta.version` `W/"n"`), never by timestamp or arrival. Updates apply one at a time and only through `ApplyDirectoryProfile`/`CreateDirectoryUser`/`DeleteDirectoryUser`, which apply only a revision newer than the subject's persisted one; equal or older revisions (outbox retries, delayed deliveries) succeed without effect, across restarts and after deletion. Deletions of subjects with no local account still record their revision. `-1` is KyIdentity's post-restore resend and resets the order. Because a reset lowers the stored revision, every delivered event ID is also spent permanently in `directory_sync_events`, applied or refused, atomically with the write; a redelivered event is acknowledged without effect even across a reset. Status or role changes revoke the user's sessions.
 
 - Managed setup requires verified issuer/sub ownership and reads the client credential
   from its protected reference per flow. Native global roles, email and usernames do not

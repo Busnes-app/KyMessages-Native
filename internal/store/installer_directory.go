@@ -69,6 +69,22 @@ func (s *SQLStore) ApplyInstallerDirectory(ctx context.Context, issuer, subject,
 	if storedOrg != orgID {
 		return "", ErrForbidden
 	}
+	if event == "user.mfa_reset" {
+		fresh, err := recordMFAReset(ctx, s, tx, "kyidentity", subject, "revision:"+version)
+		if err != nil || !fresh {
+			return "", err
+		}
+		if err := revokeSSOGrants(ctx, s, tx, owned.UserID); err != nil {
+			return "", err
+		}
+		if _, err := tx.ExecContext(ctx, s.rebind("INSERT INTO audit_records(user_id,action,resource,details,ip_address,created_at) VALUES(?,?,?,?,?,?)"), owned.UserID, "installer.directory_applied", subject, version, "kyidentity", time.Now().UTC()); err != nil {
+			return "", err
+		}
+		if err := tx.Commit(); err != nil {
+			return "", err
+		}
+		return owned.UserID, nil
+	}
 	stateKey := "installer.directory." + hex.EncodeToString(hash[:])
 	var prior string
 	err = tx.QueryRowContext(ctx, s.rebind("SELECT value FROM server_settings WHERE key=?"), stateKey).Scan(&prior)

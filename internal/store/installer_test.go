@@ -164,6 +164,9 @@ func TestInstallerMFAResetFencesInFlightPairing(t *testing.T) {
 	if err = st.Devices().ConsumePairing(ctx, "in-flight", "phone", "android", ""); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := st.ApplyInstallerDirectory(ctx, b.SSO.IssuerURL, "daily", "user.updated", "2", "profile-newer", true, false, ""); err != nil {
+		t.Fatal(err)
+	}
 	if revoked, err := st.ApplyInstallerDirectory(ctx, b.SSO.IssuerURL, "daily", "user.mfa_reset", "1", "reset", true, false, ""); err != nil || revoked != u.ID {
 		t.Fatalf("MFA reset revoked %q, want %q: %v", revoked, u.ID, err)
 	}

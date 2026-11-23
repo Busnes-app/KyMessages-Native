@@ -400,12 +400,43 @@ func (u *userStore) ApplyDirectoryProfile(ctx context.Context, user *User, ev Di
 	})
 }
 
-// ResetDirectoryMFA spends the ordered event and revokes grants without rewriting a profile
-// read before a concurrent directory update on another replica.
+// ResetDirectoryMFA deduplicates resets independently of profile ordering. An unseen reset
+// still revokes grants after a newer profile delivery, without rewriting that profile.
 func (u *userStore) ResetDirectoryMFA(ctx context.Context, user *User, ev DirectoryEvent) (bool, error) {
-	return u.directoryWrite(ctx, user, ev, func(tx *sql.Tx) error {
-		return revokeSSOGrants(ctx, u.store, tx, user.ID)
-	})
+	tx, err := u.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var managed int
+	if err := tx.QueryRowContext(ctx, u.store.rebind("SELECT COUNT(*) FROM server_settings z WHERE z.key LIKE 'installer.user.%' AND 'usr_' || substr(z.key,16,24) = ?"), user.ID).Scan(&managed); err != nil {
+		return false, err
+	}
+	if managed != 0 {
+		return false, errors.New("managed directory requires installer authority")
+	}
+	res, err := tx.ExecContext(ctx, u.store.rebind(`INSERT INTO directory_sync_events (provider, event_id) VALUES (?, ?) ON CONFLICT (provider, event_id) DO NOTHING`), user.SSOProvider, ev.ID)
+	if err != nil {
+		return false, err
+	}
+	if n, err := res.RowsAffected(); err != nil || n == 0 {
+		return false, err
+	}
+	key := fmt.Sprintf("revision:%d", ev.Revision)
+	if ev.Revision == -1 {
+		key = "restore:" + ev.ID
+	}
+	fresh, err := recordMFAReset(ctx, u.store, tx, user.SSOProvider, user.SSOSubject, key)
+	if err != nil {
+		return false, err
+	}
+	if !fresh {
+		return false, tx.Commit()
+	}
+	if err := revokeSSOGrants(ctx, u.store, tx, user.ID); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
 }
 
 func (u *userStore) CreateDirectoryUser(ctx context.Context, user *User, ev DirectoryEvent) (bool, error) {
