@@ -21,7 +21,7 @@ import './ky-ui/navigation.css';
 import { errorMessage, secureFetch } from './api';
 import { browserPushEndpoint, unsubscribeBrowserPush } from './chat/push';
 import { announceSignOut, forgetSearchIndex, onSignOutElsewhere } from './chat/searchIndex';
-import { abandonDevice, forgetCryptoStore, replaceDevice, retireDevice } from './chat/e2ee';
+import { abandonDevice, forgetCryptoStore, retireDevice } from './chat/e2ee';
 import { parseSettings, parseUser, type SessionUser, type SiteSettings } from './dto';
 import { ErrorBoundary } from './components/ErrorBoundary';
 
@@ -124,13 +124,14 @@ export const App: React.FC = () => {
   // Only a confirmed sign-out leaves the console; otherwise the session may still be live.
   const handleLogout = async () => {
     setError('');
-    let retired = false;
+    let retirement: ReturnType<typeof retireDevice> | undefined;
     try {
       // The server drops this browser's push subscription with the session, so a refused
       // sign-out leaves notifications as they were.
       const pushEndpoint = await browserPushEndpoint();
       // The device's keys go before the session does; its local store goes either way below.
-      retired = await retireDevice();
+      retirement = retireDevice();
+      const retired = await retirement.wait;
       const res = await secureFetch('/api/auth/logout', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -145,7 +146,7 @@ export const App: React.FC = () => {
     } catch (err) {
       // Still signed in, but the old device is gone from the server: start a new one. (If the
       // delete failed, the device and its store are still intact and stay in use.)
-      if (retired) void replaceDevice().catch(() => undefined);
+      void retirement?.replaceIfRetired().catch(() => undefined);
       setError(`You are still signed in: ${err instanceof Error ? err.message : 'sign-out failed'}`);
     }
   };

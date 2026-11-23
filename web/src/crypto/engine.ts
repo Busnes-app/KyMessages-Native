@@ -676,8 +676,8 @@ export class CryptoEngine {
     } finally {
       // Keys already stored are announced even if a later ack or mailbox read fails: a retry
       // would find them known and announce nothing, leaving waiting messages stuck.
-      if (usedOneTimeKey) await this.publishKeys().catch(() => undefined);
       if (fresh.length > 0) for (const fn of this.listeners) fn(fresh);
+      if (usedOneTimeKey) await this.publishKeys().catch(() => undefined);
     }
     return fresh;
   }

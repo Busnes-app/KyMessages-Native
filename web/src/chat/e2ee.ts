@@ -273,11 +273,13 @@ export const RETIRE_MS = 5000;
  * Removes this browser's device from the key server, for sign-out: members stop sending it keys
  * and rotate their sessions. Call it while the session is still valid; it answers whether the
  * server no longer lists the device. When it does not, use abandonDevice so a later sign-in retires it.
- * It gives up after RETIRE_MS (a start-up or request stuck on the network), so sign-out never waits on it.
+ * `wait` gives up after RETIRE_MS, so sign-out never waits on a stuck start-up or request.
+ * On a refused logout, `replaceIfRetired` follows the eventual result, including a late deletion.
  */
-export function retireDevice(): Promise<boolean> {
+export function retireDevice() {
+  const entry = current;
   const attempt = (async () => {
-    const e = await current?.engine.catch(() => undefined);
+    const e = await entry?.engine.catch(() => undefined);
     if (!e) return false;
     try {
       await call(`/api/v1/keys/devices/${encodeURIComponent(e.deviceId)}`, 'DELETE');
@@ -286,7 +288,13 @@ export function retireDevice(): Promise<boolean> {
       return err instanceof KeyServerError && err.status === 404;
     }
   })();
-  return Promise.race([attempt, new Promise<boolean>((r) => setTimeout(r, RETIRE_MS, false))]);
+  return {
+    wait: Promise.race([attempt, new Promise<boolean>((r) => setTimeout(r, RETIRE_MS, false))]),
+    async replaceIfRetired(): Promise<void> {
+      // Never reset a different device after another sign-out, sign-in or revocation.
+      if (await attempt && entry && current === entry) await replaceDevice();
+    },
+  };
 }
 
 // Devices abandoned when a session was revoked: the server no longer accepts that session, so

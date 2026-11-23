@@ -265,6 +265,35 @@ describe('encrypted rooms between two client engines', () => {
     expect(await read(bob, m1)).toBe('still delivered');
   });
 
+  it('announces stored room keys before a stalled replenishment upload finishes', async () => {
+    const server = new FakeKeyServer();
+    const alice = await device(server, 'u_alice');
+    const bobServer = server.as('u_bob');
+    const bob = await CryptoEngine.open('u_bob', bobServer, await openCryptoStore('u_bob'));
+    opened.push(bob);
+    server.join('r1', 'u_alice', 'u_bob');
+    const message = await send('r1', alice, 'read while upload stalls');
+    const arrived = vi.fn();
+    bob.onKeys(arrived);
+    let release = () => {};
+    const stalled = new Promise<void>((resolve) => { release = resolve; });
+    const upload = bobServer.upload;
+    const uploading = vi.fn(async (...args: Parameters<typeof upload>) => {
+      await stalled;
+      return upload(...args);
+    });
+    bobServer.upload = uploading;
+    const receiving = bob.receive();
+    try {
+      await vi.waitFor(() => expect(uploading).toHaveBeenCalled());
+      expect(arrived).toHaveBeenCalledWith([parseEnvelope(message.body)!.session_id]);
+      expect(await read(bob, message)).toBe('read while upload stalls');
+    } finally {
+      release();
+      await receiving;
+    }
+  });
+
   it('announces stored room keys even when acknowledging the mail fails', async () => {
     const server = new FakeKeyServer();
     const alice = await device(server, 'u_alice');

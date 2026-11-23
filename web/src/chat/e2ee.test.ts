@@ -162,7 +162,7 @@ describe('the signed-in device', () => {
     void startE2EE('u_alice').catch(() => undefined);
     vi.useFakeTimers({ toFake: ['setTimeout'] });
     try {
-      const retiring = retireDevice();
+      const retiring = retireDevice().wait;
       await vi.advanceTimersByTimeAsync(RETIRE_MS);
       expect(await retiring).toBe(false);
     } finally {
@@ -244,11 +244,72 @@ describe('the signed-in device', () => {
       return json({ error: `unexpected ${url}` }, 404);
     }));
     await startE2EE('u_alice');
-    expect(await retireDevice()).toBe(false); // a 5xx: the device is still listed
+    expect(await retireDevice().wait).toBe(false); // a 5xx: the device is still listed
     deleteStatus = 404;
-    expect(await retireDevice()).toBe(true); // already gone
+    expect(await retireDevice().wait).toBe(true); // already gone
     deleteStatus = 204;
-    expect(await retireDevice()).toBe(true);
+    expect(await retireDevice().wait).toBe(true);
+  });
+
+  it.each(['before', 'after'])('replaces a late-retired device when logout fails %s deletion completes, preserving history', async (order) => {
+    let finishDelete: (r: Response) => void = () => {};
+    const deletion = new Promise<Response>((resolve) => { finishDelete = resolve; });
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/v1/keys/upload') {
+        const req = JSON.parse(String(init?.body)) as { one_time_keys: unknown[] };
+        return json({ one_time_key_count: req.one_time_keys.length });
+      }
+      if (url.startsWith('/api/v1/keys/devices/') && init?.method === 'DELETE') return deletion;
+      return json({ messages: [] });
+    }));
+    const old = await startE2EE('u_alice');
+    const store = await openCryptoStore('u_alice');
+    await store.write([['in:sender:session', { kept: true }], ['seen:sender:session:0', 'm1'], ['pin:peer', 'key']]);
+    store.close();
+    vi.useFakeTimers({ toFake: ['setTimeout'] });
+    const retiring = retireDevice();
+    try {
+      await vi.advanceTimersByTimeAsync(RETIRE_MS);
+      expect(await retiring.wait).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+    // App calls this on refused logout, whether deletion is still pending or already finished.
+    if (order === 'after') {
+      finishDelete(new Response(null, { status: 204 }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    const repairing = retiring.replaceIfRetired();
+    finishDelete(new Response(null, { status: 204 }));
+    await repairing;
+    expect((await startE2EE('u_alice')).deviceId).not.toBe(old.deviceId);
+    const after = await openCryptoStore('u_alice');
+    try {
+      expect(await after.get('in:sender:session')).toEqual({ kept: true });
+      expect(await after.get('seen:sender:session:0')).toBe('m1');
+      expect(await after.get('pin:peer')).toBe('key');
+    } finally {
+      after.close();
+    }
+  });
+
+  it('does not recreate keys when a pending retirement finishes after session revocation', async () => {
+    let finishDelete: (r: Response) => void = () => {};
+    const deletion = new Promise<Response>((resolve) => { finishDelete = resolve; });
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/v1/keys/upload') return json({ one_time_key_count: 50 });
+      if (url.startsWith('/api/v1/keys/devices/') && init?.method === 'DELETE') return deletion;
+      return json({ messages: [] });
+    }));
+    await startE2EE('u_alice');
+    const retiring = retireDevice();
+    const repairing = retiring.replaceIfRetired(); // refused logout, deletion still pending
+    await abandonDevice(); // session revoked before that deletion finishes
+    finishDelete(new Response(null, { status: 204 }));
+    await repairing;
+    expect((await indexedDB.databases()).filter((d) => d.name?.startsWith('kymessages-crypto-'))).toEqual([]);
   });
 
   it('keeps received room keys when it replaces a retired device after a refused sign-out', async () => {
