@@ -239,6 +239,12 @@ func LoadFromEnv() (*Config, error) {
 	}
 }
 
+// LoadForMaintenance reads deployment configuration for offline grant invalidation only.
+// Server startup must use LoadFromEnv, which retains the multi-tenant release gate.
+func LoadForMaintenance() (*Config, error) {
+	return loadFromEnv(strings.ToLower(getEnv("KY_TENANCY_MODE", TenancySingle)))
+}
+
 func loadFromEnv(tenancyMode string) (*Config, error) {
 	if err := rejectLegacyEnvironment(); err != nil {
 		return nil, err

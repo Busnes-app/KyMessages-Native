@@ -503,3 +503,24 @@ func TestTenancyModeFromEnv(t *testing.T) {
 		}
 	})
 }
+
+func TestMaintenanceLoaderKeepsServerGate(t *testing.T) {
+	t.Setenv("KY_DATA_DIR", t.TempDir())
+	t.Setenv("KY_TENANCY_MODE", "multi")
+	t.Setenv("KY_DB_DRIVER", "postgres")
+	t.Setenv("KY_DB_DSN", "postgres://unused/maintenance")
+	t.Setenv("KY_STAFF_ORG_ID", "00000000-0000-4000-8000-000000000001")
+	t.Setenv("KY_SESSION_SECRET", "maintenance-session-secret-0123456789")
+	t.Setenv("KY_ENCRYPTION_KEY", strings.Repeat("ab", 32))
+	t.Setenv("KY_PUSH_ENABLED", "false")
+	if cfg, err := config.LoadForMaintenance(); err != nil || !cfg.Tenancy.IsMultiTenant() {
+		t.Fatalf("offline multi config: %+v %v", cfg, err)
+	}
+	if _, err := config.LoadFromEnv(); err == nil || !strings.Contains(err.Error(), "unavailable in this release") {
+		t.Fatalf("server gate lost: %v", err)
+	}
+	t.Setenv("KY_TENANCY_MODE", "invalid")
+	if _, err := config.LoadForMaintenance(); err == nil {
+		t.Fatal("maintenance accepted invalid tenancy mode")
+	}
+}

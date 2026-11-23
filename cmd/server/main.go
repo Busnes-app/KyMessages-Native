@@ -432,7 +432,7 @@ func runInvalidateGrants(args []string) {
 		fmt.Fprintln(os.Stderr, "Usage: kymessages invalidate-grants (with every replica stopped)")
 		os.Exit(2)
 	}
-	cfg, err := config.LoadFromEnv()
+	cfg, err := config.LoadForMaintenance()
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}

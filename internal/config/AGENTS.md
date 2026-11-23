@@ -40,6 +40,8 @@ Owns environment variable parsing, configuration validation, default fallbacks, 
   automatic provisioning and unsupported recovery pairing are refused before writes.
   Restart applies committed config through the existing graceful shutdown/drain path.
 
+- `LoadForMaintenance` is the offline `invalidate-grants` loader: it validates the full deployment configuration while accepting multi mode. Server startup exclusively uses the gated `LoadFromEnv`.
+
 ## Verification
 - `go test -v ./internal/config/...`
 - `go test -v ./internal/auth/ -run TestClientIP` (the helper that consumes the allowlist)
