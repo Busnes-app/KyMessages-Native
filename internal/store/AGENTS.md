@@ -112,6 +112,24 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   check the org's usage plus the new bytes against the unexpired ceiling under the tenant lock:
   `ErrPoolFull`, or `ErrPoolUnavailable` with no grant or an expired one. Single mode never sets
   `Pool` and never reads the columns.
+- `ErasureBlobs` and `EraseUser` (`erase.go`, multi mode `user.erased`) delete one person's data:
+  account (sessions, MFA, presence and push cascade), pairings, reservations, reactions,
+  memberships, owned bots and their content/accounts, staged and posted attachments, and every DM whose
+  other members are all gone; their messages elsewhere become tombstones (`body`, `sender_name`
+  emptied, `deleted_at` set, row kept). The caller first runs `DeactivateForErasure` (status
+  `deleted`) and drops every grant, deletes the blobs `ErasureBlobs` lists, then `EraseUser`
+  removes the rows and returns the blobs of attachment rows it deleted (an upload that committed
+  meanwhile) for the caller to delete; it queues them in `pending_blob_deletes` in the same
+  transaction, so a delete that fails after commit is retried (`PendingBlobDeletes`,
+  `ClearPendingBlobDeletes`; the multi-mode attachment sweep drains the queue). Both are idempotent and need no account row. The completion audit
+  `sso.user_erased` names only `user:<id>` and commits once after all queued cleanup succeeds.
+- `user_erasure_actors` retains the human and owned bot IDs before deactivation. Every actor's messages, memberships and attachments join the same durable workflow, with pending blob deletes attributed to the human owner and one completion audit. Actor IDs outlive removed agent/account rows so retries remain complete. `DeleteAgent` records the exact owner-to-bot association in that table atomically before ordinary registry removal, using the live owner or retained `user_subjects` mapping; a later erasure therefore includes previously removed bots. No ownership is inferred from usernames or audit text.
+- Migration 60 (`erasure_state`) adds `pending_blob_deletes` and `user_subjects (provider, subject, user_id, org_id)`: `DeleteDirectoryUser`
+  and `EraseUser` record an org-bound account's mapping before its row goes, so an erasure after
+  `user.deleted`, a repeat, or a recreation under a new ID still finds every account the person had (`ErasureTargets`; the key is provider, subject and user ID). Single-mode
+  accounts (no org) are never recorded.
+- `AttachmentQuotaLimits.ActiveUploader` (multi mode) makes `CommitAttachmentWithQuota` refuse
+  (`ErrForbidden`) an uploader whose account no longer serves.
 - `PurgeOrphanAttachments` returns `BlobRef`s (tenant and key), and `AttachmentTenant` returns a blob key's org, because the multi-mode blob layout needs each blob's org.
 - SQLite runs in WAL mode with foreign keys enabled.
 - PostgreSQL queries are rebound dynamically from standard positional parameters.
@@ -138,3 +156,4 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
 None.
 
 - Shared leave timers rearm while a disconnected guest keeps polling. The eventual database delete emits one departure and evicts the call seat; deterministic scheduler callbacks cover polling beyond the first timer and later inactivity.
+- `user_erasure_state` tracks pending and completed erasures. `ClearPendingBlobDeletes` commits each completion and its sole `sso.user_erased` audit together, only when all of that user's queued deletes are gone. Replays retain completion; retries read their queued keys through `ErasureBlobs`.

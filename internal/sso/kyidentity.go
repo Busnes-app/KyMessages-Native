@@ -38,6 +38,9 @@ type KyIdentityClient struct {
 	onUserRevoked func(ctx context.Context, userID string)
 	// onTenantRevoked fires when an org is suspended or deleted, before its members are revoked.
 	onTenantRevoked func(ctx context.Context, orgID string) error
+	// onUserErased deletes one person's data (user.erased, multi mode); its error fails the
+	// delivery so KyIdentity retries.
+	onUserErased func(ctx context.Context, user *store.User) error
 }
 
 func NewKyIdentityClient(cfg config.SSOConfig, st store.Store) *KyIdentityClient {
@@ -57,6 +60,11 @@ func (k *KyIdentityClient) SetTenancy(t config.TenancyConfig) {
 // OnTenantRevoked registers a callback invoked when an org is suspended or deleted.
 func (k *KyIdentityClient) OnTenantRevoked(fn func(ctx context.Context, orgID string) error) {
 	k.onTenantRevoked = fn
+}
+
+// OnUserErased registers what deletes a person's data on user.erased (multi mode).
+func (k *KyIdentityClient) OnUserErased(fn func(ctx context.Context, user *store.User) error) {
+	k.onUserErased = fn
 }
 
 // OnUserRevoked registers a callback invoked immediately when directory sync revokes or deletes a user.
@@ -212,6 +220,8 @@ func (k *KyIdentityClient) applySyncWebhook(ctx context.Context, headers syncaut
 	switch event.Type {
 	case "org.suspended", "org.unsuspended", "org.resumed", "org.deleted":
 		return event.Type, k.applyOrgLifecycle(ctx, event.Type, body)
+	case "user.erased":
+		return event.Type, k.applyErasure(ctx, body)
 	}
 
 	var user DirectoryUser
@@ -272,6 +282,56 @@ func (k *KyIdentityClient) applySyncWebhook(ctx context.Context, headers syncaut
 		return event.Type, err
 	}
 	return event.Type, nil // other event types (groups) are not for this product
+}
+
+// applyErasure deletes the data of one person who used Delete everything (multi mode). The body
+// is the bare inactive SCIM user with org_id. A person this install never held, or holds in
+// another org, is acknowledged without effect; a repeat finds no one and is acknowledged too.
+// Single mode acknowledges it unchanged, as before.
+func (k *KyIdentityClient) applyErasure(ctx context.Context, body []byte) error {
+	if !k.tenancy.IsMultiTenant() {
+		return nil
+	}
+	var in struct {
+		ID    string `json:"id"`
+		OrgID string `json:"org_id"`
+	}
+	if err := json.Unmarshal(body, &in); err != nil || in.ID == "" || !config.IsCanonicalUUID(strings.TrimSpace(in.OrgID)) {
+		return ErrSyncMalformed
+	}
+	k.syncMu.Lock()
+	defer k.syncMu.Unlock()
+	// Every local account the subject ever had: the current row, and any whose row went
+	// (user.deleted first, a repeat, or a recreation under a new ID).
+	var targets []*store.User
+	user, err := k.store.Users().GetUserBySSO(ctx, "kyidentity", in.ID)
+	if err == nil {
+		targets = append(targets, user)
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	past, err := k.store.Chat().ErasureTargets(ctx, "kyidentity", in.ID)
+	if err != nil {
+		return err
+	}
+	for _, p := range past {
+		if user == nil || p.ID != user.ID {
+			targets = append(targets, p)
+		}
+	}
+	if k.onUserErased == nil && len(targets) > 0 {
+		return errors.New("sso: user.erased has no handler")
+	}
+	for _, t := range targets {
+		if t.OrgID != strings.TrimSpace(in.OrgID) {
+			k.auditOrgMismatch(ctx, in.ID, t.OrgID, in.OrgID)
+			continue
+		}
+		if err := k.onUserErased(ctx, t); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (k *KyIdentityClient) applyOrgLifecycle(ctx context.Context, eventType string, body []byte) error {

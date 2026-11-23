@@ -131,6 +131,25 @@ func (s *agentStore) TouchAgentLastUsed(ctx context.Context, id string, at time.
 func uniqueResult(res sql.Result, err error) (sql.Result, error) { return res, uniqueError(err) }
 
 func (s *agentStore) DeleteAgent(ctx context.Context, id string) error {
-	res, err := s.store.db.ExecContext(ctx, s.store.rebind(`DELETE FROM agents WHERE id = ?`), id)
-	return oneRow(res, err)
+	tx, err := s.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	// Ordinary removal keeps the bot account and its posted history. Retain the exact
+	// owner association before the registry row goes, including an offboarded owner's
+	// durable subject mapping. Org-less single-mode owners create no erasure state.
+	if _, err := tx.ExecContext(ctx, s.store.rebind(`INSERT INTO user_erasure_actors (owner_user_id, tenant_id, user_id)
+        SELECT a.owner_user_id, COALESCE(NULLIF(u.org_id, ''), p.org_id), a.user_id
+        FROM agents a LEFT JOIN users u ON u.id = a.owner_user_id
+        LEFT JOIN user_subjects p ON p.user_id = a.owner_user_id
+        WHERE a.id = ? AND COALESCE(NULLIF(u.org_id, ''), p.org_id, '') <> ''
+        ON CONFLICT DO NOTHING`), id); err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx, s.store.rebind(`DELETE FROM agents WHERE id = ?`), id)
+	if err := oneRow(res, err); err != nil {
+		return err
+	}
+	return tx.Commit()
 }

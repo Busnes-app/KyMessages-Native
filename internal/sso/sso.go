@@ -22,7 +22,9 @@ type IdentityClaims struct {
 	Name              string `json:"name"`
 	PreferredUsername string `json:"preferred_username"`
 	Role              string `json:"role,omitempty"`
-	Provider          string `json:"provider"` // "kyidentity"
+	// ExportOnly is KyIdentity's export_only claim, issued while an org is deletion_scheduled.
+	ExportOnly bool   `json:"-"`
+	Provider   string `json:"provider"` // "kyidentity"
 	// AuthenticatedAt is the signed auth_time, or zero when absent or implausible. The IdP
 	// may reuse an old login, so only this, never the callback time, says how fresh it is.
 	AuthenticatedAt time.Time `json:"-"`

@@ -286,7 +286,38 @@ ALTER TABLE mfa_challenges ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';`,
 	{Version: 58, Name: "meeting_guest_sessions", SQLite: guestSessionsSchema, Postgres: guestSessionsSchema},
 	// The org storage pool (multi mode): each org's report sequence and KyIdentity's latest grant.
 	{Version: 59, Name: "tenant_storage_pool", SQLite: tenantPoolSchema, Postgres: tenantPoolSchema},
+	// Erasure state: which local account a KyIdentity subject was, kept after the account row
+	// goes (so an erasure after user.deleted, or a repeat, still finds the data), and blob
+	// deletes an erasure committed but has not finished.
+	{Version: 60, Name: "erasure_state", SQLite: userSubjectsSchema, Postgres: userSubjectsSchema},
 }
+
+const userSubjectsSchema = `
+CREATE TABLE user_subjects (
+    provider VARCHAR(32) NOT NULL,
+    subject VARCHAR(255) NOT NULL,
+    user_id VARCHAR(64) NOT NULL,
+    org_id VARCHAR(64) NOT NULL,
+    PRIMARY KEY (provider, subject, user_id)
+);
+CREATE TABLE pending_blob_deletes (
+    user_id VARCHAR(64) NOT NULL DEFAULT '',
+    tenant_id VARCHAR(64) NOT NULL,
+    blob_key VARCHAR(512) NOT NULL,
+    PRIMARY KEY (tenant_id, blob_key)
+);
+CREATE TABLE user_erasure_state (
+    user_id VARCHAR(64) PRIMARY KEY,
+    tenant_id VARCHAR(64) NOT NULL,
+    completed_at BIGINT
+);
+CREATE TABLE user_erasure_actors (
+ owner_user_id VARCHAR(64) NOT NULL,
+ tenant_id VARCHAR(64) NOT NULL,
+ user_id VARCHAR(64) NOT NULL,
+ PRIMARY KEY (owner_user_id, tenant_id, user_id)
+);
+`
 
 const tenantPoolSchema = `
 ALTER TABLE tenants ADD COLUMN pool_seq BIGINT NOT NULL DEFAULT 0;

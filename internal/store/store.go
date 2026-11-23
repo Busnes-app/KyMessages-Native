@@ -394,6 +394,13 @@ type ChatStore interface {
 	SetPoolGrant(ctx context.Context, tenantID string, seq, reportedBytes, ceilingBytes, expiresAtMs int64) error
 	RecordStalePoolReport(ctx context.Context, tenantID string, sentSeq, heldSeq int64) error
 	RaisePoolSeq(ctx context.Context, tenantID string, seq int64) error
+	// Erasure of one person (multi mode, erase.go): blobs first, then rows.
+	ErasureBlobs(ctx context.Context, tenantID, userID string) ([]BlobRef, error)
+	ErasureTargets(ctx context.Context, provider, subject string) ([]*User, error)
+	DeactivateForErasure(ctx context.Context, tenantID, userID string) error
+	EraseUser(ctx context.Context, tenantID string, user *User) ([]BlobRef, error)
+	PendingBlobDeletes(ctx context.Context, limit int) ([]BlobRef, error)
+	ClearPendingBlobDeletes(ctx context.Context, refs []BlobRef) error
 	// AttachmentTenant returns the org of the attachment stored under blobKey.
 	AttachmentTenant(ctx context.Context, blobKey string) (string, error)
 
