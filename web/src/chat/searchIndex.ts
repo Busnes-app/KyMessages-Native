@@ -18,6 +18,8 @@ interface Entry {
   id: string;
   room_id: string;
   created_at: number;
+  // In the clear like created_at, so a stale copy can be told from a newer one without decrypting.
+  edited_at: number;
   iv: Uint8Array;
   ct: ArrayBuffer;
 }
@@ -135,7 +137,7 @@ export class SearchIndex {
       const plain: SearchHit = { id: m.id, room_id: m.room_id, seq: m.seq, sender_id: m.sender_id, sender_name: m.sender_name, body: m.body, created_at: m.created_at, edited_at: m.edited_at };
       const iv = crypto.getRandomValues(new Uint8Array(12));
       const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, this.key, new TextEncoder().encode(JSON.stringify(plain)));
-      keep.push({ id: m.id, room_id: m.room_id, created_at: m.created_at, iv, ct });
+      keep.push({ id: m.id, room_id: m.room_id, created_at: m.created_at, edited_at: m.edited_at ?? 0, iv, ct });
     }
     if (keep.length === 0 && drop.length === 0) return;
     this.live();
@@ -150,6 +152,28 @@ export class SearchIndex {
   /** Drops entries, for messages deleted or edited while their room was not loaded here. */
   remove(ids: string[]): Promise<void> {
     return ids.length === 0 ? Promise.resolve() : this.serial(() => this.drop(ids));
+  }
+
+  /**
+   * Drops the indexed copies hits came from, but only where the stored copy is still that
+   * version: a newer copy written meanwhile (an edit) stays.
+   */
+  removeStale(hits: SearchHit[]): Promise<void> {
+    if (hits.length === 0) return Promise.resolve();
+    return this.serial(async () => {
+      this.live();
+      const tx = this.db.transaction(STORE, 'readwrite');
+      const store = tx.objectStore(STORE);
+      for (const h of hits) {
+        const get = store.get(h.id);
+        get.onsuccess = () => {
+          const e = get.result as Entry | undefined;
+          // An entry from before edited_at was stored has no version to compare: drop it.
+          if (e && (e.edited_at === undefined || e.edited_at === (h.edited_at ?? 0))) store.delete(h.id);
+        };
+      }
+      await done(tx);
+    });
   }
 
   private async drop(ids: string[]): Promise<void> {
@@ -264,14 +288,14 @@ export interface MessageState {
 export async function freshHits(index: SearchIndex, hits: SearchHit[], states: (ids: string[]) => Promise<MessageState[]>): Promise<SearchHit[]> {
   if (hits.length === 0) return hits;
   const live = new Map((await states(hits.map((h) => h.id))).map((s) => [s.id, s]));
-  const stale: string[] = [];
+  const stale: SearchHit[] = [];
   const fresh = hits.filter((h) => {
     const s = live.get(h.id);
     const ok = !!s && !s.deleted && (s.edited_at || 0) === (h.edited_at || 0);
-    if (!ok) stale.push(h.id);
+    if (!ok) stale.push(h);
     return ok;
   });
-  await index.remove(stale).catch(() => undefined);
+  await index.removeStale(stale).catch(() => undefined);
   return fresh;
 }
 

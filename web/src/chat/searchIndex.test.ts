@@ -155,6 +155,17 @@ describe('on-device search index', () => {
     expect((await index.search('wording')).map((h) => h.body)).toEqual(['new wording']);
   });
 
+  it('keeps a newer copy written while the server was checking the old one', async () => {
+    const index = await searchIndexFor('u-alice');
+    await index.put([msg('x', 'r1', 'roadmap first draft', 1)]);
+    const [old] = await index.search('roadmap');
+    // The message is edited and re-indexed while search is still asking about the old copy.
+    await index.put([msg('x', 'r1', 'roadmap final', 1, { edited_at: 7 })]);
+    const shown = await freshHits(index, [old], async () => [{ id: 'x', deleted: false, edited_at: 7 }]);
+    expect(shown).toEqual([]); // the old copy is not shown
+    expect((await index.search('roadmap')).map((h) => h.body)).toEqual(['roadmap final']);
+  });
+
   it('drops an earlier copy when a message stops being indexable without being deleted', async () => {
     const index = await searchIndexFor('u-alice');
     await index.put([msg('m1', 'r1', 'readable secret', 1), msg('m2', 'r1', 'another secret', 2), msg('m3', 'r1', 'third secret', 3)]);
