@@ -285,8 +285,9 @@ func (k *KyIdentityClient) applySyncWebhook(ctx context.Context, headers syncaut
 }
 
 // applyErasure deletes the data of one person who used Delete everything (multi mode). The body
-// is the bare inactive SCIM user with org_id. A person this install never held, or holds in
-// another org, is acknowledged without effect; a repeat finds no one and is acknowledged too.
+// is the bare inactive SCIM user with org_id. Every accepted subject gets a permanent fence,
+// including one never held here. A known different-org binding is acknowledged without change;
+// repeated deliveries reuse the same fence and durable cleanup targets.
 // Single mode acknowledges it unchanged, as before.
 func (k *KyIdentityClient) applyErasure(ctx context.Context, body []byte) error {
 	if !k.tenancy.IsMultiTenant() {
@@ -305,8 +306,20 @@ func (k *KyIdentityClient) applyErasure(ctx context.Context, body []byte) error 
 // eraseSubject erases sub's data if this install holds sub in orgID (user.erased, and the
 // erased list re-read by tenancy sync).
 func (k *KyIdentityClient) eraseSubject(ctx context.Context, sub, orgID string) error {
+	if sub == "" || len(sub) > 255 || !config.IsCanonicalUUID(orgID) {
+		return ErrSyncMalformed
+	}
 	k.syncMu.Lock()
 	defer k.syncMu.Unlock()
+	// Persist the subject fence even when no account was held, before discovering targets.
+	// Account creation and this transition serialize in PostgreSQL; SQLite has one writer.
+	if err := k.store.Chat().RememberErasedSubject(ctx, sub, orgID); err != nil {
+		if errors.Is(err, store.ErrErasureOrgMismatch) {
+			k.auditOrgMismatch(ctx, sub, "", orgID)
+			return nil
+		}
+		return err
+	}
 	// Every local account the subject ever had: the current row, and any whose row went
 	// (user.deleted first, a repeat, or a recreation under a new ID).
 	var targets []*store.User

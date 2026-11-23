@@ -214,6 +214,9 @@ INSERT INTO users (
 // usernameTaken passed) ErrUsernameTaken, any other ErrAlreadyExists. The wording is the
 // engines': SQLite names table.column, Postgres the column constraint users_username_key.
 func uniqueError(err error) error {
+	if err != nil && (strings.HasPrefix(err.Error(), "constraint failed: erased_subject (") || strings.HasPrefix(err.Error(), "ERROR: erased_subject (SQLSTATE 23514)")) {
+		return ErrSubjectErased
+	}
 	if err == nil {
 		return nil
 	}
@@ -388,6 +391,11 @@ WHERE directory_sync_state.revision < excluded.revision OR excluded.revision = -
 		return false, errors.Join(err, tx.Commit())
 	}
 	if err := write(tx); err != nil {
+		// A delayed directory delivery cannot recreate an erased subject. Roll back its
+		// event/revision writes and acknowledge the permanent tombstone instead.
+		if errors.Is(uniqueError(err), ErrSubjectErased) {
+			return false, nil
+		}
 		return false, err
 	}
 	return true, tx.Commit()

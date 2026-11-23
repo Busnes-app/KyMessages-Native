@@ -512,6 +512,17 @@ Reservation and commit both check the current quotas under the same tenant quota
 parallel replicas cannot overspend staging capacity and an in-flight upload cannot bypass a
 new lower upload limit. Single mode keeps its existing limits and wire responses.
 
+### Permanent erased-subject fences (implemented, startup still gated)
+
+Migration 63 retains opaque KyIdentity subject/org tombstones independently of account and
+org purge. Every accepted erasure records the fence before discovering local accounts; unknown
+subjects are fenced too, and wrong-org bindings remain unchanged. Native account insert and
+reactivation triggers enforce it across sign-in, directory replay and revision resets. A
+PostgreSQL identity lock serializes first provisioning with erasure. Upgrade backfill uses only
+exact retained erasure provenance. Single-mode org-less accounts stay outside this contract.
+Tenancy reconciliation applies the erased feed before org snapshots can restore access.
+Shared-room successor handover and distributed calls remain separate work.
+
 ## 12. Phased build plan
 
 Each PR is gated on the tenancy mode, carries its negative tests (wrong org, single mode,

@@ -62,6 +62,10 @@ func (k *KyIdentityClient) SyncTenancy(ctx context.Context, full, startup bool) 
 	if dir == nil {
 		return ErrSuiteOff
 	}
+	// Erasure is authoritative before any listing can admit restored accounts or orgs.
+	if err := k.syncErased(ctx, full); err != nil {
+		return err
+	}
 	settings := k.store.Settings()
 	since := int64(0)
 	if !full {
@@ -97,9 +101,6 @@ func (k *KyIdentityClient) SyncTenancy(ctx context.Context, full, startup bool) 
 		}
 	}
 	if err := settings.SetSetting(ctx, settingOrgsRevision, strconv.FormatInt(next, 10)); err != nil {
-		return err
-	}
-	if err := k.syncErased(ctx, full); err != nil {
 		return err
 	}
 	now := strconv.FormatInt(time.Now().Unix(), 10)

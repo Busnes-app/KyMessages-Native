@@ -130,7 +130,9 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
   sanity guard stops a short or empty list from taking many orgs offline.
 - In `KY_TENANCY_MODE=multi`, KyIdentity's `user.erased` (a member used Delete everything) deletes
   that person's data: account, bots, attachments, and DMs nobody else uses. Their messages in
-  rooms others still use stay as "deleted message" tombstones with no text, name or files. A
+  rooms others still use stay as "deleted message" tombstones with no text, name or files.
+  An opaque subject tombstone permanently prevents reprovisioning, including a subject this
+  install never held. Restore reconciliation applies erasures before admitting listed orgs. A
   sign-in with an `export_only` token (the org is scheduled for deletion) is refused like a
   suspended org's: KyMessages has no export, and encrypted rooms are exported on the device.
 - In `KY_TENANCY_MODE=multi`, every user account is bound immutably to `(sub, org_id)`, tokens or

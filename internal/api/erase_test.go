@@ -603,3 +603,40 @@ func TestErasureIncludesOwnedBotContentAcrossCleanupRetry(t *testing.T) {
 		})
 	}
 }
+
+func TestErasedUnknownSubjectCannotSignInLater(t *testing.T) {
+	ctx := context.Background()
+	srv, _, st, cfg := newReplicas(t)
+	const sub = "never-held-erased"
+	if r := postErased(t, srv, sub, replicaOrgA); r.Code != http.StatusOK {
+		t.Fatalf("unknown subject: %d %s", r.Code, r.Body.String())
+	}
+	admitOrg(t, st, replicaOrgA)
+	cfg.SSO.Enabled = true
+	cfg.SSO.AutoProvision = true
+	idp := newFakeIdP(t, cfg)
+	fresh := api.NewServer(cfg, st)
+	t.Cleanup(fresh.CloseChat)
+	r := idp.signIn(fresh, map[string]any{"sub": sub, "preferred_username": "new-after-erasure", "org_id": replicaOrgA})
+	if r.Code != http.StatusForbidden || sessionCookie(r) != nil {
+		t.Fatalf("erased subject sign-in: %d %s", r.Code, r.Body.String())
+	}
+	if _, err := st.Users().GetUserBySSO(ctx, "kyidentity", sub); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("erased subject provisioned: %v", err)
+	}
+}
+
+func TestWrongOrgErasureDoesNotRecordASubjectFence(t *testing.T) {
+	ctx := context.Background()
+	srv, _, st, _ := newReplicas(t)
+	u, tok := createOrgUser(t, st, "wrong-fence", "wrongfence", "user", replicaOrgA)
+	if r := postErased(t, srv, u.SSOSubject, replicaOrgB); r.Code != http.StatusOK {
+		t.Fatalf("wrong-org delivery: %d", r.Code)
+	}
+	if err := st.Users().UpdateProfile(ctx, u); err != nil {
+		t.Fatalf("wrong-org delivery fenced profile: %v", err)
+	}
+	if r := doBearerJSON(t, srv, http.MethodGet, "/api/v1/rooms", tok, nil, nil); r.Code != http.StatusOK {
+		t.Fatalf("wrong-org delivery changed access: %d %s", r.Code, r.Body.String())
+	}
+}

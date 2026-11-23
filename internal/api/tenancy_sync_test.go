@@ -37,12 +37,13 @@ type erasedSubject struct {
 
 // fakeDirectory is KyIdentity's org list, erased list and storage pool.
 type fakeDirectory struct {
-	pool   fakePool
-	mu     sync.Mutex
-	orgs   []listedOrg
-	erased []erasedSubject
-	down   bool
-	page   int // entries per page when set: answers carry next, and a cursor resumes
+	pool       fakePool
+	mu         sync.Mutex
+	orgs       []listedOrg
+	erased     []erasedSubject
+	down       bool
+	erasedDown bool
+	page       int // entries per page when set: answers carry next, and a cursor resumes
 }
 
 func (f *fakeDirectory) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -52,6 +53,10 @@ func (f *fakeDirectory) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.erasedDown && r.URL.Path == "/api/suite/erased" {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
 	if f.down {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
@@ -240,7 +245,7 @@ func TestTenancySyncDeletedOrgIsPurged(t *testing.T) {
 		_, tok := createOrgUser(t, e.st, "usr_"+user, user, "user", org)
 		rec := doBearerJSON(t, e.srv, http.MethodPost, "/api/v1/rooms", tok, map[string]any{"kind": store.RoomKindChannel, "name": user}, nil)
 		room := roomOf(t, rec)
-		if rec := doBearerJSON(t, e.srv, http.MethodPost, "/api/v1/rooms/"+room+"/messages", tok, map[string]any{"body": "hi"}, nil); rec.Code != http.StatusCreated {
+		if rec := doBearerJSON(t, e.srv, http.MethodPost, "/api/v1/rooms/"+room+"/messages", tok, sealed("hi", nil), nil); rec.Code != http.StatusCreated {
 			t.Fatal(rec.Code)
 		}
 		up := doMultipartUpload(t, e.srv, "/api/v1/rooms/"+room+"/attachments", tok, "file", "f.txt", []byte("bytes of "+user))
@@ -318,16 +323,27 @@ func TestTenancySyncErasedList(t *testing.T) {
 	if _, err := e.st.Users().GetUserByID(ctx, u.ID); err == nil {
 		t.Fatal("listed person not erased")
 	}
-	// A restore brings the person back and rewinds the stored revision: the next run erases again.
-	createOrgUser(t, e.st, "usr_erlist", "erlist", "user", org)
-	if err := e.st.Settings().SetSetting(ctx, "tenancy.erased_revision", "0"); err != nil {
+	// A live database cannot recreate the person. A restored pre-erasure database has no
+	// tombstone yet, so exercise a separate database with that earlier state and the same
+	// authoritative feed, rather than deleting the permanent fence to fake a restore.
+	if err := e.st.Users().CreateUser(ctx, u); !errors.Is(err, store.ErrSubjectErased) {
+		t.Fatalf("live reprovision: %v", err)
+	}
+	restored := newSyncEnv(t)
+	restored.kyid.OnUserErased(func(ctx context.Context, u *store.User) error {
+		_, err := restored.st.Chat().EraseUser(ctx, u.OrgID, u)
+		return err
+	})
+	createOrgUser(t, restored.st, "usr_erlist", "erlist", "user", org)
+	restored.dir.list(listedOrg{ID: org, Status: "active", Enabled: true, Revision: 1})
+	restored.dir.mu.Lock()
+	restored.dir.erased = []erasedSubject{{Sub: u.SSOSubject, OrgID: org, Revision: 7}}
+	restored.dir.mu.Unlock()
+	if err := restored.kyid.SyncTenancy(ctx, false, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.kyid.SyncTenancy(ctx, false, false); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := e.st.Users().GetUserByID(ctx, u.ID); err == nil {
-		t.Fatal("restored person not erased again")
+	if _, err := restored.st.Users().GetUserByID(ctx, u.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("restored person not erased again: %v", err)
 	}
 }
 
@@ -663,5 +679,29 @@ func TestTenancyStartupDoesNotDeferMissingReconciliation(t *testing.T) {
 	}
 	if e.kyid.FullSyncDue(ctx) || e.status(t, syncOrgID(3)) != store.TenantStatusSuspended {
 		t.Fatal("background full read did not enforce missing org and renew its deadline")
+	}
+}
+
+func TestErasedFeedFailureCannotAdmitAnOrgFirst(t *testing.T) {
+	ctx := context.Background()
+	e := newSyncEnv(t)
+	e.dir.mu.Lock()
+	e.dir.erasedDown = true
+	e.dir.mu.Unlock()
+	e.dir.list(listedOrg{ID: replicaOrgA, Revision: 1, Status: "active", Enabled: true})
+	if err := e.kyid.SyncTenancy(ctx, true, false); err == nil {
+		t.Fatal("acknowledged unavailable erased feed")
+	}
+	if got, err := e.st.Chat().GetTenant(ctx, replicaOrgA); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("failed erasure reconciliation admitted org first: %+v %v", got, err)
+	}
+	e.dir.mu.Lock()
+	e.dir.erasedDown = false
+	e.dir.mu.Unlock()
+	if err := e.kyid.SyncTenancy(ctx, true, false); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := e.st.Chat().GetTenant(ctx, replicaOrgA); err != nil || !got.DirectoryReady {
+		t.Fatalf("recovery did not admit org: %+v %v", got, err)
 	}
 }

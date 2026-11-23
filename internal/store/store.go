@@ -24,6 +24,8 @@ var (
 	ErrRoomClosed                     = errors.New("room is closed")
 	ErrReplyNotFound                  = errors.New("reply target is not a message in this room")
 	ErrAttachmentInvalid              = errors.New("attachment not found, not owned by sender, or already attached")
+	ErrErasureOrgMismatch             = errors.New("erasure org mismatch")
+	ErrSubjectErased                  = errors.New("subject erased")
 	ErrAttachmentUploadQuotaExceeded  = errors.New("organization upload quota exceeded")
 	ErrAttachmentTenantQuotaExceeded  = errors.New("workspace attachment storage quota exceeded")
 	ErrAttachmentPendingQuotaExceeded = errors.New("pending attachment quota exceeded")
@@ -414,6 +416,7 @@ type ChatStore interface {
 	// Erasure of one person (multi mode, erase.go): blobs first, then rows.
 	ErasureBlobs(ctx context.Context, tenantID, userID string) ([]BlobRef, error)
 	ErasureTargets(ctx context.Context, provider, subject string) ([]*User, error)
+	RememberErasedSubject(ctx context.Context, subject, orgID string) error
 	DeactivateForErasure(ctx context.Context, tenantID, userID string) error
 	EraseUser(ctx context.Context, tenantID string, user *User) ([]BlobRef, error)
 	PendingBlobDeletes(ctx context.Context, limit int) ([]BlobRef, error)

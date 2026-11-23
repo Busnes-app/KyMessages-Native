@@ -145,6 +145,10 @@ func (s *Server) handleKyIdentityCallback(w http.ResponseWriter, r *http.Request
 			user.OrgID = orgID
 		}
 		err = s.store.Users().CreateUser(r.Context(), user)
+		if errors.Is(err, store.ErrSubjectErased) {
+			s.writeError(w, http.StatusForbidden, "Identity is not assigned")
+			return
+		}
 		if errors.Is(err, store.ErrUsernameTaken) {
 			log.Printf("[SSO] sign-in by %q refused: username %q is held by another KyMessages account", claims.Subject, user.Username)
 			s.audit(r.Context(), "", r, "sso.login_conflict", user.Username, fmt.Sprintf("subject=%q", claims.Subject))
