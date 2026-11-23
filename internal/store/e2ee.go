@@ -109,7 +109,7 @@ func (s *e2eeStore) AddOneTimeKeys(ctx context.Context, userID, deviceID string,
 		}
 		// A key ID already uploaded keeps its first value, so a retried upload is harmless and
 		// an upload cannot swap a key someone may already be using.
-		if _, err := tx.ExecContext(ctx, s.store.rebind(`INSERT INTO e2ee_one_time_keys (user_id, device_id, key_id, key_value, signature, fallback) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (user_id, device_id, key_id) DO NOTHING`),
+		if _, err := tx.ExecContext(ctx, s.store.rebind(`INSERT INTO e2ee_one_time_keys (user_id, device_id, key_id, key_value, signature, fallback) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (user_id, device_id, fallback, key_id) DO NOTHING`),
 			userID, deviceID, k.KeyID, k.Key, k.Signature, fallback); err != nil {
 			return err
 		}

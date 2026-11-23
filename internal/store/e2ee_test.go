@@ -132,6 +132,20 @@ func TestE2EEOneTimeKeysClaimOnceAcrossReplicas(t *testing.T) {
 	if n, _ := a.E2EE().CountOneTimeKeys(ctx, "u-a", "D1"); n != 0 {
 		t.Fatalf("%d one-time keys left", n)
 	}
+	// vodozemac gives a device's first one-time key and first fallback key the same ID: both
+	// must be stored and served.
+	if err := a.E2EE().AddOneTimeKeys(ctx, "u-a", "D1", []store.E2EEOneTimeKey{
+		{KeyID: "AAAAAAAAAAA", Key: "otk-0", Signature: "sig"},
+		{KeyID: "AAAAAAAAAAA", Key: "fallback-0", Signature: "sig", Fallback: true},
+	}, 100); err != nil {
+		t.Fatal(err)
+	}
+	if k, err := a.E2EE().ClaimOneTimeKey(ctx, "u-a", "D1"); err != nil || k.Key != "otk-0" || k.Fallback {
+		t.Fatalf("one-time key sharing the fallback's ID = %+v %v", k, err)
+	}
+	if k, err := a.E2EE().ClaimOneTimeKey(ctx, "u-a", "D1"); err != nil || k.Key != "fallback-0" || !k.Fallback {
+		t.Fatalf("fallback key sharing a one-time key's ID = %+v %v", k, err)
+	}
 	// A new fallback key replaces the old one.
 	if err := a.E2EE().AddOneTimeKeys(ctx, "u-a", "D1", []store.E2EEOneTimeKey{{KeyID: "fb2", Key: "fallback-2", Signature: "sig", Fallback: true}}, 100); err != nil {
 		t.Fatal(err)
