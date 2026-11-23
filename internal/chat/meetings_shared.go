@@ -10,9 +10,10 @@ import (
 // Multi mode keeps every lobby session in the shared database, so a guest is known on every
 // replica: a knock on one, an admission on another and the next request on a third all agree.
 // Leave timers stay in process, on the replica whose socket closed. Each replica refreshes the
-// seen_at of the guests it holds sockets for every quarter of the leave grace; a timer ends a
-// session only if no replica refreshed it for half the grace, so a guest still connected
-// elsewhere (overlapping sockets, or a reconnect noticed before the old close) keeps it.
+// seen_at of the guests it holds sockets for every quarter of the leave grace, and every
+// authenticated guest request refreshes it too. Timers and reads share one rule: a session
+// ends once nobody refreshed it for the presence window (1.25 × the grace), so a guest still
+// connected elsewhere, or still polling, keeps it.
 
 // guestSessionTTL matches the guest cookie's lifetime.
 const guestSessionTTL = 4 * time.Hour
@@ -162,9 +163,11 @@ func (l *LobbyManager) disconnectShared(guestID string) {
 	if t := l.timers[guestID]; t != nil {
 		t.Stop()
 	}
-	grace := l.leaveGrace
+	// One inactivity rule for timers and reads: the session ends once nobody (socket heartbeat
+	// or authenticated request, on any replica) refreshed it for the presence window.
+	live := l.leaveGrace + l.leaveGrace/4
 	var timer *time.Timer
-	timer = time.AfterFunc(grace, func() {
+	timer = time.AfterFunc(live, func() {
 		l.mu.Lock()
 		if l.timers[guestID] == timer {
 			delete(l.timers, guestID)
@@ -172,8 +175,7 @@ func (l *LobbyManager) disconnectShared(guestID string) {
 		l.mu.Unlock()
 		ctx, cancel := context.WithTimeout(context.Background(), sharedLobbyTimeout)
 		defer cancel()
-		// A socket open on any replica refreshed the row within grace/4, so it survives.
-		rows, err := l.db.DeleteIfUnseen(ctx, guestID, grace/2)
+		rows, err := l.db.DeleteIfUnseen(ctx, guestID, live)
 		if err != nil {
 			return
 		}

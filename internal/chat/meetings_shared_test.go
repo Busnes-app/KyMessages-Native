@@ -176,3 +176,37 @@ func TestSharedLobbyPollingGuestStaysWaiting(t *testing.T) {
 		t.Fatalf("admitting a polling guest: %v", err)
 	}
 }
+
+// A guest whose socket closed but who keeps polling keeps the session past the leave timer:
+// the timer and reads apply the same inactivity window.
+func TestSharedLobbyPollingAfterDisconnect(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, testdb.Config(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	res, err := st.Chat().UpsertMeeting(ctx, store.UpsertMeetingParams{ID: "m", TenantID: store.DefaultTenantID, OrganizerSub: "s", Title: "T"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := NewLobbyManager(NewHub(&captureBus{}), nil)
+	l.UseShared(st.GuestSessions())
+	l.SetLeaveGrace(400 * time.Millisecond) // presence window 500 ms
+	s, err := l.Knock(ctx, &store.MeetingGuest{MeetingID: "m", GuestKey: "k"}, res.Meeting, nil, "Visitor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.MarkConnected(s.GuestID)
+	l.HandleDisconnect(s.GuestID, 0)
+	for range 6 { // polls every 200 ms across the timer at 500 ms
+		time.Sleep(200 * time.Millisecond)
+		if _, ok := l.GetBySecret(s.SessionSecret); !ok {
+			t.Fatal("a polling guest lost the session to the leave timer")
+		}
+	}
+	time.Sleep(time.Second) // no polls, no socket: the window passes and the timer has no hold
+	if _, ok := l.GetBySecret(s.SessionSecret); ok {
+		t.Fatal("an idle guest kept the session")
+	}
+}

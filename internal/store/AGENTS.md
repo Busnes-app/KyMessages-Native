@@ -89,8 +89,9 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   `AttemptState`), `pow_spent` (`SpendPoW`) and `meeting_guest_sessions`
   (`GuestSessions()`: keyed by the secret's SHA-256, one live session per tenant, meeting and
   guest key, 4 h expiry). `seen_at` is on the database clock: each replica `Touch`es the guests
-  it holds sockets for every quarter of the leave grace, and `DeleteIfUnseen` ends a session only
-  when nobody touched it for half the grace (`TestSharedLobbyOverlappingSocketsAcrossReplicas`).
+  it holds sockets for every quarter of the leave grace, and a leave timer (`DeleteIfUnseen`) ends a
+  session only when nobody touched it for the same window reads use, 1.25 × the grace
+  (`TestSharedLobbyOverlappingSocketsAcrossReplicas`, `TestSharedLobbyPollingAfterDisconnect`).
   Departure does not depend on that timer: `BySecret`, `ByID`, `InRoom` and `Admit` accept a
   session only if `seen_at` is within `live` (the lobby passes 1.25 × the leave grace), so a
   replica that exits or a failed delete cannot keep an admission usable. Every authenticated
