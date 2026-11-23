@@ -358,8 +358,11 @@ func TestTenancyStartupSync(t *testing.T) {
 	if err := e.kyid.StartupSync(ctx); err != nil {
 		t.Fatalf("KyIdentity up: %v", err)
 	}
-	if e.kyid.FullSyncDue(ctx) {
-		t.Fatal("a successful start-up read did not record the full sync")
+	if !e.kyid.FullSyncDue(ctx) {
+		t.Fatal("a successful startup read postponed enforcing background reconciliation")
+	}
+	if at, err := e.st.Settings().GetSetting(ctx, sso.SettingSyncedAt); err != nil || at == "" {
+		t.Fatalf("successful startup did not retain sync freshness: %q %v", at, err)
 	}
 }
 
@@ -610,5 +613,46 @@ func TestTenancySyncStopsServingADisabledApp(t *testing.T) {
 	}
 	if rec := doBearerJSON(t, e.srv, http.MethodGet, "/api/v1/rooms", tok, nil, nil); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("disabled app revived prior session: %d", rec.Code)
+	}
+}
+
+// Startup alerts without enforcing missing orgs, so it cannot renew the background job's
+// reconciliation deadline. Repeated successful restarts must leave that work due.
+func TestTenancyStartupDoesNotDeferMissingReconciliation(t *testing.T) {
+	ctx := context.Background()
+	e := newSyncEnv(t)
+	for i := range 10 {
+		if _, err := e.st.Chat().EnsureTenant(ctx, syncOrgID(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.dir.list(listedAll(10, 3)...)
+	if err := e.st.Settings().SetSetting(ctx, sso.SettingFullSyncAt, "1"); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if err := e.kyid.StartupSync(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := e.st.Settings().GetSetting(ctx, sso.SettingFullSyncAt); err != nil || got != "1" {
+			t.Fatalf("startup renewed enforcing timestamp: %q %v", got, err)
+		}
+		if !e.kyid.FullSyncDue(ctx) || e.status(t, syncOrgID(3)) != store.TenantStatusActive {
+			t.Fatal("startup either enforced or postponed missing-org reconciliation")
+		}
+	}
+	elected, err := e.st.AcquireLease(ctx, "tenancy_sync", "elected-background", time.Minute)
+	if err != nil || !elected {
+		t.Fatalf("background election: %v %v", elected, err)
+	}
+	other, err := e.st.AcquireLease(ctx, "tenancy_sync", "other-background", time.Minute)
+	if err != nil || other {
+		t.Fatalf("second background worker also elected: %v %v", other, err)
+	}
+	if err := e.kyid.SyncTenancy(ctx, e.kyid.FullSyncDue(ctx), false); err != nil {
+		t.Fatal(err)
+	}
+	if e.kyid.FullSyncDue(ctx) || e.status(t, syncOrgID(3)) != store.TenantStatusSuspended {
+		t.Fatal("background full read did not enforce missing org and renew its deadline")
 	}
 }

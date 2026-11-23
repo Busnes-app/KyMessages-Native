@@ -26,7 +26,7 @@ const (
 	settingErasedRevision = "tenancy.erased_revision"
 	// SettingSyncedAt is the Unix second of the last complete sync, incremental or full.
 	SettingSyncedAt = "tenancy.kyidentity_synced_at"
-	// SettingFullSyncAt is the Unix second of the last complete full read.
+	// SettingFullSyncAt is the Unix second of the last full read that enforced missing orgs.
 	SettingFullSyncAt = "tenancy.full_sync_at"
 	// StartupSyncMaxAge is how old the last sync may be for a replica to serve while KyIdentity
 	// cannot be reached at its start.
@@ -103,7 +103,9 @@ func (k *KyIdentityClient) SyncTenancy(ctx context.Context, full, startup bool) 
 		return err
 	}
 	now := strconv.FormatInt(time.Now().Unix(), 10)
-	if full {
+	// Startup deliberately skips missing-org enforcement. Only an enforcing background read
+	// completes the daily reconciliation; frequent restarts must not postpone it forever.
+	if full && !startup {
 		if err := settings.SetSetting(ctx, SettingFullSyncAt, now); err != nil {
 			return err
 		}
