@@ -293,7 +293,20 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 		lobbyMgr.RevokeTenant(context.Background(), tenantID)
 		callMgr.RevokeTenant(context.Background(), tenantID)
 	})
-	kyidentity.OnTenantRevoked(chatHub.RevokeTenant)
+	kyidentity.OnTenantRevoked(func(ctx context.Context, tenantID string) error {
+		if cfg.Tenancy.IsMultiTenant() && st != nil {
+			if err := st.Chat().QueueTenantCallSeatRemoval(ctx, tenantID); err != nil {
+				return err
+			}
+		}
+		if err := chatHub.RevokeTenant(ctx, tenantID); err != nil {
+			return err
+		}
+		if cfg.Tenancy.IsMultiTenant() {
+			return callMgr.DrainCleanup(ctx, tenantID, "")
+		}
+		return nil
+	})
 	if cfg.Tenancy.IsMultiTenant() && st != nil {
 		cleanupHolder := uuid.NewString()
 		callMgr.SetCleanupLease(func(ctx context.Context) (bool, error) {

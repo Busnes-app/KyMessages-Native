@@ -28,28 +28,31 @@ func seedCallRoom(t *testing.T, s *SQLStore, org, roomID, userID string) (*User,
 	t.Helper()
 	ctx := context.Background()
 	if _, err := s.Chat().EnsureTenant(ctx, org); err != nil {
-		t.Fatal(err)
+		t.Fatalf("seed step: %v", err)
 	}
 	if err := s.Chat().ApplyTenantDirectory(ctx, TenantDirectoryEntry{TenantID: org, Status: TenantStatusActive, Enabled: true, Valid: true, Revision: 1}); err != nil {
-		t.Fatal(err)
+		t.Fatalf("seed step: %v", err)
 	}
 	u := &User{ID: userID, Username: userID, SSOProvider: "kyidentity", SSOSubject: userID, OrgID: org, Role: "user", Status: "active"}
 	if err := s.Users().CreateUser(ctx, u); err != nil {
-		t.Fatal(err)
+		t.Fatalf("seed step: %v", err)
 	}
 	if err := s.Chat().CreateRoom(ctx, &Room{ID: roomID, TenantID: org, Kind: RoomKindChannel, CreatedBy: userID}, nil); err != nil {
-		t.Fatal(err)
+		t.Fatalf("seed step: %v", err)
 	}
 	l, err := s.Chat().AcquireCallRoom(ctx, org, roomID, "owner-a", time.Minute)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("seed step: %v", err)
 	}
 	cs := &CallSession{ID: "call-" + roomID, TenantID: org, RoomID: roomID, Mode: CallModeSFULiveKit, Epoch: 1, LiveKitRoom: "sfu-" + roomID, StartedBy: userID, OwnerID: l.Holder, OwnerGeneration: l.Generation}
 	if err := s.Chat().CreateCallSession(ctx, cs); err != nil {
-		t.Fatal(err)
+		t.Fatalf("seed step: %v", err)
 	}
-	if err := s.Chat().PutCallSeat(ctx, cs, userID, "peer-"+userID, false); err != nil {
-		t.Fatal(err)
+	if err := s.Sessions().CreateSession(ctx, &Session{TokenHash: "call-session-" + userID, UserID: userID, CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().Add(time.Hour), SSOSession: SSOSession{Issuer: "https://id.example", SID: "sid-a-" + userID, IssuedAt: time.Now().Unix()}}, u.PasswordHash); err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	if err := s.Chat().PutCallSeat(ctx, cs, CallSeat{UserID: userID, PeerID: "peer-" + userID, SessionHash: "call-session-" + userID}); err != nil {
+		t.Fatalf("seat: %v", err)
 	}
 	return u, cs
 }
@@ -77,7 +80,9 @@ func TestCallRoomLeaseFencesStaleOwnerAndWrongOrg(t *testing.T) {
 	for name, write := range map[string]func() error{
 		"update": func() error { return s.Chat().UpdateCallSession(ctx, cs) },
 		"end":    func() error { return s.Chat().EndOwnedCallSession(ctx, cs, 0) },
-		"seat":   func() error { return s.Chat().PutCallSeat(ctx, cs, "routed-user", "stale-peer", false) },
+		"seat": func() error {
+			return s.Chat().PutCallSeat(ctx, cs, CallSeat{UserID: "routed-user", PeerID: "stale-peer", SessionHash: "call-session-routed-user"})
+		},
 	} {
 		if err := write(); !errors.Is(err, ErrCallOwnerLost) {
 			t.Fatalf("stale %s: %v", name, err)
@@ -115,7 +120,10 @@ func TestCallSeatErasureKeepsCleanupAndCompletionAtomic(t *testing.T) {
 	if err := s.Chat().AddRoomMember(ctx, &RoomMember{TenantID: org, RoomID: cs.RoomID, UserID: survivor.ID}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Chat().PutCallSeat(ctx, cs, survivor.ID, "peer-survivor", false); err != nil {
+	if err := s.Sessions().CreateSession(ctx, &Session{TokenHash: "survivor-session", UserID: survivor.ID, CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().Add(time.Hour)}, survivor.PasswordHash); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Chat().PutCallSeat(ctx, cs, CallSeat{UserID: survivor.ID, PeerID: "peer-survivor", SessionHash: "survivor-session"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.Chat().EraseUser(ctx, org, u); err != nil {
@@ -192,12 +200,25 @@ func TestCallPurgeRetainsSFUCleanupUntilTerminalMark(t *testing.T) {
 		}
 	}
 	pending, err := s.Chat().PendingCallEvictions(ctx, gone, "", 10)
-	if err != nil || len(pending) != 1 || pending[0].PeerID != "" || pending[0].LiveKitRoom != cs.LiveKitRoom {
-		t.Fatalf("whole SFU room cleanup lost: %+v %v", pending, err)
+	if err != nil || len(pending) != 2 {
+		t.Fatalf("whole-room/issued-seat cleanup lost: %+v %v", pending, err)
 	}
-	if err := s.Chat().ClearCallEviction(ctx, pending[0]); err != nil {
-		t.Fatal(err)
+	whole := false
+	for _, p := range pending {
+		if p.LiveKitRoom != cs.LiveKitRoom {
+			t.Fatalf("wrong SFU purge target: %+v", p)
+		}
+		if p.PeerID == "" {
+			whole = true
+		}
+		if err := s.Chat().ClearCallEviction(ctx, p); err != nil {
+			t.Fatal(err)
+		}
 	}
+	if !whole {
+		t.Fatal("purge did not retain whole-room cleanup")
+	}
+
 	for range 2 {
 		if err := s.Chat().PurgeTenantRows(ctx, gone); err != nil {
 			t.Fatal(err)
@@ -303,5 +324,235 @@ func TestCallLeaseCannotChangeAnotherRoomSession(t *testing.T) {
 	}
 	if pending, err := s.Chat().PendingCallEvictions(ctx, org, "", 10); err != nil || len(pending) != 0 {
 		t.Fatalf("wrong room queued cleanup: %+v %v", pending, err)
+	}
+}
+
+func TestCallSeatSIDLogoutPreservesAnotherSessionAndRetiresOnlyItsEpoch(t *testing.T) {
+	ctx := context.Background()
+	s, _ := callRoutingStore(t)
+	const org = "00000000-0000-4000-8000-00000000006c"
+	u, cs := seedCallRoom(t, s, org, "sid-call-room", "sid-call-user")
+	makeSession := func(hash, sid string) {
+		t.Helper()
+		if err := s.Sessions().CreateSession(ctx, &Session{TokenHash: hash, UserID: u.ID, CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(time.Hour), SSOSession: SSOSession{Issuer: "https://id.example", SID: sid, IssuedAt: time.Now().Unix()}}, u.PasswordHash); err != nil {
+			t.Fatal(err)
+		}
+	}
+	makeSession("sid-session-b", "sid-b")
+	if err := s.Chat().PutCallSeat(ctx, cs, CallSeat{UserID: u.ID, PeerID: "peer-b", SessionHash: "sid-session-b"}); !errors.Is(err, ErrCallStateStale) {
+		t.Fatalf("silent replacement lost old session linkage: %v", err)
+	}
+	if err := s.Chat().QueueCallSeatRemoval(ctx, cs.RoomID, u.ID); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := s.Chat().PendingCallEvictions(ctx, org, u.ID, 10)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("replacement cleanup: %+v %v", pending, err)
+	}
+	if err := s.Chat().ClearCallEviction(ctx, pending[0]); err != nil {
+		t.Fatal(err)
+	}
+	current, err := s.Chat().GetActiveCallSession(ctx, org, cs.RoomID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.OwnerID = cs.OwnerID
+	current.OwnerGeneration = cs.OwnerGeneration
+	if err := s.Chat().PutCallSeat(ctx, current, CallSeat{UserID: u.ID, PeerID: "peer-b", SessionHash: "sid-session-b"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Sessions().ApplySSOLogout(ctx, "https://id.example", u.SSOSubject, org, "sid-a-"+u.ID, "old-sid-logout", time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM call_seats WHERE session_hash='sid-session-b'`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("different SID removed current seat: %d %v", n, err)
+	}
+	if p, err := s.Chat().PendingCallEvictions(ctx, org, "", 10); err != nil || len(p) != 0 {
+		t.Fatalf("different SID retired current media: %+v %v", p, err)
+	}
+	if _, _, err := s.Sessions().ApplySSOLogout(ctx, "https://id.example", u.SSOSubject, "wrong-org", "sid-b", "wrong-org-sid", time.Now().Unix()); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("wrong org logout: %v", err)
+	}
+	if _, _, err := s.Sessions().ApplySSOLogout(ctx, "https://id.example", u.SSOSubject, org, "sid-b", "current-sid-logout", time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM call_seats WHERE user_id='sid-call-user'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("current SID left seat: %d %v", n, err)
+	}
+	pending, err = s.Chat().PendingCallEvictions(ctx, org, u.ID, 10)
+	if err != nil || len(pending) != 1 || pending[0].LiveKitRoom != current.LiveKitRoom {
+		t.Fatalf("SID cleanup lost: %+v %v", pending, err)
+	}
+	if _, _, err := s.Sessions().ApplySSOLogout(ctx, "https://id.example", u.SSOSubject, org, "sid-b", "current-sid-logout", time.Now().Unix()); !errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("logout replay: %v", err)
+	}
+	makeSession("sid-session-c", "sid-c")
+	fresh, err := s.Chat().GetActiveCallSession(ctx, org, cs.RoomID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh.OwnerID = cs.OwnerID
+	fresh.OwnerGeneration = cs.OwnerGeneration
+	if fresh.Epoch <= current.Epoch || fresh.LiveKitRoom == current.LiveKitRoom {
+		t.Fatal("SID logout did not retire old bearer target")
+	}
+	if err := s.Chat().PutCallSeat(ctx, fresh, CallSeat{UserID: u.ID, PeerID: "peer-c", SessionHash: "sid-session-c"}); !errors.Is(err, ErrCallCleanupPending) {
+		t.Fatalf("new media admitted before cleanup: %v", err)
+	}
+	if pending[0].LiveKitRoom == fresh.LiveKitRoom {
+		t.Fatal("old cleanup targets replacement media")
+	}
+	if err := s.Chat().ClearCallEviction(ctx, pending[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Chat().PutCallSeat(ctx, fresh, CallSeat{UserID: u.ID, PeerID: "peer-c", SessionHash: "sid-session-c"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Chat().ClearCallEviction(ctx, pending[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM call_seats WHERE session_hash='sid-session-c'`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("old cleanup removed replacement seat: %d %v", n, err)
+	}
+}
+
+func TestCallSeatIssuanceRacingSessionDeletionCannotSurvive(t *testing.T) {
+	ctx := context.Background()
+	s, cfg := callRoutingStore(t)
+	const org = "00000000-0000-4000-8000-00000000006d"
+	u, cs := seedCallRoom(t, s, org, "session-race-room", "session-race-user")
+	opened, err := Open(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	for i := range 8 {
+		if err := s.Chat().QueueCallSeatRemoval(ctx, cs.RoomID, u.ID); err != nil {
+			t.Fatal(err)
+		}
+		pending, err := s.Chat().PendingCallEvictions(ctx, org, u.ID, 200)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, p := range pending {
+			if err := s.Chat().ClearCallEviction(ctx, p); err != nil {
+				t.Fatal(err)
+			}
+		}
+		current, err := s.Chat().GetActiveCallSession(ctx, org, cs.RoomID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		current.OwnerID = cs.OwnerID
+		current.OwnerGeneration = cs.OwnerGeneration
+		hash := fmt.Sprintf("racing-session-%d", i)
+		if err := s.Sessions().CreateSession(ctx, &Session{TokenHash: hash, UserID: u.ID, CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(time.Hour)}, u.PasswordHash); err != nil {
+			t.Fatal(err)
+		}
+		seat := CallSeat{UserID: u.ID, PeerID: fmt.Sprintf("racing-peer-%d", i), SessionHash: hash}
+		if err := s.Chat().PutCallSeat(ctx, current, seat); err != nil {
+			t.Fatal(err)
+		}
+		start := make(chan struct{})
+		var putErr, deleteErr error
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); <-start; putErr = s.Chat().PutCallSeat(ctx, current, seat) }()
+		go func() { defer wg.Done(); <-start; deleteErr = opened.Sessions().DeleteSession(ctx, hash) }()
+		close(start)
+		wg.Wait()
+		if deleteErr != nil || putErr != nil && !errors.Is(putErr, ErrNotFound) {
+			t.Fatalf("concurrent grant/revoke: %v %v", putErr, deleteErr)
+		}
+		var n int
+		if err := s.db.QueryRowContext(ctx, s.rebind(`SELECT COUNT(*) FROM call_seats WHERE session_hash=?`), hash).Scan(&n); err != nil || n != 0 {
+			t.Fatalf("revoked session kept seat: %d %v", n, err)
+		}
+	}
+}
+
+func TestCallSeatExpiredSessionAndDeadOwnerAreRetired(t *testing.T) {
+	for _, reason := range []string{"expired-session", "dead-owner"} {
+		t.Run(reason, func(t *testing.T) {
+			ctx := context.Background()
+			s, _ := callRoutingStore(t)
+			const org = "00000000-0000-4000-8000-00000000006e"
+			u, cs := seedCallRoom(t, s, org, "expired-room", "expired-user")
+			if reason == "expired-session" {
+				if _, err := s.db.ExecContext(ctx, s.rebind(`UPDATE sessions SET expires_at=? WHERE token_hash=?`), time.Now().UTC().Add(-time.Minute), "call-session-"+u.ID); err != nil {
+					t.Fatal(err)
+				}
+				if err := s.Chat().PutCallSeat(ctx, cs, CallSeat{UserID: u.ID, PeerID: "peer-" + u.ID, SessionHash: "call-session-" + u.ID}); !errors.Is(err, ErrNotFound) {
+					t.Fatalf("expired grant issued a seat: %v", err)
+				}
+				if err := s.Sessions().CleanExpiredSessions(ctx); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if _, err := s.db.ExecContext(ctx, s.rebind(`UPDATE call_room_owners SET expires_at=0 WHERE room_id=?`), cs.RoomID); err != nil {
+					t.Fatal(err)
+				}
+				if err := s.Chat().PruneCallSeats(ctx, 25*time.Second); err != nil {
+					t.Fatal(err)
+				}
+			}
+			pending, err := s.Chat().PendingCallEvictions(ctx, org, u.ID, 10)
+			if err != nil || len(pending) != 1 || pending[0].LiveKitRoom != cs.LiveKitRoom {
+				t.Fatalf("retired target lost: %+v %v", pending, err)
+			}
+			var n int
+			if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM call_seats`).Scan(&n); err != nil || n != 0 {
+				t.Fatalf("retired seat remains: %d %v", n, err)
+			}
+		})
+	}
+}
+
+func TestCallConcurrentErasureCausesRetainTheIssuedMediaTarget(t *testing.T) {
+	ctx := context.Background()
+	s, _ := callRoutingStore(t)
+	const org = "00000000-0000-4000-8000-00000000006f"
+	first, cs := seedCallRoom(t, s, org, "shared-epoch-room", "erased-first")
+	second := &User{ID: "erased-second", Username: "erased-second", OrgID: org, SSOProvider: "kyidentity", SSOSubject: "erased-second", Role: "user", Status: "active"}
+	if err := s.Users().CreateUser(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Chat().AddRoomMember(ctx, &RoomMember{TenantID: org, RoomID: cs.RoomID, UserID: second.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Sessions().CreateSession(ctx, &Session{UserID: second.ID, TokenHash: "second-session", CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(time.Hour)}, second.PasswordHash); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Chat().PutCallSeat(ctx, cs, CallSeat{UserID: second.ID, PeerID: "second-peer", SessionHash: "second-session"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, u := range []*User{first, second} {
+		if _, err := s.Chat().EraseUser(ctx, org, u); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pending, err := s.Chat().PendingCallEvictions(ctx, org, "", 10)
+	if err != nil || len(pending) != 2 {
+		t.Fatalf("erasure causes lost: %+v %v", pending, err)
+	}
+	for _, p := range pending {
+		if p.LiveKitRoom != cs.LiveKitRoom {
+			t.Fatalf("cleanup used a later unissued target: %+v", p)
+		}
+	}
+	if err := s.Chat().ClearPendingBlobDeletes(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, n, err := s.Audit().ListAuditRecords(ctx, 0, 100, "sso.user_erased"); err != nil || n != 0 {
+		t.Fatalf("premature completion: %d %v", n, err)
+	}
+	for _, p := range pending {
+		if err := s.Chat().ClearCallEviction(ctx, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, n, err := s.Audit().ListAuditRecords(ctx, 0, 100, "sso.user_erased"); err != nil || n != 2 {
+		t.Fatalf("missing completion: %d %v", n, err)
 	}
 }

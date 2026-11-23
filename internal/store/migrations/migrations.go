@@ -297,7 +297,7 @@ ALTER TABLE mfa_challenges ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';`,
 	{Version: 61, Name: "tenant_missing_and_purge", SQLite: tenantMissingSchema, Postgres: tenantMissingSchema},
 	{Version: 62, Name: "tenant_directory", SQLite: tenantDirectorySchema, Postgres: tenantDirectorySchema},
 	{Version: 63, Name: "erased_subjects", SQLite: erasedSubjectsSQLite, Postgres: erasedSubjectsPostgres},
-	{Version: 64, Name: "call_routing", SQLite: callRoutingSchema, Postgres: callRoutingSchema},
+	{Version: 64, Name: "call_routing", SQLite: callRoutingSQLite, Postgres: callRoutingPostgres},
 }
 
 const tenantDirectorySchema = `

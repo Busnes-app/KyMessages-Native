@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"sort"
 	"time"
 )
 
@@ -70,7 +71,11 @@ func (c *chatStore) callLeaseTx(ctx context.Context, tx *sql.Tx, cs *CallSession
 
 // PutCallSeat binds SFU credentials to a durable opaque account/peer link before they leave
 // the server. User/guest locks serialize it with revocation; the owner generation fences it.
-func (c *chatStore) PutCallSeat(ctx context.Context, cs *CallSession, userID, peerID string, guest bool) error {
+func (c *chatStore) PutCallSeat(ctx context.Context, cs *CallSession, seat CallSeat) error {
+	userID, peerID, guest := seat.UserID, seat.PeerID, seat.Guest
+	if !guest && seat.SessionHash == "" {
+		return ErrInvalidInput
+	}
 	tx, err := c.store.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -80,10 +85,22 @@ func (c *chatStore) PutCallSeat(ctx context.Context, cs *CallSession, userID, pe
 	if guest {
 		res, err = tx.ExecContext(ctx, c.store.rebind(`UPDATE meeting_guest_sessions SET guest_id=guest_id WHERE guest_id=? AND tenant_id=? AND room_id=? AND status='admitted' AND expires_at>`+c.store.dbNowMillis()), userID, cs.TenantID, cs.RoomID)
 	} else {
-		res, err = tx.ExecContext(ctx, c.store.rebind(`UPDATE users SET id=id WHERE id=? AND org_id=? AND status='active' AND role<>'bot'`), userID, cs.TenantID)
+		res, err = tx.ExecContext(ctx, c.store.rebind(`UPDATE users SET id=id WHERE id=? AND org_id=? AND status='active' AND role='user' AND NOT must_change_password`), userID, cs.TenantID)
 	}
 	if err := oneRow(res, err); err != nil {
 		return err
+	}
+	if !guest {
+		if err := oneRow(tx.ExecContext(ctx, c.store.rebind(`UPDATE sessions SET token_hash=token_hash WHERE token_hash=? AND user_id=?`), seat.SessionHash, userID)); err != nil {
+			return err
+		}
+		var expires time.Time
+		if err := tx.QueryRowContext(ctx, c.store.rebind(`SELECT expires_at FROM sessions WHERE token_hash=? AND user_id=?`), seat.SessionHash, userID).Scan(&expires); err != nil {
+			return err
+		}
+		if !expires.After(time.Now().UTC()) {
+			return ErrNotFound
+		}
 	}
 	if err := c.lockAttachmentQuotaTx(ctx, tx, cs.TenantID); err != nil {
 		return err
@@ -94,17 +111,32 @@ func (c *chatStore) PutCallSeat(ctx context.Context, cs *CallSession, userID, pe
 	if err := c.callLeaseTx(ctx, tx, cs); err != nil {
 		return err
 	}
+	if cs.Mode == CallModeSFULiveKit {
+		var pending int
+		if err := tx.QueryRowContext(ctx, c.store.rebind(`SELECT COUNT(*) FROM pending_call_evictions WHERE tenant_id=?`), cs.TenantID).Scan(&pending); err != nil {
+			return err
+		}
+		if pending != 0 {
+			return ErrCallCleanupPending
+		}
+	}
 	membership := `AND EXISTS(SELECT 1 FROM room_members m WHERE m.tenant_id=call_sessions.tenant_id AND m.room_id=call_sessions.room_id AND m.user_id=?)`
-	args := []any{userID, peerID, cs.ID, cs.TenantID, cs.RoomID, userID}
+	args := []any{userID, peerID, seat.SessionHash, cs.ID, cs.TenantID, cs.RoomID, cs.Epoch, userID}
 	if guest {
 		membership = ""
-		args = args[:5]
+		args = args[:7]
 	}
-	res, err = tx.ExecContext(ctx, c.store.rebind(`INSERT INTO call_seats(room_id,tenant_id,user_id,peer_id,call_id)
- SELECT room_id,tenant_id,?,?,id FROM call_sessions WHERE id=? AND tenant_id=? AND room_id=? AND ended_at IS NULL `+membership+`
- ON CONFLICT(room_id,user_id) DO UPDATE SET peer_id=excluded.peer_id,call_id=excluded.call_id`), args...)
-	if err := oneRow(res, err); err != nil {
+	res, err = tx.ExecContext(ctx, c.store.rebind(`INSERT INTO call_seats(room_id,tenant_id,user_id,peer_id,session_hash,livekit_room,media_epoch,call_id)
+ SELECT room_id,tenant_id,?,?,?,CASE WHEN mode='sfu_livekit' THEN COALESCE(livekit_room,'') ELSE '' END,epoch,id FROM call_sessions WHERE id=? AND tenant_id=? AND room_id=? AND ended_at IS NULL AND epoch=? `+membership+`
+ ON CONFLICT(room_id,user_id) DO UPDATE SET peer_id=excluded.peer_id,session_hash=excluded.session_hash,livekit_room=excluded.livekit_room,media_epoch=excluded.media_epoch,call_id=excluded.call_id
+ WHERE call_seats.peer_id=excluded.peer_id AND call_seats.session_hash=excluded.session_hash AND call_seats.call_id=excluded.call_id AND call_seats.media_epoch<=excluded.media_epoch`), args...)
+	if err != nil {
 		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n != 1 {
+		return ErrCallStateStale
 	}
 	return tx.Commit()
 }
@@ -112,23 +144,44 @@ func (c *chatStore) PutCallSeat(ctx context.Context, cs *CallSession, userID, pe
 // queueCallSeatsTx retains cleanup before the seat/account/room can disappear. where is a
 // fixed internal SQL predicate, never wire data. Empty SFU rooms need no external cleanup.
 func queueCallSeatsTx(ctx context.Context, st *SQLStore, tx *sql.Tx, where string, args ...any) error {
-	_, err := tx.ExecContext(ctx, st.rebind(`INSERT INTO pending_call_evictions(tenant_id,livekit_room,peer_id,user_id)
- SELECT call_seats.tenant_id,c.livekit_room,call_seats.peer_id,call_seats.user_id FROM call_seats
- JOIN call_sessions c ON c.id=call_seats.call_id AND c.tenant_id=call_seats.tenant_id AND c.room_id=call_seats.room_id
- WHERE `+where+` AND c.livekit_room IS NOT NULL AND c.livekit_room<>'' ON CONFLICT DO NOTHING`), args...)
+	// DELETE RETURNING is the target snapshot. Re-evaluating a clock/status predicate in
+	// separate SELECT/DELETE statements could discard a newly expired seat without cleanup.
+	rows, err := tx.QueryContext(ctx, st.rebind(`DELETE FROM call_seats WHERE `+where+` RETURNING tenant_id,room_id,call_id,user_id,peer_id,livekit_room`), args...)
 	if err != nil {
 		return err
 	}
-	// Retire the media address as well as the participant: a former bearer must never
-	// reach the survivors' next media epoch by reconnecting with an old SFU token.
-	if _, err := tx.ExecContext(ctx, st.rebind(`UPDATE call_sessions SET epoch=epoch+1,
- livekit_room='ky_' || id || '_e' || CAST(epoch+1 AS TEXT)
- WHERE ended_at IS NULL AND mode='sfu_livekit' AND livekit_room IS NOT NULL AND livekit_room<>''
- AND id IN(SELECT call_id FROM call_seats WHERE `+where+`)`), args...); err != nil {
+	type removed struct{ tenant, room, call, user, peer, media string }
+	var seats []removed
+	for rows.Next() {
+		var p removed
+		if err := rows.Scan(&p.tenant, &p.room, &p.call, &p.user, &p.peer, &p.media); err != nil {
+			rows.Close()
+			return err
+		}
+		seats = append(seats, p)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, st.rebind(`DELETE FROM call_seats WHERE `+where), args...)
-	return err
+	sort.Slice(seats, func(i, j int) bool { return seats[i].call < seats[j].call })
+	lastCall := ""
+	for _, p := range seats {
+		if p.media != "" {
+			if _, err := tx.ExecContext(ctx, st.rebind(`INSERT INTO pending_call_evictions(tenant_id,livekit_room,peer_id,user_id) VALUES(?,?,?,?) ON CONFLICT DO NOTHING`), p.tenant, p.media, p.peer, p.user); err != nil {
+				return err
+			}
+		}
+		if p.call == lastCall {
+			continue
+		}
+		lastCall = p.call
+		if _, err := tx.ExecContext(ctx, st.rebind(`UPDATE call_sessions SET epoch=epoch+1,livekit_room='ky_' || id || '_e' || CAST(epoch+1 AS TEXT)
+ WHERE id=? AND tenant_id=? AND room_id=? AND ended_at IS NULL AND mode='sfu_livekit' AND livekit_room IS NOT NULL AND livekit_room<>''
+ AND EXISTS(SELECT 1 FROM tenants WHERE id=? AND status<>'deleted')`), p.call, p.tenant, p.room, p.tenant); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *chatStore) QueueCallSeatRemoval(ctx context.Context, roomID, userID string) error {
@@ -244,13 +297,26 @@ func (c *chatStore) PruneCallSeats(ctx context.Context, guestLive time.Duration)
 		return err
 	}
 	defer tx.Rollback()
-	where := `NOT EXISTS(SELECT 1 FROM tenants WHERE id=call_seats.tenant_id AND status='active' AND ` + directoryReadySQL + ` AND NOT EXISTS(SELECT 1 FROM tenant_pending_revocations p WHERE p.tenant_id=tenants.id))
+	where := `NOT EXISTS(SELECT 1 FROM call_room_owners o WHERE o.room_id=call_seats.room_id AND o.tenant_id=call_seats.tenant_id AND o.expires_at>` + c.store.dbNowMillis() + `)
+ OR NOT EXISTS(SELECT 1 FROM tenants WHERE id=call_seats.tenant_id AND status='active' AND ` + directoryReadySQL + ` AND NOT EXISTS(SELECT 1 FROM tenant_pending_revocations p WHERE p.tenant_id=tenants.id))
  OR (NOT EXISTS(SELECT 1 FROM users u JOIN room_members m ON m.user_id=u.id
  WHERE u.id=call_seats.user_id AND u.org_id=call_seats.tenant_id AND u.status='active' AND u.role<>'bot' AND m.tenant_id=call_seats.tenant_id AND m.room_id=call_seats.room_id)
  AND NOT EXISTS(SELECT 1 FROM meeting_guest_sessions g WHERE g.guest_id=call_seats.user_id AND g.tenant_id=call_seats.tenant_id AND g.room_id=call_seats.room_id AND g.status='admitted'
  AND g.expires_at>` + c.store.dbNowMillis() + ` AND g.seen_at>` + c.store.dbNowMillis() + `-?))`
 	// Parenthesize the disjunction before the queue helper appends its SFU predicate.
 	if err := queueCallSeatsTx(ctx, c.store, tx, `(`+where+`)`, guestLive.Milliseconds()); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (c *chatStore) QueueTenantCallSeatRemoval(ctx context.Context, tenantID string) error {
+	tx, err := c.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := queueCallSeatsTx(ctx, c.store, tx, `call_seats.tenant_id=?`, tenantID); err != nil {
 		return err
 	}
 	return tx.Commit()

@@ -336,8 +336,9 @@ type ChatStore interface {
 	AcquireCallRoom(ctx context.Context, tenantID, roomID, holder string, ttl time.Duration) (CallLease, error)
 	CallRoomHeld(ctx context.Context, lease CallLease) (bool, error)
 	ReleaseCallRoom(ctx context.Context, lease CallLease) error
-	PutCallSeat(ctx context.Context, cs *CallSession, userID, peerID string, guest bool) error
+	PutCallSeat(ctx context.Context, cs *CallSession, seat CallSeat) error
 	QueueCallSeatRemoval(ctx context.Context, roomID, userID string) error
+	QueueTenantCallSeatRemoval(ctx context.Context, tenantID string) error
 	QueueCallRoomRemoval(ctx context.Context, tenantID, livekitRoom string) error
 	PruneCallSeats(ctx context.Context, guestLive time.Duration) error
 	PendingCallEvictions(ctx context.Context, tenantID, userID string, limit int) ([]CallEviction, error)

@@ -145,6 +145,9 @@ func (c *chatStore) PurgeTenantRows(ctx context.Context, tenantID string) error 
 		}
 		return err
 	}
+	if err := queueCallSeatsTx(ctx, c.store, tx, `call_seats.tenant_id=?`, tenantID); err != nil {
+		return err
+	}
 	// Retain every SFU room before its call/room rows disappear. Cleanup must finish before
 	// MarkTenantPurged may hide this org from later attempts.
 	if _, err := tx.ExecContext(ctx, c.store.rebind(`INSERT INTO pending_call_evictions(tenant_id,livekit_room,peer_id,user_id)

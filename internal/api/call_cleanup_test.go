@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Busnes-app/ky_server_base/internal/config"
+	"github.com/Busnes-app/ky_server_base/internal/crypto"
 	"github.com/Busnes-app/ky_server_base/internal/store"
 	"github.com/google/uuid"
 )
@@ -48,7 +49,7 @@ func TestCallErasureRetainsSFUCleanupAcrossOwnerFailure(t *testing.T) {
 	})
 	ctx := context.Background()
 	u, tok := createOrgUser(t, st, "media-erased", "mediaerased", "user", replicaOrgA)
-	other, _ := createOrgUser(t, st, "media-stays", "mediastays", "user", replicaOrgA)
+	other, otherToken := createOrgUser(t, st, "media-stays", "mediastays", "user", replicaOrgA)
 	room := roomOf(t, doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", tok, map[string]any{"kind": "channel", "name": "shared media", "member_ids": []string{other.ID}}, nil))
 	lease, err := st.Chat().AcquireCallRoom(ctx, replicaOrgA, room, "failed-owner", time.Minute)
 	if err != nil {
@@ -58,8 +59,12 @@ func TestCallErasureRetainsSFUCleanupAcrossOwnerFailure(t *testing.T) {
 	if err := st.Chat().CreateCallSession(ctx, cs); err != nil {
 		t.Fatal(err)
 	}
-	for _, user := range []*store.User{u, other} {
-		if err := st.Chat().PutCallSeat(ctx, cs, user.ID, "peer-"+user.ID, false); err != nil {
+	for _, entry := range []struct {
+		user  *store.User
+		token string
+	}{{u, tok}, {other, otherToken}} {
+		user := entry.user
+		if err := st.Chat().PutCallSeat(ctx, cs, store.CallSeat{UserID: user.ID, PeerID: "peer-" + user.ID, SessionHash: crypto.SHA256Hex([]byte(entry.token))}); err != nil {
 			t.Fatal(err)
 		}
 	}

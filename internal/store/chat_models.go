@@ -304,3 +304,9 @@ type CallLease struct {
 
 // CallEviction retires an SFU room. PeerID/UserID retain its opaque erasure cause.
 type CallEviction struct{ TenantID, LiveKitRoom, PeerID, UserID string }
+
+// CallSeat binds a human to the verified originating session; guests use their lobby identity.
+type CallSeat struct {
+	UserID, PeerID, SessionHash string
+	Guest                       bool
+}
