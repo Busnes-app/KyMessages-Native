@@ -335,16 +335,26 @@ func (s *Server) suiteOrgID(body []byte) (string, map[string]json.RawMessage, er
 	return orgID, fields, nil
 }
 
-// decodeSuiteBody checks org_id with suiteOrgID, then strictly decodes the remaining fields
-// into v (unknown fields refused). v must not declare org_id itself.
-func (s *Server) decodeSuiteBody(body []byte, v any) (string, error) {
+// suitePayload checks org_id with suiteOrgID and returns the body a strict decoder reads: the
+// original bytes in single mode, the object without org_id in multi.
+func (s *Server) suitePayload(body []byte) (string, []byte, error) {
 	orgID, fields, err := s.suiteOrgID(body)
-	if err != nil {
-		return "", err
+	if err != nil || !s.config.Tenancy.IsMultiTenant() {
+		return orgID, body, err
 	}
 	rest, err := json.Marshal(fields)
 	if err != nil {
-		return "", errSuiteBadBody
+		return "", nil, errSuiteBadBody
+	}
+	return orgID, rest, nil
+}
+
+// decodeSuiteBody strictly decodes suitePayload's body into v (unknown fields refused). v must
+// not declare org_id itself.
+func (s *Server) decodeSuiteBody(body []byte, v any) (string, error) {
+	orgID, rest, err := s.suitePayload(body)
+	if err != nil {
+		return "", err
 	}
 	dec := json.NewDecoder(bytes.NewReader(rest))
 	dec.DisallowUnknownFields()
@@ -367,18 +377,9 @@ func (s *Server) suiteUser(ctx context.Context, r *http.Request, sub, issuer, or
 	if want == "" || strings.TrimRight(issuer, "/") != want {
 		return nil, nil
 	}
-	u, err := s.store.Users().GetUserBySSO(ctx, "kyidentity", sub)
-	if errors.Is(err, store.ErrNotFound) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	if u.Status != "active" || u.Role != "user" {
-		return nil, nil
-	}
-	if !s.config.Tenancy.IsMultiTenant() {
-		return u, nil
+	u, err := s.suiteAccount(ctx, sub)
+	if u == nil || err != nil || !s.config.Tenancy.IsMultiTenant() {
+		return u, err
 	}
 	if u.OrgID != orgID {
 		s.audit(ctx, u.ID, r, "suite.org_mismatch", "suite", "")
@@ -389,6 +390,28 @@ func (s *Server) suiteUser(ctx context.Context, r *http.Request, sub, issuer, or
 		return nil, err
 	}
 	return u, nil
+}
+
+// suiteAccount is sub's KyIdentity account when it is active and an everyday user, else nil.
+func (s *Server) suiteAccount(ctx context.Context, sub string) (*store.User, error) {
+	u, err := s.store.Users().GetUserBySSO(ctx, "kyidentity", sub)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return nil, nil
+	case err != nil:
+		return nil, err
+	case u.Status != "active" || u.Role != "user":
+		return nil, nil
+	}
+	return u, nil
+}
+
+// suiteTenant is the tenant a verified suite request acts in.
+func (s *Server) suiteTenant(orgID string) string {
+	if s.config.Tenancy.IsMultiTenant() {
+		return orgID
+	}
+	return store.DefaultTenantID
 }
 
 // suiteRateLimited counts one request against key and, over limit, releases the event and

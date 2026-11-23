@@ -11,6 +11,7 @@ import (
 
 var (
 	ErrNotFound      = errors.New("record not found")
+	ErrSharingOff    = errors.New("status sharing is off")
 	ErrAlreadyExists = errors.New("record already exists")
 	// ErrUsernameTaken: another account holds the username (exact case, as the column is unique).
 	ErrUsernameTaken                  = fmt.Errorf("username is taken: %w", ErrAlreadyExists)
@@ -40,6 +41,7 @@ type Store interface {
 	Agents() AgentStore
 	Chat() ChatStore
 	SuiteReplay() SuiteReplayStore
+	Presence() PresenceStore
 
 	// Notify emits a PostgreSQL NOTIFY on channel with payload (no-op on SQLite).
 	Notify(ctx context.Context, channel, payload string) error
@@ -49,6 +51,45 @@ type Store interface {
 	Ping(ctx context.Context) error
 	Close() error
 }
+
+// PresenceStore holds each user's suite status inputs, keyed by (tenant, user).
+type PresenceStore interface {
+	// Presence reads the rows of userIDs in tenantID; a user without one is absent from the map.
+	Presence(ctx context.Context, tenantID string, userIDs []string) (map[string]Presence, error)
+	// SetSharing turns sharing on or off; off clears every other input in the same write.
+	SetSharing(ctx context.Context, tenantID, userID string, on bool) error
+	// SetManual sets a manual status, or clears it with state "". ErrSharingOff while off.
+	SetManual(ctx context.Context, tenantID, userID, state string, until time.Time) error
+	// SetCalendar and SetOutOfOffice store a push unless its revision is older than the stored
+	// one (PresenceStale) or sharing is off (PresenceSharingOff). A zero OOO period is off.
+	SetCalendar(ctx context.Context, tenantID, userID string, revision int64, busy []BusyWindow) (PresenceOutcome, error)
+	SetOutOfOffice(ctx context.Context, tenantID, userID string, revision int64, start, end time.Time) (PresenceOutcome, error)
+}
+
+// Presence is one user's stored status inputs. Zero times are unset.
+type Presence struct {
+	ShareOff            bool
+	ManualState         string // available, busy, away or ""
+	ManualUntil         time.Time
+	OOOStart, OOOEnd    time.Time
+	CalendarAt          time.Time // when the last calendar push was stored
+	Busy                []BusyWindow
+	CalendarRev, OOORev int64
+}
+
+// BusyWindow is one calendar busy block, [Start, End).
+type BusyWindow struct {
+	Start, End time.Time
+}
+
+// PresenceOutcome is what a calendar or out-of-office push did.
+type PresenceOutcome string
+
+const (
+	PresenceApplied    PresenceOutcome = "applied"
+	PresenceStale      PresenceOutcome = "stale"
+	PresenceSharingOff PresenceOutcome = "sharing_off"
+)
 
 // SuiteReplayStore tracks verified suite syncauth event IDs in the primary database so
 // replays are rejected across restarts and across replicas.
