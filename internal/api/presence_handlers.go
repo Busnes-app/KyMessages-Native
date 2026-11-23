@@ -149,7 +149,9 @@ func (s *Server) handlePresenceMe(w http.ResponseWriter, r *http.Request) {
 		}
 		outcome = "changed"
 	}
-	if manual != nil || clear {
+	// Turning sharing off already clears the manual status (DecodeMe refuses setting one with it).
+	sharingOff := req.Share != nil && !*req.Share
+	if manual != nil || (clear && !sharingOff) {
 		m := presence.Manual{}
 		if manual != nil {
 			m = *manual
