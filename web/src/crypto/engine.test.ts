@@ -1,7 +1,7 @@
 import 'fake-indexeddb/auto';
 import { readFileSync } from 'node:fs';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { CryptoEngine, parseEnvelope, ROTATE_AFTER_MESSAGES, ROTATE_AFTER_MS, type SealedMessage } from './engine';
+import { CryptoEngine, deviceSigned, oneTimeKeySigned, parseEnvelope, ROTATE_AFTER_MESSAGES, ROTATE_AFTER_MS, type SealedMessage } from './engine';
 import { FakeKeyServer } from './fakeKeyServer';
 import { Account, GroupSession, loadCryptoSync } from './index';
 import { deleteCryptoStores, openCryptoStore } from './store';
@@ -243,6 +243,42 @@ describe('encrypted rooms between two client engines', () => {
     await bob.receive();
     expect(await read(bob, m1)).toBe('waiting');
     expect(server.mail.get(`u_bob\n${bob.deviceId}`)).toEqual([]);
+  });
+
+  it('keeps sharing with healthy devices when a member publishes a key the crypto core refuses', async () => {
+    const server = new FakeKeyServer();
+    const alice = await device(server, 'u_alice');
+    const bob = await device(server, 'u_bob');
+    // Mallory's device validly signs a one-time key that is all zeros (non-contributory).
+    const acct = new Account();
+    const mid = 'MALLORYDEV1';
+    const zero = btoa(String.fromCharCode(...new Uint8Array(32))).replace(/=+$/, '');
+    await server.as('u_mallory').upload({
+      device_id: mid,
+      device_keys: { curve25519: acct.curve25519, ed25519: acct.ed25519, signature: acct.sign(deviceSigned('u_mallory', mid, acct.curve25519, acct.ed25519)) },
+      one_time_keys: [{ key_id: 'AAAAAQ', key: zero, signature: acct.sign(oneTimeKeySigned('u_mallory', mid, 'AAAAAQ', zero)) }],
+    });
+    acct.free();
+    server.join('r1', 'u_alice', 'u_bob', 'u_mallory');
+    const m1 = await send('r1', alice, 'still delivered');
+    await bob.receive();
+    expect(await read(bob, m1)).toBe('still delivered');
+  });
+
+  it('announces stored room keys even when acknowledging the mail fails', async () => {
+    const server = new FakeKeyServer();
+    const alice = await device(server, 'u_alice');
+    const bobServer = server.as('u_bob');
+    const bob = await CryptoEngine.open('u_bob', bobServer, await openCryptoStore('u_bob'));
+    opened.push(bob);
+    server.join('r1', 'u_alice', 'u_bob');
+    const m1 = await send('r1', alice, 'acked later');
+    const arrived = vi.fn();
+    bob.onKeys(arrived);
+    bobServer.ack = () => Promise.reject(new Error('offline'));
+    await expect(bob.receive()).rejects.toThrow('offline');
+    expect(arrived).toHaveBeenCalledWith([parseEnvelope(m1.body)!.session_id]);
+    expect(await read(bob, m1)).toBe('acked later');
   });
 
   it('shares the key with a member’s new device on the very next send', async () => {

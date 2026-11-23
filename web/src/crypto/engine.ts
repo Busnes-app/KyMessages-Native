@@ -453,7 +453,14 @@ export class CryptoEngine {
           if (!t || !isStr(c.key_id, 64) || !isStr(c.key, 64) || !isStr(c.signature, 128)) continue;
           if (!verifyEd25519(t.ed25519, oneTimeKeySigned(t.user_id, t.device_id, c.key_id, c.key), c.signature)) continue;
           byDevice.delete(devKey(c));
-          const s = account.createOutboundSession(t.curve25519, c.key);
+          let s: Session;
+          try {
+            s = account.createOutboundSession(t.curve25519, c.key);
+          } catch {
+            // A signed key the crypto core refuses (e.g. non-contributory): skip only this device,
+            // so one bad device cannot stop the room's key reaching everyone else.
+            continue;
+          }
           try {
             puts.push([`olm:${t.curve25519}:${s.sessionId}`, { pickle: s.pickle(this.key), used: Date.now() } satisfies OlmRecord]);
           } finally {
@@ -664,7 +671,19 @@ export class CryptoEngine {
   async receive(): Promise<string[]> {
     const fresh: string[] = [];
     let usedOneTimeKey = false;
-    await this.locked(async () => {
+    try {
+      await this.receiveLocked(fresh, () => (usedOneTimeKey = true));
+    } finally {
+      // Keys already stored are announced even if a later ack or mailbox read fails: a retry
+      // would find them known and announce nothing, leaving waiting messages stuck.
+      if (usedOneTimeKey) await this.publishKeys().catch(() => undefined);
+      if (fresh.length > 0) for (const fn of this.listeners) fn(fresh);
+    }
+    return fresh;
+  }
+
+  private receiveLocked(fresh: string[], spentOneTimeKey: () => void): Promise<void> {
+    return this.locked(async () => {
       for (;;) {
         const mail = await this.server.mailbox(this.deviceId);
         if (mail.length === 0) return;
@@ -675,7 +694,7 @@ export class CryptoEngine {
             const r = await this.handleMail(m);
             if (r) {
               fresh.push(r.sessionId);
-              usedOneTimeKey ||= r.preKey;
+              if (r.preKey) spentOneTimeKey();
             }
           } catch (e) {
             // A network or local storage failure (IndexedDB raises DOMException: quota, an aborted
@@ -692,9 +711,6 @@ export class CryptoEngine {
         if (stop || mail.length < MAILBOX_PAGE) return;
       }
     });
-    if (usedOneTimeKey) await this.publishKeys().catch(() => undefined);
-    if (fresh.length > 0) for (const fn of this.listeners) fn(fresh);
-    return fresh;
   }
 
   private async handleMail(m: Mail): Promise<{ sessionId: string; preKey: boolean } | undefined> {
