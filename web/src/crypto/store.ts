@@ -25,18 +25,22 @@ export interface CryptoStore {
 // How long a delete waits for other tabs to let go before reporting failure.
 const DELETE_TIMEOUT_MS = 5_000;
 
+// Storage failures always reject with a DOMException (an aborted transaction may carry no error
+// of its own), so callers can tell them from unreadable data and keep the work for a retry.
+const storageError = (e: DOMException | null, what: string) => e ?? new DOMException(what, 'AbortError');
+
 function req<T>(r: IDBRequest<T>): Promise<T> {
   return new Promise((resolve, reject) => {
     r.onsuccess = () => resolve(r.result);
-    r.onerror = () => reject(r.error);
+    r.onerror = () => reject(storageError(r.error, 'IndexedDB request failed'));
   });
 }
 
 function done(tx: IDBTransaction): Promise<void> {
   return new Promise((resolve, reject) => {
     tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () => reject(tx.error);
+    tx.onerror = () => reject(storageError(tx.error, 'IndexedDB transaction failed'));
+    tx.onabort = () => reject(storageError(tx.error, 'IndexedDB transaction aborted'));
   });
 }
 
@@ -155,7 +159,8 @@ function deleteDb(name: string): Promise<void> {
   });
 }
 
-/** The registered device in every crypto store in this browser, read before they are wiped. */
+/** The device in every crypto store in this browser, read before they are wiped. A device whose
+ * registration may still be in flight is included: retiring one the server never saw is a 404. */
 export async function storedDevices(): Promise<{ user_id: string; device_id: string }[]> {
   if (typeof indexedDB === 'undefined') return [];
   const out: { user_id: string; device_id: string }[] = [];
@@ -165,7 +170,7 @@ export async function storedDevices(): Promise<{ user_id: string; device_id: str
     const store = await openCryptoStore(userId);
     try {
       const rec = await store.get<{ device_id?: unknown; registered?: unknown }>('device');
-      if (rec?.registered === true && typeof rec.device_id === 'string') out.push({ user_id: userId, device_id: rec.device_id });
+      if (typeof rec?.device_id === 'string') out.push({ user_id: userId, device_id: rec.device_id });
     } finally {
       store.close();
     }

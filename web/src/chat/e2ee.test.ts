@@ -1,7 +1,7 @@
 import 'fake-indexeddb/auto';
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { abandonDevice, forgetCryptoStore, onRoomKeys, openMessage, retireDevice, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
+import { abandonDevice, forgetCryptoStore, NOT_YET, onRoomKeys, openMessage, retireDevice, retryable, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
 import { parseMessage } from './types';
 
 // jsdom cannot fetch the module by URL; load it from disk instead.
@@ -93,6 +93,82 @@ describe('the signed-in device', () => {
     const bobAgain = await startE2EE('u_bob');
     await vi.waitFor(() => expect(deleted).toContain(bob.deviceId));
     expect(bobAgain.deviceId).not.toBe(bob.deviceId);
+  });
+
+  it('deletes local keys on revocation without waiting for a start-up stuck on the network', async () => {
+    let releaseUpload: () => void = () => undefined;
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/v1/keys/upload') {
+        const req = JSON.parse(String(init?.body)) as { one_time_keys: unknown[] };
+        // The key upload hangs, as on a dead connection.
+        return new Promise<Response>((resolve) => {
+          releaseUpload = () => resolve(json({ one_time_key_count: req.one_time_keys.length }));
+        });
+      }
+      if (url.startsWith('/api/v1/to-device')) return Promise.resolve(json({ messages: [] }));
+      return Promise.resolve(json({ error: `unexpected ${url}` }, 404));
+    }));
+    const stores = async () => (await indexedDB.databases()).map((d) => d.name).filter((n) => n?.startsWith('kymessages-crypto-'));
+    const starting = startE2EE('u_alice').catch((e: unknown) => e);
+    await vi.waitFor(async () => expect(await stores()).toEqual(['kymessages-crypto-u_alice']));
+    await vi.waitFor(() => expect(releaseUpload).not.toBe(undefined));
+    // The session is revoked while the upload is still pending.
+    await abandonDevice();
+    expect(await stores()).toEqual([]);
+    expect(JSON.parse(localStorage.getItem('kymessages-e2ee-retire') ?? '[]')).toHaveLength(1);
+    releaseUpload();
+    await starting;
+    // The cancelled start-up never brings the store back.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(await stores()).toEqual([]);
+  });
+
+  it('marks a message whose open threw as worth trying again', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/v1/keys/upload') {
+        const req = JSON.parse(String(init?.body)) as { one_time_keys: unknown[] };
+        return json({ one_time_key_count: req.one_time_keys.length });
+      }
+      return json({ messages: [] });
+    }));
+    const e = await startE2EE('u_alice');
+    await vi.waitFor(async () => expect((await openMessage(parseMessage({ id: 'x', room_id: 'r1', sender_id: 'u_bob', encoding: 'plain_v1', body: 'p' }))).body).toBe('p'));
+    // A local storage failure while opening: not a verdict on the message.
+    vi.spyOn(e, 'decrypt').mockRejectedValue(new DOMException('transaction aborted', 'AbortError'));
+    const m = parseMessage({
+      id: 'm1', room_id: 'r1', sender_id: 'u_bob', encoding: 'e2ee_room_v1',
+      body: '{"alg":"megolm.v1","sender_key":"k","device_id":"DEVICE0001","session_id":"s","ciphertext":"AAAA"}',
+    });
+    await vi.waitFor(async () => expect((await openMessage(m)).e2ee).toEqual({ kind: 'failed', reason: NOT_YET }));
+    expect(retryable(NOT_YET)).toBe(true);
+    expect(retryable(UNAVAILABLE)).toBe(true);
+    expect(retryable('This message was moved into another room.')).toBe(false);
+  });
+
+  it('does not recreate keys after another tab deleted the store, until this tab signs out', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/v1/keys/upload') {
+        const req = JSON.parse(String(init?.body)) as { one_time_keys: unknown[] };
+        return json({ one_time_key_count: req.one_time_keys.length });
+      }
+      return json({ messages: [] });
+    }));
+    const stores = async () => (await indexedDB.databases()).map((d) => d.name).filter((n) => n?.startsWith('kymessages-crypto-'));
+    await startE2EE('u_alice');
+    // Another tab signs out and deletes the store; this tab never hears why.
+    await new Promise<void>((resolve, reject) => {
+      const r = indexedDB.deleteDatabase('kymessages-crypto-u_alice');
+      r.onsuccess = () => resolve();
+      r.onerror = () => reject(r.error);
+    });
+    await expect(startE2EE('u_alice')).rejects.toThrow('reset in another tab');
+    expect(await stores()).toEqual([]);
+    await forgetCryptoStore(); // this tab's own sign-out
+    await startE2EE('u_alice');
+    expect(await stores()).toEqual(['kymessages-crypto-u_alice']);
   });
 
   it('reports whether sign-out removed the device from the server', async () => {

@@ -450,13 +450,16 @@ export class CryptoEngine {
   }
 
   /** Decrypts an Olm message from curve, starting an inbound session for a pre-key message. */
-  private async olmDecrypt(curve: string, type: number, body: string): Promise<{ plaintext: string; preKey: boolean }> {
+  // Decrypts one Olm message and returns the state it changed (the session, and for a pre-key
+  // message the account whose one-time key it spent) without storing it: the caller stores it in
+  // the same transaction as what the message delivered, so a failed write leaves both as they
+  // were and the mail can be read again.
+  private async olmDecrypt(curve: string, type: number, body: string): Promise<{ plaintext: string; preKey: boolean; writes: [string, unknown][] }> {
     for (const [k, r] of await this.store.list<OlmRecord>(`olm:${curve}:`)) {
       const s = Session.fromPickle(r.pickle, this.key);
       try {
         const plaintext = s.decrypt(type, body);
-        await this.store.write([[k, { pickle: s.pickle(this.key), used: Date.now() } satisfies OlmRecord]]);
-        return { plaintext, preKey: false };
+        return { plaintext, preKey: false, writes: [[k, { pickle: s.pickle(this.key), used: Date.now() } satisfies OlmRecord]] };
       } catch {
         // Not this session; try the next one.
       } finally {
@@ -469,11 +472,14 @@ export class CryptoEngine {
       const inbound = account.createInboundSession(curve, body);
       const s = inbound.takeSession();
       try {
-        await this.store.write([
-          ['account', account.pickle(this.key)],
-          [`olm:${curve}:${s.sessionId}`, { pickle: s.pickle(this.key), used: Date.now() } satisfies OlmRecord],
-        ]);
-        return { plaintext: inbound.plaintext, preKey: true };
+        return {
+          plaintext: inbound.plaintext,
+          preKey: true,
+          writes: [
+            ['account', account.pickle(this.key)],
+            [`olm:${curve}:${s.sessionId}`, { pickle: s.pickle(this.key), used: Date.now() } satisfies OlmRecord],
+          ],
+        };
       } finally {
         s.free();
         inbound.free();
@@ -655,11 +661,13 @@ export class CryptoEngine {
               usedOneTimeKey ||= r.preKey;
             }
           } catch (e) {
-            if (e instanceof Transient) {
+            // A network or local storage failure (IndexedDB raises DOMException: quota, an aborted
+            // write, a store closed by another tab) keeps this mail and the rest for a retry; only
+            // mail that is itself unreadable (bad shape, unverified sender, failed Olm) is dropped.
+            if (e instanceof Transient || e instanceof DOMException) {
               stop = true;
               break;
             }
-            // Mail that cannot be read now never will be: drop it.
           }
           handled.push(m.id);
         }
@@ -686,7 +694,23 @@ export class CryptoEngine {
     // The Olm identity must be the verified key of the device the server says sent the mail.
     const sender = devices.find((d) => d.device_id === m.sender_device_id && d.curve25519 === c.sender_key);
     if (!sender) throw new Error('Mail from an unverified device');
-    const { plaintext, preKey } = await this.olmDecrypt(sender.curve25519, c.type, c.body);
+    const { plaintext, preKey, writes } = await this.olmDecrypt(sender.curve25519, c.type, c.body);
+    // The Olm step succeeded, so its state is kept even if what it carried is refused below.
+    let bad: unknown;
+    let room: { sessionId: string; key: string; record: InboundRecord } | undefined;
+    try {
+      room = await this.roomKey(plaintext, sender);
+    } catch (e) {
+      bad = e;
+    }
+    await this.store.write(room ? [...writes, [room.key, room.record]] : writes);
+    if (bad !== undefined) throw bad;
+    return room ? { sessionId: room.sessionId, preKey } : undefined;
+  }
+
+  // Checks a decrypted room key and returns the record to store, or undefined when an equal or
+  // better copy is already stored.
+  private async roomKey(plaintext: string, sender: Target): Promise<{ sessionId: string; key: string; record: InboundRecord } | undefined> {
     const p = parseJSON(plaintext);
     if (
       !isObj(p) || p.type !== ROOM_KEY_TYPE ||
@@ -711,15 +735,18 @@ export class CryptoEngine {
           known.sender_device === sender.device_id && known.room_id === k.room_id;
         if (!same || known.first_index <= session.firstKnownIndex) return undefined;
       }
-      await this.store.write([[key, {
-        pickle: session.pickle(this.key),
-        room_id: k.room_id,
-        sender_user: sender.user_id,
-        sender_device: sender.device_id,
-        sender_key: sender.curve25519,
-        first_index: session.firstKnownIndex,
-      } satisfies InboundRecord]]);
-      return { sessionId: k.session_id, preKey };
+      return {
+        sessionId: k.session_id,
+        key,
+        record: {
+          pickle: session.pickle(this.key),
+          room_id: k.room_id,
+          sender_user: sender.user_id,
+          sender_device: sender.device_id,
+          sender_key: sender.curve25519,
+          first_index: session.firstKnownIndex,
+        },
+      };
     } finally {
       session.free();
     }

@@ -8,7 +8,12 @@ const stores = (page) => page.evaluate(async () => (await indexedDB.databases())
 
 async function signInAndOpenChat(page, context) {
   await page.goto('/');
-  const login = await page.request.post('/api/auth/login', { data: { username: 'admin', password: 'BrowserUpdated456!' } });
+  // Every project shares the server's sign-in limit (20 a minute per client): wait it out.
+  let login = await page.request.post('/api/auth/login', { data: { username: 'admin', password: 'BrowserUpdated456!' } });
+  for (let i = 0; i < 3 && login.status() === 429; i++) {
+    await page.waitForTimeout(1000 * (Number(login.headers()['retry-after']) || 20));
+    login = await page.request.post('/api/auth/login', { data: { username: 'admin', password: 'BrowserUpdated456!' } });
+  }
   expect(login.ok()).toBe(true);
   await page.goto('/');
   await expect(page.getByRole('region', { name: 'Conversation' })).toBeVisible();
@@ -46,19 +51,16 @@ test('sign-out deletes the encryption store while another tab holds it open', as
 test('sign-out reports a store it cannot delete, which goes once the holder lets go', async ({ page, context }) => {
   await signInAndOpenChat(page, context);
   const [name] = await stores(page);
-  // An old tab that never closes on versionchange.
-  const other = await context.newPage();
-  await other.routeWebSocket(/\/api\/v1\/ws/, () => {});
-  await other.addInitScript(() => { delete window.BroadcastChannel; });
-  await other.goto('/');
-  await other.evaluate((n) => new Promise((resolve) => {
+  // A connection that never closes on versionchange, as an old tab's would. It is held in this
+  // same foreground page, so no browser drops it or throttles the sign-out's timers.
+  await page.evaluate((n) => new Promise((resolve) => {
     const r = indexedDB.open(n);
     r.onsuccess = () => { window.held = r.result; resolve(); };
   }), name);
 
   await signOut(page);
   await expect(page.getByText('could not delete all of its local message data')).toBeVisible({ timeout: 10_000 });
-  await other.evaluate(() => window.held.close());
+  expect(await stores(page)).toHaveLength(1);
+  await page.evaluate(() => window.held.close());
   await expect.poll(() => stores(page)).toEqual([]);
-  await other.close();
 });

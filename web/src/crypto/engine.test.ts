@@ -384,4 +384,29 @@ describe('encrypted rooms between two client engines', () => {
     await bob.receive();
     expect(await read(bob, m1)).toBe('later');
   });
+
+  it('keeps a room key whose write fails in local storage, even after its one-time key is spent', async () => {
+    const server = new FakeKeyServer();
+    const alice = await device(server, 'u_alice');
+    const store = await openCryptoStore('u_bob');
+    const write = store.write.bind(store);
+    let fail = true;
+    // The first write of a room session fails as a full disk would.
+    store.write = async (puts, deletes) => {
+      if (fail && puts.some(([k]) => k.startsWith('in:'))) {
+        fail = false;
+        throw new DOMException('quota exceeded', 'QuotaExceededError');
+      }
+      return write(puts, deletes);
+    };
+    const bob = await CryptoEngine.open('u_bob', server.as('u_bob'), store);
+    opened.push(bob);
+    server.join('r1', 'u_alice', 'u_bob');
+    const m1 = await send('r1', alice, 'kept for later'); // a pre-key message: spends a one-time key
+    expect(await bob.receive()).toEqual([]);
+    expect(server.mail.get(`u_bob\n${bob.deviceId}`)).toHaveLength(1);
+    expect(await read(bob, m1)).toBe('waiting');
+    expect(await bob.receive()).toHaveLength(1);
+    expect(await read(bob, m1)).toBe('kept for later');
+  });
 });

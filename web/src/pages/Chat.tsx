@@ -87,7 +87,7 @@ import { MessageRow } from '../components/chat/MessageRow';
 import { RoomDetailsDrawer, type DrawerTab } from '../components/chat/RoomDetailsDrawer';
 import { CreateChannelModal, SearchModal, StartDMModal } from '../components/chat/ChatModals';
 import { searchIndexFor } from '../chat/searchIndex';
-import { onRoomKeys, openMessages, receiveRoomKeys, roomMemberLeft, startE2EE, UNAVAILABLE } from '../chat/e2ee';
+import { onRoomKeys, openMessages, receiveRoomKeys, retryable, roomMemberLeft, startE2EE } from '../chat/e2ee';
 import { CallAudioLayer, CallStage } from '../components/chat/CallStage';
 import { HybridCallController, type HybridCallSnapshot } from '../rtc/hybridCall';
 
@@ -253,7 +253,7 @@ export const Chat: React.FC<ChatProps> = ({
     () =>
       onRoomKeys(() => {
         const retry = Object.values(bucketsRef.current).flatMap((b) =>
-          b.messages.filter((m) => m.e2ee?.kind === 'waiting' || (m.e2ee?.kind === 'failed' && m.e2ee.reason === UNAVAILABLE)),
+          b.messages.filter((m) => m.e2ee?.kind === 'waiting' || (m.e2ee?.kind === 'failed' && retryable(m.e2ee.reason))),
         );
         if (retry.length === 0) return;
         void openMessages(retry).then((list) => {

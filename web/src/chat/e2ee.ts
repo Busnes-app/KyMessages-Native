@@ -87,34 +87,68 @@ export const httpKeyServer: KeyServer = {
   },
 };
 
-let current: { userId: string; engine: Promise<CryptoEngine>; ready?: CryptoEngine } | undefined;
+// One device start-up. Stopping it (sign-out, revocation, another user) is immediate: it closes
+// the store connection now and marks the start-up cancelled, so a pending network step can never
+// hold local keys alive or reopen a store after it was deleted.
+interface Entry {
+  userId: string;
+  engine: Promise<CryptoEngine>;
+  ready?: CryptoEngine;
+  cancelled: boolean;
+  store?: CryptoStore;
+}
+
+let current: Entry | undefined;
 const keyListeners = new Set<() => void>();
+// Set when another tab deleted this tab's store (a sign-out or a device reset there). This tab may
+// have missed that sign-out, so it must not create a new device and new private keys on its own:
+// encryption stays off here until this tab signs out (which clears it) or reloads.
+let deletedElsewhere = false;
+
+class Cancelled extends Error {}
 
 /** Opens (once) the device for userId: loads the crypto core, restores or creates keys, then reads waiting mail. */
 export function startE2EE(userId: string): Promise<CryptoEngine> {
   if (current?.userId === userId) return current.engine;
-  void stopE2EE();
-  const engine = (async () => {
-    await loadCrypto();
-    let e: CryptoEngine;
+  if (deletedElsewhere) return Promise.reject(new Error('Encryption was reset in another tab; reload this tab to continue.'));
+  stopE2EE();
+  const entry = { userId, cancelled: false } as Entry;
+  const live = () => {
+    if (entry.cancelled) throw new Cancelled('Device start-up was cancelled');
+  };
+  const openStore = async () => {
+    live();
+    const s = await openCryptoStore(userId);
+    if (entry.cancelled) {
+      s.close();
+      live();
+    }
+    entry.store = s;
     // Another tab deleted the store (sign-out, device reset): drop this engine, so the next use
     // starts afresh instead of writing to a closed or deleted store.
-    const dropOnClose = (s: CryptoStore) => {
-      s.onClosed(() => {
-        if (current === entry) current = undefined;
-      });
-      return s;
-    };
-    const store = dropOnClose(await openCryptoStore(userId));
+    s.onClosed(() => {
+      if (current === entry) current = undefined;
+      deletedElsewhere = true;
+    });
+    return s;
+  };
+  entry.engine = (async () => {
+    await loadCrypto();
+    let e: CryptoEngine;
+    const store = await openStore();
     try {
       e = await CryptoEngine.open(userId, httpKeyServer, store);
     } catch (err) {
       store.close();
       // The server no longer knows this device (removed from another session): never revive it,
       // start over as a new device.
-      if (!(err instanceof KeyServerError && err.status === 404)) throw err;
+      if (entry.cancelled || !(err instanceof KeyServerError && err.status === 404)) throw err;
       await deleteCryptoStore(userId);
-      e = await CryptoEngine.open(userId, httpKeyServer, dropOnClose(await openCryptoStore(userId)));
+      e = await CryptoEngine.open(userId, httpKeyServer, await openStore());
+    }
+    if (entry.cancelled) {
+      e.close();
+      live();
     }
     void retireAbandoned(userId).catch(() => undefined);
     e.onKeys(() => {
@@ -122,25 +156,28 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
     });
     return e;
   })();
-  const entry: NonNullable<typeof current> = { userId, engine };
   current = entry;
   // Ready first, then reopen what arrived while the device was starting (those messages read as
   // unavailable meanwhile).
-  void engine.then((e) => {
+  void entry.engine.then((e) => {
     entry.ready = e;
     if (current === entry) for (const fn of keyListeners) fn();
   }, () => undefined);
   // A failed start (offline, a blocked database) is retried by the next call.
-  engine.then((e) => void e.receive().catch(() => undefined)).catch(() => {
+  entry.engine.then((e) => void e.receive().catch(() => undefined)).catch(() => {
     if (current === entry) current = undefined;
   });
-  return engine;
+  return entry.engine;
 }
 
-async function stopE2EE(): Promise<void> {
+/** Stops the device now, even mid start-up; never waits on the network. */
+function stopE2EE(): void {
   const old = current;
   current = undefined;
-  await old?.engine.then((e) => e.close()).catch(() => undefined);
+  if (!old) return;
+  old.cancelled = true;
+  old.store?.close();
+  void old.engine.then((e) => e.close(), () => undefined);
 }
 
 function engine(): Promise<CryptoEngine> {
@@ -165,6 +202,10 @@ export function roomMemberLeft(roomId: string): void {
 
 /** The reason shown while this browser's device could not start; such messages are retried. */
 export const UNAVAILABLE = 'Encryption is not available in this browser yet.';
+/** An open that threw (local storage, a store closed under the device): tried again later. */
+export const NOT_YET = 'This message could not be opened yet.';
+/** Whether a failed message is worth opening again when keys arrive or the device restarts. */
+export const retryable = (reason: string) => reason === UNAVAILABLE || reason === NOT_YET;
 
 // The plaintext limit members had before encryption; the envelope may be larger.
 export const MAX_MESSAGE_BYTES = 16 << 10;
@@ -206,7 +247,8 @@ export async function openMessage(m: ChatMessage): Promise<ChatMessage> {
     // The encrypted reply target is the true one; the server's copy is only a hint.
     return { ...m, body: r.inner.body, reply_to_id: r.inner.reply_to_id, e2ee: { kind: 'decrypted' } };
   } catch {
-    return shut({ kind: 'failed', reason: 'This message could not be decrypted.' });
+    // Not a verdict on the message: the engine's own checks return 'failed' without throwing.
+    return shut({ kind: 'failed', reason: NOT_YET });
   }
 }
 
@@ -279,8 +321,8 @@ async function retireAbandoned(userId: string): Promise<void> {
  * after its user next signs in here, so members stop sending keys to a device nobody holds.
  */
 export async function abandonDevice(): Promise<void> {
-  const e = await current?.engine.catch(() => undefined);
-  if (e) saveAbandoned([...abandoned(), { user_id: e.userId, device_id: e.deviceId }]);
+  // Never wait for a start-up still on the network: the store's device record says which device
+  // to retire, and forgetCryptoStore records it before deleting.
   await forgetCryptoStore();
 }
 
@@ -291,7 +333,8 @@ export async function abandonDevice(): Promise<void> {
  * holding it. The signed-in user's device may already be retired; its later delete is a 404.
  */
 export async function forgetCryptoStore(): Promise<void> {
-  await stopE2EE();
+  stopE2EE();
+  deletedElsewhere = false;
   saveAbandoned([...abandoned(), ...(await storedDevices())]);
   await deleteCryptoStores();
 }

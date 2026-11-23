@@ -5,6 +5,8 @@ import type { RoomInner } from '../crypto/engine';
 import type { ChatMessage } from './types';
 
 export const UNAVAILABLE = 'Encryption is not available in this browser yet.';
+export const NOT_YET = 'This message could not be opened yet.';
+export const retryable = (reason: string) => reason === UNAVAILABLE || reason === NOT_YET;
 export const MAX_MESSAGE_BYTES = 16 << 10;
 export const MAX_INNER_BYTES = 32 << 10;
 
