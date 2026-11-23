@@ -580,4 +580,12 @@ func TestHubUserEventWithRoomReachesOnlyThatUser(t *testing.T) {
 	if got.Type != EventTyping || got.UserID != "" || json.Unmarshal(got.Data, &typing) != nil || typing.UserID != "alice" {
 		t.Fatalf("bob got %+v, want alice's typing as a room event", got)
 	}
+
+	// PublishRoom enforces it: a room event that names a user still reaches every member.
+	if err := hub.PublishRoom(context.Background(), "r1", Event{Type: EventMessageNew, RoomID: "r1", Seq: 8, UserID: "alice"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := readEvent(t, bob); got.Type != EventMessageNew || got.Seq != 8 || got.UserID != "" {
+		t.Fatalf("bob got %+v, want the room message", got)
+	}
 }
