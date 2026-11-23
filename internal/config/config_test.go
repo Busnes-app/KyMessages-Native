@@ -349,21 +349,32 @@ func TestAttachmentLimitsConsistency(t *testing.T) {
 }
 
 func TestTenancyModeFromEnv(t *testing.T) {
-	t.Run("default_is_single", func(t *testing.T) {
-		t.Setenv("KY_DATA_DIR", t.TempDir())
-		t.Setenv("KY_TENANCY_MODE", "")
-		cfg, err := config.LoadFromEnv()
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if cfg.Tenancy.EffectiveMode() != config.TenancySingle || cfg.Tenancy.IsMultiTenant() {
-			t.Fatalf("unexpected default tenancy: %+v", cfg.Tenancy)
-		}
-	})
+	for _, mode := range []string{"", "single"} {
+		t.Run("single/"+mode, func(t *testing.T) {
+			t.Setenv("KY_DATA_DIR", t.TempDir())
+			t.Setenv("KY_TENANCY_MODE", mode)
+			cfg, err := config.LoadFromEnv()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Tenancy.Mode != config.TenancySingle {
+				t.Fatalf("tenancy mode = %q, want single", cfg.Tenancy.Mode)
+			}
+		})
+	}
+
+	for _, mode := range []string{"multi", " MuLtI "} {
+		t.Run("unavailable/"+mode, func(t *testing.T) {
+			t.Setenv("KY_DATA_DIR", t.TempDir())
+			t.Setenv("KY_TENANCY_MODE", mode)
+			if _, err := config.LoadFromEnv(); err == nil || !strings.Contains(err.Error(), "KY_TENANCY_MODE=multi: multi-tenant mode is unavailable in this release") {
+				t.Fatalf("want multi-tenant release refusal, got %v", err)
+			}
+		})
+	}
 
 	multiEnv := func(t *testing.T) {
 		t.Setenv("KY_DATA_DIR", t.TempDir())
-		t.Setenv("KY_TENANCY_MODE", "multi")
 		t.Setenv("KY_DB_DRIVER", "postgres")
 		t.Setenv("KY_DB_DSN", "postgres://user:pass@localhost:5432/testdb")
 		t.Setenv("KY_STAFF_ORG_ID", "00000000-0000-4000-8000-000000000001")
@@ -372,7 +383,7 @@ func TestTenancyModeFromEnv(t *testing.T) {
 	t.Run("multi_requires_postgres", func(t *testing.T) {
 		multiEnv(t)
 		t.Setenv("KY_DB_DRIVER", "sqlite")
-		if _, err := config.LoadFromEnv(); err == nil || !strings.Contains(err.Error(), "requires KY_DB_DRIVER=postgres") {
+		if _, err := config.LoadForTenancy(config.TenancyMulti); err == nil || !strings.Contains(err.Error(), "requires KY_DB_DRIVER=postgres") {
 			t.Fatalf("multi on sqlite: %v", err)
 		}
 	})
@@ -381,7 +392,7 @@ func TestTenancyModeFromEnv(t *testing.T) {
 		for _, staff := range []string{"", "org-staff", "00000000-0000-4000-8000-00000000000A", "{00000000-0000-4000-8000-000000000001}"} {
 			multiEnv(t)
 			t.Setenv("KY_STAFF_ORG_ID", staff)
-			if _, err := config.LoadFromEnv(); err == nil || !strings.Contains(err.Error(), "KY_STAFF_ORG_ID") {
+			if _, err := config.LoadForTenancy(config.TenancyMulti); err == nil || !strings.Contains(err.Error(), "KY_STAFF_ORG_ID") {
 				t.Errorf("KY_STAFF_ORG_ID=%q: %v", staff, err)
 			}
 		}
@@ -390,7 +401,7 @@ func TestTenancyModeFromEnv(t *testing.T) {
 	t.Run("multi_forces_scim_off", func(t *testing.T) {
 		multiEnv(t)
 		t.Setenv("KY_SCIM_ENABLED", "true")
-		cfg, err := config.LoadFromEnv()
+		cfg, err := config.LoadForTenancy(config.TenancyMulti)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -408,7 +419,7 @@ func TestTenancyModeFromEnv(t *testing.T) {
 	t.Run("staff_org_administers", func(t *testing.T) {
 		multiEnv(t)
 		t.Setenv("KY_STAFF_ORG_ID", " 00000000-0000-4000-8000-000000000001 ")
-		cfg, err := config.LoadFromEnv()
+		cfg, err := config.LoadForTenancy(config.TenancyMulti)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}

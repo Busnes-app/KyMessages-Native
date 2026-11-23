@@ -97,15 +97,15 @@ func runServer() {
 		log.Fatalf("Failed to initialize database (%s): %v", cfg.Database.Driver, err)
 	}
 	defer st.Close()
+	if err := api.EnsureTenancyMode(ctx, st, cfg.Tenancy); err != nil {
+		log.Fatalf("Tenancy mode check failed: %v", err)
+	}
 	if err := loadInstallerConfiguration(ctx, cfg, st); err != nil {
 		log.Fatalf("Installer configuration unavailable: %v", err)
 	}
 
 	if err := bootstrapAdmin(ctx, st, cfg.Security.AdminUsername, os.Getenv("KY_ADMIN_PASSWORD")); err != nil {
 		log.Fatalf("Failed to create bootstrap admin: %v", err)
-	}
-	if err := api.EnsureTenancyMode(ctx, st, cfg.Tenancy); err != nil {
-		log.Fatalf("Tenancy mode check failed: %v", err)
 	}
 
 	srv := api.NewServer(cfg, st)

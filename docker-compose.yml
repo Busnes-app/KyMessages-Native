@@ -43,6 +43,7 @@ services:
       - KY_ADMIN_USERNAME=${KY_ADMIN_USERNAME:-admin}
       - KY_ADMIN_PASSWORD=${KY_ADMIN_PASSWORD:?Set a bootstrap operator password}
       - KY_SESSION_SECRET=${KY_SESSION_SECRET:-}
+      - KY_TENANCY_MODE=${KY_TENANCY_MODE:-single}
       - KY_DB_DRIVER=sqlite
       - KY_DATA_DIR=/app/data
       - KY_BACKUP_DIR=${KY_BACKUP_DIR-/app/backups}
