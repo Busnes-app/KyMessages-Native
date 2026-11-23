@@ -2,6 +2,7 @@ package blobs_test
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -178,6 +179,29 @@ func TestDeleteDuringRelocationLeavesNothing(t *testing.T) {
 			if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("relocateFirst=%v: %s survived", relocateFirst, p)
 			}
+		}
+	}
+}
+
+// A read racing the relocation of its blob always finds it, at one path or the other.
+func TestReadDuringRelocationFindsTheBlob(t *testing.T) {
+	dir := t.TempDir()
+	flat, _ := blobs.NewStore(dir)
+	st, _ := blobs.NewOrgStore(dir)
+	for i := range 300 {
+		k := fmt.Sprintf("att_race_%08d", i)
+		if _, err := flat.Put(orgA, k, strings.NewReader("x"), 64); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- st.Relocate(orgA, k) }()
+		f, _, err := st.Open(orgA, k)
+		if err != nil {
+			t.Fatalf("read %d during relocation: %v", i, err)
+		}
+		f.Close()
+		if err := <-done; err != nil {
+			t.Fatal(err)
 		}
 	}
 }

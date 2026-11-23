@@ -233,6 +233,9 @@ func (s *Store) Open(tenantID, key string) (io.ReadSeekCloser, int64, error) {
 	f, err := root.Open(rel)
 	if errors.Is(err, os.ErrNotExist) && s.orgs && s.flatFallback.Load() {
 		f, err = root.Open(key)
+		if errors.Is(err, os.ErrNotExist) {
+			f, err = root.Open(rel) // relocated between the two opens
+		}
 	}
 	if err != nil {
 		return nil, 0, err
