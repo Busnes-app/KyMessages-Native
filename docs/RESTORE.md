@@ -122,23 +122,11 @@ Multi mode runs several replicas on one PostgreSQL database. The capsule schedul
   `data/encryption.key`) and `KY_VAPID_PRIVATE_KEY` (or the shared `data/vapid.key`) live in the
   operator's secret store, never next to the database backup. A restored database needs the same
   encryption key, or stored TOTP secrets cannot be read. Multi mode never mints these at start.
-- **Attachments.** `KY_ATTACHMENTS_DIR` is a volume every replica mounts, with each org's blobs
-  under `orgs/<org_id>/att/`; back it up with the volume's own snapshots or copies. The capsule's
-  attachment mirror is not used in multi mode. Restore the volume's `.store-id` file with it: a
-  replica whose directory holds no ID or another one than the database's `blobs.store_id`
-  refuses to start. For a deliberately new volume, delete that setting before the first start.
-- **Return to service.** Stop every replica before the restore, then start them all. Migrations
-  take a PostgreSQL advisory lock, so replicas starting together apply each migration once.
-  Restart every replica after any restore, including one made underneath running replicas: the
-  server cannot detect a PostgreSQL restore, and the tenancy spec's restart re-read of
-  KyIdentity's erased and org lists (not built yet) runs at start.
-- **Restored grants.** A restored database still holds sessions, pairings and bot tokens that
-  were revoked after its restore point. Before starting any replica, run
-  `kymessages invalidate-grants` once with the same environment. It does what `restore` does for
-  a capsule: deletes sessions, MFA challenges, device pairings, push subscriptions and meeting
-  guest sessions, ends active calls, revokes bot tokens, and audits `restore.grants_invalidated`. Users sign in again.
-  Then review the audit trail and KyIdentity for offboarding and org changes after the restore
-  point, as above.
+- **Attachments.** Hosted multi mode requires S3-compatible object storage, with no disk-volume
+  fallback. Its object backend and version-aware restore/erasure tooling are not built in this
+  phase, so the release still refuses multi startup. The capsule attachment mirror remains
+  single-tenant only. Org-layout disk/store-ID tests are internal migration checks, not a hosted
+  backup or rolling-upgrade procedure.
 
 ## Installer-managed console
 

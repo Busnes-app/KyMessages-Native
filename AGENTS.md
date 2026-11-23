@@ -129,6 +129,8 @@ When the user requests a durable behavior change, record it here or in the relev
 
 ## Tenancy
 
+- Hosted multi mode requires S3-compatible object storage only; there is no disk-volume fallback.
+  Org-layout disk constructors are internal migration/isolation fixtures while startup is gated.
 - Only `KY_TENANCY_MODE=single` (default) can start until the final tenancy build phase.
   Preserve the first-boot `tenancy.mode` database lock, including on refused startup.
   Exercise the multi-tenant contracts below through internal constructors. Product contract: [docs/PRODUCT.md](docs/PRODUCT.md).
