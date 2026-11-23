@@ -2,6 +2,13 @@ package chat
 
 import (
 	"context"
+	"database/sql"
+	"github.com/Busnes-app/ky_server_base/internal/config"
+	"github.com/Busnes-app/ky_server_base/internal/rtc"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -100,7 +107,8 @@ func TestSharedLobbyOverlappingSocketsAcrossReplicas(t *testing.T) {
 // must knock and be admitted again.
 func TestSharedLobbyAdmissionLapsesWithoutAnyReplica(t *testing.T) {
 	ctx := context.Background()
-	st, err := store.Open(ctx, testdb.Config(t))
+	dbCfg := testdb.Config(t)
+	st, err := store.Open(ctx, dbCfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +119,7 @@ func TestSharedLobbyAdmissionLapsesWithoutAnyReplica(t *testing.T) {
 	}
 	l := NewLobbyManager(NewHub(&captureBus{}), nil)
 	l.UseShared(st.GuestSessions())
-	l.SetLeaveGrace(400 * time.Millisecond) // presence window 500 ms
+	l.SetLeaveGrace(time.Hour) // expiry is controlled through the stored fixture
 	s, err := l.Knock(ctx, &store.MeetingGuest{MeetingID: "m", GuestKey: "k"}, res.Meeting, nil, "Visitor")
 	if err != nil {
 		t.Fatal(err)
@@ -123,7 +131,7 @@ func TestSharedLobbyAdmissionLapsesWithoutAnyReplica(t *testing.T) {
 		t.Fatalf("fresh admission: %+v %v", got, ok)
 	}
 	// No socket anywhere, no timer: the replica that held it is gone.
-	time.Sleep(time.Second)
+	ageSharedPresence(t, dbCfg, s.GuestID)
 	if _, ok := l.GetBySecret(s.SessionSecret); ok {
 		t.Fatal("an admission nobody refreshed outlived the leave grace")
 	}
@@ -181,7 +189,8 @@ func TestSharedLobbyPollingGuestStaysWaiting(t *testing.T) {
 // the timer and reads apply the same inactivity window.
 func TestSharedLobbyPollingAfterDisconnect(t *testing.T) {
 	ctx := context.Background()
-	st, err := store.Open(ctx, testdb.Config(t))
+	dbCfg := testdb.Config(t)
+	st, err := store.Open(ctx, dbCfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,20 +201,22 @@ func TestSharedLobbyPollingAfterDisconnect(t *testing.T) {
 	}
 	l := NewLobbyManager(NewHub(&captureBus{}), nil)
 	l.UseShared(st.GuestSessions())
-	l.SetLeaveGrace(400 * time.Millisecond) // presence window 500 ms
+	l.SetLeaveGrace(time.Hour) // expiry is controlled through the stored fixture
 	s, err := l.Knock(ctx, &store.MeetingGuest{MeetingID: "m", GuestKey: "k"}, res.Meeting, nil, "Visitor")
 	if err != nil {
 		t.Fatal(err)
 	}
-	l.MarkConnected(s.GuestID)
-	l.HandleDisconnect(s.GuestID, 0)
-	for range 6 { // polls every 200 ms across the timer at 500 ms
-		time.Sleep(200 * time.Millisecond)
+	// Run the timer's conditional delete explicitly after a poll, without a wall-clock wait.
+	for range 6 {
 		if _, ok := l.GetBySecret(s.SessionSecret); !ok {
-			t.Fatal("a polling guest lost the session to the leave timer")
+			t.Fatal("poll lost the session")
+		}
+		rows, err := st.GuestSessions().DeleteIfUnseen(ctx, s.GuestID, l.presence())
+		if err != nil || len(rows) > 0 {
+			t.Fatalf("cleanup removed a polling guest: %v %v", rows, err)
 		}
 	}
-	time.Sleep(time.Second) // no polls, no socket: the window passes and the timer has no hold
+	ageSharedPresence(t, dbCfg, s.GuestID)
 	if _, ok := l.GetBySecret(s.SessionSecret); ok {
 		t.Fatal("an idle guest kept the session")
 	}
@@ -215,7 +226,8 @@ func TestSharedLobbyPollingAfterDisconnect(t *testing.T) {
 // is still open on this replica passes the socket check: the check itself is presence.
 func TestSharedLobbyConnectedGuestSurvivesAnOutage(t *testing.T) {
 	ctx := context.Background()
-	st, err := store.Open(ctx, testdb.Config(t))
+	dbCfg := testdb.Config(t)
+	st, err := store.Open(ctx, dbCfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +238,7 @@ func TestSharedLobbyConnectedGuestSurvivesAnOutage(t *testing.T) {
 	}
 	l := NewLobbyManager(NewHub(&captureBus{}), nil)
 	l.UseShared(st.GuestSessions())
-	l.SetLeaveGrace(400 * time.Millisecond) // presence window 500 ms
+	l.SetLeaveGrace(time.Hour) // expiry is controlled through the stored fixture
 	s, err := l.Knock(ctx, &store.MeetingGuest{MeetingID: "m", GuestKey: "k"}, res.Meeting, nil, "Visitor")
 	if err != nil {
 		t.Fatal(err)
@@ -235,7 +247,7 @@ func TestSharedLobbyConnectedGuestSurvivesAnOutage(t *testing.T) {
 	l.mu.Lock()
 	l.live[s.GuestID] = struct{}{}
 	l.mu.Unlock()
-	time.Sleep(700 * time.Millisecond)
+	ageSharedPresence(t, dbCfg, s.GuestID)
 	active := func(context.Context, string) (bool, error) { return true, nil }
 	if !l.GuestCheck(active)(s.GuestID) {
 		t.Fatal("a guest still connected here was dropped after the outage")
@@ -245,8 +257,74 @@ func TestSharedLobbyConnectedGuestSurvivesAnOutage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(700 * time.Millisecond)
+	ageSharedPresence(t, dbCfg, s2.GuestID)
 	if l.GuestCheck(active)(s2.GuestID) {
 		t.Fatal("a guest with no socket here was kept alive by the check")
+	}
+}
+
+// A revoked invite removes a remote SFU seat even when that replica has no chat socket.
+func TestSharedGuestRevocationRemovesRemoteCallWithoutSocket(t *testing.T) {
+	ctx := context.Background()
+	st := openChatTestStore(t)
+	res, err := st.Chat().UpsertMeeting(ctx, store.UpsertMeetingParams{ID: "remote", TenantID: store.DefaultTenantID, OrganizerSub: "host", Title: "Remote"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	removed := make(chan string, 4)
+	lk := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/RemoveParticipant") {
+			b, _ := io.ReadAll(r.Body)
+			removed <- string(b)
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer lk.Close()
+	bus := &podBus{}
+	a, b := NewHub(bus), NewHub(bus)
+	bus.pods = []*Hub{a, b}
+	calls := NewCallManager(st.Chat(), b, rtc.NewClient(lk.URL, "testkey", "testsecret1234567890"), nil)
+	b.SetUserRevokeHandler(func(id string) { calls.HandleDisconnect(id, 0) })
+	lobby := NewLobbyManager(a, nil)
+	lobby.UseShared(st.GuestSessions())
+	s, err := lobby.Knock(ctx, &store.MeetingGuest{MeetingID: "remote", GuestKey: "guest"}, res.Meeting, nil, "Guest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lobby.Decide(ctx, res.Meeting.RoomID, s.GuestID, "host", true); err != nil {
+		t.Fatal(err)
+	}
+	joined, err := calls.Join(ctx, JoinCallRequest{TenantID: store.DefaultTenantID, RoomID: res.Meeting.RoomID, UserID: s.GuestID, IsGuest: true, Audio: true, ProtectIP: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lobby.RevokeGuestKey(ctx, store.DefaultTenantID, "remote", "guest")
+	select {
+	case body := <-removed:
+		if !strings.Contains(body, joined.PeerID) {
+			t.Fatalf("removed wrong peer: %s", body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("remote SFU participant was not removed")
+	}
+	if state := calls.GetState(res.Meeting.RoomID); state != nil && len(state.Peers) > 0 {
+		t.Fatal("revoked guest still seated")
+	}
+}
+
+// Backdate the database fixture to model elapsed presence without sleeps or scheduler margins.
+func ageSharedPresence(t *testing.T, cfg config.DatabaseConfig, id string) {
+	t.Helper()
+	driver, ph := "sqlite", "?"
+	if cfg.Driver == "postgres" {
+		driver, ph = "pgx", "$1"
+	}
+	db, err := sql.Open(driver, cfg.DSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("UPDATE meeting_guest_sessions SET seen_at = 0 WHERE guest_id = "+ph, id); err != nil {
+		t.Fatal(err)
 	}
 }

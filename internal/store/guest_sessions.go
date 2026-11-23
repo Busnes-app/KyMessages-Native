@@ -108,7 +108,8 @@ func (g *GuestSessionStore) create(ctx context.Context, secret string, sess Gues
 	return replaced, tx.Commit()
 }
 
-// BySecret resolves the unexpired session a guest's secret names.
+// BySecret atomically checks and refreshes the live session a guest's secret names.
+// It shares the row lock with DeleteIfUnseen: a poll cannot succeed without extending presence.
 // present is the presence rule every read and admission applies: a session counts only while
 // some replica refreshed seen_at (database clock) within live. Departure is therefore enforced
 // by the database, not by whichever replica's leave timer happens to run.
@@ -117,7 +118,7 @@ func (g *GuestSessionStore) present() string {
 }
 
 func (g *GuestSessionStore) BySecret(ctx context.Context, secret string, nowMs int64, live time.Duration) (*GuestSession, error) {
-	return scanGuestSession(g.s.db.QueryRowContext(ctx, g.s.rebind(`SELECT `+guestSessionCols+` FROM meeting_guest_sessions WHERE secret_hash = ? AND expires_at > ?`+g.present()),
+	return scanGuestSession(g.s.db.QueryRowContext(ctx, g.s.rebind(`UPDATE meeting_guest_sessions SET seen_at = `+g.s.dbNowMillis()+` WHERE secret_hash = ? AND expires_at > ?`+g.present()+` RETURNING `+guestSessionCols),
 		crypto.SHA256Hex([]byte(secret)), nowMs, live.Milliseconds()))
 }
 

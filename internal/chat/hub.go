@@ -38,6 +38,7 @@ type Hub struct {
 	callFrameHook  CallFrameHandler
 	disconnectHook DisconnectHandler
 	tenantRevoked  func(tenantID string)
+	userRevoked    func(userID string)
 	// guestValid, when set, reports whether a guest still holds a lobby session. It is checked
 	// when the socket registers and on every ping, as sessionValid is for members.
 	guestValid   func(guestID string) bool
@@ -113,6 +114,12 @@ func (h *Hub) SetDisconnectHandler(fn DisconnectHandler) {
 // SetGuestCheck registers the guest session lookup. Call it before serving connections.
 func (h *Hub) SetGuestCheck(fn func(guestID string) bool) {
 	h.guestValid = fn
+}
+
+// SetUserRevokeHandler registers what each pod does when a user (not one session) is revoked,
+// beyond closing its sockets: a call seat may live on a pod with no socket of that user.
+func (h *Hub) SetUserRevokeHandler(fn func(userID string)) {
+	h.userRevoked = fn
 }
 
 // SetTenantRevokeHandler registers what each pod does when a tenant's access is revoked.
@@ -245,6 +252,9 @@ func (h *Hub) Dispatch(ev Event) {
 		if len(ev.Data) > 0 {
 			_ = json.Unmarshal(ev.Data, &only)
 			raw, _ = json.Marshal(Event{Type: EventAuthRevoked, UserID: ev.UserID})
+		}
+		if only.Session == "" && h.userRevoked != nil {
+			go h.userRevoked(ev.UserID) // may call LiveKit; never block the bus
 		}
 		h.mu.RLock()
 		targets := copyClients(h.byUser[ev.UserID])

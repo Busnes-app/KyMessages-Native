@@ -119,3 +119,5 @@ Owns HTTP routing, request parsing, session cookie validation, CORS headers, and
 
 ## Child DOX Index
 None.
+
+- In multi mode, whole-user bus revocations remove call seats on every replica even without a chat socket; session-only revocations leave calls alone. Guest invite replacement, denial and revocation use the same bus path.

@@ -430,7 +430,7 @@ func TestConcurrentRunsAllSucceed(t *testing.T) {
 	}
 }
 
-// Migration 41 rekeys meetings by (tenant_id, id): existing meetings, windows and guests keep
+// Migration 56 rekeys meetings by (tenant_id, id): existing meetings, windows and guests keep
 // their data and gain their meeting's tenant, and a second org may then reuse a meeting ID.
 func TestMeetingsPerTenantKeyKeepsData(t *testing.T) {
 	ctx := context.Background()
@@ -444,7 +444,7 @@ func TestMeetingsPerTenantKeyKeepsData(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if err := migrations.RunThrough(ctx, db, cfg.Driver, 40); err != nil {
+	if err := migrations.RunThrough(ctx, db, cfg.Driver, 55); err != nil {
 		t.Fatal(err)
 	}
 	ph := func(q string) string {
