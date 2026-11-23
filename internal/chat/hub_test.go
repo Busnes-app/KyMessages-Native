@@ -563,4 +563,21 @@ func TestHubUserEventWithRoomReachesOnlyThatUser(t *testing.T) {
 	if got := readEvent(t, alice); got.Type != EventMessageNew || got.Seq != 7 {
 		t.Fatalf("alice got %+v, want only the room message", got)
 	}
+	if got := readEvent(t, bob); got.Type != EventMessageNew || got.Seq != 7 {
+		t.Fatalf("bob got %+v, want the room message", got)
+	}
+
+	// A room event from a real producer (alice's typing frame) still reaches the other member,
+	// with the actor in Data and no recipient.
+	frame, _ := json.Marshal(ClientFrame{Type: ClientFrameTyping, RoomID: "r1", Active: true})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := alice.Write(ctx, websocket.MessageText, frame); err != nil {
+		t.Fatal(err)
+	}
+	got := readEvent(t, bob)
+	var typing TypingPayload
+	if got.Type != EventTyping || got.UserID != "" || json.Unmarshal(got.Data, &typing) != nil || typing.UserID != "alice" {
+		t.Fatalf("bob got %+v, want alice's typing as a room event", got)
+	}
 }
