@@ -85,7 +85,7 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   gain `tenant_id` and reference `meetings (tenant_id, id)`. It rebuilds and renames the three
   tables, one SQL for both engines (`TestMeetingsPerTenantKeyKeepsData`). Every meeting query
   matches `tenant_id`, and `UpsertMeeting` takes `pg_advisory_xact_lock` on the pair first.
-- Migrations 42-43 add multi mode's shared state: `attempt_counters` (`BumpAttempt`,
+- Migrations 57–58 add multi mode's shared state: `attempt_counters` (`BumpAttempt`,
   `AttemptState`), `pow_spent` (`SpendPoW`) and `meeting_guest_sessions`
   (`GuestSessions()`: keyed by the secret's SHA-256, one live session per tenant, meeting and
   guest key, 4 h expiry). `seen_at` is on the database clock: each replica `Touch`es the guests
