@@ -172,11 +172,18 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 		return s.store.Chat().ReserveAttachmentQuota(r.Context(), tenantID, user.ID, requestedBytes, limits, attachmentUploadDeadline(maxBytes)+time.Minute)
 	}
 	res, err := reserve()
-	// No usable grant, or not enough of it: report the org once and look again. The attempt
-	// limit keeps a full org from turning every upload into a KyIdentity call.
-	if (errors.Is(err, store.ErrPoolUnavailable) || errors.Is(err, store.ErrPoolFull)) &&
-		s.allowAccountAttempt("pool-sync:"+tenantID, 6, time.Minute) && s.refreshOrgPool(r.Context(), tenantID) == nil {
-		res, err = reserve()
+	// No usable grant, or less of it than this upload may need: report the org once and look
+	// again (a short reservation is released first, so the report does not count it). The
+	// attempt limit keeps a full org from turning every upload into a KyIdentity call.
+	short := err == nil && res.LimitingKind == store.AttachmentQuotaLimitPool
+	if (short || errors.Is(err, store.ErrPoolUnavailable) || errors.Is(err, store.ErrPoolFull)) &&
+		s.allowAccountAttempt("pool-sync:"+tenantID, 6, time.Minute) {
+		if short {
+			_ = s.store.Chat().ReleaseAttachmentQuota(r.Context(), tenantID, res.ID)
+		}
+		if rerr := s.refreshOrgPool(r.Context(), tenantID); rerr == nil || short {
+			res, err = reserve()
+		}
 	}
 	if err != nil {
 		if s.writePoolError(w, err) {

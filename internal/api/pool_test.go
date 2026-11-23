@@ -150,7 +150,8 @@ func TestPoolCeilingIsExact(t *testing.T) {
 	if rec := e.upload(t, e.a, 2000); rec.Code != http.StatusCreated {
 		t.Fatalf("upload under the ceiling = %d: %s", rec.Code, rec.Body.String())
 	}
-	// Grant now: ceiling 0 + 3000 from the first report. 1000 more reaches it exactly.
+	// 1000 bytes of room are left in the pool; an upload of exactly that fits.
+	e.pool.set("", 1000)
 	if rec := e.upload(t, e.a, 1000); rec.Code != http.StatusCreated {
 		t.Fatalf("upload to the ceiling = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -295,5 +296,19 @@ func TestPoolSkipsTheStaffOrg(t *testing.T) {
 		if r["org_id"] == testStaffOrg {
 			t.Fatal("staff org reported")
 		}
+	}
+}
+
+// A grant with some room but less than the file needs is refreshed before the upload is
+// refused, so a file that fits the pool is not turned away by a small grant.
+func TestPoolShortGrantIsRefreshed(t *testing.T) {
+	e := newPoolEnv(t)
+	e.pool.set("", 1000) // first grant: 1000 bytes
+	if rec := e.upload(t, e.a, 500); rec.Code != http.StatusCreated {
+		t.Fatalf("seed = %d", rec.Code)
+	}
+	e.pool.set("", 1<<20) // KyIdentity now has room
+	if rec := e.upload(t, e.a, 2000); rec.Code != http.StatusCreated {
+		t.Fatalf("upload larger than the remaining grant = %d: %s", rec.Code, rec.Body.String())
 	}
 }
