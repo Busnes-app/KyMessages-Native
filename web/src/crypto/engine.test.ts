@@ -220,6 +220,31 @@ describe('encrypted rooms between two client engines', () => {
     expect(server.oneTimeKeyCount('u_bob', bob.deviceId)).toBe(50);
   });
 
+  it('reads room keys queued by a device that signed out before they were read', async () => {
+    const server = new FakeKeyServer();
+    const alice = await device(server, 'u_alice');
+    const bob = await device(server, 'u_bob');
+    server.join('r1', 'u_alice', 'u_bob');
+    const m1 = await send('r1', alice, 'sent before sign-out');
+    // Alice signs out (her device leaves the key server) while Bob is offline.
+    server.devices.get('u_alice')!.delete(alice.deviceId);
+    await bob.receive();
+    expect(await read(bob, m1)).toBe('sent before sign-out');
+  });
+
+  it('refuses mail whose carried sender keys are not validly signed', async () => {
+    const server = new FakeKeyServer();
+    const alice = await device(server, 'u_alice');
+    const bob = await device(server, 'u_bob');
+    server.join('r1', 'u_alice', 'u_bob');
+    const m1 = await send('r1', alice, 'forged');
+    const [mail] = server.mail.get(`u_bob\n${bob.deviceId}`)!;
+    mail.sender_keys = { ...mail.sender_keys, signature: mail.sender_keys.signature.replace(/^./, (ch) => (ch === 'A' ? 'B' : 'A')) };
+    await bob.receive();
+    expect(await read(bob, m1)).toBe('waiting');
+    expect(server.mail.get(`u_bob\n${bob.deviceId}`)).toEqual([]);
+  });
+
   it('shares the key with a member’s new device on the very next send', async () => {
     const server = new FakeKeyServer();
     const alice = await device(server, 'u_alice');
@@ -385,7 +410,7 @@ describe('encrypted rooms between two client engines', () => {
     expect(await read(bob, m1)).toBe('waiting');
   });
 
-  it('leaves mail for later when the server cannot list the sender', async () => {
+  it('reads mail without listing the sender, whose keys the mail carries', async () => {
     const server = new FakeKeyServer();
     const alice = await device(server, 'u_alice');
     const bobServer = server.as('u_bob');
@@ -395,11 +420,9 @@ describe('encrypted rooms between two client engines', () => {
     const m1 = await send('r1', alice, 'later');
     const query = bobServer.query;
     bobServer.query = () => Promise.reject(new Error('offline'));
-    expect(await bob.receive()).toEqual([]);
-    expect(server.mail.get(`u_bob\n${bob.deviceId}`)).toHaveLength(1);
-    bobServer.query = query;
     await bob.receive();
     expect(await read(bob, m1)).toBe('later');
+    bobServer.query = query;
   });
 
   it('keeps a room key whose write fails in local storage, even after its one-time key is spent', async () => {

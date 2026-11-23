@@ -72,11 +72,11 @@ export const httpKeyServer: KeyServer = {
       try {
         return [{
           id: o.id, sender_user_id: str(o.sender_user_id, 128), sender_device_id: str(o.sender_device_id, 64),
-          type: str(o.type, 64), content: str(o.content, 65536),
+          sender_keys: device(o.sender_keys), type: str(o.type, 64), content: str(o.content, 65536),
         }];
       } catch {
         // Malformed mail still has an ID: the engine refuses it and acknowledges it.
-        return [{ id: o.id, sender_user_id: '', sender_device_id: '', type: '', content: '' }];
+        return [{ id: o.id, sender_user_id: '', sender_device_id: '', sender_keys: { device_id: '', curve25519: '', ed25519: '', signature: '' }, type: '', content: '' }];
       }
     });
   },
@@ -257,20 +257,26 @@ export function openMessages(list: ChatMessage[]): Promise<ChatMessage[]> {
   return Promise.all(list.map(openMessage));
 }
 
+export const RETIRE_MS = 5000;
+
 /**
  * Removes this browser's device from the key server, for sign-out: members stop sending it keys
  * and rotate their sessions. Call it while the session is still valid; it answers whether the
  * server no longer lists the device. When it does not, use abandonDevice so a later sign-in retires it.
+ * It gives up after RETIRE_MS (a start-up or request stuck on the network), so sign-out never waits on it.
  */
-export async function retireDevice(): Promise<boolean> {
-  const e = await current?.engine.catch(() => undefined);
-  if (!e) return false;
-  try {
-    await call(`/api/v1/keys/devices/${encodeURIComponent(e.deviceId)}`, 'DELETE');
-    return true;
-  } catch (err) {
-    return err instanceof KeyServerError && err.status === 404;
-  }
+export function retireDevice(): Promise<boolean> {
+  const attempt = (async () => {
+    const e = await current?.engine.catch(() => undefined);
+    if (!e) return false;
+    try {
+      await call(`/api/v1/keys/devices/${encodeURIComponent(e.deviceId)}`, 'DELETE');
+      return true;
+    } catch (err) {
+      return err instanceof KeyServerError && err.status === 404;
+    }
+  })();
+  return Promise.race([attempt, new Promise<boolean>((r) => setTimeout(r, RETIRE_MS, false))]);
 }
 
 // Devices abandoned when a session was revoked: the server no longer accepts that session, so

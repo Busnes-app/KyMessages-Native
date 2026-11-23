@@ -1,7 +1,7 @@
 import 'fake-indexeddb/auto';
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { abandonDevice, forgetCryptoStore, NOT_YET, onRoomKeys, openMessage, retireDevice, retryable, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
+import { abandonDevice, forgetCryptoStore, NOT_YET, onRoomKeys, openMessage, RETIRE_MS, retireDevice, retryable, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
 import { parseMessage } from './types';
 
 // Tests may replace the device read; everything else is the real store.
@@ -149,6 +149,24 @@ describe('the signed-in device', () => {
     // The cancelled start-up never brings the store back.
     await new Promise((r) => setTimeout(r, 50));
     expect(await stores()).toEqual([]);
+  });
+
+  it('gives up retiring the device when start-up is stuck, so sign-out goes on', async () => {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      // The key upload never answers, as on a dead connection.
+      if (url === '/api/v1/keys/upload') return new Promise<Response>(() => undefined);
+      return Promise.resolve(json({ error: `unexpected ${url}` }, 404));
+    }));
+    void startE2EE('u_alice').catch(() => undefined);
+    vi.useFakeTimers({ toFake: ['setTimeout'] });
+    try {
+      const retiring = retireDevice();
+      await vi.advanceTimersByTimeAsync(RETIRE_MS);
+      expect(await retiring).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('marks a message whose open threw as worth trying again', async () => {

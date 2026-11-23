@@ -65,6 +65,8 @@ export interface Mail {
   id: number;
   sender_user_id: string;
   sender_device_id: string;
+  /** The sender device's self-signed keys when it sent the mail (it may be signed out since). */
+  sender_keys: DeviceKeys;
   type: string;
   content: string;
 }
@@ -378,21 +380,31 @@ export class CryptoEngine {
       }
       for (const userId of batch) {
         for (const d of listed[userId] ?? []) {
-          if (!isObj(d) || !isStr(d.device_id, 64) || !DEVICE_ID.test(d.device_id)) continue;
-          if (userId === this.userId && d.device_id === this.deviceId) continue;
-          if (!isStr(d.curve25519, 64) || !isStr(d.ed25519, 64) || !isStr(d.signature, 128)) continue;
-          if (!verifyEd25519(d.ed25519, deviceSigned(userId, d.device_id, d.curve25519, d.ed25519), d.signature)) continue;
-          const target: Target = { user_id: userId, device_id: d.device_id, curve25519: d.curve25519, ed25519: d.ed25519 };
-          const pinKey = `pin:${devKey(target)}`;
-          const pin = await this.store.get<PinRecord>(pinKey);
-          if (pin && (pin.curve25519 !== d.curve25519 || pin.ed25519 !== d.ed25519)) continue;
-          if (!pin) pins.push([pinKey, { curve25519: d.curve25519, ed25519: d.ed25519 } satisfies PinRecord]);
-          out.push(target);
+          if (userId === this.userId && isObj(d) && d.device_id === this.deviceId) continue;
+          const checked = await this.checkDevice(userId, d);
+          if (!checked) continue;
+          if (checked.pin) pins.push(checked.pin);
+          out.push(checked.target);
         }
       }
     }
     await this.store.write(pins);
     return out;
+  }
+
+  /**
+   * A device of userId whose self-signature verifies and whose keys match its pin, with the pin
+   * to store when it is new; undefined otherwise.
+   */
+  private async checkDevice(userId: string, d: unknown): Promise<{ target: Target; pin?: [string, unknown] } | undefined> {
+    if (!isObj(d) || !isStr(d.device_id, 64) || !DEVICE_ID.test(d.device_id)) return undefined;
+    if (!isStr(d.curve25519, 64) || !isStr(d.ed25519, 64) || !isStr(d.signature, 128)) return undefined;
+    if (!verifyEd25519(d.ed25519, deviceSigned(userId, d.device_id, d.curve25519, d.ed25519), d.signature)) return undefined;
+    const target: Target = { user_id: userId, device_id: d.device_id, curve25519: d.curve25519, ed25519: d.ed25519 };
+    const pinKey = `pin:${devKey(target)}`;
+    const pin = await this.store.get<PinRecord>(pinKey);
+    if (pin && (pin.curve25519 !== d.curve25519 || pin.ed25519 !== d.ed25519)) return undefined;
+    return { target, pin: pin ? undefined : [pinKey, { curve25519: d.curve25519, ed25519: d.ed25519 } satisfies PinRecord] };
   }
 
   /**
@@ -653,7 +665,6 @@ export class CryptoEngine {
     const fresh: string[] = [];
     let usedOneTimeKey = false;
     await this.locked(async () => {
-      const senders = new Map<string, Target[]>();
       for (;;) {
         const mail = await this.server.mailbox(this.deviceId);
         if (mail.length === 0) return;
@@ -661,7 +672,7 @@ export class CryptoEngine {
         let stop = false;
         for (const m of mail) {
           try {
-            const r = await this.handleMail(m, senders);
+            const r = await this.handleMail(m);
             if (r) {
               fresh.push(r.sessionId);
               usedOneTimeKey ||= r.preKey;
@@ -686,20 +697,19 @@ export class CryptoEngine {
     return fresh;
   }
 
-  private async handleMail(m: Mail, senders: Map<string, Target[]>): Promise<{ sessionId: string; preKey: boolean } | undefined> {
+  private async handleMail(m: Mail): Promise<{ sessionId: string; preKey: boolean } | undefined> {
     if (m.type !== ROOM_KEY_TYPE) throw new Error('Unknown mail type');
     const c = parseJSON(m.content);
     if (!isObj(c) || c.algorithm !== 'olm.v1' || !isStr(c.sender_key, 64) || (c.type !== 0 && c.type !== 1) || !isStr(c.body)) {
       throw new Error('Malformed mail');
     }
-    let devices = senders.get(m.sender_user_id);
-    if (!devices) {
-      devices = await this.verifiedDevices([m.sender_user_id]);
-      senders.set(m.sender_user_id, devices);
-    }
-    // The Olm identity must be the verified key of the device the server says sent the mail.
-    const sender = devices.find((d) => d.device_id === m.sender_device_id && d.curve25519 === c.sender_key);
-    if (!sender) throw new Error('Mail from an unverified device');
+    // The Olm identity must be the verified key of the device the server says sent the mail. The
+    // mail carries that device's self-signed keys from when it was sent, so it stays readable
+    // after the sender signs out; they are checked like listed keys, against the same pins.
+    const checked = isObj(m.sender_keys) && m.sender_keys.device_id === m.sender_device_id ? await this.checkDevice(m.sender_user_id, m.sender_keys) : undefined;
+    if (!checked || checked.target.curve25519 !== c.sender_key) throw new Error('Mail from an unverified device');
+    const sender = checked.target;
+    const pin: [string, unknown][] = checked.pin ? [checked.pin] : [];
     const { plaintext, preKey, writes } = await this.olmDecrypt(sender.curve25519, c.type, c.body);
     // The Olm step succeeded, so its state is kept even if what it carried is refused below.
     let bad: unknown;
@@ -709,7 +719,7 @@ export class CryptoEngine {
     } catch (e) {
       bad = e;
     }
-    await this.store.write(room ? [...writes, [room.key, room.record]] : writes);
+    await this.store.write(room ? [...pin, ...writes, [room.key, room.record]] : [...pin, ...writes]);
     if (bad !== undefined) throw bad;
     return room ? { sessionId: room.sessionId, preKey } : undefined;
   }

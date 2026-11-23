@@ -77,11 +77,12 @@ export class FakeKeyServer {
         return out;
       },
       sendToDevice: async (deviceId, messages) => {
-        if (!this.devices.get(userId)?.has(deviceId)) throw new Error('Unknown device');
+        const sender = this.devices.get(userId)?.get(deviceId);
+        if (!sender) throw new Error('Unknown device');
         for (const m of messages) {
           const id = dk(m.user_id, m.device_id);
           const box = this.mail.get(id) ?? [];
-          box.push({ id: this.nextMail++, sender_user_id: userId, sender_device_id: deviceId, type: m.type, content: m.content });
+          box.push({ id: this.nextMail++, sender_user_id: userId, sender_device_id: deviceId, sender_keys: { ...sender }, type: m.type, content: m.content });
           this.mail.set(id, box);
           this.sent.push({ from: userId, to: m.user_id, type: m.type });
         }
