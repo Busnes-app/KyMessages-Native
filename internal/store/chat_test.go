@@ -192,10 +192,10 @@ func TestChatStoreMessagesSeqIdempotencyPaginationAndReadCursor(t *testing.T) {
 	}
 
 	// Edit/delete ownership checks.
-	if _, err := chat.EditMessage(ctx, store.DefaultTenantID, room.ID, firstMsg.ID, "u_bob", "hijack"); !errors.Is(err, store.ErrForbidden) {
+	if _, err := chat.EditMessage(ctx, store.DefaultTenantID, room.ID, firstMsg.ID, "u_bob", "hijack", store.MessageEncodingPlainV1); !errors.Is(err, store.ErrForbidden) {
 		t.Fatalf("non-sender EditMessage = %v, want ErrForbidden", err)
 	}
-	edited, err := chat.EditMessage(ctx, store.DefaultTenantID, room.ID, firstMsg.ID, "u_alice", "edited text")
+	edited, err := chat.EditMessage(ctx, store.DefaultTenantID, room.ID, firstMsg.ID, "u_alice", "edited text", store.MessageEncodingPlainV1)
 	if err != nil || edited.Body != "edited text" || edited.EditedAt == nil {
 		t.Fatalf("EditMessage = (%+v, %v)", edited, err)
 	}
@@ -355,7 +355,7 @@ func TestChatStoreAttachments(t *testing.T) {
 	if err != nil || len(fetched.Attachments) != 1 {
 		t.Fatalf("GetMessage = (%+v, %v)", fetched, err)
 	}
-	edited, err := chat.EditMessage(ctx, store.DefaultTenantID, roomA.ID, msg.ID, "u_alice", "updated sketch caption")
+	edited, err := chat.EditMessage(ctx, store.DefaultTenantID, roomA.ID, msg.ID, "u_alice", "updated sketch caption", store.MessageEncodingPlainV1)
 	if err != nil || len(edited.Attachments) != 1 {
 		t.Fatalf("EditMessage = (%+v, %v)", edited, err)
 	}

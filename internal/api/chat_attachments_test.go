@@ -160,7 +160,8 @@ func TestChatAttachmentsUploadLinkDownloadAndCleanup(t *testing.T) {
 
 	// Bob cannot hijack Alice's staged attachment into his message.
 	hijackRec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+roomID+"/messages", bobTok, map[string]any{
-		"body":           "mine",
+		"body":           testEnvelope("mine"),
+		"encoding":       "e2ee_room_v1",
 		"attachment_ids": []string{att.ID},
 	}, nil)
 	if hijackRec.Code != http.StatusBadRequest {
@@ -169,7 +170,8 @@ func TestChatAttachmentsUploadLinkDownloadAndCleanup(t *testing.T) {
 
 	// Alice sends an attachment-only message (empty body allowed when attachment_ids is non-empty).
 	sendRec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+roomID+"/messages", aliceTok, map[string]any{
-		"body":           "",
+		"body":           testEnvelope(""),
+		"encoding":       "e2ee_room_v1",
 		"attachment_ids": []string{att.ID},
 	}, nil)
 	if sendRec.Code != http.StatusCreated {
@@ -410,7 +412,8 @@ func TestChatAttachmentQuotasDeleteAndOrphanSweep(t *testing.T) {
 	_ = json.Unmarshal(upLinked.Body.Bytes(), &linkedResp)
 
 	sendRec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+roomID+"/messages", aliceTok, map[string]any{
-		"body":           "attached",
+		"body":           testEnvelope("attached"),
+		"encoding":       "e2ee_room_v1",
 		"attachment_ids": []string{linkedResp.Attachment.ID},
 	}, map[string]string{"Idempotency-Key": "idem-quota-1"})
 	if sendRec.Code != http.StatusCreated {

@@ -198,7 +198,8 @@ func TestPushMessageNotifyModesCallsAndGonePruning(t *testing.T) {
 
 	// 1. Default notify_mode ("all"): Alice sends message -> Bob receives Web Push.
 	rec = doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+rm.ID+"/messages", aliceTok, map[string]any{
-		"body": "Hello engineering!",
+		"body":     testEnvelope("Hello engineering!"),
+		"encoding": "e2ee_room_v1",
 	}, nil)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("send msg 1: %d %s", rec.Code, rec.Body.String())
@@ -220,7 +221,8 @@ func TestPushMessageNotifyModesCallsAndGonePruning(t *testing.T) {
 		t.Fatalf("update notify_mode mentions: %d %s", rec.Code, rec.Body.String())
 	}
 	rec = doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+rm.ID+"/messages", aliceTok, map[string]any{
-		"body": "Just chatting without mentioning anyone",
+		"body":     testEnvelope("Just chatting without mentioning anyone"),
+		"encoding": "e2ee_room_v1",
 	}, nil)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("send msg 2: %d", rec.Code)
@@ -231,20 +233,17 @@ func TestPushMessageNotifyModesCallsAndGonePruning(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 
-	// Mentioning @bob triggers push!
-	rec = doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+rm.ID+"/messages", aliceTok, map[string]any{
-		"body": "Hey @Bob, can you check this?",
-	}, nil)
+	// The server cannot read an encrypted message, so it cannot see an @bob inside one: in
+	// "mentions" mode an encrypted channel message never pushes. (Plaintext mention matching,
+	// still used for bot messages, is covered by TestBodyHasMention.)
+	rec = doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+rm.ID+"/messages", aliceTok, sealed("Hey @Bob, can you check this?", nil), nil)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("send msg 3: %d", rec.Code)
 	}
 	select {
 	case p := <-gotCh:
-		if p.Path != "/bob" {
-			t.Fatalf("unexpected mention push: %+v", p)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatalf("timed out waiting for @bob mention push")
+		t.Fatalf("unexpected push for an encrypted message in mentions mode: %+v", p)
+	case <-time.After(200 * time.Millisecond):
 	}
 
 	// 3. Incoming call start -> high-urgency TTL=60 push!
@@ -271,7 +270,8 @@ func TestPushMessageNotifyModesCallsAndGonePruning(t *testing.T) {
 		t.Fatalf("update notify_mode mute: %d", rec.Code)
 	}
 	rec = doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+rm.ID+"/messages", aliceTok, map[string]any{
-		"body": "Hey @bob are you there?",
+		"body":     testEnvelope("Hey @bob are you there?"),
+		"encoding": "e2ee_room_v1",
 	}, nil)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("send msg 4: %d", rec.Code)
@@ -288,7 +288,8 @@ func TestPushMessageNotifyModesCallsAndGonePruning(t *testing.T) {
 	}, nil)
 	returnGone.Store(true)
 	_ = doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+rm.ID+"/messages", aliceTok, map[string]any{
-		"body": "Trigger 410 cleanup",
+		"body":     testEnvelope("Trigger 410 cleanup"),
+		"encoding": "e2ee_room_v1",
 	}, nil)
 
 	deadline := time.Now().Add(3 * time.Second)
@@ -427,7 +428,8 @@ func TestPushExcludedForRevokedAndInstallerDeactivatedUsers(t *testing.T) {
 
 	// 3. Send a message: ONLY activeUser should receive a push.
 	rec = doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+rm.ID+"/messages", aliceTok, map[string]any{
-		"body": "Secret message after revocation",
+		"body":     testEnvelope("Secret message after revocation"),
+		"encoding": "e2ee_room_v1",
 	}, nil)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("send msg: %d %s", rec.Code, rec.Body.String())
@@ -537,7 +539,8 @@ func TestPushEndpointOwnershipTransfersOnAccountSwitch(t *testing.T) {
 
 	// Posting to user A's private room MUST NOT push to the shared browser.
 	rec = doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+roomA.ID+"/messages", senderTok, map[string]any{
-		"body": "Confidential for User A only",
+		"body":     testEnvelope("Confidential for User A only"),
+		"encoding": "e2ee_room_v1",
 	}, nil)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("send roomA: %d %s", rec.Code, rec.Body.String())
@@ -550,7 +553,8 @@ func TestPushEndpointOwnershipTransfersOnAccountSwitch(t *testing.T) {
 
 	// Posting to user B's private room MUST push to the shared browser.
 	rec = doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+roomB.ID+"/messages", senderTok, map[string]any{
-		"body": "Hello User B",
+		"body":     testEnvelope("Hello User B"),
+		"encoding": "e2ee_room_v1",
 	}, nil)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("send roomB: %d %s", rec.Code, rec.Body.String())

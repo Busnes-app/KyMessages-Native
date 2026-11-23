@@ -318,7 +318,7 @@ func buildCSP(cfg *config.Config) string {
 			}
 		}
 	}
-	return "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self'; connect-src " + connectSrc + "; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+	return "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self'; connect-src " + connectSrc + "; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
 }
 
 func (l *attemptLimiter) allow(key string, limit int, window time.Duration) bool {

@@ -372,7 +372,7 @@ type ChatStore interface {
 	// in a room they are a member of. Others are left out. It returns no message content.
 	MessageStates(ctx context.Context, tenantID, userID string, ids []string) ([]MessageState, error)
 	ListMessages(ctx context.Context, q MessagePageQuery) ([]*Message, bool, error)
-	EditMessage(ctx context.Context, tenantID, roomID, messageID, actorID, newBody string) (*Message, error)
+	EditMessage(ctx context.Context, tenantID, roomID, messageID, actorID, newBody, encoding string) (*Message, error)
 	DeleteMessage(ctx context.Context, tenantID, roomID, messageID, actorID string, allowModerator bool) (*Message, error)
 
 	AddReaction(ctx context.Context, tenantID, roomID, messageID, userID, emoji string) error

@@ -44,14 +44,14 @@ func TestChatInputHardening(t *testing.T) {
 	roomA, roomB := newRoom("a"), newRoom("b")
 
 	// Replies must point at a message in the same room.
-	_, inB := send(roomB, map[string]any{"body": "elsewhere"})
-	if code, _ := send(roomA, map[string]any{"body": "re", "reply_to_id": inB.ID}); code != http.StatusBadRequest {
+	_, inB := send(roomB, sealed("elsewhere", nil))
+	if code, _ := send(roomA, sealed("re", map[string]any{"reply_to_id": inB.ID})); code != http.StatusBadRequest {
 		t.Fatalf("reply to another room's message = %d, want 400", code)
 	}
-	if code, _ := send(roomA, map[string]any{"body": "re", "reply_to_id": "msg_missing"}); code != http.StatusBadRequest {
+	if code, _ := send(roomA, sealed("re", map[string]any{"reply_to_id": "msg_missing"})); code != http.StatusBadRequest {
 		t.Fatalf("reply to a missing message = %d, want 400", code)
 	}
-	if code, _ := send(roomB, map[string]any{"body": "re", "reply_to_id": inB.ID}); code != http.StatusCreated {
+	if code, _ := send(roomB, sealed("re", map[string]any{"reply_to_id": inB.ID})); code != http.StatusCreated {
 		t.Fatalf("reply in the same room = %d, want 201", code)
 	}
 
