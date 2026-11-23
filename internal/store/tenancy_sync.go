@@ -152,6 +152,7 @@ func (c *chatStore) PurgeTenantRows(ctx context.Context, tenantID string) error 
 		// Sessions, MFA challenges, presence and push subscriptions cascade from users.
 		{`DELETE FROM users WHERE org_id = ?`, []any{tenantID}},
 		{`DELETE FROM user_subjects WHERE org_id = ?`, []any{tenantID}},
+		{`DELETE FROM pending_blob_deletes WHERE tenant_id = ?`, []any{tenantID}},
 		{`UPDATE tenants SET purged_at = ? WHERE id = ?`, []any{time.Now().UnixMilli(), tenantID}},
 		{`INSERT INTO audit_records (action, resource, details, created_at) VALUES ('tenancy.org_purged', ?, '', ?)`, []any{"tenant:" + tenantID, time.Now().UTC()}},
 	} {
