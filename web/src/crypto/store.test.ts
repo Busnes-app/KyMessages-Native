@@ -1,6 +1,8 @@
 import 'fake-indexeddb/auto';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { deleteCryptoStores, openCryptoStore } from './store';
+
+afterEach(() => vi.restoreAllMocks());
 
 const names = async () => (await indexedDB.databases()).map((d) => d.name).filter((n) => n?.startsWith('kymessages-crypto-'));
 
@@ -34,4 +36,24 @@ describe('crypto store deletion', () => {
     stuck.close();
     await expect.poll(names).toEqual([]);
   }, 15_000);
+
+  it('rejects when the browser fails the delete, so sign-out can warn', async () => {
+    const store = await openCryptoStore('u-c');
+    await store.write([['secret', 'k']]);
+    store.close();
+    vi.spyOn(indexedDB, 'deleteDatabase').mockImplementation(() => {
+      const r = {} as IDBOpenDBRequest;
+      setTimeout(() => {
+        Object.defineProperty(r, 'error', { value: new DOMException('disk failure', 'UnknownError') });
+        r.onerror?.(new Event('error'));
+      });
+      return r;
+    });
+    await expect(deleteCryptoStores()).rejects.toThrow('disk failure');
+  });
+
+  it('rejects when the browser cannot list its databases', async () => {
+    vi.spyOn(indexedDB, 'databases').mockRejectedValue(new DOMException('listing refused', 'UnknownError'));
+    await expect(deleteCryptoStores()).rejects.toThrow('listing refused');
+  });
 });

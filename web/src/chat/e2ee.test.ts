@@ -72,6 +72,29 @@ describe('the signed-in device', () => {
     expect(localStorage.getItem('kymessages-e2ee-retire')).toBeNull();
   });
 
+  it("retires another user's device whose store a sign-out wiped, at that user's next sign-in", async () => {
+    const deleted: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/v1/keys/upload') {
+        const req = JSON.parse(String(init?.body)) as { one_time_keys: unknown[] };
+        return json({ one_time_key_count: req.one_time_keys.length });
+      }
+      if (url.startsWith('/api/v1/keys/devices/') && init?.method === 'DELETE') {
+        deleted.push(decodeURIComponent(url.slice('/api/v1/keys/devices/'.length)));
+        return new Response(null, { status: 204 });
+      }
+      if (url.startsWith('/api/v1/to-device')) return json({ messages: [] });
+      return json({ error: `unexpected ${url}` }, 404);
+    }));
+    const bob = await startE2EE('u_bob'); // Bob used this shared browser
+    await startE2EE('u_alice'); // then Alice signed in
+    await forgetCryptoStore(); // and signed out, wiping every store here
+    const bobAgain = await startE2EE('u_bob');
+    await vi.waitFor(() => expect(deleted).toContain(bob.deviceId));
+    expect(bobAgain.deviceId).not.toBe(bob.deviceId);
+  });
+
   it('reports whether sign-out removed the device from the server', async () => {
     let deleteStatus = 500;
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {

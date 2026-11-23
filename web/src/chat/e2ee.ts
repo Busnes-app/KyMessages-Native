@@ -5,7 +5,7 @@ import { errorMessage, secureFetch } from '../api';
 import { arr, bool, obj, str } from '../dto';
 import { CryptoEngine, type ClaimedKey, type DeviceKeys, type KeyServer, type Mail, type RoomInner } from '../crypto/engine';
 import { loadCrypto } from '../crypto/index';
-import { type CryptoStore, deleteCryptoStore, deleteCryptoStores, openCryptoStore } from '../crypto/store';
+import { type CryptoStore, deleteCryptoStore, deleteCryptoStores, openCryptoStore, storedDevices } from '../crypto/store';
 import { parseRoomDetail, type ChatMessage, type E2EEState } from './types';
 
 export class KeyServerError extends Error {
@@ -245,6 +245,11 @@ function abandoned(): Abandoned[] {
 }
 
 function saveAbandoned(list: Abandoned[]): void {
+  const seen = new Set<string>();
+  list = list.filter((d) => {
+    const k = `${d.user_id}\u0000${d.device_id}`;
+    return !seen.has(k) && !!seen.add(k);
+  });
   try {
     if (list.length === 0) localStorage.removeItem(RETIRE_KEY);
     else localStorage.setItem(RETIRE_KEY, JSON.stringify(list.slice(-20)));
@@ -279,9 +284,15 @@ export async function abandonDevice(): Promise<void> {
   await forgetCryptoStore();
 }
 
-/** Closes the device and deletes every crypto store in this browser, for sign-out. */
+/**
+ * Closes the device and deletes every crypto store in this browser, for sign-out. Each store's
+ * device (other users of a shared browser included) is first remembered, so it is removed from
+ * the key server at its user's next sign-in here instead of being left listed with nobody
+ * holding it. The signed-in user's device may already be retired; its later delete is a 404.
+ */
 export async function forgetCryptoStore(): Promise<void> {
   await stopE2EE();
+  saveAbandoned([...abandoned(), ...(await storedDevices())]);
   await deleteCryptoStores();
 }
 

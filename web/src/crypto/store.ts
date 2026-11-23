@@ -155,6 +155,24 @@ function deleteDb(name: string): Promise<void> {
   });
 }
 
+/** The registered device in every crypto store in this browser, read before they are wiped. */
+export async function storedDevices(): Promise<{ user_id: string; device_id: string }[]> {
+  if (typeof indexedDB === 'undefined') return [];
+  const out: { user_id: string; device_id: string }[] = [];
+  for (const d of await indexedDB.databases()) {
+    if (!d.name?.startsWith(DB_PREFIX)) continue;
+    const userId = d.name.slice(DB_PREFIX.length);
+    const store = await openCryptoStore(userId);
+    try {
+      const rec = await store.get<{ device_id?: unknown; registered?: unknown }>('device');
+      if (rec?.registered === true && typeof rec.device_id === 'string') out.push({ user_id: userId, device_id: rec.device_id });
+    } finally {
+      store.close();
+    }
+  }
+  return out;
+}
+
 /** Deletes one user's crypto store in this browser. */
 export function deleteCryptoStore(userId: string): Promise<void> {
   return typeof indexedDB === 'undefined' ? Promise.resolve() : deleteDb(DB_PREFIX + userId);
