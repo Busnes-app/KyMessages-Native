@@ -76,7 +76,7 @@ export async function openMessage(m: ChatMessage): Promise<ChatMessage> {
 
 function openNow(m: ChatMessage): ChatMessage {
   if (m.encoding !== 'e2ee_room_v1' || !m.envelope || m.deleted_at) return m;
-  if (unavailable) return { ...m, body: '', e2ee: { kind: 'failed', reason: UNAVAILABLE } };
+  if (unavailable) return { ...m, body: '', e2ee: { kind: 'failed', reason: UNAVAILABLE, gen: keyGen } };
   const env = JSON.parse(m.envelope) as { session_id: string; ciphertext: string };
   if (!keys.has(env.session_id)) return { ...m, body: '', e2ee: { kind: 'waiting', gen: keyGen } };
   const inner = JSON.parse(atob(env.ciphertext)) as RoomInner;

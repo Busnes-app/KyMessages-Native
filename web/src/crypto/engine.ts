@@ -733,6 +733,9 @@ export class CryptoEngine {
     try {
       room = await this.roomKey(plaintext, sender);
     } catch (e) {
+      // A storage failure says nothing about the payload: keep the Olm state as it was, so the
+      // queued mail decrypts again on retry. Only a definite refusal commits the spent state.
+      if (e instanceof Transient || e instanceof DOMException) throw e;
       bad = e;
     }
     await this.store.write(room ? [...pin, ...writes, [room.key, room.record]] : [...pin, ...writes]);

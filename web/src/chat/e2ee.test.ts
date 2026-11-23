@@ -198,7 +198,7 @@ describe('the signed-in device', () => {
       id: 'm1', room_id: 'r1', sender_id: 'u_bob', encoding: 'e2ee_room_v1',
       body: '{"alg":"megolm.v1","sender_key":"k","device_id":"DEVICE0001","session_id":"s","ciphertext":"AAAA"}',
     });
-    await vi.waitFor(async () => expect((await openMessage(m)).e2ee).toEqual({ kind: 'failed', reason: NOT_YET }));
+    await vi.waitFor(async () => expect((await openMessage(m)).e2ee).toEqual({ kind: 'failed', reason: NOT_YET, gen: expect.any(Number) }));
     expect(retryable(NOT_YET)).toBe(true);
     expect(retryable(UNAVAILABLE)).toBe(true);
     expect(retryable('This message was moved into another room.')).toBe(false);
@@ -264,7 +264,7 @@ describe('the signed-in device', () => {
     await vi.waitFor(() => expect(release).toBeDefined()); // the upload is in flight
     const reopened = vi.fn();
     const stop = onRoomKeys(reopened);
-    expect((await openMessage(m)).e2ee).toEqual({ kind: 'failed', reason: UNAVAILABLE });
+    expect((await openMessage(m)).e2ee).toEqual({ kind: 'failed', reason: UNAVAILABLE, gen: expect.any(Number) });
     stop();
     release!(json({ error: 'stop' }, 500));
     await starting.catch(() => undefined);

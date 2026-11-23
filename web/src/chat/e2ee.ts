@@ -250,7 +250,7 @@ export async function openMessage(m: ChatMessage): Promise<ChatMessage> {
   const shut = (e2ee: E2EEState): ChatMessage => ({ ...m, body: '', e2ee });
   const gen = keyGen;
   const e = current?.ready;
-  if (!e) return shut({ kind: 'failed', reason: UNAVAILABLE });
+  if (!e) return shut({ kind: 'failed', reason: UNAVAILABLE, gen });
   try {
     const r = await e.decrypt({ id: m.id, room_id: m.room_id, sender_id: m.sender_id, body: m.envelope });
     if (r.state === 'waiting') return shut({ kind: 'waiting', gen });
@@ -259,7 +259,7 @@ export async function openMessage(m: ChatMessage): Promise<ChatMessage> {
     return { ...m, body: r.inner.body, reply_to_id: r.inner.reply_to_id, e2ee: { kind: 'decrypted' } };
   } catch {
     // Not a verdict on the message: the engine's own checks return 'failed' without throwing.
-    return shut({ kind: 'failed', reason: NOT_YET });
+    return shut({ kind: 'failed', reason: NOT_YET, gen });
   }
 }
 

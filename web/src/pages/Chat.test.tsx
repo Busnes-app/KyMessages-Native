@@ -277,6 +277,30 @@ describe('Native Chat page', () => {
     });
     expect(await screen.findByText('raced its key')).toBeTruthy();
 
+    // Likewise a message opened before the device was up, when the device starts before it shows.
+    setFakeUnavailable(true);
+    const releaseStart = holdFakeOpens();
+    act(() => {
+      ws.emit({
+        t: 'message.new',
+        room: 'rm_gen',
+        seq: 8,
+        d: {
+          id: 'msg_8', tenant_id: 'default', room_id: 'rm_gen', seq: 8, sender_id: 'u_bob', sender_name: 'Bob',
+          encoding: 'e2ee_room_v1', body: fakeEnvelope({ room_id: 'rm_gen', type: 'text', body: 'opened once the device was up' }, 's_race'),
+          created_at: 1_700_000_070_000, reactions: [],
+        },
+      });
+    });
+    await waitFor(() => expect(heldOpenCount()).toBe(1));
+    await act(async () => {
+      setFakeUnavailable(false);
+      storeKeySilently('s_race'); // the device came up, bumping the generation, with no row yet
+      releaseStart();
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(await screen.findByText('opened once the device was up')).toBeTruthy();
+
     // Instant auth revocation notifies parent shell.
     act(() => {
       ws.emit({ t: 'auth.revoked' });

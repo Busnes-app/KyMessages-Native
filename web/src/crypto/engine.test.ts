@@ -485,4 +485,28 @@ describe('encrypted rooms between two client engines', () => {
     expect(await bob.receive()).toHaveLength(1);
     expect(await read(bob, m1)).toBe('kept for later');
   });
+
+  it('keeps the Olm state when reading the stored room key fails, so the mail decrypts again', async () => {
+    const server = new FakeKeyServer();
+    const alice = await device(server, 'u_alice');
+    const store = await openCryptoStore('u_bob');
+    const get = store.get.bind(store);
+    let fail = true;
+    // The first lookup of a room session fails as a closed or broken store would.
+    store.get = (async (key: string) => {
+      if (fail && key.startsWith('in:')) {
+        fail = false;
+        throw new DOMException('store closed', 'InvalidStateError');
+      }
+      return get(key);
+    }) as typeof store.get;
+    const bob = await CryptoEngine.open('u_bob', server.as('u_bob'), store);
+    opened.push(bob);
+    server.join('r1', 'u_alice', 'u_bob');
+    const m1 = await send('r1', alice, 'read on retry'); // a pre-key message: spends a one-time key
+    expect(await bob.receive()).toEqual([]);
+    expect(server.mail.get(`u_bob\n${bob.deviceId}`)).toHaveLength(1);
+    expect(await bob.receive()).toHaveLength(1);
+    expect(await read(bob, m1)).toBe('read on retry');
+  });
 });

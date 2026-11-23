@@ -264,7 +264,7 @@ export const Chat: React.FC<ChatProps> = ({
             messages: b.messages.map((m) => {
               const o = opened.get(m.id);
               if (!o || m.deleted_at || m.envelope !== o.envelope || m.e2ee?.kind === 'decrypted') return m;
-              const gen = (e: ChatMessage['e2ee']) => (e?.kind === 'waiting' ? e.gen : undefined);
+              const gen = (e: ChatMessage['e2ee']) => (e && e.kind !== 'decrypted' ? e.gen : undefined);
               if (e2eeLabel(m) === e2eeLabel(o) && gen(m.e2ee) === gen(o.e2ee)) return m;
               changed = true;
               return { ...m, body: o.body, reply_to_id: o.reply_to_id, e2ee: o.e2ee };
@@ -285,11 +285,17 @@ export const Chat: React.FC<ChatProps> = ({
       }),
     [reopen],
   );
-  // Keys can land between a message's open and its display, when no row was there to retry:
-  // a waiting row opened before the latest key generation is opened again.
+  // Keys (or the device's start) can land between a message's open and its display, when no row
+  // was there to retry: a waiting or retryable row opened before the latest generation is opened again.
   useEffect(() => {
     const now = keyGeneration();
-    const stale = Object.values(buckets).flatMap((b) => b.messages.filter((m) => m.e2ee?.kind === 'waiting' && m.e2ee.gen !== undefined && m.e2ee.gen < now));
+    const stale = Object.values(buckets).flatMap((b) =>
+      b.messages.filter((m) => {
+        const e = m.e2ee;
+        const again = e?.kind === 'waiting' || (e?.kind === 'failed' && retryable(e.reason));
+        return again && e.gen !== undefined && e.gen < now;
+      }),
+    );
     if (stale.length > 0) reopen(stale);
   }, [buckets, reopen]);
   bucketsRef.current = buckets;
