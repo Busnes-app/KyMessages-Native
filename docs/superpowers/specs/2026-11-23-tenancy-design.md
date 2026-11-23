@@ -379,6 +379,15 @@ rows. A message body is bounded per message and refusing text would break chat.
 
 - `tenants` gains `pool_allowance_bytes`, `pool_checked_at` and `pool_low`. The allowance is
   the pool less what every other app reports, as KyIdentity's headroom answer gives it.
+- **A new org** starts with `pool_allowance_bytes` and `pool_checked_at` NULL, which means
+  unknown. Unknown never passes a write that adds bytes, so the pool is never unenforced. Two
+  steps fetch it early: the first event that creates the tenant row (`EnsureTenant`, from sign-in
+  or a directory event: `internal/api/sso_handlers.go:99`, `internal/sso/kyidentity.go:347`) starts a
+  best-effort headroom read, and an upload that finds the allowance unknown makes one
+  synchronous headroom read before it reserves. That read runs outside the tenant lock, with a
+  5-second timeout, and stores the answer. If KyIdentity cannot answer, the upload gets `503
+  pool_unavailable`, and shrinking writes still pass. So a new org's first upload succeeds
+  whenever KyIdentity is up, without waiting for the reporter.
 - `ReserveAttachmentQuota` and `CommitAttachmentWithQuota` already take the tenant lock and
   count. In multi mode they also compare the count plus the new bytes with
   `pool_allowance_bytes`, inside the same transaction. No network call on the write path.
@@ -469,7 +478,8 @@ Tests each PR must add, beyond its own:
 - **Two replicas:** two servers on one PostgreSQL schema (`internal/testdb`). A migration race, a
   lease handover, a sign-in budget shared across both, a PoW spent on one and refused on the
   other, a guest admitted on one and recognised on the other.
-- **Pool:** at the allowance, one byte over, a stale allowance before and after 15 minutes,
+- **Pool:** a new org's first upload (allowance unknown: fetched and then admitted, or `503`
+  with KyIdentity down), at the allowance, one byte over, a stale allowance before and after 15 minutes,
   shrinking writes while over, two concurrent uploads on two replicas that together pass the
   allowance (one is refused).
 - **Single-tenant:** the upgrade test from the last release, and the answers byte for byte.
