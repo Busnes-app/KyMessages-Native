@@ -88,8 +88,22 @@ func TestRestoreInvalidatesGrants(t *testing.T) {
 	if err := st.E2EE().AddOneTimeKeys(ctx, "u", "D1", []store.E2EEOneTimeKey{{KeyID: "k1", Key: "spent-after-backup", Signature: "s"}}, 100); err != nil {
 		t.Fatal(err)
 	}
-	if k, err := st.E2EE().ClaimOneTimeKey(ctx, "u", "D1"); err != nil || !k.Fallback {
-		t.Fatalf("after restore the claim = %+v %v, want the kept fallback key", k, err)
+	// The fallback key may have been rotated away after the backup, so it is retired too, and
+	// retrying its upload cannot revive it: claims find nothing until the device uploads anew.
+	if err := st.E2EE().AddOneTimeKeys(ctx, "u", "D1", []store.E2EEOneTimeKey{{KeyID: "fb", Key: "fallback", Signature: "s", Fallback: true}}, 100); err != nil {
+		t.Fatal(err)
+	}
+	if has, err := st.E2EE().HasFallbackKey(ctx, "u", "D1"); err != nil || has {
+		t.Fatalf("after restore has fallback = %v %v, want false", has, err)
+	}
+	if k, err := st.E2EE().ClaimOneTimeKey(ctx, "u", "D1"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("after restore the claim = %+v %v, want none", k, err)
+	}
+	if err := st.E2EE().AddOneTimeKeys(ctx, "u", "D1", []store.E2EEOneTimeKey{{KeyID: "fb2", Key: "fresh", Signature: "s", Fallback: true}}, 100); err != nil {
+		t.Fatal(err)
+	}
+	if k, err := st.E2EE().ClaimOneTimeKey(ctx, "u", "D1"); err != nil || k.KeyID != "fb2" {
+		t.Fatalf("claim after a new fallback = %+v %v", k, err)
 	}
 	if mail, _ := st.E2EE().ToDevice(ctx, "u", "D1", 10); len(mail) != 0 {
 		t.Fatalf("restored to-device mail survived: %+v", mail)

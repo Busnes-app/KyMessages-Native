@@ -68,13 +68,15 @@ type E2EEStore interface {
 	ListDevices(ctx context.Context, tenantID string, userIDs []string) ([]E2EEDevice, error)
 	// DeleteDevice removes the device with its one-time keys and mail. ErrNotFound if absent.
 	DeleteDevice(ctx context.Context, userID, deviceID string) error
-	// AddOneTimeKeys stores keys; a fallback key replaces the device's previous one, and a key
-	// ID already stored keeps its first value. If the device would then hold more than max
+	// AddOneTimeKeys stores keys; a fallback key retires the device's previous one, and a key
+	// ID already stored (live or retired) keeps its first value. If the device would then hold more than max
 	// one-time keys it stores nothing and returns ErrE2EETooManyKeys; a retried upload of keys
 	// already stored adds none, so it never trips the cap.
 	AddOneTimeKeys(ctx context.Context, userID, deviceID string, keys []E2EEOneTimeKey, max int) error
 	CountOneTimeKeys(ctx context.Context, userID, deviceID string) (int, error)
-	// ClaimOneTimeKey removes and returns one one-time key, never the same key twice across
+	// HasFallbackKey reports whether the device has a live fallback key (restore retires it).
+	HasFallbackKey(ctx context.Context, userID, deviceID string) (bool, error)
+	// ClaimOneTimeKey retires and returns one one-time key, never the same key twice across
 	// replicas; with none left it returns the fallback key without removing it, or ErrNotFound.
 	ClaimOneTimeKey(ctx context.Context, userID, deviceID string) (*E2EEOneTimeKey, error)
 	SendToDevice(ctx context.Context, msgs []E2EEToDevice) error

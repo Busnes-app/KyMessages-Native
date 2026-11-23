@@ -93,7 +93,8 @@ Owns HTTP routing, request parsing, session cookie validation, CORS headers, and
 - Installer ownership settings (`installer.*`) are omitted from `extra_settings`.
 - End-to-end encryption key server (`e2ee_handlers.go`): `POST /api/v1/keys/upload` (strict body:
   self-signed device keys plus signed one-time and fallback keys; `409` when a device ID's keys
-  change), `/keys/query`, `/keys/claim`, `DELETE /api/v1/keys/devices/{id}`, `PUT /api/v1/to-device`,
+  change; answers `one_time_key_count` and `has_fallback_key`, false when none was uploaded yet or
+  a restore retired it), `/keys/query`, `/keys/claim`, `DELETE /api/v1/keys/devices/{id}`, `PUT /api/v1/to-device`,
   `GET /api/v1/to-device?device_id=` and `POST /api/v1/to-device/ack {device_id, ids}`. Every
   route stays inside the caller's org; another org's device reads as no device. A sent message
   publishes a `to_device` WebSocket event to the recipient. These routes spend their own `e2ee:`

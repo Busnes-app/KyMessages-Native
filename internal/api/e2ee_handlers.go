@@ -165,14 +165,19 @@ func (s *Server) handleE2EEUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var count int
+	var fallback bool
 	if err == nil {
 		count, err = s.store.E2EE().CountOneTimeKeys(ctx, user.ID, dev.DeviceID)
+	}
+	if err == nil {
+		fallback, err = s.store.E2EE().HasFallbackKey(ctx, user.ID, dev.DeviceID)
 	}
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to store keys")
 		return
 	}
-	s.writeJSON(w, http.StatusOK, map[string]int{"one_time_key_count": count})
+	// A device with no live fallback key (none yet, or retired by a restore) must upload a new one.
+	s.writeJSON(w, http.StatusOK, map[string]any{"one_time_key_count": count, "has_fallback_key": fallback})
 }
 
 type e2eeDeviceJSON struct {

@@ -76,7 +76,7 @@ func TestE2EEKeyUpload(t *testing.T) {
 		"one_time_keys": []map[string]string{dev.otk("AAAAAQ"), dev.otk("AAAAAg")},
 		"fallback_key":  dev.otk("AAAAFB"),
 	}, nil)
-	if rec.Code != http.StatusOK || rec.Body.String() != `{"one_time_key_count":2}`+"\n" {
+	if rec.Code != http.StatusOK || rec.Body.String() != `{"has_fallback_key":true,"one_time_key_count":2}`+"\n" {
 		t.Fatalf("upload = %d %s", rec.Code, rec.Body.String())
 	}
 	if c := upload(map[string]any{"device_id": dev.id, "device_keys": dev.keys()}); c != http.StatusOK {
@@ -115,7 +115,7 @@ func TestE2EEKeyUpload(t *testing.T) {
 	}
 	for i := range 2 {
 		rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/keys/upload", tok, map[string]any{"device_id": capped.id, "device_keys": capped.keys(), "one_time_keys": sixty}, nil)
-		if rec.Code != http.StatusOK || rec.Body.String() != `{"one_time_key_count":60}`+"\n" {
+		if rec.Code != http.StatusOK || rec.Body.String() != `{"has_fallback_key":false,"one_time_key_count":60}`+"\n" {
 			t.Fatalf("upload %d of the same 60 keys = %d %s", i+1, rec.Code, rec.Body.String())
 		}
 	}
@@ -128,7 +128,7 @@ func TestE2EEKeyUpload(t *testing.T) {
 		t.Fatalf("upload past the cap = %d", c)
 	}
 	rec = doBearerJSON(t, srv, http.MethodPost, "/api/v1/keys/upload", tok, map[string]any{"device_id": capped.id, "one_time_keys": more[:40]}, nil)
-	if rec.Code != http.StatusOK || rec.Body.String() != `{"one_time_key_count":100}`+"\n" {
+	if rec.Code != http.StatusOK || rec.Body.String() != `{"has_fallback_key":false,"one_time_key_count":100}`+"\n" {
 		t.Fatalf("upload up to the cap = %d %s (a refused upload must store nothing)", rec.Code, rec.Body.String())
 	}
 }

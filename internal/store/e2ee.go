@@ -148,6 +148,12 @@ func (s *e2eeStore) CountOneTimeKeys(ctx context.Context, userID, deviceID strin
 	return n, err
 }
 
+func (s *e2eeStore) HasFallbackKey(ctx context.Context, userID, deviceID string) (bool, error) {
+	var n int
+	err := s.store.db.QueryRowContext(ctx, s.store.rebind(`SELECT COUNT(*) FROM e2ee_one_time_keys WHERE user_id = ? AND device_id = ? AND fallback = 1 AND claimed = 0`), userID, deviceID).Scan(&n)
+	return n > 0, err
+}
+
 func (s *e2eeStore) ClaimOneTimeKey(ctx context.Context, userID, deviceID string) (*E2EEOneTimeKey, error) {
 	// SQLite serializes writers; PostgreSQL must not send every claim at the same lowest key.
 	lock := ""
