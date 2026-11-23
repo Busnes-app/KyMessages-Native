@@ -146,7 +146,7 @@ func (f *fakeIdP) signIn(srv *api.Server, claims map[string]any) *httptest.Respo
 	}
 	srv.ServeHTTP(login, loginRequest)
 	authorize, _ := url.Parse(login.Header().Get("Location"))
-	full := map[string]any{"iss": f.issuer, "aud": "client", "exp": time.Now().Add(time.Hour).Unix(), "iat": time.Now().Unix(), "nonce": authorize.Query().Get("nonce")}
+	full := map[string]any{"sid": crypto.RandomHex(16), "iss": f.issuer, "aud": "client", "exp": time.Now().Add(time.Hour).Unix(), "iat": time.Now().Unix(), "nonce": authorize.Query().Get("nonce")}
 	maps.Copy(full, claims)
 	body, _ := json.Marshal(full)
 	input := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","kid":"k"}`)) + "." + base64.RawURLEncoding.EncodeToString(body)

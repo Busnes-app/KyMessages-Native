@@ -222,3 +222,17 @@ func TestSSOLogoutFencesInFlightCallback(t *testing.T) {
 		})
 	}
 }
+
+func TestSSOSignInRequiresSessionBinding(t *testing.T) {
+	_, st, cfg := setupTestServer(t)
+	cfg.SSO.Enabled = true
+	idp := makeFakeIdP(t, cfg, true)
+	srv := api.NewServer(cfg, st)
+	defer srv.CloseChat()
+	for _, sid := range []any{"", nil, 42} {
+		w := idp.signIn(srv, map[string]any{"sub": "binding-required", "sid": sid})
+		if w.Code != 401 || sessionCookie(w) != nil {
+			t.Fatalf("unbound sign-in accepted: %d %s", w.Code, w.Body.String())
+		}
+	}
+}

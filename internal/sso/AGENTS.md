@@ -20,7 +20,8 @@ Owns the application adapters around KyIdentity OAuth/OIDC login and the HMAC-SH
   - On `user.created` it is `ErrSyncUsernameConflict` naming the username: 409, counted as `username_conflict`, nothing written (the event stays unspent). KyIdentity takes a 409 on a create as delivered and never resends it, so recovery is manual: rename the local account (`KY_ADMIN_USERNAME` only applies to an empty database) or change the KyIdentity user, then press Resync Directory on the system in KyIdentity, which sends the user as a new event.
   - On `user.updated` only the rename is refused: the user keeps its stored username and everything else (status, role, email, name) applies, sessions are revoked on a status or role change, and the delivery is acknowledged. A deactivation or downgrade carried with a clashing rename can never be dropped, and a 409 here would be retried and then marked failed by KyIdentity, losing it. `ErrSyncUnauthorized` wraps its cause with `%w`, so reasons are told apart with `errors.Is`. A delivery that fails on the database (500) is neither recorded nor counted.
 - PKCE with `S256` is enforced on all OAuth/OIDC authorization requests.
-- ID tokens require provider signature, issuer, audience, expiry, and one-time nonce verification before claims are trusted.
+- New ID-token sign-ins require provider signature, issuer, audience, expiry, one-time nonce,
+  nonempty sid and iat before claims are trusted; the verified binding is retained in the session.
 - OAuth discovery, authorization URLs, PKCE parameters, code exchange, and token verification are delegated to `golang.org/x/oauth2` and `coreos/go-oidc`; application code only maps verified claims.
 - Login does not require `auth_time`, but a plausible signed one (positive, not after `iat`
   or now) becomes `IdentityClaims.AuthenticatedAt`, the session's credential time for

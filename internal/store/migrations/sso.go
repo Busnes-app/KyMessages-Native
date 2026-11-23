@@ -21,8 +21,5 @@ CREATE TABLE sso_revocations (
     generation BIGINT NOT NULL,
     PRIMARY KEY (user_id, sid)
 );
--- Existing sessions have no verifiable IdP binding. Require a fresh suite sign-in.
-DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE sso_provider = 'kyidentity');
-DELETE FROM device_pairings WHERE user_id IN (SELECT id FROM users WHERE sso_provider = 'kyidentity');
-DELETE FROM push_subscriptions WHERE user_id IN (SELECT id FROM users WHERE sso_provider = 'kyidentity');
+-- Existing sessions and pairings remain unbound (empty sso_sid) until a new sign-in.
 `

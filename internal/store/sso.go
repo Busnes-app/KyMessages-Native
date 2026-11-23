@@ -19,8 +19,8 @@ func (s *sessionStore) SSOGeneration(ctx context.Context) (int64, error) {
 func checkSSOFence(ctx context.Context, st *SQLStore, tx *sql.Tx, userID string, binding SSOSession) error {
 	var count int
 	err := tx.QueryRowContext(ctx, st.rebind(`SELECT COUNT(*) FROM sso_revocations WHERE user_id = ? AND
-        ((sid <> '' AND sid = ?) OR (sid = '' AND (issued_before >= ? OR generation > ?)))`),
-		userID, binding.SID, binding.IssuedAt, binding.Generation).Scan(&count)
+        ((sid <> '' AND (sid = ? OR ? = '')) OR (sid = '' AND (issued_before >= ? OR generation > ?)))`),
+		userID, binding.SID, binding.SID, binding.IssuedAt, binding.Generation).Scan(&count)
 	if err == nil && count > 0 {
 		return ErrNotFound
 	}
@@ -95,7 +95,9 @@ func (s *sessionStore) ApplySSOLogout(ctx context.Context, issuer, subject, orgI
 	predicate := "user_id = ?"
 	args := []any{userID}
 	if sid != "" {
-		predicate += " AND sso_sid = ?"
+		// Unbound legacy sessions belong to this already-verified subject/org. With no
+		// IdP sid to narrow them further, every logout of that subject must cover them.
+		predicate += " AND (sso_sid = ? OR sso_sid = '')"
 		args = append(args, sid)
 	}
 	rows, err := tx.QueryContext(ctx, s.store.rebind("SELECT token_hash FROM sessions WHERE "+predicate), args...)
@@ -114,8 +116,11 @@ func (s *sessionStore) ApplySSOLogout(ctx context.Context, issuer, subject, orgI
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 		return "", nil, err
 	}
-	for _, table := range []string{"sessions", "device_pairings"} {
-		if _, err := tx.ExecContext(ctx, s.store.rebind("DELETE FROM "+table+" WHERE "+predicate), args...); err != nil {
+	if _, err := tx.ExecContext(ctx, s.store.rebind("DELETE FROM sessions WHERE "+predicate), args...); err != nil {
+		return "", nil, err
+	}
+	if sid != "" {
+		if _, err := tx.ExecContext(ctx, s.store.rebind("DELETE FROM device_pairings WHERE user_id = ? AND sso_sid = ?"), userID, sid); err != nil {
 			return "", nil, err
 		}
 	}

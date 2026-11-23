@@ -9,7 +9,7 @@ import (
 	"github.com/Busnes-app/ky_server_base/internal/testdb"
 )
 
-func TestSSOLifecycleUpgradePreservesLocalGrants(t *testing.T) {
+func TestSSOLifecycleUpgradePreservesExistingGrants(t *testing.T) {
 	ctx := context.Background()
 	cfg := testdb.Config(t)
 	driver := cfg.Driver
@@ -39,11 +39,17 @@ func TestSSOLifecycleUpgradePreservesLocalGrants(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, table := range []string{"sessions", "device_pairings", "push_subscriptions"} {
-		for user, want := range map[string]int{"suite": 0, "local": 1} {
+		for user, want := range map[string]int{"suite": 1, "local": 1} {
 			var got int
 			if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+table+" WHERE user_id = '"+user+"'").Scan(&got); err != nil || got != want {
 				t.Fatalf("%s %s: got %d want %d (%v)", table, user, got, want, err)
 			}
+		}
+	}
+	for _, table := range []string{"sessions", "device_pairings"} {
+		var unbound int
+		if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+table+" WHERE sso_sid = '' AND sso_issued_at = 0 AND sso_generation = 0").Scan(&unbound); err != nil || unbound != 2 {
+			t.Fatalf("%s legacy binding: %d (%v)", table, unbound, err)
 		}
 	}
 	var users int

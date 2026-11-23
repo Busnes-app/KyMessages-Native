@@ -81,8 +81,9 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
 - KyIdentity back-channel logout (`POST /api/sso/kyidentity/logout`) ends one IdP session
   and its paired-device sessions by `sid`, or all of a subject's sessions when `sid` is omitted.
   Shared replay records and issuance fences work across replicas. Configure this URI on the
-  OAuth client. The schema upgrade requires existing KyIdentity users to sign in again and
-  re-register notifications once; local operator sessions are preserved.
+  OAuth client. Existing sessions, pairings and notification registrations stay on upgrade.
+  Legacy sessions have no IdP sid: a sid logout also ends every unbound session for its verified
+  subject and org. New suite sign-ins require and retain the IdP sid.
 - Signed `user.mfa_reset` revokes sessions, MFA challenges, device pairings and push
   subscriptions even when role/status are unchanged. Reset, deletion and installer-managed
   directory events compare the account's org binding before acting.

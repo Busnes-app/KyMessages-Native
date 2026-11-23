@@ -97,3 +97,81 @@ func TestSSOLogoutFencesAcrossConnections(t *testing.T) {
 		})
 	}
 }
+
+func TestSSOSIDLogoutCoversUnboundSessionsOnlyForSubjectAndOrg(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	const orgA = "00000000-0000-4000-8000-000000000001"
+	const orgB = "00000000-0000-4000-8000-000000000002"
+	for _, org := range []string{orgA, orgB} {
+		if _, err := st.Chat().EnsureTenant(ctx, org); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now().UTC()
+	for _, item := range []struct{ id, org string }{{"a", orgA}, {"b", orgA}, {"c", orgB}} {
+		u := &store.User{ID: item.id, Username: item.id, SSOProvider: "kyidentity", SSOSubject: "sub-" + item.id, OrgID: item.org, Status: "active", Role: "user"}
+		if err := st.Users().CreateUser(ctx, u); err != nil {
+			t.Fatal(err)
+		}
+		// Empty binding models a session retained by the additive upgrade.
+		if err := st.Sessions().CreateSession(ctx, &store.Session{UserID: u.ID, TokenHash: u.ID, CreatedAt: now, ExpiresAt: now.Add(time.Hour)}, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pairing := &store.DevicePairing{Secret: "legacy-pair", UserID: "a", Status: "pending", CreatedAt: now, ExpiresAt: now.Add(time.Hour)}
+	if err := st.Devices().CreatePairing(ctx, pairing, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Chat().UpsertPushSubscription(ctx, "a", &store.PushSubscription{TenantID: orgA, UserID: "a", Endpoint: "https://push.example/legacy", P256DH: "key", AuthSecret: "secret"}, 20); err != nil {
+		t.Fatal(err)
+	}
+	live := func(id string) bool { _, err := st.Sessions().GetSession(ctx, id); return err == nil }
+	// Another subject's logout cannot remove a's unbound session.
+	if _, _, err := st.Sessions().ApplySSOLogout(ctx, "https://identity.example", "sub-b", orgA, "sid-a", "logout-b", now.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if !live("a") || live("b") || !live("c") {
+		t.Fatal("another subject's logout changed unrelated sessions")
+	}
+	// The right subject with the wrong org cannot remove any of its sessions.
+	if _, _, err := st.Sessions().ApplySSOLogout(ctx, "https://identity.example", "sub-a", orgB, "sid-a", "logout-a", now.Unix()); !errors.Is(err, store.ErrNotFound) {
+		t.Fatal("wrong org accepted", err)
+	}
+	if !live("a") || !live("c") {
+		t.Fatal("another org's logout changed sessions")
+	}
+	for _, sid := range []string{"sid-a", "sid-other"} {
+		if err := st.Sessions().CreateSession(ctx, &store.Session{SSOSession: store.SSOSession{SID: sid, IssuedAt: now.Unix()}, UserID: "a", TokenHash: sid, CreatedAt: now, ExpiresAt: now.Add(time.Hour)}, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := st.Sessions().ApplySSOLogout(ctx, "https://identity.example", "sub-a", orgA, "sid-a", "logout-a", now.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if live("a") || live("sid-a") || !live("sid-other") || !live("c") {
+		t.Fatal("sid logout did not narrow bound sessions and cover legacy sessions")
+	}
+	if _, err := st.Devices().GetPairingBySecret(ctx, "legacy-pair"); err != nil {
+		t.Fatal("sid logout removed unbound pairing", err)
+	}
+	if subs, err := st.Chat().ListPushSubscriptions(ctx, orgA, "a"); err != nil || len(subs) != 1 {
+		t.Fatal("sid logout removed legacy push", err)
+	}
+	// Even a pairing consumed before logout cannot reissue an unbound session afterward.
+	if err := st.Sessions().CreateSession(ctx, &store.Session{UserID: "a", TokenHash: "legacy-derived", CreatedAt: now, ExpiresAt: now.Add(time.Hour)}, ""); !errors.Is(err, store.ErrNotFound) {
+		t.Fatal("unbound issuance passed sid fence", err)
+	}
+	if _, _, err := st.Sessions().ApplySSOLogout(ctx, "https://identity.example", "sub-a", orgA, "", "logout-sub-a", now.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if live("sid-other") {
+		t.Fatal("subject logout retained session")
+	}
+	if _, err := st.Devices().GetPairingBySecret(ctx, "legacy-pair"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatal("subject logout retained legacy pairing", err)
+	}
+	if subs, err := st.Chat().ListPushSubscriptions(ctx, orgA, "a"); err != nil || len(subs) != 0 {
+		t.Fatal("subject logout retained legacy push", err)
+	}
+}

@@ -112,7 +112,7 @@ func claimsFromIDToken(idToken *oidc.IDToken) (*IdentityClaims, error) {
 		Role              string `json:"role"`
 		AuthTime          int64  `json:"auth_time"`
 	}
-	if err := idToken.Claims(&raw); err != nil || raw.Sub == "" {
+	if err := idToken.Claims(&raw); err != nil || raw.Sub == "" || raw.SID == "" || len(raw.SID) > 256 || idToken.IssuedAt.IsZero() {
 		return nil, ErrInvalidIDToken
 	}
 	username := raw.PreferredUsername
