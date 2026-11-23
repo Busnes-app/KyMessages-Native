@@ -298,7 +298,9 @@ KyIdentity's erased and org lists before serving (§7.4).
 `internal/blobs` gets one interface with the methods its callers use today: `Put(key, r,
 maxBytes)`, `Open(key)`, `Delete(key)`, `SweepStaleTemps` (`internal/blobs/store.go:83`, `:148`,
 `:175`, `:196`; called from `internal/api/attachment_handlers.go:197`, `:223`, `:299`, `:398`,
-`:416`, `:423` and `internal/api/chat_handlers.go:891`), plus `DeletePrefix` for the purge and `Erase` (every version; PR 6).
+`:416`, `:423` and `internal/api/chat_handlers.go:891`), plus `DeletePrefix` for the purge and `Erase` (every version; PR 6). Like `Erase`, `DeletePrefix`
+removes **every version** of every object under the prefix (on `disk`, the listed files), so the
+purge's final orphan sweep leaves no old versions behind (§9.4).
 `Open` returns an `io.ReadSeekCloser` and the size, so downloads keep range requests
 (`http.ServeContent`, `internal/api/attachment_handlers.go:329`).
 
@@ -361,7 +363,8 @@ local mirror (`MirrorAttachments`) is off in multi mode.
 ### 9.5 What KyMessages needs from ky-primitives
 
 An S3 type with `PUT`, `GET`, `HEAD`, `DELETE`, list by prefix, and versioned
-delete, using SigV4 signing over `net/http`, with no new module dependency. KyNotes asks for the
+delete, both of one object and of every version under a prefix (list object versions, then
+delete each version ID), using SigV4 signing over `net/http`, with no new module dependency. KyNotes asks for the
 same type (PR #176). One shared type is the default (open question 8).
 
 ## 10. The org storage pool (decision 9)
