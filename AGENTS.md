@@ -123,6 +123,9 @@ When the user requests a durable behavior change, record it here or in the relev
   (`KY_STUN_URLS`) and an optional LiveKit SFU (`KY_LIVEKIT_URL`, `KY_LIVEKIT_API_KEY`,
   `KY_LIVEKIT_API_SECRET`). KyCalendar meeting rooms (`KY_MEETING_SYNC_SECRET`) admit external
   guests from a waiting room during the meeting.
+- `chat.Hub.Dispatch` sends an event that carries `user_id` only to that user's sockets, even when
+  it also names a room (call signals, call migrations with their LiveKit token, lobby decisions);
+  only events without `user_id` fan out to a room (`TestHubUserEventWithRoomReachesOnlyThatUser`).
 
 ## Tenancy
 
@@ -140,6 +143,9 @@ When the user requests a durable behavior change, record it here or in the relev
   (`ChatStore.ApplyTenantLifecycle`; deletion is terminal). Tenant status is read from the
   primary. Grant issuance (`withPassword`) locks an org-bound account's active tenant row, and
   suspension publishes `tenant.revoked` so every pod drops that org's meeting guests.
+- Every route that names a user or room answers another org's ID exactly like an unknown one,
+  and no live event crosses orgs (`TestMultiTenantCrossOrgUserPaths`). The resume event is
+  `org.resumed`; `org.unsuspended` stays accepted until KyIdentity confirms the name.
 
 ## Installer setup
 
