@@ -349,6 +349,9 @@ type ChatStore interface {
 	// Messages & Reactions
 	CreateMessage(ctx context.Context, p CreateMessageParams) (*Message, bool, error)
 	GetMessage(ctx context.Context, tenantID, roomID, messageID string) (*Message, error)
+	// MessageStates reports, for the given IDs, the messages userID can still read in tenantID:
+	// in a room they are a member of. Others are left out. It returns no message content.
+	MessageStates(ctx context.Context, tenantID, userID string, ids []string) ([]MessageState, error)
 	ListMessages(ctx context.Context, q MessagePageQuery) ([]*Message, bool, error)
 	EditMessage(ctx context.Context, tenantID, roomID, messageID, actorID, newBody string) (*Message, error)
 	DeleteMessage(ctx context.Context, tenantID, roomID, messageID, actorID string, allowModerator bool) (*Message, error)

@@ -101,6 +101,7 @@ Owns HTTP routing, request parsing, session cookie validation, CORS headers, and
 - `POST /api/installer/directory` and the managed suite sync alias verify the protected
   HMAC credential before owned, revision-fenced authority updates.
 - Installer ownership settings (`installer.*`) are omitted from `extra_settings`.
+- `POST /api/v1/messages/state {ids}` (1–50) answers which messages the caller can still read (a member of the room, in their org), with `deleted` and `edited_at` and never the text; on-device search checks its hits with it. It reads the primary.
 - End-to-end encryption key server (`e2ee_handlers.go`): `POST /api/v1/keys/upload` (strict body:
   self-signed device keys plus signed one-time and fallback keys; `409` when a device ID's keys
   change; answers `one_time_key_count` and `has_fallback_key`, false when none was uploaded yet or

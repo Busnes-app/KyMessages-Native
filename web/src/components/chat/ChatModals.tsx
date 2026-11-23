@@ -4,7 +4,8 @@ import { Combobox } from '@base-ui/react/combobox';
 import { Dialog } from '@base-ui/react/dialog';
 import { Hash, Lock, MessageSquare, Search, Video, X } from 'lucide-react';
 import type { ChatDirectoryUser, ChatRoomSummary } from '../../chat/types';
-import { type SearchHit, searchIndexFor } from '../../chat/searchIndex';
+import { fetchMessageStates } from '../../chat/client';
+import { freshHits, type SearchHit, searchIndexFor } from '../../chat/searchIndex';
 import { formatTime, isBotSender, isWebhookSender } from '../../chat/state';
 
 interface ChatDialogProps {
@@ -357,7 +358,11 @@ export const SearchModal: React.FC<SearchModalProps> = ({ userId, rooms, activeR
     setErr('');
     const timer = setTimeout(() => {
       void searchIndexFor(userId)
-        .then((index) => index.search(trimmed, scopeCurrent && activeRoomId ? activeRoomId : undefined, 50, abort.signal))
+        .then(async (index) => {
+          const hits = await index.search(trimmed, scopeCurrent && activeRoomId ? activeRoomId : undefined, 50, abort.signal);
+          // Show only what the server still vouches for (fails closed if it cannot be asked).
+          return freshHits(index, hits, fetchMessageStates);
+        })
         .then((res) => {
           if (!cancelled) setHits(res);
         })

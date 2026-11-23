@@ -215,6 +215,14 @@ export const Chat: React.FC<ChatProps> = ({
   // Search runs on this device: index every message as it is read, edited or deleted. Only
   // messages whose text or state changed since they were last indexed are written again.
   const indexedRef = useRef(new Map<string, string>());
+  const forgetIndexed = useCallback((id: string | undefined) => {
+    const user = currentUserRef.current;
+    if (!id || !user) return;
+    indexedRef.current.delete(id);
+    void searchIndexFor(user.id)
+      .then((index) => index.remove([id]))
+      .catch(() => undefined);
+  }, []);
   useEffect(() => {
     if (!currentUser) return;
     const changed: ChatMessage[] = [];
@@ -630,6 +638,8 @@ export const Chat: React.FC<ChatProps> = ({
           return;
         }
         case 'message.edit': {
+          // Not loaded here: the indexed copy is out of date, so drop it (re-indexed when viewed).
+          if (!bucketsRef.current[event.roomId]) forgetIndexed(event.message?.id);
           if (event.refetch || !event.message) {
             void catchUpRoom(event.roomId);
             return;
@@ -649,6 +659,7 @@ export const Chat: React.FC<ChatProps> = ({
           return;
         }
         case 'message.delete': {
+          forgetIndexed(event.messageId);
           setBuckets((prev) => {
             const current = prev[event.roomId];
             if (!current) return prev;
@@ -809,7 +820,7 @@ export const Chat: React.FC<ChatProps> = ({
         }
       }
     },
-    [catchUpRoom, refreshRoomDetail, refreshRoomsList, scrollToBottom, syncReadCursor],
+    [catchUpRoom, forgetIndexed, refreshRoomDetail, refreshRoomsList, scrollToBottom, syncReadCursor],
   );
 
   // Initial bootstrap + WebSocket connection.

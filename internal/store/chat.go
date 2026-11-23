@@ -804,6 +804,36 @@ func (c *chatStore) CreateMessage(ctx context.Context, p CreateMessageParams) (*
 	}, true, nil
 }
 
+func (c *chatStore) MessageStates(ctx context.Context, tenantID, userID string, ids []string) ([]MessageState, error) {
+	out := []MessageState{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	tenantID = normalizeTenant(tenantID)
+	args := []any{tenantID, userID}
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	q := c.store.rebind(`SELECT m.id, m.room_id, m.deleted_at, m.edited_at FROM messages m
+		JOIN room_members rm ON rm.tenant_id = m.tenant_id AND rm.room_id = m.room_id
+		WHERE m.tenant_id = ? AND rm.user_id = ? AND m.id IN (?` + strings.Repeat(", ?", len(ids)-1) + `)`)
+	rows, err := c.store.db.QueryContext(ctx, q, args...) // the primary: a lagging replica could vouch for a deleted message
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var s MessageState
+		var deleted, edited sql.NullInt64
+		if err := rows.Scan(&s.ID, &s.RoomID, &deleted, &edited); err != nil {
+			return nil, err
+		}
+		s.Deleted, s.EditedAt = deleted.Valid, edited.Int64
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
 func (c *chatStore) GetMessage(ctx context.Context, tenantID, roomID, messageID string) (*Message, error) {
 	tenantID = normalizeTenant(tenantID)
 	q := c.store.rebind(`SELECT ` + messageColumns + ` FROM messages WHERE tenant_id = ? AND room_id = ? AND id = ?`)

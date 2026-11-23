@@ -1,6 +1,6 @@
 import 'fake-indexeddb/auto';
 import { afterEach, describe, expect, it } from 'vitest';
-import { forgetSearchIndex, SearchIndex, searchIndexFor } from './searchIndex';
+import { forgetSearchIndex, freshHits, type MessageState, SearchIndex, searchIndexFor } from './searchIndex';
 import type { ChatMessage } from './types';
 
 const msg = (id: string, room: string, body: string, created: number, extra: Partial<ChatMessage> = {}): ChatMessage => ({
@@ -101,4 +101,32 @@ describe('on-device search index', () => {
     await expect(forgetSearchIndex()).rejects.toThrow('still open in another tab');
     stuck.close();
   }, 15_000);
+
+  it('shows only hits the server still vouches for and drops the rest from the index', async () => {
+    const index = await searchIndexFor('u-alice');
+    await index.put([
+      msg('kept', 'r1', 'quarterly plan', 1),
+      msg('edited', 'r1', 'quarterly draft', 2, { edited_at: 5 }),
+      msg('deleted', 'r1', 'quarterly secret', 3),
+      msg('left', 'r2', 'quarterly gossip', 4),
+    ]);
+    const server: MessageState[] = [
+      { id: 'kept', deleted: false, edited_at: 0 },
+      { id: 'edited', deleted: false, edited_at: 9 }, // edited again while this browser was away
+      { id: 'deleted', deleted: true, edited_at: 0 },
+      // 'left': the reader left r2, so the server does not answer for it
+    ];
+    const asked: string[][] = [];
+    const states = async (ids: string[]) => {
+      asked.push(ids);
+      return server.filter((s) => ids.includes(s.id));
+    };
+    const hits = await freshHits(index, await index.search('quarterly'), states);
+    expect(hits.map((h) => h.id)).toEqual(['kept']);
+    expect(asked).toEqual([['left', 'deleted', 'edited', 'kept']]);
+    // The stale copies are gone from the device, not just hidden once.
+    expect((await index.search('quarterly')).map((h) => h.id)).toEqual(['kept']);
+    // If the server cannot be asked, nothing unverified is shown.
+    await expect(freshHits(index, await index.search('quarterly'), async () => { throw new Error('offline'); })).rejects.toThrow('offline');
+  });
 });

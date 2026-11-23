@@ -23,7 +23,7 @@ interface Entry {
 }
 
 // The fields kept for a hit: enough to show it and jump to it.
-export type SearchHit = Pick<ChatMessage, 'id' | 'room_id' | 'seq' | 'sender_id' | 'sender_name' | 'body' | 'created_at'>;
+export type SearchHit = Pick<ChatMessage, 'id' | 'room_id' | 'seq' | 'sender_id' | 'sender_name' | 'body' | 'created_at' | 'edited_at'>;
 
 const dbName = (userId: string) => PREFIX + userId;
 
@@ -118,7 +118,7 @@ export class SearchIndex {
         if (m.deleted_at) drop.push(m.id);
         continue;
       }
-      const plain: SearchHit = { id: m.id, room_id: m.room_id, seq: m.seq, sender_id: m.sender_id, sender_name: m.sender_name, body: m.body, created_at: m.created_at };
+      const plain: SearchHit = { id: m.id, room_id: m.room_id, seq: m.seq, sender_id: m.sender_id, sender_name: m.sender_name, body: m.body, created_at: m.created_at, edited_at: m.edited_at };
       const iv = crypto.getRandomValues(new Uint8Array(12));
       const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, this.key, new TextEncoder().encode(JSON.stringify(plain)));
       keep.push({ id: m.id, room_id: m.room_id, created_at: m.created_at, iv, ct });
@@ -131,6 +131,16 @@ export class SearchIndex {
     for (const id of drop) store.delete(id);
     await done(tx);
     await this.prune();
+  }
+
+  /** Drops entries, for messages deleted or edited while their room was not loaded here. */
+  async remove(ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+    this.live();
+    const tx = this.db.transaction(STORE, 'readwrite');
+    const store = tx.objectStore(STORE);
+    for (const id of ids) store.delete(id);
+    await done(tx);
   }
 
   private async prune(): Promise<void> {
@@ -202,6 +212,32 @@ export class SearchIndex {
       if (entries.length < PAGE) return hits;
     }
   }
+}
+
+/** The server's word on a message: still readable by this user, deleted, or edited since. */
+export interface MessageState {
+  id: string;
+  deleted: boolean;
+  edited_at: number;
+}
+
+/**
+ * Keeps only hits the server still vouches for: the reader can see the message, it is not
+ * deleted, and it has not been edited since it was indexed. The rest leave the index. A message
+ * changed while this browser was away is never shown from its old copy.
+ */
+export async function freshHits(index: SearchIndex, hits: SearchHit[], states: (ids: string[]) => Promise<MessageState[]>): Promise<SearchHit[]> {
+  if (hits.length === 0) return hits;
+  const live = new Map((await states(hits.map((h) => h.id))).map((s) => [s.id, s]));
+  const stale: string[] = [];
+  const fresh = hits.filter((h) => {
+    const s = live.get(h.id);
+    const ok = !!s && !s.deleted && (s.edited_at || 0) === (h.edited_at || 0);
+    if (!ok) stale.push(h.id);
+    return ok;
+  });
+  await index.remove(stale).catch(() => undefined);
+  return fresh;
 }
 
 /**

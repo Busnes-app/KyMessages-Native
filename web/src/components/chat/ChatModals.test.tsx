@@ -5,7 +5,10 @@ import type { ChatDirectoryUser, ChatMessage, ChatRoomSummary } from '../../chat
 
 const searchMessages = vi.fn();
 const searchIndexFor = vi.fn();
-vi.mock('../../chat/searchIndex', () => ({ searchIndexFor: (userId: string) => searchIndexFor(userId) }));
+vi.mock('../../chat/searchIndex', () => ({
+  searchIndexFor: (userId: string) => searchIndexFor(userId),
+  freshHits: (_index: unknown, hits: unknown[]) => Promise.resolve(hits),
+}));
 
 const { CreateChannelModal, SearchModal, StartDMModal } = await import('./ChatModals');
 
