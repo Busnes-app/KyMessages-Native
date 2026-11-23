@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -366,5 +368,46 @@ func TestUserErasedCoversARecreatedAccount(t *testing.T) {
 	_ = json.Unmarshal(rec.Body.Bytes(), &p)
 	if len(p.Messages) != 1 || p.Messages[0].Body != "" || p.Messages[0].DeletedAt == nil {
 		t.Fatalf("the first account's message survived: %+v", p.Messages)
+	}
+}
+
+// failKey fails every delete of one key.
+type failKey struct {
+	blobs.Backend
+	key string
+}
+
+func (f *failKey) Delete(tenantID, key string) error {
+	if key == f.key {
+		return errors.New("injected")
+	}
+	return f.Backend.Delete(tenantID, key)
+}
+
+// One blob that keeps failing to delete does not hold back the rest of the queue.
+func TestQueuedBlobDeletesAreIndependent(t *testing.T) {
+	ctx := context.Background()
+	srv, _, st, _ := newReplicas(t, withPool(t, &fakePool{headroom: 1 << 20}))
+	alice, aliceTok := createOrgUser(t, st, "usr_qi_alice", "qialice", "user", replicaOrgA)
+	room := roomOf(t, doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", aliceTok, map[string]any{"kind": store.RoomKindChannel, "name": "c"}, nil))
+	var ids []string
+	for i := range 3 {
+		up := doMultipartUpload(t, srv, "/api/v1/rooms/"+room+"/attachments", aliceTok, "file", "f.txt", []byte(fmt.Sprintf("blob %d", i)))
+		var a struct {
+			Attachment store.Attachment `json:"attachment"`
+		}
+		_ = json.Unmarshal(up.Body.Bytes(), &a)
+		ids = append(ids, a.Attachment.ID)
+	}
+	if _, err := st.Chat().EraseUser(ctx, replicaOrgA, alice); err != nil {
+		t.Fatal(err)
+	}
+	api.SetBlobsForTest(srv, &failKey{Backend: api.BlobsForTest(srv), key: ids[0]})
+	if _, err := srv.SweepOrphanAttachments(ctx, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	q, _ := st.Chat().PendingBlobDeletes(ctx, 10)
+	if len(q) != 1 || q[0].Key != ids[0] {
+		t.Fatalf("queue after a sweep with one failing blob: %v", q)
 	}
 }

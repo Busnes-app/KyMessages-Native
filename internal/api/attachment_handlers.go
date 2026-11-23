@@ -537,15 +537,23 @@ func (s *Server) eraseUser(ctx context.Context, user *store.User, revoke func(co
 }
 
 // drainPendingBlobDeletes finishes blob deletes an erasure committed but could not complete.
+// Each entry is tried on its own: successes are cleared, failures stay queued, and the batch is
+// a random sample, so a blob that keeps failing cannot hold back the others.
 func (s *Server) drainPendingBlobDeletes(ctx context.Context) error {
 	refs, err := s.store.Chat().PendingBlobDeletes(ctx, 500)
-	if err != nil || len(refs) == 0 {
+	if err != nil || len(refs) == 0 || s.blobs == nil {
 		return err
 	}
-	if err := s.deleteBlobs(refs); err != nil {
-		return err
+	var done []store.BlobRef
+	var failed []error
+	for _, ref := range refs {
+		if err := s.blobs.Delete(ref.TenantID, ref.Key); err != nil && !errors.Is(err, blobs.ErrInvalidKey) {
+			failed = append(failed, err)
+			continue
+		}
+		done = append(done, ref)
 	}
-	return s.store.Chat().ClearPendingBlobDeletes(ctx, refs)
+	return errors.Join(append(failed, s.store.Chat().ClearPendingBlobDeletes(ctx, done))...)
 }
 
 func (s *Server) deleteBlobs(refs []store.BlobRef) error {

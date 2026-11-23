@@ -139,9 +139,9 @@ func (c *chatStore) EraseUser(ctx context.Context, tenantID string, user *User) 
 	return late, tx.Commit()
 }
 
-// PendingBlobDeletes lists up to limit queued blob deletes.
+// PendingBlobDeletes lists up to limit queued blob deletes, a random sample of them.
 func (c *chatStore) PendingBlobDeletes(ctx context.Context, limit int) ([]BlobRef, error) {
-	rows, err := c.store.db.QueryContext(ctx, c.store.rebind(`SELECT tenant_id, blob_key FROM pending_blob_deletes ORDER BY tenant_id, blob_key LIMIT ?`), limit)
+	rows, err := c.store.db.QueryContext(ctx, c.store.rebind(`SELECT tenant_id, blob_key FROM pending_blob_deletes ORDER BY random() LIMIT ?`), limit)
 	if err != nil {
 		return nil, err
 	}
