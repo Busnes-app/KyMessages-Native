@@ -228,7 +228,9 @@ Multi mode, `origin/main` plus PR #27. Every row has a cross-org test in
    `deleted`. T's downstream contract says the same: "Keep its data unless the status is
    `deleted`" (T, "Downstream contract", item 5), so T lists deleted orgs with that status.
    Other cases never purge:
-   - An org that is missing from a complete, fully paged read is marked `suspended` (it stops
+   - Missing-org detection (this rule and the guard below) runs **only** on a full read from
+     `since=0`, never on an incremental one, which by design lists only changed orgs. An org
+     that is missing from a complete, fully paged full read is marked `suspended` (it stops
      serving, and its data is kept), audited as `tenancy.org_missing`, and raised to the
      operator's alerts.
    - A read that is not complete (a page error, a short page without `next`) changes nothing.
@@ -522,7 +524,8 @@ Tests each PR must add, beyond its own:
   other, a guest admitted on one and recognised on the other.
 - **Tenancy sync:** a fake KyIdentity returns an empty `/api/suite/orgs`, then a partial one, with
   no tombstones. Every tenant stays non-deleted, with its attachment rows and blobs. Missing orgs
-  are not suspended on a start-up read or past the guard. On a small install (10 active orgs),
+  are not suspended on a start-up read or past the guard. An incremental read that lists only
+  changed orgs suspends nothing. On a small install (10 active orgs),
   one missing org is suspended, and four missing are not. A `deleted` entry purges exactly
   that org. Run on SQLite and PostgreSQL.
 - **Pool:** a new org's first upload (allowance unknown: fetched and then admitted, or `503`
