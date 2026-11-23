@@ -466,7 +466,8 @@ func (s *Server) relocateFlatBlobs(ctx context.Context) error {
 			return err
 		}
 		for _, ref := range refs {
-			if err := disk.Relocate(ref.TenantID, ref.Key); err != nil {
+			// A row whose org or key is not a valid name was never servable; skip it.
+			if err := disk.Relocate(ref.TenantID, ref.Key); err != nil && !errors.Is(err, blobs.ErrInvalidKey) {
 				return err
 			}
 			after = ref.ID
