@@ -118,3 +118,41 @@ func TestAgentTokenStateIsConsistent(t *testing.T) {
 		}
 	}
 }
+
+// A prior directory offboarding can remove the human row before staff remove their bot.
+// The retained subject mapping is exact provenance; names and audit text are not used.
+func TestRemovedAgentRetainsOffboardedOwnerForErasure(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	const org = "00000000-0000-4000-8000-0000000000d8"
+	if _, err := st.Chat().EnsureTenant(ctx, org); err != nil {
+		t.Fatal(err)
+	}
+	owner := &store.User{ID: "history-owner", Username: "history-owner", OrgID: org, SSOProvider: "kyidentity", SSOSubject: "history-sub", Role: "user", Status: "active"}
+	bot := &store.User{ID: "history-bot", Username: "agent-history", SSOProvider: "bot", Role: "bot", Status: "active"} // legacy org-less bot
+	unrelated := &store.User{ID: "unrelated-bot", Username: "agent-history-other", SSOProvider: "bot", Role: "bot", Status: "active"}
+	for _, u := range []*store.User{owner, bot, unrelated} {
+		if err := st.Users().CreateUser(ctx, u); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a := &store.Agent{ID: "history-agent", UserID: bot.ID, Username: bot.Username, OwnerUserID: owner.ID, TokenHash: "history-hash", TokenState: store.AgentTokenActive, CreatedBy: owner.ID}
+	if err := st.Agents().CreateAgent(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	if applied, err := st.Users().DeleteDirectoryUser(ctx, owner, store.DirectoryEvent{ID: "history-offboard", Revision: 1}); err != nil || !applied {
+		t.Fatalf("offboard: %v %v", applied, err)
+	}
+	if err := st.Agents().DeleteAgent(ctx, a.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Chat().EraseUser(ctx, org, owner); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Users().GetUserByID(ctx, bot.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("historical bot account survived: %v", err)
+	}
+	if _, err := st.Users().GetUserByID(ctx, unrelated.ID); err != nil {
+		t.Fatalf("unrelated bot was guessed from its name: %v", err)
+	}
+}

@@ -123,7 +123,7 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   transaction, so a delete that fails after commit is retried (`PendingBlobDeletes`,
   `ClearPendingBlobDeletes`; the multi-mode attachment sweep drains the queue). Both are idempotent and need no account row. The completion audit
   `sso.user_erased` names only `user:<id>` and commits once after all queued cleanup succeeds.
-- `user_erasure_actors` retains the human and owned bot IDs before deactivation. Every actor's messages, memberships and attachments join the same durable workflow, with pending blob deletes attributed to the human owner and one completion audit. Actor IDs outlive removed agent/account rows so retries remain complete.
+- `user_erasure_actors` retains the human and owned bot IDs before deactivation. Every actor's messages, memberships and attachments join the same durable workflow, with pending blob deletes attributed to the human owner and one completion audit. Actor IDs outlive removed agent/account rows so retries remain complete. `DeleteAgent` records the exact owner-to-bot association in that table atomically before ordinary registry removal, using the live owner or retained `user_subjects` mapping; a later erasure therefore includes previously removed bots. No ownership is inferred from usernames or audit text.
 - Migration 60 (`erasure_state`) adds `pending_blob_deletes` and `user_subjects (provider, subject, user_id, org_id)`: `DeleteDirectoryUser`
   and `EraseUser` record an org-bound account's mapping before its row goes, so an erasure after
   `user.deleted`, a repeat, or a recreation under a new ID still finds every account the person had (`ErasureTargets`; the key is provider, subject and user ID). Single-mode
