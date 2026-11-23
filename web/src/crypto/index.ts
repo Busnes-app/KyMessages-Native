@@ -12,8 +12,13 @@ export {
 
 let loading: Promise<unknown> | undefined;
 
+// Idempotent once it succeeds; a failed load (offline start, a swapped asset) is retried by the
+// next call instead of being cached until a reload.
 export function loadCrypto(): Promise<unknown> {
-  loading ??= init({ module_or_path: new URL('./pkg/kycrypto_bg.wasm', import.meta.url) });
+  loading ??= init({ module_or_path: new URL('./pkg/kycrypto_bg.wasm', import.meta.url) }).catch((e: unknown) => {
+    loading = undefined;
+    throw e;
+  });
   return loading;
 }
 
