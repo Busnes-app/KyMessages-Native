@@ -272,12 +272,14 @@ func (h *Hub) Dispatch(ev Event) {
 		}
 	}
 
-	if ev.RoomID != "" {
-		h.broadcastRoom(ev.RoomID, raw)
-		return
-	}
+	// A user-targeted event (call signal, call migration, lobby decision) may also name its
+	// room; it still goes only to that user, never to everyone in the room.
 	if ev.UserID != "" {
 		h.broadcastUser(ev.UserID, raw)
+		return
+	}
+	if ev.RoomID != "" {
+		h.broadcastRoom(ev.RoomID, raw)
 	}
 }
 

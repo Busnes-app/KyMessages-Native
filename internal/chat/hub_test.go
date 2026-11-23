@@ -526,3 +526,41 @@ func TestHubRoleDeltaKeepsTheMemberSubscribed(t *testing.T) {
 		}
 	}
 }
+
+// A user-targeted event that names its room, as a call signal, call migration (with its
+// LiveKit token) or lobby decision does, must reach only that user when it crosses the bus.
+func TestHubUserEventWithRoomReachesOnlyThatUser(t *testing.T) {
+	hub := NewHub(NewMemoryBus())
+	defer hub.Close()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		uid := r.URL.Query().Get("u")
+		hub.ServeConn(r.Context(), conn, "default", uid, "sess_"+uid, []string{"r1"})
+	}))
+	defer srv.Close()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	alice, bob := dialTestWS(t, wsURL+"?u=alice"), dialTestWS(t, wsURL+"?u=bob")
+	for _, c := range []*websocket.Conn{alice, bob} {
+		if ev := readEvent(t, c); ev.Type != EventHello {
+			t.Fatalf("first frame = %+v, want hello", ev)
+		}
+	}
+	for _, typ := range []string{EventCallSignal, EventCallMigrate, EventLobbyDecision} {
+		if err := hub.PublishUser(context.Background(), "bob", Event{Type: typ, RoomID: "r1", UserID: "bob"}); err != nil {
+			t.Fatal(err)
+		}
+		if got := readEvent(t, bob); got.Type != typ {
+			t.Fatalf("bob got %+v, want %s", got, typ)
+		}
+	}
+	// The next frame alice sees must be this room message, not one of bob's events.
+	if err := hub.PublishRoom(context.Background(), "r1", Event{Type: EventMessageNew, RoomID: "r1", Seq: 7}); err != nil {
+		t.Fatal(err)
+	}
+	if got := readEvent(t, alice); got.Type != EventMessageNew || got.Seq != 7 {
+		t.Fatalf("alice got %+v, want only the room message", got)
+	}
+}
