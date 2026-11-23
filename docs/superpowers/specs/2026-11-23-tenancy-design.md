@@ -203,10 +203,11 @@ Multi mode, `origin/main` plus PR #27. Every row has a cross-org test in
    `GET /api/suite/orgs`, as T requires of every app after a restore (T,
    "`GET /api/suite/erased`"). A PostgreSQL restore bypasses the app, so the server cannot know
    one happened. The re-read is therefore not triggered by a restore. It always runs:
-   - **incrementally**, on every reporter tick, from the erased-list revision stored in the
+   - **incrementally**, on every tick of the leased tenancy-sync job (§8.1, about every 5
+     minutes), from the erased-list revision stored in the
      database. A restore rewinds that stored revision with everything else, so the next
      successful tick replays every erasure the restore undid, without detecting the restore;
-   - **daily**, from `since=0`, in the leased reporter job (§8.1), as a backstop;
+   - **daily**, from `since=0`, in the same tenancy-sync job, as a backstop;
    - on **every start** of every replica, before it serves. If KyIdentity cannot be reached,
      the replica still serves, and keeps retrying, as long as the database records a successful
      full re-read (`server_settings`, `tenancy.kyidentity_synced_at`) less than 24 hours old. A
@@ -237,7 +238,7 @@ Multi mode, `origin/main` plus PR #27. Every row has a cross-org test in
   checks that it still holds the lease, by a conditional renewal that must update one row. If
   that fails, it stops, so two replicas never run the same batch. The lease lasts three ticks, so a dead replica's job moves within three
   ticks. Jobs: backup scheduler (single only, §8.4), agent expiry, attachment sweep, pairing and
-  replay sweeps, the org purge (§7), the pool reporter (§10). Single mode skips the lease and
+  replay sweeps, the org purge (§7.3), tenancy sync (§7.4), the pool reporter (§10). Single mode skips the lease and
   runs as today.
 
 ### 8.2 Limits and the PoW ledger
@@ -314,9 +315,16 @@ single mode cannot change by accident.
   object into a private temp file on the replica, verifies the GCM tag, and only then serves it,
   ranges included, from that file. It never serves unauthenticated bytes. One object is at most
   `KY_MAX_UPLOAD_BYTES` (25 MiB by default, 100 MiB at most, `internal/config/config.go:92-95`),
-  so a whole-object fetch is bounded. Chunked sealing, which would allow ranged `GET`s, is not
-  needed at these sizes. It is never a presigned URL, so a
-  revoked member cannot reuse a link.
+  so a whole-object fetch is bounded.
+- **Verified cache.** Media players send many small `Range` requests per view. So the verified
+  temp file stays in a per-replica cache, keyed by object key and S3 version ID, and later
+  ranges are served from it. The cache directory is private (0700, files 0600) and holds
+  plaintext only until E5. It is bounded by size (`KY_ATTACHMENTS_S3_CACHE_BYTES`, default
+  1 GiB) and by idle time (10 minutes), evicting least recently used. An attachment delete, an
+  erasure or an org purge evicts the entry on every replica, through an event on the existing
+  PostgreSQL bus (`internal/chat/pgbus.go`). Every request still checks membership before touching the cache.
+  Chunked sealing, which would make ranged `GET`s verifiable, is not needed at these sizes.
+- A download is never a presigned URL, so a revoked member cannot reuse a link.
 - **Content.** Under E5, every file is already ciphertext from the client, and quota uses
   ciphertext size (E §5). Keep it that way: the server never decrypts and never thumbnails. Until
   E5 ships, uploads are plaintext. The `s3` backend therefore seals every object with AES-256-GCM
@@ -420,13 +428,14 @@ replay or stale revision where it applies, oversize input), and runs CI on SQLit
 | PR | Scope | Blocks launch | Depends on |
 |---|---|---|---|
 | 0 | **#27 (open):** the hub fix and the cross-org tests | Yes | — |
-| 1 | Lifecycle (§7): refuse `export_only`, handle `user.erased`, purge on `org.deleted`, re-read KyIdentity's erased and org lists after a restore (§7.4) | Yes | — |
+| 1a | Lifecycle, webhook side (§7.1, §7.2): refuse `export_only`, handle `user.erased` (rows, plus blob deletes by key through today's `blobs.Store`) | Yes | — |
+| 1b | Lifecycle, job side (§7.3, §7.4): the leased org purge, and the leased tenancy-sync job with the start-up check | Yes | 2 (leases), 5 (blob interface and `DeletePrefix`) |
 | 2 | Replica safety I (§8.1, §8.4, §5): migration lock, `job_leases`, the capsule scheduler off in multi mode, `RESTORE.md` multi section, multi mode requires the shared VAPID key, encryption key and session secret (§5) | Yes | — |
 | 3 | Replica safety II (§8.2, §8.3): shared limiters, the PoW table, meeting upsert lock and 409, guest sessions in PostgreSQL | Yes | 2 |
 | 4 | Calls across replicas (§8.3), as open question 5 decides | Yes | 3 |
 | 5 | The blob interface, the shared-volume store-ID check, and `disk` behind it (§9.1) | Yes (volumes at launch) | 2 |
 | 6 | The `s3` backend, sealing, the purge by prefix (§9.2-§9.5) | No | 5, the ky-primitives S3 type |
-| 7 | The org pool: columns, check, `org_storage_full`, reporter (§10) | Yes | 2, KyIdentity's pool API |
+| 7 | The org pool: columns, check, `org_storage_full`, reporter (§10) | Yes | 2 (leases), KyIdentity's pool API |
 | 8 | Multi-region cells (K22 §6.2, its PR D) | No | 3, 4 |
 
 Tests each PR must add, beyond its own:
