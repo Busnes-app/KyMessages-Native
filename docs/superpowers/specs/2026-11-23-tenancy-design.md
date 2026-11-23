@@ -374,13 +374,15 @@ single mode cannot change by accident.
 
 ### 9.4 Backup copy and deletion
 
-The bucket gets versioning, or a provider replica, and a lifecycle rule that removes
-non-current versions after 30 days. That is the "backup copy" in the decision's price. A user's
-delete removes the current version only, so it stays recoverable for 30 days (open question 7).
-The org purge (§7.3) and an erasure (§7.2) are different. They delete **every version** of each
-object at once, and the same objects on a provider replica, so nothing waits for the lifecycle
-rule. The
-local mirror (`MirrorAttachments`) is off in multi mode.
+The bucket uses versioning or a provider replica as its backup copy. The owner decided there
+is **no automatic version pruning at launch**: every retained previous version counts in the
+org pool until a person explicitly removes it. PR 6 must extend the usage ledger to account for
+those retained bytes and provide explicit removal; attachment-row totals alone are insufficient
+once versions survive a row deletion. Provider lifecycle rules must not silently delete versions.
+
+A person's erasure and an org purge delete every version of each affected object immediately,
+and the same objects on a provider replica. Neither waits for retention. The local attachment
+mirror remains off in multi mode.
 
 ### 9.5 What KyMessages needs from ky-primitives
 
@@ -530,7 +532,8 @@ Tests each PR must add, beyond its own:
 - Until PR 4, a call needs both peers on one replica. The bus carries signalling, but seats are
   local.
 - A stale allowance can let the pool be overshot by other apps' growth for up to 15 minutes.
-- A user's own deleted attachment stays as an old object version for 30 days.
+- Retained object versions continue to consume the org pool until explicitly removed; there is
+  no automatic pruning at launch.
 - Staff see every org's usernames in the install-wide audit (open question 6).
 - An org that KyIdentity stops listing without a `deleted` status is held offline and kept, not
   purged, until a later full read lists it again or staff resolve it. Its data costs storage
@@ -555,9 +558,8 @@ Tests each PR must add, beyond its own:
    `call_sessions` as the record to rebuild from.
 6. **Staff audit shows usernames from every org.** *Default:* keep (platform operations),
    staff only, and say so in `docs/PRODUCT.md`.
-7. **How long a user's deleted attachment stays as an old version.** *Default:* 30 days,
-   matching the database's backup window (unverified: the hosted PostgreSQL retention is not set
-   yet). A purge or an erasure never waits for it (§9.4).
+7. **Retained versions (decided).** No automatic pruning at launch. Every kept version counts
+   in the pool until explicitly removed; erasure and org purge remove all versions immediately.
 8. **The S3 client:** one ky-primitives type shared with KyNotes. *Default:* yes. The other
    choice, a KyMessages-only SigV4 client, duplicates signing code.
 9. **`org.unsuspended`:** *Default:* keep accepting it until KyIdentity confirms it never sends it,
