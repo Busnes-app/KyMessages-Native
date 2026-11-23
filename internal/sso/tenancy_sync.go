@@ -132,30 +132,26 @@ func (k *KyIdentityClient) applyListedOrg(ctx context.Context, o suitedir.Org) e
 		status = store.TenantStatusSuspended
 	}
 	chat := k.store.Chat()
-	if status == store.TenantStatusDeleted {
-		if _, err := chat.GetTenant(ctx, o.ID); errors.Is(err, store.ErrNotFound) {
-			return nil // nothing held: nothing to delete
-		} else if err != nil {
-			return err
-		}
-	} else if _, err := chat.EnsureTenant(ctx, o.ID); err != nil {
+	if _, err := chat.EnsureTenant(ctx, o.ID); err != nil {
 		return err
 	}
 	missing, err := chat.TenantMissing(ctx, o.ID)
 	if err != nil {
 		return err
 	}
-	if missing && status == store.TenantStatusActive {
-		if found, err := chat.ClearTenantMissing(ctx, o.ID, o.Revision); err != nil {
+	quotas, qerr := parseTenantQuotas(o.Quotas)
+	if err := chat.ApplyTenantDirectory(ctx, store.TenantDirectoryEntry{TenantID: o.ID, Revision: o.Revision, Status: listedStatus(o.Status), Enabled: o.Enabled, Valid: qerr == nil, Quotas: quotas}); err != nil {
+		return err
+	}
+	if qerr != nil {
+		k.auditSync(ctx, "tenancy.quotas_refused", o.ID, "")
+	}
+	if missing && status == store.TenantStatusActive && qerr == nil {
+		if stillMissing, err := chat.TenantMissing(ctx, o.ID); err != nil {
 			return err
-		} else if found {
+		} else if !stillMissing {
 			k.auditSync(ctx, "tenancy.org_found", o.ID, "")
 		}
-	}
-	// A non-active listing leaves the missing flag alone: ApplyTenantLifecycle clears it only if
-	// it applies, so a stale listing can neither drop the flag nor block the later recovery.
-	if _, err := chat.ApplyTenantLifecycle(ctx, o.ID, status, o.Revision); err != nil {
-		return err
 	}
 	// Revoke from the resulting state, not from whether this read changed it: a revocation that
 	// failed last time (the revision then stays unstored) is retried. Revoking an org with no
@@ -165,7 +161,7 @@ func (k *KyIdentityClient) applyListedOrg(ctx context.Context, o suitedir.Org) e
 		return err
 	}
 	if tenant.Status != store.TenantStatusActive {
-		return k.revokeTenant(ctx, o.ID)
+		return k.finishPendingRevocations(ctx)
 	}
 	return nil
 }

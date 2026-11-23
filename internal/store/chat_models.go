@@ -69,16 +69,17 @@ const (
 
 // Tenant represents an isolated organization or personal space on a hosted or self-hosted instance.
 type Tenant struct {
-	ID            string `json:"id"`
-	Slug          string `json:"slug"`
-	DisplayName   string `json:"display_name"`
-	Plan          string `json:"plan"`
-	Status        string `json:"status"`
-	P2PPolicy     string `json:"p2p_policy"`
-	P2PMaxVideo   int    `json:"p2p_max_video"`
-	P2PMaxAudio   int    `json:"p2p_max_audio"`
-	GuestForceSFU bool   `json:"guest_force_sfu"`
-	CreatedAt     int64  `json:"created_at"` // Unix milliseconds
+	DirectoryReady bool   `json:"-"`
+	ID             string `json:"id"`
+	Slug           string `json:"slug"`
+	DisplayName    string `json:"display_name"`
+	Plan           string `json:"plan"`
+	Status         string `json:"status"`
+	P2PPolicy      string `json:"p2p_policy"`
+	P2PMaxVideo    int    `json:"p2p_max_video"`
+	P2PMaxAudio    int    `json:"p2p_max_audio"`
+	GuestForceSFU  bool   `json:"guest_force_sfu"`
+	CreatedAt      int64  `json:"created_at"` // Unix milliseconds
 }
 
 // Room represents a DM, team channel, or KyCalendar meeting room.
@@ -134,6 +135,7 @@ type Attachment struct {
 // AttachmentQuotaLimits bounds workspace total and per-uploader pending attachment bytes.
 // Zero or negative values leave the corresponding quota unenforced.
 type AttachmentQuotaLimits struct {
+	MaxUploadBytes      int64
 	MaxTotalBytes       int64
 	MaxPendingUserBytes int64
 	// Pool (multi mode, customer orgs) checks the org's storage-pool grant as well: committed

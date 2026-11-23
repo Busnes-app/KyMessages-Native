@@ -44,7 +44,8 @@ func TestExportOnlyTokenIsRefusedInMultiMode(t *testing.T) {
 	if err != nil || len(recs) != 1 || recs[0].Resource != "tenant:"+org || recs[0].UserID != "" || recs[0].Details != "" {
 		t.Fatalf("audit: %v %+v", err, recs)
 	}
-	// export_only false signs in as usual.
+	// export_only false signs in once the org is admitted by the directory.
+	admitOrg(t, st, org)
 	if w := idp.signIn(srv, map[string]any{"sub": "exp-3", "preferred_username": "staying", "org_id": org, "export_only": false}); sessionCookie(w) == nil {
 		t.Fatalf("ordinary sign-in = %d %s", w.Code, w.Body.String())
 	}

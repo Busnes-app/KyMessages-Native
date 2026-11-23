@@ -7,6 +7,9 @@ Provides the unified Database Abstraction Layer (DAL) supporting pluggable backe
 Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, `GroupStore`, `AuditStore`, `SettingsStore`, `AgentStore`), dialect translations, and schema migrations.
 
 ## Local Contracts
+- Migration 62 adds `tenant_directory`, the verified per-app org snapshot. `ApplyTenantDirectory` serializes with upload admission and grant issuance, rejects conflicting same-revision snapshots, ignores older revisions and keeps deletion terminal. Non-active snapshots queue durable grant cleanup; a newer active snapshot cannot restore access before cleanup completes. Org-bound multi-mode grants and uploads need an active, enabled, valid snapshot at least as new as the tenant lifecycle revision. ID-token/user-event tenant creation alone confers no access.
+- Per-org `max_upload_bytes` and `max_pending_user_bytes` narrow install safety limits under the quota lock, at reservation and commit. SQLite acquires its writer before quota reads, avoiding concurrent deferred read-to-write upgrades; PostgreSQL keeps the per-tenant advisory lock.
+
 - Web Push endpoint ownership changes require both stored subscription keys to match (decoded base64url); comparison and transfer commit in one transaction, with a PostgreSQL row lock. A mismatch returns `ErrInvalidInput` without changing the subscription. Same-owner registration may refresh keys.
 - Migration 51 adds IdP issuer/sid/issuance/generation to sessions and device pairings, permanent
   `sso_logout_events` replay IDs and `sso_revocations` fences. Preserve existing sessions,

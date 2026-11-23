@@ -71,9 +71,7 @@ func newSuiteServer(t *testing.T, cfg *config.Config, st store.Store) *api.Serve
 func (e *suiteEnv) user(id, role, orgID string) *store.User {
 	e.t.Helper()
 	if orgID != "" {
-		if _, err := e.st.Chat().EnsureTenant(context.Background(), orgID); err != nil {
-			e.t.Fatal(err)
-		}
+		admitOrg(e.t, e.st, orgID)
 	}
 	u := &store.User{ID: id, Username: id, Role: role, Status: "active", SSOProvider: "kyidentity", SSOSubject: "sub-" + id, OrgID: orgID}
 	if err := e.st.Users().CreateUser(context.Background(), u); err != nil {

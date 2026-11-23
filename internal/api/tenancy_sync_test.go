@@ -26,8 +26,7 @@ type listedOrg struct {
 	Status   string `json:"status"`
 	Revision int64  `json:"revision"`
 	Enabled  bool   `json:"enabled"`
-	Quotas   struct {
-	} `json:"quotas"`
+	Quotas   any    `json:"quotas"`
 }
 
 type erasedSubject struct {
@@ -72,6 +71,9 @@ func (f *fakeDirectory) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		out := []listedOrg{}
 		for _, o := range f.orgs {
 			if o.Revision > since {
+				if o.Quotas == nil {
+					o.Quotas = map[string]any{}
+				}
 				out = append(out, o)
 			}
 		}
@@ -173,6 +175,7 @@ func TestTenancySyncMissingOrgGuards(t *testing.T) {
 		if _, err := e.st.Chat().EnsureTenant(ctx, syncOrgID(i)); err != nil {
 			t.Fatal(err)
 		}
+		admitOrg(t, e.st, syncOrgID(i))
 	}
 	victim, victimTok := createOrgUser(t, e.st, "usr_sync_v", "syncv", "user", syncOrgID(3))
 	_ = victim
@@ -374,6 +377,7 @@ func TestTenancySyncStaleListingCannotUndoANewerSuspension(t *testing.T) {
 		if _, err := e.st.Chat().EnsureTenant(ctx, syncOrgID(i)); err != nil {
 			t.Fatal(err)
 		}
+		admitOrg(t, e.st, syncOrgID(i))
 	}
 	e.dir.list(listedAll(10)...)
 	if err := e.kyid.SyncTenancy(ctx, true, false); err != nil {
@@ -466,6 +470,7 @@ func TestTenancySyncReadsEveryPage(t *testing.T) {
 		if _, err := e.st.Chat().EnsureTenant(ctx, syncOrgID(i)); err != nil {
 			t.Fatal(err)
 		}
+		admitOrg(t, e.st, syncOrgID(i))
 	}
 	e.dir.mu.Lock()
 	e.dir.page, e.dir.erased, e.dir.orgs = 1, subjects, orgs
@@ -493,6 +498,7 @@ func TestTenancySyncSmallInstallGuard(t *testing.T) {
 		if _, err := e.st.Chat().EnsureTenant(ctx, syncOrgID(i)); err != nil {
 			t.Fatal(err)
 		}
+		admitOrg(t, e.st, syncOrgID(i))
 	}
 	e.dir.list()
 	if err := e.kyid.SyncTenancy(ctx, true, false); err != nil || e.activeCount(t) != 3 {
@@ -523,6 +529,7 @@ func TestTenancySyncStaleSuspendedListingKeepsRecovery(t *testing.T) {
 		if _, err := e.st.Chat().EnsureTenant(ctx, syncOrgID(i)); err != nil {
 			t.Fatal(err)
 		}
+		admitOrg(t, e.st, syncOrgID(i))
 	}
 	e.dir.list(listedAll(10)...) // org 3 active at revision 13
 	if err := e.kyid.SyncTenancy(ctx, true, false); err != nil {
@@ -558,6 +565,7 @@ func TestTenancySyncRetriesMissingOrgRevocationBeforeRecovery(t *testing.T) {
 		if _, err := e.st.Chat().EnsureTenant(ctx, syncOrgID(i)); err != nil {
 			t.Fatal(err)
 		}
+		admitOrg(t, e.st, syncOrgID(i))
 	}
 	kyid := sso.NewKyIdentityClient(e.cfg.SSO, &failOnceStore{Store: e.st, sessions: &failOnceSessions{SessionStore: e.st.Sessions()}})
 	kyid.SetTenancy(e.cfg.Tenancy)
