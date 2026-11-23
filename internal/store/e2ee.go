@@ -180,10 +180,10 @@ func (s *e2eeStore) SendToDevice(ctx context.Context, msgs []E2EEToDevice) error
 	return tx.Commit()
 }
 
-func (s *e2eeStore) ToDevice(ctx context.Context, userID, deviceID string, afterID int64, limit int) ([]E2EEToDevice, error) {
+func (s *e2eeStore) ToDevice(ctx context.Context, userID, deviceID string, limit int) ([]E2EEToDevice, error) {
 	rows, err := s.store.db.QueryContext(ctx, s.store.rebind(`
 		SELECT id, tenant_id, recipient_user, recipient_device, sender_user, sender_device, type, content, created_at
-		FROM e2ee_to_device WHERE recipient_user = ? AND recipient_device = ? AND id > ? ORDER BY id LIMIT ?`), userID, deviceID, afterID, limit)
+		FROM e2ee_to_device WHERE recipient_user = ? AND recipient_device = ? ORDER BY id LIMIT ?`), userID, deviceID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -201,8 +201,15 @@ func (s *e2eeStore) ToDevice(ctx context.Context, userID, deviceID string, after
 	return out, rows.Err()
 }
 
-func (s *e2eeStore) AckToDevice(ctx context.Context, userID, deviceID string, uptoID int64) error {
-	_, err := s.store.db.ExecContext(ctx, s.store.rebind(`DELETE FROM e2ee_to_device WHERE recipient_user = ? AND recipient_device = ? AND id <= ?`), userID, deviceID, uptoID)
+func (s *e2eeStore) AckToDevice(ctx context.Context, userID, deviceID string, ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	args := []any{userID, deviceID}
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	_, err := s.store.db.ExecContext(ctx, s.store.rebind(`DELETE FROM e2ee_to_device WHERE recipient_user = ? AND recipient_device = ? AND id IN (?`+strings.Repeat(", ?", len(ids)-1)+`)`), args...)
 	return err
 }
 

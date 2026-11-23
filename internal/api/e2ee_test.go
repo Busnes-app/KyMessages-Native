@@ -216,7 +216,7 @@ func TestE2EEQueryClaimAndMailStayInTheOrg(t *testing.T) {
 	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &mail) != nil || len(mail.Messages) != 1 || mail.Messages[0].Content != "ciphertext-for-"+bob.ID {
 		t.Fatalf("bob's mail = %d %s", rec.Code, rec.Body.String())
 	}
-	if c := doBearerJSON(t, srv, http.MethodPost, "/api/v1/to-device/ack", bobTok, map[string]any{"device_id": devs[bob.ID].id, "up_to": mail.Messages[0].ID}, nil).Code; c != http.StatusNoContent {
+	if c := doBearerJSON(t, srv, http.MethodPost, "/api/v1/to-device/ack", bobTok, map[string]any{"device_id": devs[bob.ID].id, "ids": []int64{mail.Messages[0].ID}}, nil).Code; c != http.StatusNoContent {
 		t.Fatalf("ack = %d", c)
 	}
 	rec = doBearerJSON(t, srv, http.MethodGet, "/api/v1/to-device?device_id="+devs[bob.ID].id, bobTok, nil, nil)
@@ -234,5 +234,17 @@ func TestE2EEQueryClaimAndMailStayInTheOrg(t *testing.T) {
 	rec = doBearerJSON(t, srv, http.MethodPost, "/api/v1/keys/query", aliceTok, map[string]any{"user_ids": []string{bob.ID}}, nil)
 	if rec.Body.String() != `{"devices":{"`+bob.ID+`":[]}}`+"\n" {
 		t.Fatalf("query after removal = %s", rec.Body.String())
+	}
+}
+
+// Key and mailbox traffic has its own budget: it must not spend the chat-write budget (240 a
+// minute) that message sends use.
+func TestE2EEUsesItsOwnRateLimit(t *testing.T) {
+	srv, st, _ := newMultiTenantTestServer(t)
+	alice, tok := createOrgUser(t, st, "usr_e2rl_alice", "e2rlalice", "user", "00000000-0000-4000-8000-00000000000a")
+	for i := range 241 {
+		if c := doBearerJSON(t, srv, http.MethodPost, "/api/v1/keys/query", tok, map[string]any{"user_ids": []string{alice.ID}}, nil).Code; c != http.StatusOK {
+			t.Fatalf("query %d = %d", i+1, c)
+		}
 	}
 }

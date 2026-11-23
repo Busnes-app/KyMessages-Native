@@ -7,7 +7,6 @@ import (
 	"errors"
 	"net/http"
 	"regexp"
-	"strconv"
 	"time"
 
 	"github.com/Busnes-app/ky_server_base/internal/chat"
@@ -26,6 +25,10 @@ const (
 	// E2EEMailboxTTL is how long undelivered to-device mail is kept.
 	E2EEMailboxTTL = 30 * 24 * time.Hour
 )
+
+// e2eeLimit is its own budget: key queries, claims and mailbox fetches and acks follow every
+// room join and WebSocket wake, and must not spend the user's chat-write budget.
+var e2eeLimit = chatLimit{"e2ee:", 600}
 
 var (
 	e2eeDeviceID = regexp.MustCompile(`^[A-Za-z0-9_-]{8,64}$`)
@@ -66,7 +69,7 @@ func (s *Server) e2eeCaller(w http.ResponseWriter, r *http.Request) (*store.User
 	if !ok {
 		return nil, "", false
 	}
-	return user, tenantID, s.allowChatAction(w, user.ID, chatLimitWrites)
+	return user, tenantID, s.allowChatAction(w, user.ID, e2eeLimit)
 }
 
 // ownDevice loads the caller's device, writing 404 when it is not theirs.
@@ -306,25 +309,17 @@ func (s *Server) handleE2EESendToDevice(w http.ResponseWriter, r *http.Request) 
 	s.writeJSON(w, http.StatusOK, map[string]int{"sent": len(msgs)})
 }
 
-// GET /api/v1/to-device?device_id=&after= reads the caller's device mail, oldest first.
+// GET /api/v1/to-device?device_id= reads the caller's oldest unacknowledged device mail.
 func (s *Server) handleE2EEToDevice(w http.ResponseWriter, r *http.Request) {
 	user, _, ok := s.e2eeCaller(w, r)
 	if !ok {
-		return
-	}
-	after, err := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
-	if r.URL.Query().Get("after") == "" {
-		after, err = 0, nil
-	}
-	if err != nil || after < 0 {
-		s.writeError(w, http.StatusBadRequest, "Invalid cursor")
 		return
 	}
 	dev, ok := s.ownDevice(w, r, user, r.URL.Query().Get("device_id"))
 	if !ok {
 		return
 	}
-	msgs, err := s.store.E2EE().ToDevice(r.Context(), user.ID, dev.DeviceID, after, e2eeMailboxPage)
+	msgs, err := s.store.E2EE().ToDevice(r.Context(), user.ID, dev.DeviceID, e2eeMailboxPage)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to read mail")
 		return
@@ -345,17 +340,17 @@ func (s *Server) handleE2EEToDevice(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]any{"messages": out})
 }
 
-// POST /api/v1/to-device/ack deletes the caller's device mail up to an ID it has processed.
+// POST /api/v1/to-device/ack deletes the device mail the caller processed, by ID.
 func (s *Server) handleE2EEAck(w http.ResponseWriter, r *http.Request) {
 	user, _, ok := s.e2eeCaller(w, r)
 	if !ok {
 		return
 	}
 	var req struct {
-		DeviceID string `json:"device_id"`
-		UpTo     int64  `json:"up_to"`
+		DeviceID string  `json:"device_id"`
+		IDs      []int64 `json:"ids"`
 	}
-	if json.NewDecoder(r.Body).Decode(&req) != nil || req.UpTo <= 0 {
+	if json.NewDecoder(r.Body).Decode(&req) != nil || len(req.IDs) == 0 || len(req.IDs) > e2eeMailboxPage {
 		s.writeError(w, http.StatusBadRequest, "Invalid acknowledgement")
 		return
 	}
@@ -363,7 +358,7 @@ func (s *Server) handleE2EEAck(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := s.store.E2EE().AckToDevice(r.Context(), user.ID, dev.DeviceID, req.UpTo); err != nil {
+	if err := s.store.E2EE().AckToDevice(r.Context(), user.ID, dev.DeviceID, req.IDs); err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to acknowledge")
 		return
 	}

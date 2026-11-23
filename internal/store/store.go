@@ -78,10 +78,11 @@ type E2EEStore interface {
 	// replicas; with none left it returns the fallback key without removing it, or ErrNotFound.
 	ClaimOneTimeKey(ctx context.Context, userID, deviceID string) (*E2EEOneTimeKey, error)
 	SendToDevice(ctx context.Context, msgs []E2EEToDevice) error
-	// ToDevice reads a device's mail after afterID, oldest first.
-	ToDevice(ctx context.Context, userID, deviceID string, afterID int64, limit int) ([]E2EEToDevice, error)
-	// AckToDevice deletes a device's mail up to and including uptoID.
-	AckToDevice(ctx context.Context, userID, deviceID string, uptoID int64) error
+	// ToDevice reads a device's oldest unacknowledged mail. There is no cursor: on PostgreSQL
+	// IDs are assigned at insert, not commit, so a row with a lower ID can appear later.
+	ToDevice(ctx context.Context, userID, deviceID string, limit int) ([]E2EEToDevice, error)
+	// AckToDevice deletes exactly the named messages of a device, never one it was not shown.
+	AckToDevice(ctx context.Context, userID, deviceID string, ids []int64) error
 	PruneToDevice(ctx context.Context, before time.Time) error
 }
 
