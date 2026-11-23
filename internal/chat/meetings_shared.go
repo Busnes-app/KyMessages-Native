@@ -187,8 +187,8 @@ func (l *LobbyManager) armDepartureLocked(guestID string) {
 		rows, err := l.db.DeleteIfUnseen(ctx, guestID, live)
 		if err != nil || len(rows) == 0 {
 			// A missing row already departed elsewhere. An error or a refreshed row needs a retry.
-			_, lookupErr := l.db.ByID(ctx, guestID, l.now().UnixMilli(), live)
-			if lookupErr == store.ErrNotFound {
+			exists, lookupErr := l.db.Exists(ctx, guestID)
+			if lookupErr == nil && !exists {
 				return
 			}
 			l.mu.Lock()

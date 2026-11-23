@@ -154,6 +154,16 @@ func (g *GuestSessionStore) Touch(ctx context.Context, guestIDs ...string) error
 	return err
 }
 
+// Exists checks cleanup ownership without treating elapsed presence as completed departure.
+func (g *GuestSessionStore) Exists(ctx context.Context, guestID string) (bool, error) {
+	var one int
+	err := g.s.db.QueryRowContext(ctx, g.s.rebind(`SELECT 1 FROM meeting_guest_sessions WHERE guest_id = ?`), guestID).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 // Delete removes guestID's session (in roomID when roomID is set) and returns it.
 func (g *GuestSessionStore) Delete(ctx context.Context, roomID, guestID string) ([]GuestSession, error) {
 	if roomID == "" {
