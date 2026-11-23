@@ -143,7 +143,14 @@ export class SearchIndex {
     this.live();
     const tx = this.db.transaction(STORE, 'readwrite');
     const store = tx.objectStore(STORE);
-    for (const e of keep) store.put(e);
+    // Tabs share the database: never replace a copy with an older version of the message.
+    for (const e of keep) {
+      const get = store.get(e.id);
+      get.onsuccess = () => {
+        const old = get.result as Entry | undefined;
+        if (!old || (old.edited_at ?? 0) <= e.edited_at) store.put(e);
+      };
+    }
     for (const id of drop) store.delete(id);
     await done(tx);
     await this.prune();

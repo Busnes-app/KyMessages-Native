@@ -166,6 +166,17 @@ describe('on-device search index', () => {
     expect((await index.search('roadmap')).map((h) => h.body)).toEqual(['roadmap final']);
   });
 
+  it('never lets another tab overwrite a newer edit with an older copy', async () => {
+    const tabA = await SearchIndex.open('u-alice');
+    const tabB = await SearchIndex.open('u-alice');
+    await tabB.put([msg('x', 'r1', 'budget final', 1, { edited_at: 9 })]);
+    // Tab A loaded the message before the edit and writes its batch afterwards.
+    await tabA.put([msg('x', 'r1', 'budget draft', 1)]);
+    expect((await tabA.search('budget')).map((h) => h.body)).toEqual(['budget final']);
+    tabA.close();
+    tabB.close();
+  });
+
   it('drops an earlier copy when a message stops being indexable without being deleted', async () => {
     const index = await searchIndexFor('u-alice');
     await index.put([msg('m1', 'r1', 'readable secret', 1), msg('m2', 'r1', 'another secret', 2), msg('m3', 'r1', 'third secret', 3)]);
