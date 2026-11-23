@@ -19,15 +19,9 @@ stored setup, so a conflicting environment override added later stops the server
   `KY_KYIDENTITY_HMAC_SECRET` must be unset or equal to the setup's values.
 - `KY_BACKUP_DIR` is `/app/backups`, the container's writable backup location; a setup
   `backup.directory` must be `/app/backups` or omitted.
-- `KY_TENANCY_MODE` defaults to `single` for self-hosted installer deployments. If set to `multi`,
-  the database locks to multi-tenant mode on first boot (a database that already holds
-  rooms, or accounts other than local operators that belong to no org, is refused: start it
-  with `single`), inbound SCIM is permanently disabled
-  (`/scim/v2/*` returns JSON 404), and every OIDC sign-in and directory webhook must carry a
-  verified `org_id`. `multi` requires PostgreSQL (`KY_DB_DRIVER=postgres`) and
-  `KY_STAFF_ORG_ID`, KyIdentity's staff org as a canonical lowercase UUID: only its accounts may
-  be administrators, and customer orgs have none. The staff org is locked in the database on
-  first boot; a replica started with a different value refuses to start.
+- Leave `KY_TENANCY_MODE` unset or set it to `single`. Startup refuses `multi` until the
+  tenancy build is complete. A database already locked to `multi` also refuses to start with
+  this release. Preserve its data and its `tenancy.mode` setting for a release that supports it.
 - KyPost and KyCalendar pair automatically through KyIdentity's suite directory. To pin a pair
   instead, set `KY_KYPOST_URL` + `KY_KYPOST_SECRET_FILE` (or `KY_KYCALENDAR_URL` +
   `KY_KYCALENDAR_SECRET_FILE`) together: an `https://host[:port]` origin and a file holding at
@@ -63,16 +57,15 @@ the server back up. KyQuickStart verifies the activated snapshot before reportin
 ## Authentication, directory sync & revocation
 
 - Sign-in requires a verified OIDC ID token matching the exact owned issuer, subject, username,
-  and role (plus verified `org_id` in `KY_TENANCY_MODE=multi`). Global admin claims, email, and
-  username alone do not grant console access. Missing protected credential files fail closed.
+  and role. Global admin claims, email, and username alone do not grant console access.
+  Missing protected credential files fail closed.
 - Independent local recovery administrators retain their native login and mandatory password
   replacement rules in single-tenant deployments.
 - `POST /api/installer/directory` (and `/api/sso/kyidentity/sync`) accepts signed SCIM User
-  desired-state events (plus `org.suspended`, `org.unsuspended`, and `org.deleted` lifecycle
-  webhooks in multi-tenant mode, each with KyIdentity's per-org `revision`; a stale one is ignored). Canonical positive `meta.version` revisions and body/event
+  desired-state events. Canonical positive `meta.version` revisions and body/event
   digests are stored transactionally so exact retries are idempotent and stale/conflicting
   revisions fail cleanly.
-- Offboarding (`active: false` / deletion), `user.mfa_reset`, and org suspension immediately
+- Offboarding (`active: false` / deletion) and `user.mfa_reset` immediately
   revoke active sessions, MFA challenges, device pairings, Web Push subscriptions, and live
   WebSocket connections in the same revocation flow, preventing in-flight sign-ins or pairings
   from minting grants afterwards. Deletion retains `deleted` status permanently; later activation

@@ -14,16 +14,13 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
 
 **Private team conversations, calls, and meetings on infrastructure you control.**
 
-- **One binary, two tenancy modes:**
-  - `KY_TENANCY_MODE=single` (default): self-hosted single-organization deployment backed by
-    SQLite (zero external dependencies) or PostgreSQL.
-  - `KY_TENANCY_MODE=multi`: multi-organization SaaS deployment isolating multiple KyIdentity
-    organizations strictly by verified `org_id` inside one deployment. Tenancy mode is locked in
-    the database on first boot and cannot be flipped in place. Every paid plan (Personal,
-    Couple, Family, Business) is one org on this shared install. Only Enterprise gets a
-    dedicated install, which runs `single`. The design for running `multi` across several
-    replicas, with object storage and the org storage pool, is
-    [the 2026-11-23 tenancy spec](superpowers/specs/2026-11-23-tenancy-design.md) (not built).
+- **Single-organization deployments** run with `KY_TENANCY_MODE` unset or set to `single`,
+  using SQLite or PostgreSQL. First boot locks the database to its tenancy mode.
+- **Planned multi-organization deployments** use one KyIdentity org per paid plan (Personal,
+  Couple, Family, Business). Enterprise gets a dedicated single-tenant install.
+  This release refuses `KY_TENANCY_MODE=multi` and databases already locked to `multi`.
+  The multi-tenant contracts below remain under development until the final phase of
+  [the tenancy build](superpowers/specs/2026-11-23-tenancy-design.md).
 - **Invite-only:** accounts come from KyIdentity (OIDC + signed directory sync webhooks) or local
   admin provisioning in single-tenant mode. No public sign-up. External guests can join only
   scheduled or instant meeting rooms through time-bounded guest links with host-approved lobby

@@ -228,6 +228,18 @@ const AppVersion = "0.4.2"
 
 // LoadFromEnv initializes a Config struct populated from environment variables with sensible defaults.
 func LoadFromEnv() (*Config, error) {
+	mode := strings.ToLower(getEnv("KY_TENANCY_MODE", TenancySingle))
+	switch mode {
+	case TenancySingle:
+		return loadFromEnv(mode)
+	case TenancyMulti:
+		return nil, errors.New("KY_TENANCY_MODE=multi: multi-tenant mode is unavailable in this release")
+	default:
+		return nil, fmt.Errorf("KY_TENANCY_MODE: only single is available in this release, got %q", mode)
+	}
+}
+
+func loadFromEnv(tenancyMode string) (*Config, error) {
 	if err := rejectLegacyEnvironment(); err != nil {
 		return nil, err
 	}
@@ -304,10 +316,6 @@ func LoadFromEnv() (*Config, error) {
 		return nil, errors.New("KY_ADMIN_USERNAME: must be 3-64 characters of letters, digits, '.', '_' or '-'")
 	}
 
-	tenancyMode := strings.ToLower(strings.TrimSpace(getEnv("KY_TENANCY_MODE", TenancySingle)))
-	if tenancyMode != TenancySingle && tenancyMode != TenancyMulti {
-		return nil, fmt.Errorf("KY_TENANCY_MODE: must be %q or %q, got %q", TenancySingle, TenancyMulti, tenancyMode)
-	}
 	staffOrgID := strings.TrimSpace(os.Getenv("KY_STAFF_ORG_ID"))
 	scimEnabled := getEnvBool("KY_SCIM_ENABLED", true)
 	if tenancyMode == TenancyMulti {

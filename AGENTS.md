@@ -129,9 +129,9 @@ When the user requests a durable behavior change, record it here or in the relev
 
 ## Tenancy
 
-- `KY_TENANCY_MODE` (`single` default, `multi`) is locked in the database (`tenancy.mode`) on first
-  boot. In `multi` every account is bound to a KyIdentity `org_id`, and every org-owned query is
-  scoped to it. Product contract: [docs/PRODUCT.md](docs/PRODUCT.md).
+- Only `KY_TENANCY_MODE=single` (default) can start until the final tenancy build phase.
+  Preserve the first-boot `tenancy.mode` database lock, including on refused startup.
+  Exercise the multi-tenant contracts below through internal constructors. Product contract: [docs/PRODUCT.md](docs/PRODUCT.md).
 - Signed suite peer routes (`/api/suite/*`, `/api/meetings/*`) follow the `org_id` wire contract in
   `docs/superpowers/specs/2026-11-22-tenancy-design.md` §4: required canonical UUID in `multi`,
   refused (even `""`/`null`) in `single`, cross-org callers and targets answered exactly like

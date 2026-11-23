@@ -90,8 +90,8 @@ attachment downloads return 404.
   over a running SQLite file or mix old `-wal`/`-shm` files with a restored database.
 - Match the original deployment configuration deliberately:
   - Same `KY_APP_NAME`, HTTPS `KY_APP_URL`, and KyIdentity OIDC callback registration.
-  - Same `KY_TENANCY_MODE` (`single` or `multi`), and in `multi` the same `KY_STAFF_ORG_ID`. The database records its locked tenancy mode
-    (the `tenancy.mode` server setting) and refuses to boot if `KY_TENANCY_MODE` disagrees.
+  - Leave `KY_TENANCY_MODE` unset or set it to `single`. If the restored database records
+    `tenancy.mode=multi`, preserve it for a release that supports multi-tenant startup.
   - Use the restored `data/encryption.key`; remove any stale `KY_ENCRYPTION_KEY` override that
     disagrees with it.
   - If using LiveKit SFU (`KY_LIVEKIT_*`) or KyCalendar meeting sync (`KY_MEETING_SYNC_SECRET`),
