@@ -28,7 +28,7 @@ func TestSharedLobbyLeaveGraceAcrossReplicas(t *testing.T) {
 	replica := func() *LobbyManager {
 		l := NewLobbyManager(NewHub(&captureBus{}), nil)
 		l.UseShared(st.GuestSessions())
-		l.SetLeaveGrace(40 * time.Millisecond)
+		l.SetLeaveGrace(400 * time.Millisecond)
 		return l
 	}
 	a, b := replica(), replica()
@@ -39,16 +39,15 @@ func TestSharedLobbyLeaveGraceAcrossReplicas(t *testing.T) {
 	if got, ok := b.GetBySecret(s.SessionSecret); !ok || got.GuestID != s.GuestID || got.TenantID != "org-a" {
 		t.Fatalf("b does not know a's guest: %+v %v", got, ok)
 	}
-	time.Sleep(2 * time.Millisecond)
 	a.HandleDisconnect(s.GuestID, 0)
-	time.Sleep(5 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
 	b.MarkConnected(s.GuestID)
-	time.Sleep(80 * time.Millisecond)
+	time.Sleep(800 * time.Millisecond)
 	if _, ok := b.GetBySecret(s.SessionSecret); !ok {
 		t.Fatal("a's leave timer ended a session that reconnected on b")
 	}
 	b.HandleDisconnect(s.GuestID, 0)
-	time.Sleep(80 * time.Millisecond)
+	time.Sleep(time.Second)
 	if _, ok := a.GetBySecret(s.SessionSecret); ok {
 		t.Fatal("a guest that never came back kept its session")
 	}
@@ -73,7 +72,7 @@ func TestSharedLobbyOverlappingSocketsAcrossReplicas(t *testing.T) {
 	replica := func() *LobbyManager {
 		l := NewLobbyManager(NewHub(&captureBus{}), nil)
 		l.UseShared(st.GuestSessions())
-		l.SetLeaveGrace(200 * time.Millisecond)
+		l.SetLeaveGrace(400 * time.Millisecond)
 		return l
 	}
 	a, b := replica(), replica()
@@ -83,14 +82,14 @@ func TestSharedLobbyOverlappingSocketsAcrossReplicas(t *testing.T) {
 	}
 	a.MarkConnected(s.GuestID)
 	b.MarkConnected(s.GuestID)
-	time.Sleep(150 * time.Millisecond) // b's last touch is now older than a's disconnect
+	time.Sleep(300 * time.Millisecond) // b's last touch is now older than a's disconnect
 	a.HandleDisconnect(s.GuestID, 0)
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(800 * time.Millisecond)
 	if _, ok := b.GetBySecret(s.SessionSecret); !ok {
 		t.Fatal("a's leave timer ended a session still connected on b")
 	}
 	b.HandleDisconnect(s.GuestID, 0)
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(time.Second)
 	if _, ok := a.GetBySecret(s.SessionSecret); ok {
 		t.Fatal("session outlived its last socket")
 	}
@@ -141,5 +140,39 @@ func TestSharedLobbyAdmissionLapsesWithoutAnyReplica(t *testing.T) {
 	}
 	if _, ok := l.GetBySecret(s2.SessionSecret); !ok {
 		t.Fatal("new knock not found")
+	}
+}
+
+// A waiting guest who polls over HTTP without a socket stays in the lobby: each authenticated
+// request refreshes its presence, as an open socket does.
+func TestSharedLobbyPollingGuestStaysWaiting(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, testdb.Config(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	res, err := st.Chat().UpsertMeeting(ctx, store.UpsertMeetingParams{ID: "m", TenantID: store.DefaultTenantID, OrganizerSub: "s", Title: "T"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := NewLobbyManager(NewHub(&captureBus{}), nil)
+	l.UseShared(st.GuestSessions())
+	l.SetLeaveGrace(200 * time.Millisecond)
+	s, err := l.Knock(ctx, &store.MeetingGuest{MeetingID: "m", GuestKey: "k"}, res.Meeting, nil, "Visitor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 8 { // 800 ms, well past the 250 ms presence window
+		time.Sleep(100 * time.Millisecond)
+		if _, ok := l.GetBySecret(s.SessionSecret); !ok {
+			t.Fatal("a polling guest lapsed")
+		}
+	}
+	if len(l.ListWaiting(res.Meeting.RoomID)) != 1 {
+		t.Fatal("a polling guest left the lobby")
+	}
+	if _, err := l.Decide(ctx, res.Meeting.RoomID, s.GuestID, "host", true); err != nil {
+		t.Fatalf("admitting a polling guest: %v", err)
 	}
 }

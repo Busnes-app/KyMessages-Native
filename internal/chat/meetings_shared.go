@@ -59,6 +59,8 @@ func (l *LobbyManager) bySecretShared(secret string) (*GuestSession, bool) {
 	if err != nil {
 		return nil, false
 	}
+	// Every authenticated guest request (polling included) is presence, like an open socket.
+	_ = l.db.Touch(ctx, g.GuestID)
 	return fromShared(*g), true
 }
 

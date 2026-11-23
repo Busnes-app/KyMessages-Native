@@ -93,7 +93,8 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   when nobody touched it for half the grace (`TestSharedLobbyOverlappingSocketsAcrossReplicas`).
   Departure does not depend on that timer: `BySecret`, `ByID`, `InRoom` and `Admit` accept a
   session only if `seen_at` is within `live` (the lobby passes 1.25 × the leave grace), so a
-  replica that exits or a failed delete cannot keep an admission usable
+  replica that exits or a failed delete cannot keep an admission usable. Every authenticated
+  guest request also `Touch`es the session, so a waiting guest who only polls stays listed
   (`TestSharedLobbyAdmissionLapsesWithoutAnyReplica`). `PruneShared` deletes rows nobody touched
   for 10 minutes. `PruneShared` deletes
   expired rows; the leased maintenance loop runs it in multi mode only.
