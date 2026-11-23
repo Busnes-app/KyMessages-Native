@@ -15,6 +15,7 @@ var (
 type IdentityClaims struct {
 	Issuer            string `json:"-"`
 	Subject           string `json:"sub"`
+	OrgID             string `json:"org_id,omitempty"`
 	Email             string `json:"email"`
 	Name              string `json:"name"`
 	PreferredUsername string `json:"preferred_username"`

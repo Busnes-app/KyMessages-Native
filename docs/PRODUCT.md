@@ -1,193 +1,119 @@
 # KyMessages product definition
 
-KyMessages is a Ky-integrated Matrix deployment: stock Synapse, Matrix Authentication Service
-(MAS), PostgreSQL and Element Web, run and backed up by the KyMessages control plane. Design:
-[Matrix platform design](superpowers/specs/2026-10-01-matrix-platform-design.md). Setup and
-operation: [README](../README.md). Restore: [RESTORE.md](RESTORE.md).
+KyMessages is a native team chat, voice/video calling, and KyCalendar meeting server built as a
+single Go binary with an embedded React/TypeScript web application (PWA). Setup and operation:
+[README](../README.md). Disaster recovery: [RESTORE.md](RESTORE.md). Installer boundary:
+[INSTALLER_SETUP.md](INSTALLER_SETUP.md). Reverse proxy and media networking:
+[Reverse_Proxy_Networking.md](Reverse_Proxy_Networking.md).
 
-Sections below separate what ships (in code and proven by `make matrix-acceptance`) from what
-is later work. KyMessages is not yet deployed or approved for private team use. Each release
-publishes an attested image, `ghcr.io/busnes-app/kymessage-server` (README, "Container image").
+Each release publishes an attested container image (`ghcr.io/busnes-app/kymessage-server` — or
+renamed upon release cutover). Historical Matrix-era specifications are archived under
+`docs/superpowers/`.
 
 ## Promise and audience
 
-**Private team conversations, on infrastructure you control.**
+**Private team conversations, calls, and meetings on infrastructure you control.**
 
-- Small business teams first: one organization per deployment, self-hosted.
-- Encrypted chat, with voice and video calls enabled by default. Widgets and integrations are off.
-- Invite-only: only users assigned to the app in KyIdentity get in. No public sign-up, no
-  guests (approved, not shipped: KyCalendar meeting rooms admit external attendees through a
-  waiting room for the time of the meeting; see "Later or out of scope").
-- Ky-integrated: KyIdentity sign-in and offboarding, KyRecovery backups, Ky console.
-- Not offered: Slack or Teams parity, compliance archiving, open federation.
+- **One binary, two tenancy modes:**
+  - `KY_TENANCY_MODE=single` (default): self-hosted single-organization deployment backed by
+    SQLite (zero external dependencies) or PostgreSQL.
+  - `KY_TENANCY_MODE=multi`: multi-organization SaaS deployment isolating multiple KyIdentity
+    organizations strictly by verified `org_id` inside one deployment. Tenancy mode is locked in
+    the database on first boot and cannot be flipped in place.
+- **Invite-only:** accounts come from KyIdentity (OIDC + signed directory sync webhooks) or local
+  admin provisioning in single-tenant mode. No public sign-up. External guests can join only
+  scheduled or instant meeting rooms through time-bounded guest links with host-approved lobby
+  admission.
+- **Ky-integrated:** KyIdentity sign-in and real-time offboarding, KyCalendar meeting room sync,
+  KyRecovery sealed server backups, and the KyMessages operator console.
 
 ## What ships
 
-**Stack.**
-- `kymessages matrix-init` generates Synapse, MAS, Element, LiveKit and Postgres configs and write-once
-  secrets; `docker-compose.matrix.yml` adds the upstream images, pinned by tag and digest,
-  unmodified (AGPL rule below).
-- One subdomain per part (Synapse, MAS, Element, LiveKit signalling, console); user IDs stay `@alice:<server name>`
-  through `.well-known` served by KyMessages. Signalling stays private behind the proxy; LiveKit publishes direct media ports.
-- Federation closed by default (empty allow-list, no federation resource). Registration, guest
-  access and password login off.
+**Messaging & realtime.**
+- Direct messages, group channels, threads, reactions, mentions (`@username`, `@here`, `@channel`),
+  typing indicators, read receipts, unread badges, and full-text search (SQLite FTS5 / Postgres
+  `tsvector`).
+- Native WebSocket fan-out (`/api/v1/ws`) with presence and immediate revocation disconnects.
+- File and image attachments stored on local disk (`KY_ATTACHMENTS_DIR`) with SHA-256 content
+  hashing, per-upload/per-user/per-tenant quotas, inline image thumbnails, and encrypted backup
+  mirroring.
+- Incoming room webhooks (`/api/v1/webhooks/in/{id}`) with hashed bearer tokens and per-org status
+  enforcement.
 
-**Federation** (owner decisions 2026-10-11, plan `superpowers/plans/2026-10-11-federation-opt-in.md`).
-- Three console levels: Closed (default), Manual approval (servers the operator adds by name),
-  Curated list + approval (plus vetted public servers ticked from the list compiled into each
-  release; an empty list says so in Settings, and servers are then added by hand). Allow-list only: both servers must list each other. Open federation is not
-  offered: its only gains (working large public rooms, no admin step for unknown servers) come
-  with remote media (including illegal content) cached on the operator's disk, database growth
-  past the backup limit, spam from any server and Synapse's federation API open to everyone.
-- Synapse applies a change after a restart; the console shows the command and a per-server
-  connection status. Widening needs a recent sign-in; narrowing never does.
-- Users of allowed servers may join calls a local user started; they never start calls.
+**Voice, video & KyCalendar meetings.**
+- Hybrid calling: direct peer-to-peer WebRTC (signaled over `/api/v1/ws`) for 1:1 / small calls,
+  with optional LiveKit SFU (`KY_LIVEKIT_URL`, `KY_LIVEKIT_API_KEY`, `KY_LIVEKIT_API_SECRET`) for
+  larger group calls and automatic escalation.
+- KyCalendar meeting sync (`PUT`/`DELETE /api/meetings/{id}`, signed with `KY_MEETING_SYNC_SECRET`)
+  creates meeting-scoped rooms with scheduled time windows, attendee resolution, and external
+  guest links (`/api/meet/{token}`) gated by an interactive waiting-room lobby.
+- Instant meetings (`POST /api/v1/meetings`) and room guest invite links
+  (`POST /api/v1/rooms/{id}/meeting/guest-link`) for ad-hoc external calls.
 
-**Calls.**
-- Stock Element Call provides voice/video in DMs and group rooms; stock LiveKit routes media.
-  Calling is enabled by default; members choose when to start or join and grant media access.
-- KyMessages authorizes the pinned client's legacy and Matrix 2.0 token requests: local Matrix
-  OpenID identity, active KyIdentity/MAS account, joined room. Grants cannot administer LiveKit.
-- Direct media needs TCP 7881/UDP 7882 and an advertised reachable IPv4; HTTPS/WebSocket
-  signalling can use cloudflared. Optional embedded TURN/TLS uses external TCP 443 and
-  UDP 3478 and 30000–30100, a DNS-only hostname and a trusted certificate. No call recording, guests
-  or third-party call service.
-- Every 5 seconds the control plane removes offboarded participants and removed room members;
-  each pass uses a 5-second context; detached admin-session minting and cleanup can extend it. A cached LiveKit token may reconnect between passes, and
-  LiveKit refreshes connected users' tokens; an unavailable control plane cannot evict calls.
-  Ending a MAS browser session alone does not end an already connected call.
-- Config, copied TURN TLS material and LiveKit keys are included in server backups; active calls are not restored.
-- The call gate requires real audio received and video decoded by both Element clients,
-  both directly and with relay-only ICE, before and after full restore.
-  The existing text-encryption acceptance remains separate; do not extend its evidence to calls.
+**Web Push notifications & PWA.**
+- Installable Progressive Web App with a service worker (`web/public/sw.js`) and RFC 8291/8292
+  Web Push delivery (`internal/push`) using a self-generated or operator-supplied VAPID P-256 key
+  (`data/vapid.key` or `KY_VAPID_PRIVATE_KEY`, `KY_VAPID_SUBJECT`; disable with
+  `KY_PUSH_ENABLED=false`).
+- Per-room notification preferences (`all`, `mentions`, `mute`), push subscription management
+  (`/api/v1/push/*`), and automatic pruning of stale `404`/`410` browser endpoints.
+- Only current room members with active human accounts in an active org get a push. A message's
+  sender, room and a short preview pass through the browser vendor's push service, encrypted to
+  the browser (RFC 8291). Signing out, offboarding, org suspension and a restore remove
+  subscriptions.
 
-**Sign-in.**
-- KyIdentity is the only upstream identity, through MAS. MAS's compatibility (legacy) login is
-  not served; only native OIDC clients (current Element Web, Element X) sign in.
-- Matrix localpart = the local part of the KyIdentity email, lowercased, characters outside
-  `[a-z0-9._=-]` replaced by `_` (`Alice.Q+Ky@example.com` is `@alice.q_ky`), only once KyIdentity
-  has verified the email (`email_verified`: a mailed activation or reset link was redeemed; any
-  email change clears it). A user without a verified email cannot sign in, so chat needs
-  KyIdentity mail delivery (a manually handed-over link does not verify), and a second user whose email has the same local part on another domain
-  is refused. Accounts link by KyIdentity `sub` and keep their localpart, so later renames or
-  email changes do not orphan them.
-- The console also supports installer-owned dedicated KyIdentity administrators through
-  container-local `apply-setup` ([contract](INSTALLER_SETUP.md)). These subjects are denied
-  ordinary Matrix access by the directory projection; central MAS assignment exclusion remains
-  an installer composition gate. The existing Matrix acceptance has not been rerun for this
-  setup path.
-- The KyMessages console keeps a local operator login (bootstrap password must be replaced
-  before privileged use), with optional TOTP two-factor sign-in and one-time recovery codes
-  under Settings > Account security; members reach chat only through KyIdentity.
+**Sign-in, tenancy & offboarding.**
+- Primary sign-in via KyIdentity OIDC (`KY_KYIDENTITY_*`) with PKCE and step-up freshness checks
+  for privileged console actions.
+- Signed KyIdentity directory webhooks (`POST /api/sso/kyidentity/sync`) synchronize user creation,
+  profile updates, deactivation, deletion, MFA resets, and — in `KY_TENANCY_MODE=multi` — org
+  lifecycle events (`org.suspended`, `org.unsuspended`, `org.deleted`). Each carries KyIdentity's
+  per-org `revision`; one at or below the last applied revision changes nothing, so a delayed
+  event never undoes a newer one, and deletion is never undone. Tenant status is read from the
+  primary database, never a read replica.
+- Deactivation, deletion, or org suspension immediately revokes sessions, push subscriptions, and
+  active WebSocket connections, and blocks API calls, incoming webhooks, and guest meeting links.
+  No new session, MFA challenge or pairing is issued to an inactive org, including one in flight
+  when the suspension lands. Org suspension or deletion also ejects that org's meeting guests, waiting or admitted, from the
+  lobby, their sockets and their calls on every server instance.
+- In `KY_TENANCY_MODE=multi`, every user account is bound immutably to `(sub, org_id)`, tokens or
+  webhooks without `org_id` are refused, cross-org `org_id` reassignment is rejected with HTTP 409
+  and audited (`sso.org_mismatch`), and inbound SCIM (`/scim/v2/*`) is forced off (404).
+- In `KY_TENANCY_MODE=multi`, customer orgs have no administrators. An `admin` role from KyIdentity
+  is honoured only for the staff org named by `KY_STAFF_ORG_ID` (unset: no directory
+  administrators), and the console refuses any account bound to another org or to an inactive
+  staff org. Local operator accounts, which belong to no org, keep the install-wide console
+  (backups, audit, health, settings); per-org pages (Agents, Media policy) need a staff-org
+  administrator and answer 403 to an account with no org.
+- Local operator login remains available for single-tenant recovery/console access, with mandatory
+  initial password replacement and optional TOTP MFA with recovery codes.
 
-**Encryption.**
-- Synapse encrypts every new room by default (`encryption_enabled_by_default_for_room_type: all`).
-- Label, exactly: "End-to-end encrypted in Element (not independently audited)". Never call
-  suite or agent review an independent audit.
-- Synapse does not enforce encryption: a client or script that does not encrypt can post
-  plaintext into an encrypted room, and the server does not stop it. Members should use
-  Element. Evidence: [CHAT-PLATFORM-OPTIONS.md](CHAT-PLATFORM-OPTIONS.md) section 7.
-- The server sees metadata in plaintext: room names and topics, membership, display names,
-  timestamps, devices and IPs.
-- Users restore history on a new device from key backup with their own security key. The
-  server and KyRecovery custodians cannot read message content.
+**Agents (bots).**
+- Admins can provision native bot/agent accounts (`agent-<name>`) owned by an organization member,
+  minting one-time scoped bearer tokens with generated skill configs for supported agent runtimes.
+- Agents inherit their owner's organization (`org_id`), follow their owner's offboarding state,
+  auto-expire after 90 days of inactivity, and cannot join voice/video calls.
 
-**Offboarding** (driven from KyIdentity; detail in
-[the offboarding design](superpowers/specs/2026-10-01-matrix-offboarding-design.md)).
-- Disable or unassign: back-channel logout ends open Element sessions (bound 30 s, measured
-  0.3-3 s), then KyMessages locks the MAS user. Re-enable unlocks; history stays.
-- Delete: MAS deactivates without erasing; the user leaves their rooms, their messages stay
-  readable. Never reactivated.
-- A signed directory webhook triggers the change; a sweep every 5 minutes repairs failed MAS
-  calls. A change sent while KyMessages was down waits in KyIdentity until an operator resumes
-  it. Every action is audited.
+**Backups & disaster recovery.**
+- Sealed server capsules to KyRecovery and/or `KY_BACKUP_DIR` on schedule or on demand: SQLite
+  snapshot (`data/ky_server.db`), `data/encryption.key`, `data/attachments.key`, `data/vapid.key`,
+  `data/recovery.pub`, and installer credentials when present.
+- Encrypted incremental attachment mirror in `KY_BACKUP_DIR/attachments` opened only by the
+  capsule's `data/attachments.key`.
+- Offline restoration via `kymessages restore` and `kymessages restore-attachments`, which
+  atomically invalidate pre-backup sessions, MFA challenges, device pairings, and push
+  subscriptions before the server returns to service.
 
-**Agents** (owner decisions 2026-10-14, plan `superpowers/plans/2026-10-14-agent-accounts.md`).
-- Admins create chat agent accounts (`@agent-<name>`) for OpenClaw or Hermes Agent, each owned
-  by a member. Off by default: none exist until an admin creates one.
-- Sign-in is a MAS personal access token scoped to the client API on one device, shown once
-  with a config block per runtime and the `kymessages` skill. No password login is added.
-- An agent follows its owner: offboarding the owner locks it in about 2 minutes (Synapse's token
-  cache); re-enabling unlocks. Deleting an agent deactivates it; its messages stay. A token
-  unused for 90 days is revoked; one in use never expires. Revoking deletes the agent's device,
-  so its next token needs encryption set up again.
-- An agent can rename itself; its Matrix ID always starts with `@agent-`.
-- An agent decrypts, like a bridge: rooms keep Element's label, but the agent's machine and
-  model see plaintext, and a hosted model takes room content off your infrastructure.
-- Agents are text participants; they never get call grants.
+**Operator console.**
+- Built-in admin UI (`/console`) with 10-minute fresh-sign-in step-up and full audit logging:
+  overview metrics, user/session management, agent management, media/call policy, branding
+  (product name, logo, accent), KyIdentity sync health, backup schedules/drills, and read-only
+  audit logs.
 
-**Backups** (detail in [the backups design](superpowers/specs/2026-10-01-matrix-backups-design.md)).
-- One sealed server capsule to KyRecovery and/or the local backup directory, on the admin's
-  schedule: app database and key, Matrix configs and secrets (not the Postgres superuser
-  password), Synapse signing key, `pg_dump`s of MAS and Synapse.
-- Media: an encrypted incremental mirror in `KY_BACKUP_DIR/media` after each scheduled run or
-  `deposit`, plus monthly full archives (default newest 3).
-- Capsule limit 256 MiB expanded; the run fails loudly past it and the screen warns from 75%.
-- `restore` then `restore-matrix` rebuild a lost host; proven end to end in acceptance.
+## Out of scope
 
-**Notifications.** Browser Web Push for new messages and incoming calls, opt-in per browser.
-Each member picks a room mode: all messages, mentions only, or mute (DMs always notify outside
-mute). Only current room members with active human accounts get a push. A plaintext message's
-sender, room and a short preview pass through the browser vendor's push service, encrypted to the
-browser (RFC 8291); end-to-end encrypted messages are never previewed. Signing out, offboarding
-and a restore remove subscriptions.
-
-**Console.** Changes need a sign-in from the last 10 minutes and are audited.
-- Overview: chat health, users, backups, KyIdentity sync cards.
-- Users: Matrix users with their KyIdentity link and sessions; end one or all sessions. No
-  lock or unlock: access is controlled in KyIdentity.
-- Rooms: list, search, members (never messages). Close (final: members removed, rejoin
-  blocked, history kept) or Delete permanently (typed name; media stays in the media store).
-  Runs as the service account `@kymessages-console` through 5-minute MAS sessions.
-- Health: per-load probes of Synapse, MAS, Element, LiveKit, Postgres and the app (LiveKit runtime version unknown), versions compared
-  with the Compose pins, links to each upstream source release.
-- Audit: read-only log filtered by kind.
-- Settings: product name and PNG logo; the logo reaches Element at once, a name after
-  `docker compose restart element`. KyIdentity sync status: last accepted webhook, rejected
-  deliveries, last sweep, with fix hints.
-
-**Clients.** Element Web is branded by config only (name, logo, Busnes Light/Dark). Element X
-stays Element-branded. Any Matrix client can connect; the encryption label covers Element only.
-
-## Licensing
-
-- Synapse, MAS and Element Web are used as unmodified official images pulled by Compose,
-  configured only through config files and HTTP APIs: no patches, no template overrides. The
-  console links to each component's exact upstream source release.
-- KyMessages' own code is MIT.
-- Pricing and distribution terms are not decided.
-
-## Later or out of scope
-
-- Teams interop: no maintained bridge exists; a self-built Teams bot is a separate project.
-- Other bridges (mautrix): later, admin-enabled. A bridge decrypts, so a bridged
-  conversation never carries the E2EE label.
-- A lighter homeserver (Tuwunel) trial.
-- Open federation (no allow-list), an inbound "request to federate" queue, room-level server
-  ACL editing, moderation bots, LAN-only peers, automatic Synapse restart.
-- Widgets and integrations: disabled in Element's config.
-- Console: room creation, membership editing, message moderation, colour editing, health
-  history and alerting.
-- KyCalendar meeting rooms (approved 2026-10-18, not scheduled): a room with a call per meeting,
-  and external guests during the meeting only, admitted from a waiting room by someone in the
-  room. Design: `docs/superpowers/specs/2026-10-18-kymessages-meeting-rooms-design.md`.
-
-## Known risks
-
-- MFA relies on KyIdentity's per-app policy; MAS ignores `acr`. Untested.
-- A public deployment through cloudflared is untested; acceptance runs the shipped configs
-  over HTTPS with a private CA on loopback.
-- A busy server will pass the 256 MiB capsule limit; backups then fail until the limit is
-  raised. Sealing holds the capsule in memory.
-- The app can read the Matrix databases and secrets, and the configs it backs up hold the
-  database owner passwords: a compromised app can write both databases and act as Synapse
-  admin. It cannot decrypt messages.
-- A held or abandoned KyIdentity webhook leaves a sessionless, sign-in-refused user unlocked in
-  MAS until an operator resumes it or resyncs.
-- `@kymessages-console` holds Synapse admin scope; sessions last 5 minutes and every use is
-  audited.
-- Operational weight: PostgreSQL plus several services, against the old single binary.
-- Federation: allowed servers hold copies the operator cannot recall; a public server's rooms
-  spread posts beyond the allow-list; the app can write Synapse's config through the federation
-  file, so a compromised app can run code in Synapse. Encryption across servers and a real
-  cross-server call are not covered by acceptance.
+- Matrix protocol / Synapse / MAS / Element Web / server-to-server federation (retired; see
+  `docs/superpowers/` for historical records).
+- Client-side end-to-end encryption (messages are protected in transit via TLS and stored on the
+  operator's database with server-side full-text search and native attachment storage).
+- Call recording or third-party hosted calling SaaS.

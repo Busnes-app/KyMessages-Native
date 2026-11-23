@@ -8,6 +8,7 @@ import (
 	"log"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,9 +23,10 @@ import (
 
 // KyIdentityClient manages interactions with the suite KyIdentity identity provider.
 type KyIdentityClient struct {
-	config config.SSOConfig
-	store  store.Store
-	flow   *oauthFlow
+	config  config.SSOConfig
+	store   store.Store
+	flow    *oauthFlow
+	tenancy config.TenancyConfig
 
 	// syncMu applies directory updates one at a time, so a read and its conditional write
 	// see the same row. Ordering itself is persisted per subject (directory_sync_state).
@@ -33,6 +35,8 @@ type KyIdentityClient struct {
 	rejects rejectCounter
 	// onUserRevoked fires after a user's sessions are revoked (deactivation, role change, deletion).
 	onUserRevoked func(ctx context.Context, userID string)
+	// onTenantRevoked fires when an org is suspended or deleted, before its members are revoked.
+	onTenantRevoked func(ctx context.Context, orgID string) error
 }
 
 func NewKyIdentityClient(cfg config.SSOConfig, st store.Store) *KyIdentityClient {
@@ -41,6 +45,17 @@ func NewKyIdentityClient(cfg config.SSOConfig, st store.Store) *KyIdentityClient
 		store:  st,
 		flow:   newOAuthFlow(cfg.KyIdentityIssuer, cfg.KyIdentityClientID, cfg.KyIdentitySecret),
 	}
+}
+
+// SetTenancy enables strict org_id binding on directory webhooks in multi-tenant mode, and
+// limits the admin role to the staff org.
+func (k *KyIdentityClient) SetTenancy(t config.TenancyConfig) {
+	k.tenancy = t
+}
+
+// OnTenantRevoked registers a callback invoked when an org is suspended or deleted.
+func (k *KyIdentityClient) OnTenantRevoked(fn func(ctx context.Context, orgID string) error) {
+	k.onTenantRevoked = fn
 }
 
 // OnUserRevoked registers a callback invoked immediately when directory sync revokes or deletes a user.
@@ -84,6 +99,7 @@ func (k *KyIdentityClient) ExchangeCode(ctx context.Context, code, verifier, red
 // type and ID travel in the signed headers, not the body.
 type DirectoryUser struct {
 	ID          string `json:"id"`
+	OrgID       string `json:"org_id,omitempty"`
 	UserName    string `json:"userName"`
 	DisplayName string `json:"displayName"`
 	Name        *struct {
@@ -122,6 +138,8 @@ var (
 	ErrSyncMalformed = errors.New("directory webhook body is not a usable SCIM user")
 	// ErrSyncUsernameConflict is an authenticated user whose username another account holds.
 	ErrSyncUsernameConflict = errors.New("directory username is held by another KyMessages account")
+	// ErrSyncOrgMismatch is an authenticated user whose org_id disagrees with the existing account.
+	ErrSyncOrgMismatch = errors.New("directory user org_id does not match existing KyMessages account")
 	// errNoSecret: the receiver has no key, so nothing can be verified.
 	errNoSecret = errors.New("KY_KYIDENTITY_HMAC_SECRET is not set")
 )
@@ -139,7 +157,7 @@ func (k *KyIdentityClient) HandleSyncWebhook(ctx context.Context, headers syncau
 	switch {
 	case err == nil:
 		k.recordDelivery(ctx, kind)
-	case errors.Is(err, ErrSyncUnauthorized), errors.Is(err, ErrSyncMalformed), errors.Is(err, ErrSyncUsernameConflict):
+	case errors.Is(err, ErrSyncUnauthorized), errors.Is(err, ErrSyncMalformed), errors.Is(err, ErrSyncUsernameConflict), errors.Is(err, ErrSyncOrgMismatch):
 		k.reject(err)
 	}
 	return err
@@ -165,6 +183,20 @@ func (k *KyIdentityClient) auditUsernameConflict(ctx context.Context, in Directo
 	}
 }
 
+func (k *KyIdentityClient) auditOrgMismatch(ctx context.Context, subject, expectedOrg, gotOrg string) {
+	details := fmt.Sprintf("subject=%q expected=%q got=%q", subject, expectedOrg, gotOrg)
+	log.Printf("[SSO] directory org_id mismatch refused: %s", details)
+	actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := k.store.Audit().LogAudit(actx, &store.AuditRecord{
+		Action:   "sso.org_mismatch",
+		Resource: recoveryclient.AuditSafe(subject),
+		Details:  recoveryclient.AuditSafe(details),
+	}); err != nil {
+		log.Printf("[AUDIT] sso.org_mismatch not recorded: %v", err)
+	}
+}
+
 // applySyncWebhook verifies and applies one event and returns its signed type. The cause of
 // ErrSyncUnauthorized stays reachable with errors.Is, so refusals can be told apart.
 func (k *KyIdentityClient) applySyncWebhook(ctx context.Context, headers syncauth.Headers, body []byte) (string, error) {
@@ -175,6 +207,12 @@ func (k *KyIdentityClient) applySyncWebhook(ctx context.Context, headers syncaut
 	if err != nil {
 		return "", fmt.Errorf("%w: %w", ErrSyncUnauthorized, err)
 	}
+
+	switch event.Type {
+	case "org.suspended", "org.unsuspended", "org.deleted":
+		return event.Type, k.applyOrgLifecycle(ctx, event.Type, body)
+	}
+
 	var user DirectoryUser
 	if err := json.Unmarshal(body, &user); err != nil || user.ID == "" || user.Meta == nil {
 		return "", ErrSyncMalformed
@@ -210,10 +248,85 @@ func (k *KyIdentityClient) applySyncWebhook(ctx context.Context, headers syncaut
 	return event.Type, nil // other event types (groups) are not for this product
 }
 
+func (k *KyIdentityClient) applyOrgLifecycle(ctx context.Context, eventType string, body []byte) error {
+	if !k.tenancy.IsMultiTenant() {
+		return nil
+	}
+	var payload struct {
+		ID       string `json:"id"`
+		OrgID    string `json:"org_id"`
+		Revision int64  `json:"revision"` // KyIdentity's per-org lifecycle counter
+	}
+	if err := json.Unmarshal(body, &payload); err != nil || payload.Revision <= 0 {
+		return ErrSyncMalformed
+	}
+	orgID := strings.TrimSpace(payload.OrgID)
+	if orgID == "" {
+		orgID = strings.TrimSpace(payload.ID)
+	}
+	if orgID == "" {
+		return ErrSyncMalformed
+	}
+	if _, err := k.store.Chat().EnsureTenant(ctx, orgID); err != nil {
+		return err
+	}
+	var nextStatus string
+	switch eventType {
+	case "org.suspended":
+		nextStatus = store.TenantStatusSuspended
+	case "org.unsuspended":
+		nextStatus = store.TenantStatusActive
+	case "org.deleted":
+		nextStatus = store.TenantStatusDeleted
+	default:
+		return nil
+	}
+	if _, err := k.store.Chat().ApplyTenantLifecycle(ctx, orgID, nextStatus, payload.Revision); err != nil {
+		return err
+	}
+	// Revoke from the resulting state, so a retry of a delivery that died mid-revocation, or a
+	// stale event, still leaves an inactive org with no grants.
+	tenant, err := k.store.Chat().GetTenant(ctx, orgID)
+	if err != nil {
+		return err
+	}
+	if tenant.Status != store.TenantStatusActive {
+		// Revoke every member, then fail the delivery if any revocation failed, so KyIdentity
+		// redelivers and the retry sweeps what is left.
+		var failed []error
+		if k.onTenantRevoked != nil {
+			if err := k.onTenantRevoked(ctx, orgID); err != nil {
+				failed = append(failed, fmt.Errorf("publish tenant revocation: %w", err))
+			}
+		}
+		const pageSize = 1000
+		for offset := 0; ; offset += pageSize {
+			users, total, err := k.store.Users().ListUsers(ctx, offset, pageSize, store.UserFilter{OrgID: orgID})
+			if err != nil {
+				return err
+			}
+			for _, u := range users {
+				if err := k.store.Sessions().DeleteUserSessions(ctx, u.ID); err != nil {
+					failed = append(failed, fmt.Errorf("revoke %s: %w", u.ID, err))
+				}
+				if k.onUserRevoked != nil {
+					k.onUserRevoked(ctx, u.ID)
+				}
+			}
+			if len(users) == 0 || offset+len(users) >= total {
+				break
+			}
+		}
+		return errors.Join(failed...)
+	}
+	return nil
+}
+
 func (k *KyIdentityClient) upsertDirectoryUser(ctx context.Context, in DirectoryUser, ev store.DirectoryEvent) error {
 	// KyIdentity sends this app's roles when it defines any, else the user's global role.
+	orgID := strings.TrimSpace(in.OrgID)
 	role := "user"
-	if primaryValue(in.Roles) == "admin" {
+	if primaryValue(in.Roles) == "admin" && k.tenancy.MayAdminister(orgID) {
 		role = "admin"
 	}
 	status := "inactive"
@@ -225,13 +338,25 @@ func (k *KyIdentityClient) upsertDirectoryUser(ctx context.Context, in Directory
 	if displayName == "" && in.Name != nil {
 		displayName = in.Name.Formatted
 	}
+	if k.tenancy.IsMultiTenant() {
+		if orgID == "" {
+			return ErrSyncMalformed
+		}
+		if _, err := k.store.Chat().EnsureTenant(ctx, orgID); err != nil {
+			return err
+		}
+	}
 
 	existing, err := k.store.Users().GetUserBySSO(ctx, "kyidentity", in.ID)
 	if errors.Is(err, store.ErrNotFound) {
-		_, err = k.store.Users().CreateDirectoryUser(ctx, &store.User{
+		newUser := &store.User{
 			ID: fmt.Sprintf("usr_%s", crypto.RandomHex(12)), Username: in.UserName, Email: email,
 			DisplayName: displayName, Role: role, Status: status, SSOProvider: "kyidentity", SSOSubject: in.ID,
-		}, ev)
+		}
+		if k.tenancy.IsMultiTenant() {
+			newUser.OrgID = orgID
+		}
+		_, err = k.store.Users().CreateDirectoryUser(ctx, newUser, ev)
 		if errors.Is(err, store.ErrUsernameTaken) {
 			k.auditUsernameConflict(ctx, in, "")
 			return fmt.Errorf("%w: %q", ErrSyncUsernameConflict, in.UserName)
@@ -240,6 +365,10 @@ func (k *KyIdentityClient) upsertDirectoryUser(ctx context.Context, in Directory
 	}
 	if err != nil {
 		return err
+	}
+	if k.tenancy.IsMultiTenant() && existing.OrgID != orgID {
+		k.auditOrgMismatch(ctx, in.ID, existing.OrgID, orgID)
+		return fmt.Errorf("%w: subject %q", ErrSyncOrgMismatch, in.ID)
 	}
 	updated := *existing
 	updated.Username, updated.Email, updated.DisplayName, updated.Role, updated.Status = in.UserName, email, displayName, role, status

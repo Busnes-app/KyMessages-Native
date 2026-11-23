@@ -380,6 +380,42 @@ func (l *LobbyManager) RevokeMeeting(ctx context.Context, roomID string) {
 	}
 }
 
+// GuestCheck returns the hub's guest check: a guest needs its lobby session on this pod and an
+// active org (isActive, read from the primary), so a missed tenant.revoked notification still
+// closes it on the next ping. A lookup error keeps it open: an outage must not eject everyone.
+func (l *LobbyManager) GuestCheck(isActive func(ctx context.Context, tenantID string) (bool, error)) func(guestID string) bool {
+	return func(guestID string) bool {
+		l.mu.Lock()
+		s := l.byGuestID[guestID]
+		l.mu.Unlock()
+		if s == nil {
+			return false
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		active, err := isActive(ctx, s.TenantID)
+		return err != nil || active
+	}
+}
+
+// RevokeTenant evicts every guest of tenantID this pod holds, waiting or admitted, and takes
+// them out of their calls.
+func (l *LobbyManager) RevokeTenant(ctx context.Context, tenantID string) {
+	type gone struct{ roomID, guestID string }
+	var evict []gone
+	l.mu.Lock()
+	for _, s := range l.byGuestID {
+		if s.TenantID == tenantID {
+			evict = append(evict, gone{s.RoomID, s.GuestID})
+			l.deleteSessionLocked(s)
+		}
+	}
+	l.mu.Unlock()
+	for _, g := range evict {
+		l.evictLiveGuest(ctx, g.roomID, g.guestID)
+	}
+}
+
 // RevokeGuestKey evicts the live session for one revoked guest_key in meetingID.
 func (l *LobbyManager) RevokeGuestKey(ctx context.Context, meetingID, guestKey string) {
 	mk := meetingID + "|" + guestKey

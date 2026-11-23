@@ -63,7 +63,11 @@ func (s *Server) handleListPushSubscriptions(w http.ResponseWriter, r *http.Requ
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
-	subs, err := s.store.Chat().ListPushSubscriptions(r.Context(), store.DefaultTenantID, user.ID)
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
+	subs, err := s.store.Chat().ListPushSubscriptions(r.Context(), tenantID, user.ID)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to list push subscriptions")
 		return
@@ -87,6 +91,10 @@ func (s *Server) handleRegisterPushSubscription(w http.ResponseWriter, r *http.R
 	}
 	if user.Role == "bot" {
 		s.writeError(w, http.StatusForbidden, "Bot accounts cannot receive push notifications")
+		return
+	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
 		return
 	}
 	if !s.allowChatAction(w, user.ID, chatLimitRooms) {
@@ -116,7 +124,7 @@ func (s *Server) handleRegisterPushSubscription(w http.ResponseWriter, r *http.R
 	}
 
 	sub, err := s.store.Chat().UpsertPushSubscription(r.Context(), sess.TokenHash, &store.PushSubscription{
-		TenantID:   store.DefaultTenantID,
+		TenantID:   tenantID,
 		UserID:     user.ID,
 		Endpoint:   endpoint,
 		P256DH:     p256dh,
@@ -142,6 +150,10 @@ func (s *Server) handleDeletePushSubscription(w http.ResponseWriter, r *http.Req
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	var req deletePushRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&req); err != nil {
 		s.writeError(w, http.StatusBadRequest, "Invalid request body")
@@ -155,9 +167,9 @@ func (s *Server) handleDeletePushSubscription(w http.ResponseWriter, r *http.Req
 	}
 	var err error
 	if id != "" {
-		err = s.store.Chat().DeletePushSubscriptionByID(r.Context(), store.DefaultTenantID, user.ID, id)
+		err = s.store.Chat().DeletePushSubscriptionByID(r.Context(), tenantID, user.ID, id)
 	} else {
-		err = s.store.Chat().DeletePushSubscriptionByEndpoint(r.Context(), store.DefaultTenantID, user.ID, endpoint)
+		err = s.store.Chat().DeletePushSubscriptionByEndpoint(r.Context(), tenantID, user.ID, endpoint)
 	}
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to delete push subscription")
@@ -174,11 +186,14 @@ func (s *Server) handleUpdateRoomNotifications(w http.ResponseWriter, r *http.Re
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	if !s.allowChatAction(w, user.ID, chatLimitRooms) {
 		return
 	}
 	roomID := r.PathValue("id")
-	tenantID := store.DefaultTenantID
 
 	if _, ok := s.requireRoomMember(w, r, tenantID, roomID, user.ID); !ok {
 		return

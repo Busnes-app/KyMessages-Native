@@ -3,6 +3,7 @@
 Date: 2026-11-20. Status: draft, awaiting owner review.
 Supersedes (if approved): Matrix/Synapse/MAS/Element backend in `docs/PRODUCT.md` and `docs/superpowers/specs/2026-10-01-matrix-platform-design.md`.
 Preserves: KyCalendar meeting-room API contract from `docs/superpowers/specs/2026-10-18-kymessages-meeting-rooms-design.md`, KyIdentity SSO/offboarding, KyRecovery capsules, and the `ky_server_base` Go + React 19 + KyUI stack.
+Companion spec: [KyMessages-Native Tenancy, Suite Peer `org_id`, and Multi-Region Design](2026-11-22-tenancy-design.md) defines the `org_id` wire contract for KyPost and KyCalendar suite routes, staff-only administration, billing boundary, and multi-region home-region cells.
 
 ---
 

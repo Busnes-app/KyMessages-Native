@@ -258,7 +258,27 @@ ALTER TABLE mfa_challenges ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';`,
 	{Version: 25, Name: "attachments_message_index", SQLite: attachmentsQuotaSchema, Postgres: attachmentsQuotaSchema},
 	// Web Push (RFC 8291/8292) per-user browser subscriptions.
 	{Version: 26, Name: "web_push_subscriptions", SQLite: pushSubscriptionsSchema, Postgres: pushSubscriptionsSchema},
+	// Multi-tenancy alignment: immutable org_id binding on users and tenant lifecycle status.
+	{Version: 27, Name: "users_org_id_and_tenant_status", SQLite: multiTenancySchemaSQLite, Postgres: multiTenancySchemaPostgres},
+	// Org lifecycle events apply in KyIdentity's per-org revision order.
+	{Version: 28, Name: "tenant_lifecycle_revision", SQLite: tenantLifecycleRevisionSchema, Postgres: tenantLifecycleRevisionSchema},
 }
+
+const multiTenancySchemaSQLite = `
+ALTER TABLE users ADD COLUMN org_id TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_users_org_id ON users(org_id);
+ALTER TABLE tenants ADD COLUMN status TEXT NOT NULL DEFAULT 'active';
+`
+
+const multiTenancySchemaPostgres = `
+ALTER TABLE users ADD COLUMN org_id VARCHAR(64) NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_users_org_id ON users(org_id);
+ALTER TABLE tenants ADD COLUMN status VARCHAR(32) NOT NULL DEFAULT 'active';
+`
+
+const tenantLifecycleRevisionSchema = `
+ALTER TABLE tenants ADD COLUMN lifecycle_revision BIGINT NOT NULL DEFAULT 0;
+`
 
 const pushSubscriptionsSchema = `
 CREATE TABLE IF NOT EXISTS push_subscriptions (

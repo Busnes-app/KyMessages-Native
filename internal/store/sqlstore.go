@@ -170,10 +170,10 @@ func (u *userStore) insertUser(ctx context.Context, db execQuerier, user *User) 
 	q := u.store.rebind(`
 INSERT INTO users (
     id, username, email, display_name, password_hash, role, status,
-    sso_provider, sso_subject, totp_secret_enc, totp_enabled,
+    sso_provider, sso_subject, org_id, totp_secret_enc, totp_enabled,
     recovery_codes_hash, push_device_id, must_change_password,
     created_at, updated_at, last_login_at
-) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE (? <> 'kyidentity' OR NOT EXISTS (SELECT 1 FROM server_settings WHERE key='installer.config'))
+) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE (? <> 'kyidentity' OR NOT EXISTS (SELECT 1 FROM server_settings WHERE key='installer.config'))
 `)
 
 	var lastLogin sql.NullTime
@@ -183,7 +183,7 @@ INSERT INTO users (
 
 	result, err := db.ExecContext(ctx, q,
 		user.ID, user.Username, user.Email, user.DisplayName, user.PasswordHash,
-		user.Role, user.Status, user.SSOProvider, user.SSOSubject,
+		user.Role, user.Status, user.SSOProvider, user.SSOSubject, user.OrgID,
 		user.TOTPSecretEnc, user.TOTPEnabled, user.RecoveryCodesHash,
 		user.PushDeviceID, user.MustChangePassword,
 		user.CreatedAt, user.UpdatedAt, lastLogin, user.SSOProvider,
@@ -224,7 +224,7 @@ func (u *userStore) scanUser(row interface{ Scan(...any) error }) (*User, error)
 
 	err := row.Scan(
 		&user.ID, &user.Username, &user.Email, &user.DisplayName, &user.PasswordHash,
-		&user.Role, &user.Status, &user.SSOProvider, &user.SSOSubject,
+		&user.Role, &user.Status, &user.SSOProvider, &user.SSOSubject, &user.OrgID,
 		&user.TOTPSecretEnc, &user.TOTPEnabled, &user.RecoveryCodesHash,
 		&user.PushDeviceID, &user.MustChangePassword, &user.TOTPLastCounter,
 		&user.CreatedAt, &user.UpdatedAt, &lastLogin,
@@ -244,7 +244,7 @@ func (u *userStore) scanUser(row interface{ Scan(...any) error }) (*User, error)
 func (u *userStore) GetUserByID(ctx context.Context, id string) (*User, error) {
 	q := u.store.rebind(`
 SELECT id, username, email, display_name, password_hash, role, status,
-       sso_provider, sso_subject, totp_secret_enc, totp_enabled,
+       sso_provider, sso_subject, org_id, totp_secret_enc, totp_enabled,
        recovery_codes_hash, push_device_id, must_change_password,
        totp_last_counter, created_at, updated_at, last_login_at
 FROM users WHERE id = ?
@@ -257,7 +257,7 @@ FROM users WHERE id = ?
 func (u *userStore) GetLocalUserByUsername(ctx context.Context, username string) (*User, error) {
 	q := u.store.rebind(`
 SELECT id, username, email, display_name, password_hash, role, status,
-       sso_provider, sso_subject, totp_secret_enc, totp_enabled,
+       sso_provider, sso_subject, org_id, totp_secret_enc, totp_enabled,
        recovery_codes_hash, push_device_id, must_change_password,
        totp_last_counter, created_at, updated_at, last_login_at
 FROM users WHERE sso_provider = 'local' AND LOWER(username) = LOWER(?)
@@ -269,7 +269,7 @@ ORDER BY username = ? DESC, id LIMIT 1
 func (u *userStore) GetUserByEmail(ctx context.Context, email string) (*User, error) {
 	q := u.store.rebind(`
 SELECT id, username, email, display_name, password_hash, role, status,
-       sso_provider, sso_subject, totp_secret_enc, totp_enabled,
+       sso_provider, sso_subject, org_id, totp_secret_enc, totp_enabled,
        recovery_codes_hash, push_device_id, must_change_password,
        totp_last_counter, created_at, updated_at, last_login_at
 FROM users WHERE LOWER(email) = LOWER(?)
@@ -280,7 +280,7 @@ FROM users WHERE LOWER(email) = LOWER(?)
 func (u *userStore) GetUserBySSO(ctx context.Context, provider, subject string) (*User, error) {
 	q := u.store.rebind(`
 SELECT id, username, email, display_name, password_hash, role, status,
-       sso_provider, sso_subject, totp_secret_enc, totp_enabled,
+       sso_provider, sso_subject, org_id, totp_secret_enc, totp_enabled,
        recovery_codes_hash, push_device_id, must_change_password,
        totp_last_counter, created_at, updated_at, last_login_at
 FROM users WHERE sso_provider = ? AND sso_subject = ?
@@ -510,11 +510,14 @@ func (u *userStore) ListUsers(ctx context.Context, offset, limit int, filter Use
 	if filter.Provider != "" {
 		where, args = where+" AND sso_provider = ?", append(args, filter.Provider)
 	}
+	if filter.OrgID != "" {
+		where, args = where+" AND org_id = ?", append(args, filter.OrgID)
+	}
 	countQuery := "SELECT COUNT(1) FROM users" + where
 	countArgs := args
 	listQuery := `
 SELECT id, username, email, display_name, password_hash, role, status,
-       sso_provider, sso_subject, totp_secret_enc, totp_enabled,
+       sso_provider, sso_subject, org_id, totp_secret_enc, totp_enabled,
        recovery_codes_hash, push_device_id, must_change_password,
        totp_last_counter, created_at, updated_at, last_login_at
 FROM users` + where + `
@@ -577,6 +580,24 @@ func (s *SQLStore) withPassword(ctx context.Context, userID, expectedHash string
 	}
 	if n != 1 {
 		return ErrNotFound
+	}
+	// An org-bound account gets a grant only while its org is active. Locking the org row
+	// orders this against a suspension: one that committed first refuses the grant, and one
+	// that waits for it then deletes it with the org's other grants.
+	var orgID string
+	if err := tx.QueryRowContext(ctx, s.rebind("SELECT org_id FROM users WHERE id = ?"), userID).Scan(&orgID); err != nil {
+		return err
+	}
+	if orgID != "" {
+		org, err := tx.ExecContext(ctx, s.rebind("UPDATE tenants SET id = id WHERE id = ? AND status = ?"), orgID, TenantStatusActive)
+		if err != nil {
+			return err
+		}
+		if n, err := org.RowsAffected(); err != nil {
+			return err
+		} else if n != 1 {
+			return ErrNotFound
+		}
 	}
 	if err := apply(tx); err != nil {
 		return err

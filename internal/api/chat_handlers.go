@@ -62,14 +62,20 @@ func (s *Server) allowChatAction(w http.ResponseWriter, userID string, l chatLim
 	return false
 }
 
-// activeChatUser loads a user who can be put in a room. A suspended or deleted account
-// reads as not found, like an unknown ID.
-func (s *Server) activeChatUser(ctx context.Context, id string) (*store.User, error) {
+// activeChatUser loads a user who can be put in a room within tenantID. A suspended,
+// deleted, or cross-organization account reads as not found, like an unknown ID.
+func (s *Server) activeChatUser(ctx context.Context, tenantID, id string) (*store.User, error) {
 	u, err := s.store.Users().GetUserByID(ctx, id)
-	if err == nil && u.Status != "active" {
+	if err != nil {
+		return nil, err
+	}
+	if u.Status != "active" {
 		return nil, store.ErrNotFound
 	}
-	return u, err
+	if s.config.Tenancy.IsMultiTenant() && u.OrgID != tenantID {
+		return nil, store.ErrNotFound
+	}
+	return u, nil
 }
 
 func isRoomModerator(member *store.RoomMember, user *store.User) bool {
@@ -131,7 +137,10 @@ func (s *Server) handleChatBootstrap(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
-	tenantID := store.DefaultTenantID
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	tenant, err := s.store.Chat().GetTenant(r.Context(), tenantID)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to load tenant")
@@ -175,11 +184,20 @@ func (s *Server) handleChatBootstrap(w http.ResponseWriter, r *http.Request) {
 // GET /api/v1/users
 func (s *Server) handleChatListUsers(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	if _, _, ok := s.currentUser(r); !ok {
+	user, _, ok := s.currentUser(r)
+	if !ok {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
-	users, _, err := s.store.Users().ListUsers(r.Context(), 0, 500, store.UserFilter{})
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
+	filter := store.UserFilter{}
+	if s.config.Tenancy.IsMultiTenant() {
+		filter.OrgID = tenantID
+	}
+	users, _, err := s.store.Users().ListUsers(r.Context(), 0, 500, filter)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to list directory")
 		return
@@ -207,12 +225,16 @@ func (s *Server) handleChatListRooms(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
-	rooms, err := s.store.Chat().ListUserRooms(r.Context(), store.DefaultTenantID, user.ID)
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
+	rooms, err := s.store.Chat().ListUserRooms(r.Context(), tenantID, user.ID)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to load rooms")
 		return
 	}
-	s.resolveDMRoomNames(r, store.DefaultTenantID, user.ID, rooms)
+	s.resolveDMRoomNames(r, tenantID, user.ID, rooms)
 	s.writeJSON(w, http.StatusOK, map[string]any{"rooms": rooms})
 }
 
@@ -236,6 +258,10 @@ func (s *Server) handleChatCreateRoom(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusForbidden, "Bot accounts cannot create rooms")
 		return
 	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	if !s.allowChatAction(w, user.ID, chatLimitRooms) {
 		return
 	}
@@ -245,7 +271,6 @@ func (s *Server) handleChatCreateRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tenantID := store.DefaultTenantID
 	kind := strings.TrimSpace(req.Kind)
 	if kind == "" {
 		kind = store.RoomKindChannel
@@ -258,7 +283,7 @@ func (s *Server) handleChatCreateRoom(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, "dm_user_id is required for DM rooms")
 			return
 		}
-		if _, err := s.activeChatUser(r.Context(), targetID); err != nil {
+		if _, err := s.activeChatUser(r.Context(), tenantID, targetID); err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				s.writeError(w, http.StatusNotFound, "Target user not found")
 				return
@@ -303,7 +328,7 @@ func (s *Server) handleChatCreateRoom(w http.ResponseWriter, r *http.Request) {
 			if uid == "" || uid == user.ID {
 				continue
 			}
-			if _, err := s.activeChatUser(r.Context(), uid); err != nil {
+			if _, err := s.activeChatUser(r.Context(), tenantID, uid); err != nil {
 				if errors.Is(err, store.ErrNotFound) {
 					s.writeError(w, http.StatusBadRequest, "Unknown member user_id")
 					return
@@ -356,8 +381,11 @@ func (s *Server) handleChatGetRoom(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	roomID := r.PathValue("id")
-	tenantID := store.DefaultTenantID
 
 	member, ok := s.requireRoomMember(w, r, tenantID, roomID, user.ID)
 	if !ok {
@@ -392,11 +420,14 @@ func (s *Server) handleChatUpdateRoom(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	if !s.allowChatAction(w, user.ID, chatLimitRooms) {
 		return
 	}
 	roomID := r.PathValue("id")
-	tenantID := store.DefaultTenantID
 
 	member, ok := s.requireRoomMember(w, r, tenantID, roomID, user.ID)
 	if !ok {
@@ -447,11 +478,14 @@ func (s *Server) handleChatAddMember(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	if !s.allowChatAction(w, user.ID, chatLimitRooms) {
 		return
 	}
 	roomID := r.PathValue("id")
-	tenantID := store.DefaultTenantID
 
 	actorMember, ok := s.requireRoomMember(w, r, tenantID, roomID, user.ID)
 	if !ok {
@@ -489,7 +523,7 @@ func (s *Server) handleChatAddMember(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "role must be member or admin")
 		return
 	}
-	if _, err := s.activeChatUser(r.Context(), targetID); err != nil {
+	if _, err := s.activeChatUser(r.Context(), tenantID, targetID); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			s.writeError(w, http.StatusNotFound, "Target user not found")
 			return
@@ -528,9 +562,12 @@ func (s *Server) handleChatRemoveMember(w http.ResponseWriter, r *http.Request) 
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	roomID := r.PathValue("id")
 	targetID := r.PathValue("uid")
-	tenantID := store.DefaultTenantID
 
 	actorMember, ok := s.requireRoomMember(w, r, tenantID, roomID, user.ID)
 	if !ok {
@@ -586,8 +623,11 @@ func (s *Server) handleChatListMessages(w http.ResponseWriter, r *http.Request) 
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	roomID := r.PathValue("id")
-	tenantID := store.DefaultTenantID
 
 	if _, ok := s.requireRoomMember(w, r, tenantID, roomID, user.ID); !ok {
 		return
@@ -649,11 +689,14 @@ func (s *Server) handleChatSendMessage(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	if !s.allowChatAction(w, user.ID, chatLimitWrites) {
 		return
 	}
 	roomID := r.PathValue("id")
-	tenantID := store.DefaultTenantID
 
 	var req sendMessageRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -758,12 +801,15 @@ func (s *Server) handleChatEditMessage(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	if !s.allowChatAction(w, user.ID, chatLimitWrites) {
 		return
 	}
 	roomID := r.PathValue("id")
 	msgID := r.PathValue("mid")
-	tenantID := store.DefaultTenantID
 
 	if _, ok := s.requireRoomMember(w, r, tenantID, roomID, user.ID); !ok {
 		return
@@ -809,12 +855,15 @@ func (s *Server) handleChatDeleteMessage(w http.ResponseWriter, r *http.Request)
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	if !s.allowChatAction(w, user.ID, chatLimitWrites) {
 		return
 	}
 	roomID := r.PathValue("id")
 	msgID := r.PathValue("mid")
-	tenantID := store.DefaultTenantID
 
 	member, ok := s.requireRoomMember(w, r, tenantID, roomID, user.ID)
 	if !ok {
@@ -871,13 +920,16 @@ func (s *Server) handleChatReaction(w http.ResponseWriter, r *http.Request, add 
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	if !s.allowChatAction(w, user.ID, chatLimitWrites) {
 		return
 	}
 	roomID := r.PathValue("id")
 	msgID := r.PathValue("mid")
 	emoji := strings.TrimSpace(r.PathValue("emoji"))
-	tenantID := store.DefaultTenantID
 
 	if emoji == "" || len(emoji) > maxEmojiLen {
 		s.writeError(w, http.StatusBadRequest, "Invalid reaction emoji")
@@ -930,8 +982,11 @@ func (s *Server) handleChatMarkRead(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	roomID := r.PathValue("id")
-	tenantID := store.DefaultTenantID
 
 	var req readCursorRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Seq < 0 {
@@ -965,6 +1020,10 @@ func (s *Server) handleChatSearch(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
 	if query == "" || len(query) > maxSearchQueryLen {
 		s.writeError(w, http.StatusBadRequest, "q must be 1 to 200 characters")
@@ -981,7 +1040,7 @@ func (s *Server) handleChatSearch(w http.ResponseWriter, r *http.Request) {
 		limit = n
 	}
 
-	hits, err := s.store.Chat().SearchMessages(r.Context(), store.DefaultTenantID, user.ID, roomID, query, limit)
+	hits, err := s.store.Chat().SearchMessages(r.Context(), tenantID, user.ID, roomID, query, limit)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Search failed")
 		return
@@ -1000,11 +1059,14 @@ func (s *Server) handleChatCreateWebhook(w http.ResponseWriter, r *http.Request)
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	if !s.allowChatAction(w, user.ID, chatLimitRooms) {
 		return
 	}
 	roomID := r.PathValue("id")
-	tenantID := store.DefaultTenantID
 
 	member, ok := s.requireRoomMember(w, r, tenantID, roomID, user.ID)
 	if !ok {
@@ -1055,8 +1117,11 @@ func (s *Server) handleChatListWebhooks(w http.ResponseWriter, r *http.Request) 
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	roomID := r.PathValue("id")
-	tenantID := store.DefaultTenantID
 
 	member, ok := s.requireRoomMember(w, r, tenantID, roomID, user.ID)
 	if !ok {
@@ -1082,9 +1147,12 @@ func (s *Server) handleChatRevokeWebhook(w http.ResponseWriter, r *http.Request)
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	roomID := r.PathValue("id")
 	webhookID := r.PathValue("wid")
-	tenantID := store.DefaultTenantID
 
 	member, ok := s.requireRoomMember(w, r, tenantID, roomID, user.ID)
 	if !ok {
@@ -1135,6 +1203,15 @@ func (s *Server) handleChatIncomingWebhook(w http.ResponseWriter, r *http.Reques
 	givenHash := crypto.SHA256Hex([]byte(rawToken))
 	if len(givenHash) != len(wh.TokenHash) || subtle.ConstantTimeCompare([]byte(givenHash), []byte(wh.TokenHash)) != 1 {
 		s.writeError(w, http.StatusUnauthorized, "Invalid webhook token")
+		return
+	}
+	active, err := s.isTenantActive(r.Context(), wh.TenantID)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "Failed to verify organization")
+		return
+	}
+	if !active {
+		s.writeError(w, http.StatusForbidden, "Organization is suspended or inactive")
 		return
 	}
 	// A webhook carries its creator's authority: it stops when they are offboarded,

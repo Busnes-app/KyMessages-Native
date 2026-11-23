@@ -15,11 +15,11 @@ Owns `kymessages/` (the skill: `SKILL.md` and `references/<runtime>.md`) and `sk
   security-relevant depends on the agent following it (scope, lock, revoke and expiry are
   server-side).
 - Each `references/<runtime>.md`'s first fenced block is that runtime's config block with the
-  placeholders `<HOMESERVER>`, `<ACCESS_TOKEN>`, `<OWNER>`. `Config` fills them and is the only
+  placeholders `<SERVER_URL>`, `<ACCESS_TOKEN>`, `<OWNER>`. `Config` fills them and is the only
   source of the console's config blocks; it refuses values holding quotes, whitespace, `#`,
   `\`, `` ` `` or `$`. `Runtimes` lists the runtimes with a reference file.
-- Blocks require encryption (`encryption: true`; `MATRIX_E2EE_MODE=required`) and serve only
-  the owner (`dm.allowFrom` and `groupAllowFrom`; `MATRIX_ALLOWED_USERS`).
+- Blocks authenticate with a `kybot_` bearer token and restrict instructions to the owner
+  (`dm.allowFrom` and `groupAllowFrom` in OpenClaw; `KYMESSAGES_ALLOWED_USERS` in Hermes).
 
 ## Verification
 - `go test ./agent-skill/`

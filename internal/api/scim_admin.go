@@ -18,6 +18,15 @@ type scimUserView struct {
 // provider's bearer token, which the console never holds. token_set says whether
 // KY_SCIM_TOKEN is configured; the token itself never leaves the process.
 func (s *Server) handleSCIMUsers(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if s.config.Tenancy.IsMultiTenant() {
+		s.writeJSON(w, http.StatusOK, map[string]any{
+			"enabled":   false,
+			"token_set": false,
+			"users":     []scimUserView{},
+		})
+		return
+	}
 	const page = 500
 	users := []scimUserView{}
 	for offset := 0; ; offset += page {
@@ -35,7 +44,6 @@ func (s *Server) handleSCIMUsers(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	w.Header().Set("Cache-Control", "no-store")
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"enabled":   s.config.SCIM.Enabled,
 		"token_set": s.config.SCIM.Enabled && s.config.SCIM.TokenSet,

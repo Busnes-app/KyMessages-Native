@@ -59,6 +59,7 @@ func (s *Server) handleKyCalendarUpsertMeeting(w http.ResponseWriter, r *http.Re
 	}
 
 	var req struct {
+		OrgID        string   `json:"org_id"`
 		OrganizerSub string   `json:"organizer_sub"`
 		Title        string   `json:"title"`
 		MemberSubs   []string `json:"member_subs"`
@@ -73,6 +74,24 @@ func (s *Server) handleKyCalendarUpsertMeeting(w http.ResponseWriter, r *http.Re
 	if err := json.Unmarshal(body, &req); err != nil {
 		s.writeError(w, http.StatusBadRequest, "Invalid JSON payload")
 		return
+	}
+
+	tenantID := store.DefaultTenantID
+	if s.config.Tenancy.IsMultiTenant() {
+		tenantID = strings.TrimSpace(req.OrgID)
+		if tenantID == "" {
+			s.writeError(w, http.StatusBadRequest, "org_id is required in multi-tenant mode")
+			return
+		}
+		tenant, err := s.store.Chat().EnsureTenant(r.Context(), tenantID)
+		if err != nil {
+			s.writeError(w, http.StatusInternalServerError, "Failed to verify organization")
+			return
+		}
+		if tenant.Status != store.TenantStatusActive {
+			s.writeError(w, http.StatusForbidden, "Organization is suspended or inactive")
+			return
+		}
 	}
 
 	title := strings.TrimSpace(req.Title)
@@ -116,25 +135,31 @@ func (s *Server) handleKyCalendarUpsertMeeting(w http.ResponseWriter, r *http.Re
 		})
 	}
 
-	// Resolve organizer & internal member subs to local user IDs.
+	// Resolve organizer & internal member subs to local user IDs within the target tenant.
 	resolveSub := func(sub string) string {
 		sub = strings.TrimSpace(sub)
 		if sub == "" {
 			return ""
 		}
-		if u, err := s.store.Users().GetUserBySSO(r.Context(), "kyidentity", sub); err == nil {
-			return u.ID
+		var u *store.User
+		if found, err := s.store.Users().GetUserBySSO(r.Context(), "kyidentity", sub); err == nil {
+			u = found
+		} else if found, err := s.store.Users().GetUserByID(r.Context(), sub); err == nil {
+			u = found
 		}
-		if u, err := s.store.Users().GetUserByID(r.Context(), sub); err == nil {
-			return u.ID
+		if u == nil {
+			return ""
 		}
-		return ""
+		if s.config.Tenancy.IsMultiTenant() && u.OrgID != tenantID {
+			return ""
+		}
+		return u.ID
 	}
 
-	orgID := resolveSub(req.OrganizerSub)
+	organizerID := resolveSub(req.OrganizerSub)
 	memberIDs := make([]string, 0, len(req.MemberSubs)+1)
-	if orgID != "" {
-		memberIDs = append(memberIDs, orgID)
+	if organizerID != "" {
+		memberIDs = append(memberIDs, organizerID)
 	}
 	for _, sub := range req.MemberSubs {
 		if uid := resolveSub(sub); uid != "" {
@@ -166,8 +191,8 @@ func (s *Server) handleKyCalendarUpsertMeeting(w http.ResponseWriter, r *http.Re
 
 	res, err := s.store.Chat().UpsertMeeting(r.Context(), store.UpsertMeetingParams{
 		ID:             meetingID,
-		TenantID:       store.DefaultTenantID,
-		OrganizerID:    orgID,
+		TenantID:       tenantID,
+		OrganizerID:    organizerID,
 		OrganizerSub:   strings.TrimSpace(req.OrganizerSub),
 		Title:          title,
 		MemberUserIDs:  memberIDs,
@@ -234,7 +259,22 @@ func (s *Server) handleKyCalendarCloseMeeting(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	closed, err := s.store.Chat().CloseMeeting(r.Context(), store.DefaultTenantID, meetingID)
+	tenantID := store.DefaultTenantID
+	if s.config.Tenancy.IsMultiTenant() {
+		var req struct {
+			OrgID string `json:"org_id"`
+		}
+		if len(body) > 0 {
+			_ = json.Unmarshal(body, &req)
+		}
+		tenantID = strings.TrimSpace(req.OrgID)
+		if tenantID == "" {
+			s.writeError(w, http.StatusBadRequest, "org_id is required in multi-tenant mode")
+			return
+		}
+	}
+
+	closed, err := s.store.Chat().CloseMeeting(r.Context(), tenantID, meetingID)
 	if errors.Is(err, store.ErrNotFound) {
 		s.writeJSON(w, http.StatusOK, map[string]bool{"closed": true})
 		return
@@ -269,6 +309,10 @@ func (s *Server) handleCreateInstantMeeting(w http.ResponseWriter, r *http.Reque
 		s.writeError(w, http.StatusForbidden, "Bot accounts cannot create meetings")
 		return
 	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
 	var req struct {
 		Title     string   `json:"title"`
 		MemberIDs []string `json:"member_ids"`
@@ -284,6 +328,24 @@ func (s *Server) handleCreateInstantMeeting(w http.ResponseWriter, r *http.Reque
 		title = title[:maxRoomNameLen]
 	}
 
+	members := make([]string, 0, len(req.MemberIDs)+1)
+	members = append(members, user.ID)
+	for _, uid := range req.MemberIDs {
+		uid = strings.TrimSpace(uid)
+		if uid == "" || uid == user.ID {
+			continue
+		}
+		if _, err := s.activeChatUser(r.Context(), tenantID, uid); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				s.writeError(w, http.StatusBadRequest, "Unknown member user_id")
+				return
+			}
+			s.writeError(w, http.StatusInternalServerError, "Failed to validate member")
+			return
+		}
+		members = append(members, uid)
+	}
+
 	meetingID := "mtg_" + uuid.Must(uuid.NewV7()).String()
 	rawTok, err := chat.GenerateOpaqueToken()
 	if err != nil {
@@ -292,10 +354,9 @@ func (s *Server) handleCreateInstantMeeting(w http.ResponseWriter, r *http.Reque
 	}
 	guestKey := "invite-" + uuid.Must(uuid.NewV7()).String()[:8]
 
-	members := append([]string{user.ID}, req.MemberIDs...)
 	res, err := s.store.Chat().UpsertMeeting(r.Context(), store.UpsertMeetingParams{
 		ID:            meetingID,
-		TenantID:      store.DefaultTenantID,
+		TenantID:      tenantID,
 		OrganizerID:   user.ID,
 		OrganizerSub:  user.ID,
 		Title:         title,
@@ -345,11 +406,15 @@ func (s *Server) handleCreateRoomGuestLink(w http.ResponseWriter, r *http.Reques
 		s.writeError(w, http.StatusForbidden, "Bot accounts cannot create meeting links")
 		return
 	}
-	roomID := r.PathValue("id")
-	if _, ok := s.requireRoomMember(w, r, store.DefaultTenantID, roomID, user.ID); !ok {
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
 		return
 	}
-	room, err := s.store.Chat().GetRoom(r.Context(), store.DefaultTenantID, roomID)
+	roomID := r.PathValue("id")
+	if _, ok := s.requireRoomMember(w, r, tenantID, roomID, user.ID); !ok {
+		return
+	}
+	room, err := s.store.Chat().GetRoom(r.Context(), tenantID, roomID)
 	if errors.Is(err, store.ErrNotFound) {
 		s.writeError(w, http.StatusNotFound, "Room not found")
 		return
@@ -363,7 +428,7 @@ func (s *Server) handleCreateRoomGuestLink(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	meeting, _, err := s.store.Chat().GetMeetingByRoomID(r.Context(), store.DefaultTenantID, roomID)
+	meeting, _, err := s.store.Chat().GetMeetingByRoomID(r.Context(), tenantID, roomID)
 	if errors.Is(err, store.ErrNotFound) {
 		// Allow attaching a guest link to any non-DM room by creating an ad-hoc meeting record.
 		if room.Kind == store.RoomKindDM {
@@ -381,7 +446,7 @@ func (s *Server) handleCreateRoomGuestLink(w http.ResponseWriter, r *http.Reques
 		// OR return a new meeting link cleanly. Let's keep guest links strictly on meeting rooms or attach directly!
 		if _, err := s.store.Chat().UpsertMeeting(r.Context(), store.UpsertMeetingParams{
 			ID:            meetingID,
-			TenantID:      store.DefaultTenantID,
+			TenantID:      tenantID,
 			OrganizerID:   user.ID,
 			OrganizerSub:  user.ID,
 			Title:         room.Name + " (Guest Meeting)",
@@ -440,7 +505,18 @@ func (s *Server) lookupGuestToken(r *http.Request) (*store.MeetingGuest, *store.
 	if len(rawTok) < 16 || len(rawTok) > 128 {
 		return nil, nil, nil, store.ErrNotFound
 	}
-	return s.store.Chat().GetMeetingGuestByTokenHash(r.Context(), chat.HashMeetingToken(rawTok))
+	guest, meeting, windows, err := s.store.Chat().GetMeetingGuestByTokenHash(r.Context(), chat.HashMeetingToken(rawTok))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	active, err := s.isTenantActive(r.Context(), meeting.TenantID)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if !active {
+		return nil, nil, nil, store.ErrNotFound
+	}
+	return guest, meeting, windows, nil
 }
 
 func (s *Server) authenticateGuestRequest(w http.ResponseWriter, r *http.Request, requireAdmitted bool) (*chat.GuestSession, *store.Meeting, bool) {
@@ -647,6 +723,14 @@ func (s *Server) handleGuestCallJoin(w http.ResponseWriter, r *http.Request) {
 		ProtectIP:   body.ProtectIP,
 		ECDHPubJWK:  body.ECDHPubJWK,
 	})
+	if errors.Is(err, chat.ErrCallSeatLost) {
+		s.writeError(w, http.StatusConflict, "The call seat ended while joining; join again")
+		return
+	}
+	if errors.Is(err, chat.ErrTenantInactive) {
+		s.writeError(w, http.StatusForbidden, "Meeting is not available")
+		return
+	}
 	if errors.Is(err, chat.ErrSFUUnavailable) {
 		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 			"error": "External guest calls require LiveKit SFU when Guest Force SFU policy is enabled",

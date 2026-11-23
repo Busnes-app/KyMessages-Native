@@ -24,6 +24,10 @@ var (
 	// ErrSFUUnavailable is returned when policy or privacy requires SFU mode (sfu_only,
 	// protect_ip, or guest_force_sfu) but LiveKit is not configured on this server.
 	ErrSFUUnavailable = errors.New("livekit sfu is not configured on this server")
+	// ErrTenantInactive is returned when the call's organization is suspended or deleted.
+	ErrTenantInactive = errors.New("organization is suspended or inactive")
+	// ErrCallSeatLost is returned when the joining peer left or was replaced during setup.
+	ErrCallSeatLost = errors.New("call seat ended while joining")
 	// ErrCallNotActive is returned when operating on a room without an active call.
 	ErrCallNotActive = errors.New("no active call in this room")
 )
@@ -177,6 +181,9 @@ func (m *CallManager) Join(ctx context.Context, req JoinCallRequest) (*JoinCallR
 		req.TenantID = store.DefaultTenantID
 	}
 	tenant, err := m.chatStore.GetTenant(ctx, req.TenantID)
+	if err == nil && tenant.Status != store.TenantStatusActive {
+		return nil, ErrTenantInactive
+	}
 	if err != nil {
 		// Fall back to safe defaults if tenant row is missing in unit tests.
 		tenant = &store.Tenant{
@@ -302,6 +309,14 @@ func (m *CallManager) Join(ctx context.Context, req JoinCallRequest) (*JoinCallR
 	stickyNow := c.session.SFUSticky
 	m.mu.Unlock()
 
+	// Check the org again now the peer is registered, before any token exists. A suspension that
+	// committed first is seen here and the join takes itself back out; one that commits later
+	// finds the peer and its revocation removes it.
+	if !m.tenantStillActive(ctx, req.TenantID) {
+		m.Leave(ctx, req.RoomID, req.UserID)
+		return nil, ErrTenantInactive
+	}
+
 	// Persist call session row.
 	if created {
 		if err := m.chatStore.CreateCallSession(ctx, &sessionCopy); err != nil {
@@ -320,6 +335,15 @@ func (m *CallManager) Join(ctx context.Context, req JoinCallRequest) (*JoinCallR
 		}
 		lkURL = m.livekit.WSURL()
 		lkToken = m.livekit.JoinToken(lkRoom, peerID, req.DisplayName, "", rtc.DefaultTokenTTL)
+	}
+	// The token is handed out only if the org is still active and the peer outlived setup. A
+	// peer that left or was replaced by a newer join is not touched: that seat is not ours now.
+	if !m.tenantStillActive(ctx, req.TenantID) {
+		m.Leave(ctx, req.RoomID, req.UserID)
+		return nil, ErrTenantInactive
+	}
+	if !m.peerRegistered(req.RoomID, peerID) {
+		return nil, ErrCallSeatLost
 	}
 
 	// Broadcast updated call state to the room.
@@ -344,6 +368,58 @@ func (m *CallManager) Join(ctx context.Context, req JoinCallRequest) (*JoinCallR
 		Peers:        statePayload.Peers,
 		Started:      created,
 	}, nil
+}
+
+func (m *CallManager) peerRegistered(roomID, peerID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c := m.calls[roomID]
+	return c != nil && c.peers[peerID] != nil
+}
+
+// RevokeTenant takes every peer of tenantID's calls on this pod out of its call, members and
+// guests alike, whether or not they hold a chat socket here.
+func (m *CallManager) RevokeTenant(ctx context.Context, tenantID string) {
+	type seat struct{ roomID, userID string }
+	var seats []seat
+	m.mu.Lock()
+	for roomID, c := range m.calls {
+		if c.session.TenantID != tenantID {
+			continue
+		}
+		for _, p := range c.peers {
+			seats = append(seats, seat{roomID, p.UserID})
+		}
+	}
+	m.mu.Unlock()
+	for _, s := range seats {
+		m.Leave(ctx, s.roomID, s.userID)
+	}
+}
+
+// ReconcileTenants takes the peers of every call whose org is no longer active out of their
+// calls, so a tenant.revoked notification this pod missed still takes effect.
+func (m *CallManager) ReconcileTenants(ctx context.Context) {
+	m.mu.Lock()
+	tenants := map[string]struct{}{}
+	for _, c := range m.calls {
+		tenants[c.session.TenantID] = struct{}{}
+	}
+	m.mu.Unlock()
+	for tenantID := range tenants {
+		tenant, err := m.chatStore.GetTenant(ctx, tenantID)
+		if err == nil && tenant.Status != store.TenantStatusActive {
+			m.RevokeTenant(ctx, tenantID)
+		}
+	}
+}
+
+func (m *CallManager) tenantStillActive(ctx context.Context, tenantID string) bool {
+	tenant, err := m.chatStore.GetTenant(ctx, tenantID)
+	if errors.Is(err, store.ErrNotFound) {
+		return true // unit tests without a tenant row, as above
+	}
+	return err == nil && tenant.Status == store.TenantStatusActive
 }
 
 // Leave removes userID from the active call in roomID, ending the call if empty or

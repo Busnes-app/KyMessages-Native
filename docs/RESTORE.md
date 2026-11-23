@@ -1,219 +1,120 @@
 # KyMessages server restore
 
-KyMessages is not deployed yet. These instructions cover the source-built server's
-SQLite capsule restore and the Matrix stack restore, which is tested with disposable custodian keys. No
-production identity/deployment verification is implied by this runbook. Restore with the
-published `ghcr.io/busnes-app/kymessage-server` image or a build of this repository. Do not
-substitute the upstream `ky-server-base` image: it does not contain this repository's restore
-policy.
+These instructions cover offline disaster recovery for the native KyMessages server using sealed
+KyRecovery capsules (SQLite deployments) and the encrypted chat attachment mirror. Restore with
+the published container image or a matching/newer build of this repository. Do not substitute the
+upstream `ky-server-base` image: it does not include KyMessages' restore policy.
 
 ## What recovery can restore
 
-The inherited `ky-primitives/recoveryclient` adapter seals the server capsule:
+The `ky-primitives/recoveryclient` adapter seals the server capsule:
 
 | File | Contents |
 |---|---|
-| `data/ky_server.db` | SQLite snapshot: accounts, MFA state, settings, audits and sealed recovery token |
+| `data/ky_server.db` | SQLite snapshot: users, tenants/orgs, rooms, messages, meetings, agents, MFA state, settings, audit logs, and sealed recovery token |
 | `data/encryption.key` | Deployment key needed to open stored MFA secrets and the recovery token |
+| `data/attachments.key` | AES-256-GCM key that opens the encrypted attachment mirror |
+| `data/vapid.key` | Web Push VAPID private key (preserved so browser push subscriptions survive key continuity checks after users re-subscribe) |
 | `data/recovery.pub` | Pinned suite recovery public key, when configured |
-| `config/settings.json` | App name, URL, port and database driver for operator reference; not automatically loaded |
-| `data/media.key` | With Matrix: the key that opens the media mirror |
-| `matrix/` | With Matrix: secrets except the Postgres superuser's, Synapse signing key, Synapse/MAS/Element configs, Postgres init SQL |
-| `matrix/dumps/{mas,synapse}.dump.NNN` | With Matrix: `pg_dump` parts, MAS first, seconds apart. Synapse's one-time keys are excluded, as Synapse's backup guide says |
+| `config/settings.json` | App name, URL, port, and database driver for operator reference; not automatically loaded |
+| `installer/*` | Sealed installer OIDC/directory credential files and path map, when installer-managed |
 
-Media is not in the capsule. It lives in `KY_BACKUP_DIR/media`: an encrypted mirror plus
-`full-YYYY-MM.tar` archives. Copy that directory off the host together with the capsules;
-only the capsule's `data/media.key` opens it.
+Attachment files are not stored inside the capsule. They live in `KY_BACKUP_DIR/attachments` as
+an encrypted mirror. Copy `KY_BACKUP_DIR/attachments` off the host alongside the capsules; only
+the capsule's `data/attachments.key` can decrypt them.
 
-Custodians together can open the capsule, including its operational secrets and
-metadata. KyRecovery cannot. The expanded limit is 256 MiB (the library's cap, counted
-with tar framing; the product reserves 1 MiB, see Busnes-app/ky-primitives#20). A larger
-payload fails the run with its size, and the backup screen warns from 75%. Allow about
-2 GiB of memory for the app near the limit (an estimate, not measured). Initial snapshot
-scratch space still needs room for the complete live database.
+Custodians together can open the capsule, including its operational secrets and database snapshot.
+KyRecovery cannot. The expanded capsule limit is 256 MiB (counted with tar framing; the product
+reserves 1 MiB). A larger payload fails the run with its size, and the console warns from 75%.
+Allow roughly 2 GiB of memory near the limit, plus scratch disk space equal to the live SQLite
+database during snapshot creation.
 
-Only SQLite capsule backup/restore is supported here. The collector refuses
-PostgreSQL because it cannot produce its consistent snapshot. PostgreSQL store
-tests do not establish a supported PostgreSQL disaster-recovery procedure. Raw
-SQLite copies and database rollbacks bypass the preparation below and are unsupported.
+Only SQLite capsule backup/restore is supported by `kymessages restore`. For PostgreSQL
+deployments (`KY_DB_DRIVER=postgres`), use standard PostgreSQL backup/PITR tooling (`pg_dump` /
+WAL archiving) alongside off-host copies of `data/encryption.key`, `data/attachments.key`,
+`data/vapid.key`, and the attachment directory.
 
 ## Restore offline
 
-1. Obtain the intended capsule from KyRecovery using an operator session, or from
-   the configured local backup directory. Product deposit tokens cannot download it.
-   Record the trusted receipt's capsule ID, creation time and SHA-256 digest. Compare
-   `sha256sum backup.kycap` with that receipt before restoration; an intact old capsule
-   is not evidence of freshness. Know the exact service name used when it was sealed.
-   Record each capsule ID when it is deposited (`kyrecovery_last_deposit`, audit
-   action `admin.backup_run`). After any refused attempt, restore into a fresh empty
-   directory.
-2. Obtain the ceremony's threshold number of custodian cards. Use a private terminal;
-   do not paste shares into chat, argv, environment variables or shell history. The
-   command reads shares from stdin. Never change or regenerate the suite recovery key
-   to make a capsule open.
-3. Build the intended checkout and restore into a new or empty directory:
+1. Obtain the intended capsule from KyRecovery using an operator session, or from the configured
+   local backup directory. Product deposit tokens cannot download capsules. Record the trusted
+   receipt's capsule ID, creation time, and SHA-256 digest, and verify `sha256sum backup.kycap`
+   against it before restoring. Know the exact service name (`KY_APP_NAME`) used when sealed.
+   After any refused attempt, restore into a fresh empty directory.
+2. Obtain the ceremony's threshold number of custodian cards. Use a private terminal; do not paste
+   shares into chat, argv, environment variables, or shell history. The command reads shares from
+   stdin. Never regenerate the suite recovery key to make a capsule open.
+3. Run `restore` into a new or empty directory:
 
    ```sh
    go build -o kymessages ./cmd/server
    ./kymessages restore -capsule ./backup.kycap -to ./restored -service 'KyMessages'
    ```
 
-   Replace `KyMessages` with the capsule's exact service name (`KY_APP_NAME` at backup
-   time). The current default is `KyMessages`; older test capsules may use `Busnes.app`. The service check runs before combining
-   shares. Paste one `ky2-...` share per line, then Ctrl-D; do not supply them as flags.
-   The library verifies the capsule and key binding and refuses a nonempty target.
-   The target's parent must already exist; symlinks in the parent path are resolved and
-   the real path is used. Because another user could otherwise swap the target
-   mid-restore, the command checks the whole path up to `/`: an existing target must be
-   a real directory you own, every ancestor must be owned by you or root, and none may be
-   writable by group or others, except a root-owned sticky directory such as `/tmp`. A
-   nonempty target is refused before anything is read and is left untouched. A target
-   that appears between the check and its creation is refused; retry. The opened
-   directory is checked again against the same rule before extraction.
-4. Compare the printed authenticated manifest's capsule ID, service, creation time,
-   recovery key ID and payload hash with your trusted records. Payload hash and the
-   downloaded container's SHA-256 are different checks. Preserve the receipt.
+   Replace `KyMessages` with the capsule's exact service name (`KY_APP_NAME` at backup time).
+   Paste one `ky2-...` share per line, then Ctrl-D. The command verifies the capsule, service name,
+   key binding, and strict ownership/permissions on every ancestor directory up to `/` before
+   extracting. A nonempty target directory is refused untouched.
+4. Compare the printed authenticated manifest's capsule ID, service, creation time, recovery key ID,
+   and payload hash against your trusted records. Preserve the receipt.
 
-The product then requires a nonempty regular SQLite file and a valid 32-byte
-hexadecimal deployment key. It opens/migrates the offline snapshot (refusing a database
-migrated by a newer build: restore with that build or newer) and, in one
-transaction, deletes sessions, MFA challenges, device pairings and Web Push
-subscriptions (browsers register again after sign-in) and records
-`restore.grants_invalidated`. It closes the store before reporting success.
+After extraction, `kymessages restore` verifies a nonempty SQLite file and a valid 32-byte hex
+deployment key, runs migrations (refusing a database created by a newer build: restore with that
+build or newer), and in one transaction invalidates all pre-backup sessions, MFA challenges,
+device pairings, and Web Push subscriptions while recording `restore.grants_invalidated`.
 
-If extraction fails, the library rolls it back. If preparation fails, or the target
-path no longer names the directory extraction started in, the extracted files are
-removed through a handle to that directory, never by path, and the command reports the failure; nothing is left to serve. Repeat restoration into an empty directory. The
-command never silently falls back to the old grants.
+If extraction or preparation fails, extracted files are removed via directory handle and the
+command exits non-zero; nothing partial is left to serve. Repeat into a fresh empty directory.
 
 ## Restore chat attachments
 
-Attachment files are not in the capsule. Each backup mirrors them, encrypted with
-AES-256-GCM, into `<KY_BACKUP_DIR>/attachments`; the capsule carries only the key,
-`data/attachments.key`. Restore them before the first start:
+Restore encrypted attachments before starting the server:
 
 ```sh
-./kymessages restore-attachments -mirror <KY_BACKUP_DIR>/attachments -data-dir ./restored/data -to <KY_ATTACHMENTS_DIR>
+./kymessages restore-attachments \
+  -mirror <KY_BACKUP_DIR>/attachments \
+  -data-dir ./restored/data \
+  -to <KY_ATTACHMENTS_DIR>
 ```
 
-`KY_ATTACHMENTS_DIR` defaults to `<data dir>/attachments`; the command creates it (0700),
-reads the attachment keys referenced by `<data-dir>/ky_server.db`, and restores only those
-blobs from the mirror (falling back to `.pruned` for blobs deleted after the capsule was
-sealed, without overwriting active blobs or resurrecting deleted blobs the database no
-longer references). Until it runs, attachment downloads answer 404, because the database
-names blobs that are not on disk. Starting first does not lose the mirror: a backup skips
-pruning while the live directory is empty, and blobs it does prune stay in the mirror's
-`.pruned` for 7 days.
-
-## Restore the Matrix stack
-
-Only on a new stack, and only for a capsule sealed with Matrix enabled. Matrix is proven
-end to end by `make matrix-acceptance`: Alice read Bob's earlier message and image after
-restoring her keys from key backup; the server name and signing key were unchanged.
-
-1. Restore as the unprivileged user that owns `./matrix` (`KY_MATRIX_UID`, the user who ran
-   `matrix-init`), as above. Move `restored/data` to `./data` and `restored/matrix` to
-   `./matrix`. Copy the backup directory (with `media/`) to `./backups`, owned by
-   `KY_MATRIX_UID`.
-2. As the same user, export the `matrix-init` environment from setup (README, Matrix step 1)
-   with the exact values used there, and run `./kymessages matrix-init`. It re-renders every
-   config from that environment, so a changed server name, host, issuer or client ID changes the
-   restored configs too. It keeps every restored secret, the signing key and the restored
-   `federation/federation.yaml` (a capsule from before federation existed has none, so it is
-   created closed; on start the app rewrites it from the restored federation settings), and
-   creates `secrets/postgres_password`: the capsule never carries the Postgres superuser
-   password, and a fresh volume does not need the old one. Compose refuses to start
-   `postgres` without it.
-   LiveKit config and API keys also come back from a calling-enabled capsule. Keep
-   `KY_MATRIX_RTC_HOST` and `KY_MATRIX_MEDIA_IP` in the setup environment (update the media IP
-   deliberately when moving hosts), and restore the direct TCP 7881/UDP 7882 forwards.
-   With TURN, restored private certificate/key copies are in `matrix/livekit`; set the
-   complete `KY_MATRIX_TURN_*` setup block to those files (or renewed PEM files), keep the
-   TURN overlay, DNS-only hostname, TCP 443 and UDP 3478/30000–30100 forwarding, and verify the
-   certificate is still valid before restarting LiveKit. For a
-   capsule from before calling, `matrix-init` generates the new LiveKit keys once. Active calls
-   and recordings are not restored; there is no recording service.
-3. Set `.env` as before, with `KY_MATRIX_UID`/`KY_MATRIX_GID` (and `KY_UID`/`KY_GID`) for that user. Pull the
-   image (`docker compose pull app`; `restore-matrix` runs the same image and never pulls) or
-   build it (build overlay).
-4. Only if this stack is meant to be replaced: `docker compose down -v`, which deletes its
-   Matrix database and media. Then `docker compose up -d postgres`, nothing else.
-5. `docker compose run --rm restore-matrix`. Add `-skip-media` only if no media backup
-   survived; uploads from before the backup are then missing. It runs as `KY_MATRIX_UID`
-   with no capabilities and restores as the database owners, with no superuser.
-6. `docker compose up -d`. The app runs as `KY_MATRIX_UID`, which owns `./data` and
-   `./backups` (it refuses key files it does not own). On start the app
-   sets Element's `brand` back to the restored console name (step 2's `matrix-init` rendered
-   the default); if a custom name was restored, `docker compose restart element` once the app
-   is up, as Element serves the copy it made at start. If Element's
-   `matrix/element/config.json` is ever left truncated or invalid (a crash mid-write), re-run
-   `matrix-init` as in step 2; the app re-applies the name within a minute; then restart
-   Element.
-7. The dumps are plaintext copies of every room. After a successful restore `restore-matrix`
-   deletes `matrix/dumps` and prints `Deleted the plaintext dumps`; after a failure it keeps
-   them for the retry. If it prints `Could not delete the plaintext dumps` (the shipped
-   Compose service mounts `./matrix` read-only), delete `./matrix/dumps` yourself.
-8. Members sign in on a new device and restore message keys from key backup with their own
-   recovery key. KyRecovery cannot do this for them.
-
-`restore-matrix` refuses, before writing anything, if a database is not empty, a dump part
-is missing or truncated, a dump creates any extension other than MAS's trusted `pg_trgm`,
-or (unless `-skip-media`) the media store is not empty or a media file does not open at its
-path. Every dump is read in full first. A failure after those checks leaves a partial stack:
-remove it (`docker compose down -v`, which deletes the Matrix database and media) and start
-again.
-
-Restored MAS and Synapse sessions and access tokens stay valid. If a compromise caused the
-restore, end them: disable the affected users in KyIdentity, which ends their sessions, then
-re-enable them to sign in afresh. A lock applied in MAS alone is undone by the next sweep.
+`KY_ATTACHMENTS_DIR` defaults to `<data dir>/attachments`. The command creates the directory
+(`0700`), reads the attachment keys referenced by `<data-dir>/ky_server.db`, and restores only
+referenced blobs from the mirror (falling back to `.pruned` for blobs deleted after the capsule
+was sealed, without overwriting active blobs or resurrecting unreferenced ones). Until this runs,
+attachment downloads return 404.
 
 ## Return to service
 
-Do not run old and restored servers simultaneously behind the same origin. Stop the
-old process before cutover; preserve its data directory and logs separately for
-investigation. Never copy a snapshot over a running SQLite file or combine it with
-old `-wal`/`-shm` files. Use the complete prepared directory.
-
-Restore the deployment configuration deliberately: the same intended app/service
-name, HTTPS public URL and identity callback registration. Review the reference
-`config/settings.json`; it is not an automatically applied configuration file.
-Use the restored `data/encryption.key`. Remove a stale `KY_ENCRYPTION_KEY` override
-rather than generating a replacement key: changing it makes the restored encrypted
-settings unreadable. Keep restored files private (0600, directories 0700). The
-recovery public-key pin remains write-once; compare its fingerprint with ceremony
-records. Token revocation at KyRecovery still applies to any restored pairing token.
-
-This repository's production HTTPS/KyIdentity deployment gate remains open. Verify
-that deployment separately before allowing real teams onto it.
-
-All users must sign in freshly; sessions, MFA challenges and device pairings from
-before the backup are gone.
-
-Review changes after the capsule's timestamp using surviving audit logs and identity
-records: disabled accounts, passwords, MFA enrollment and SCIM state may be stale.
-If compromise caused the incident, resolve those credentials and permissions before
-reopening access. Automatic grant invalidation does not make stale account data current.
-Check backup destinations, schedule, public-key fingerprint and last receipt after
-recovery, then create a fresh sealed backup. Remove scratch plaintext restore copies
-according to the operator's storage policy; deletion is not a physical-erasure guarantee.
-
-## Verification
-
-`go test -race ./cmd/server ./internal/store ./internal/backup/...` includes a real 2-of-3 capsule round
-trip, wrong-service/key/threshold refusals, restored-grant invalidation and removal of
-the extracted files when preparation fails. The store policy is also tested on
-PostgreSQL; capsule extraction remains SQLite-only.
-`backup-drill` uses a throwaway key, so a successful automated drill does not prove
-that the real custodian cards are available. A controlled ceremony restore with the
-actual cards, and the deployed identity checks, remain operator acceptance work.
-The Matrix dump split, size limit, media mirror and the `restore-matrix` refusals are
-covered by `go test`. `make matrix-acceptance` proves the full cycle: back up, lose the
-host, restore from custodian shares on stdin, then read old history.
+- Do not run old and restored servers simultaneously behind the same origin. Stop the old process
+  before cutover and preserve its data directory and logs for investigation. Never copy a snapshot
+  over a running SQLite file or mix old `-wal`/`-shm` files with a restored database.
+- Match the original deployment configuration deliberately:
+  - Same `KY_APP_NAME`, HTTPS `KY_APP_URL`, and KyIdentity OIDC callback registration.
+  - Same `KY_TENANCY_MODE` (`single` or `multi`), and in `multi` the same `KY_STAFF_ORG_ID`. The database records its locked tenancy mode
+    (the `tenancy.mode` server setting) and refuses to boot if `KY_TENANCY_MODE` disagrees.
+  - Use the restored `data/encryption.key`; remove any stale `KY_ENCRYPTION_KEY` override that
+    disagrees with it.
+  - If using LiveKit SFU (`KY_LIVEKIT_*`) or KyCalendar meeting sync (`KY_MEETING_SYNC_SECRET`),
+    restore those environment variables before starting. Active calls are not restored across
+    restarts; members can rejoin rooms immediately.
+  - Keep restored key files private (`0600`) and data directories `0700`.
+- All users must sign in freshly and re-enable browser push notifications if desired; sessions,
+  MFA challenges, device pairings, and push subscriptions from before the backup are invalidated.
+- Review changes after the capsule timestamp using surviving audit logs and KyIdentity records:
+  offboarded accounts, suspended orgs, passwords, or MFA enrollments may be newer than the
+  snapshot. Resolve stale access before reopening traffic, then create a fresh sealed backup.
 
 ## Installer-managed console
 
 When the restored database retains installer configuration, restore the sealed
-`installer/client.secret` and `installer/directory.secret` to their original protected paths
-from `installer/credential-paths.json` before restart. Keep process ownership and 0600 modes.
-The managed restore drill requires these members. Capsules sealed by v0.4.2 or earlier CLI
-`deposit` or `export-capsule` lack them; seal a new one. See [INSTALLER_SETUP.md](INSTALLER_SETUP.md).
+`installer/client.secret` and `installer/directory.secret` files to their recorded protected paths
+from `installer/credential-paths.json` (`0600`, process-owned) before restarting the server. See
+[INSTALLER_SETUP.md](INSTALLER_SETUP.md).
+
+## Verification
+
+`go test -race ./cmd/server ./internal/store ./internal/backup/...` verifies a 2-of-3 capsule
+round trip, wrong-service/key/threshold refusals, restored-grant invalidation, attachment mirror
+restoration, and cleanup on failed preparation. `backup-drill` validates capsule sealing and
+restore readiness with a disposable key; a periodic controlled restore using real custodian cards
+remains an operator responsibility.
