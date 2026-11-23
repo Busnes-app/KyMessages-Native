@@ -482,6 +482,10 @@ func (s *Server) routes() {
 	// KyCalendar signed meeting sync
 	s.mux.HandleFunc("PUT /api/meetings/{id}", s.handleKyCalendarUpsertMeeting)
 	s.mux.HandleFunc("POST /api/suite/chat", s.handleSuiteChat)
+	s.mux.HandleFunc("POST /api/suite/presence/lookup", s.handlePresenceLookup)
+	s.mux.HandleFunc("POST /api/suite/presence/out-of-office", s.handlePresenceOOO)
+	s.mux.HandleFunc("POST /api/suite/presence/calendar", s.handlePresenceCalendar)
+	s.mux.HandleFunc("POST /api/suite/presence/me", s.handlePresenceMe)
 	s.mux.HandleFunc("DELETE /api/meetings/{id}", s.handleKyCalendarCloseMeeting)
 
 	// Confined external guest waiting room & meeting endpoints

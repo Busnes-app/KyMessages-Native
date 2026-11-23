@@ -264,6 +264,8 @@ ALTER TABLE mfa_challenges ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';`,
 	{Version: 28, Name: "tenant_lifecycle_revision", SQLite: tenantLifecycleRevisionSchema, Postgres: tenantLifecycleRevisionSchema},
 	// Durable replay ledger shared across signed /api/suite/* and /api/meetings/* requests.
 	{Version: 29, Name: "suite_replay_events", SQLite: suiteReplayEventsSchema, Postgres: suiteReplayEventsSchema},
+	// Coarse suite status inputs (KyCalendar busy blocks, KyPost out-of-office, manual status).
+	{Version: 30, Name: "suite_presence", SQLite: presenceSchema, Postgres: presenceSchema},
 }
 
 const multiTenancySchemaSQLite = `
@@ -291,6 +293,23 @@ CREATE TABLE IF NOT EXISTS suite_replay_events (
 	expires_at BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_suite_replay_events_expires_at ON suite_replay_events(expires_at);
+`
+
+const presenceSchema = `
+CREATE TABLE IF NOT EXISTS presence (
+	tenant_id VARCHAR(64) NOT NULL,
+	user_id VARCHAR(64) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	share_off INTEGER NOT NULL DEFAULT 0,
+	manual_state VARCHAR(16) NOT NULL DEFAULT '',
+	manual_until BIGINT NOT NULL DEFAULT 0,
+	ooo_revision BIGINT NOT NULL DEFAULT 0,
+	ooo_start BIGINT NOT NULL DEFAULT 0,
+	ooo_end BIGINT NOT NULL DEFAULT 0,
+	cal_revision BIGINT NOT NULL DEFAULT 0,
+	cal_at BIGINT NOT NULL DEFAULT 0,
+	busy TEXT NOT NULL DEFAULT '',
+	PRIMARY KEY (tenant_id, user_id)
+);
 `
 
 const pushSubscriptionsSchema = `
