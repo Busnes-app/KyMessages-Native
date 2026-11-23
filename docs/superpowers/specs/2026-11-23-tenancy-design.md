@@ -147,6 +147,7 @@ State outside the database:
 | Attachment backup mirror | `<KY_BACKUP_DIR>/attachments` (`internal/backup/AGENTS.md`) | Off in multi mode. The bucket's own versioned copy is the backup (§9.4). |
 | Encryption key (TOTP secrets) | `KY_ENCRYPTION_KEY`, else `data/encryption.key`, **created when missing** (`internal/config/config.go:259-267`) | Multi mode requires `KY_ENCRYPTION_KEY` or a shared file, and refuses to create one |
 | Session secret (signs PoW challenges) | `KY_SESSION_SECRET`, required only when `env=production`, else **random per process** (`internal/config/config.go:251-257`) | Multi mode requires it, so a challenge from one replica verifies on another |
+| S3 seal key | `KY_ATTACHMENTS_S3_SEAL_KEY_FILE`, required with the `s3` backend (§9.3) | The same 32 bytes on every replica, from the secret store. It is never created at start and never stored in the bucket. |
 | `data/attachments.key` | Data directory, made by the backup collector for the mirror (`internal/backup/attachments.go:54`) | Unused in multi mode: the mirror is off there (§9.4) |
 | VAPID push key | `KY_VAPID_PRIVATE_KEY`, else `data/vapid.key`, **created when missing** (`internal/push/vapid.go:98-110`) | Multi mode requires `KY_VAPID_PRIVATE_KEY` (or a file every replica shares), so replicas never sign pushes under different keys |
 | Limiters, PoW ledger, guest sessions, calls | Process memory | PostgreSQL (§8) |
@@ -239,9 +240,9 @@ Multi mode, `origin/main` plus PR #27. Every row has a cross-org test in
   the lease from a heartbeat every third of the lease while it runs. Before each batch it
   checks that it still holds the lease, by a conditional renewal that must update one row. If
   that fails, it stops, so two replicas never run the same batch. The lease lasts three ticks, so a dead replica's job moves within three
-  ticks. Jobs: backup scheduler (single only, §8.4), agent expiry, attachment sweep, pairing and
+  ticks. Jobs: agent expiry, attachment sweep, pairing and
   replay sweeps, the org purge (§7.3), tenancy sync (§7.4), the pool reporter (§10). Single mode skips the lease and
-  runs as today.
+  runs as today. The capsule backup scheduler is never leased: it runs only in single mode (§8.4).
 
 ### 8.2 Limits and the PoW ledger
 
@@ -437,7 +438,7 @@ replay or stale revision where it applies, oversize input), and runs CI on SQLit
 | 0 | **#27 (open):** the hub fix and the cross-org tests | Yes | — |
 | 1a | Lifecycle, webhook side (§7.1, §7.2): refuse `export_only`, handle `user.erased` (rows, plus blob deletes by key through today's `blobs.Store`) | Yes | — |
 | 1b | Lifecycle, job side (§7.3, §7.4): the leased org purge, and the leased tenancy-sync job with the start-up check | Yes | 2 (leases), 5 (blob interface and `DeletePrefix`) |
-| 2 | Replica safety I (§8.1, §8.4, §5): migration lock, `job_leases`, the capsule scheduler off in multi mode, `RESTORE.md` multi section, multi mode requires the shared VAPID key, encryption key and session secret (§5) | Yes | — |
+| 2 | Replica safety I (§8.1, §8.4, §5): migration lock, `job_leases`, the capsule scheduler off in multi mode, `RESTORE.md` multi section, multi mode requires the shared VAPID key, encryption key and session secret (§5; the S3 seal key is PR 6's) | Yes | — |
 | 3 | Replica safety II (§8.2, §8.3): shared limiters, the PoW table, the meetings key per org and the upsert lock, guest sessions in PostgreSQL | Yes | 2 |
 | 4 | Calls across replicas (§8.3), as open question 5 decides | Yes | 3 |
 | 5 | The blob interface, the shared-volume store-ID check, and `disk` behind it (§9.1) | Yes (volumes at launch) | 2 |
