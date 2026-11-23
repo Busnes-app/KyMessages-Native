@@ -804,6 +804,36 @@ func (c *chatStore) CreateMessage(ctx context.Context, p CreateMessageParams) (*
 	}, true, nil
 }
 
+func (c *chatStore) MessageStates(ctx context.Context, tenantID, userID string, ids []string) ([]MessageState, error) {
+	out := []MessageState{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	tenantID = normalizeTenant(tenantID)
+	args := []any{tenantID, userID}
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	q := c.store.rebind(`SELECT m.id, m.room_id, m.deleted_at, m.edited_at FROM messages m
+		JOIN room_members rm ON rm.tenant_id = m.tenant_id AND rm.room_id = m.room_id
+		WHERE m.tenant_id = ? AND rm.user_id = ? AND m.id IN (?` + strings.Repeat(", ?", len(ids)-1) + `)`)
+	rows, err := c.store.db.QueryContext(ctx, q, args...) // the primary: a lagging replica could vouch for a deleted message
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var s MessageState
+		var deleted, edited sql.NullInt64
+		if err := rows.Scan(&s.ID, &s.RoomID, &deleted, &edited); err != nil {
+			return nil, err
+		}
+		s.Deleted, s.EditedAt = deleted.Valid, edited.Int64
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
 func (c *chatStore) GetMessage(ctx context.Context, tenantID, roomID, messageID string) (*Message, error) {
 	tenantID = normalizeTenant(tenantID)
 	q := c.store.rebind(`SELECT ` + messageColumns + ` FROM messages WHERE tenant_id = ? AND room_id = ? AND id = ?`)
@@ -989,86 +1019,6 @@ func (c *chatStore) DeleteMessage(ctx context.Context, tenantID, roomID, message
 	m.DeletedAt = &deletedAt
 	m.Attachments = nil
 	return m, nil
-}
-
-func escapeLike(s string) string {
-	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, `%`, `\%`)
-	s = strings.ReplaceAll(s, `_`, `\_`)
-	return s
-}
-
-func (c *chatStore) SearchMessages(ctx context.Context, tenantID, userID, roomID, query string, limit int) ([]*Message, error) {
-	tenantID = normalizeTenant(tenantID)
-	query = strings.TrimSpace(query)
-	if query == "" {
-		return []*Message{}, nil
-	}
-	if limit <= 0 {
-		limit = 25
-	}
-	if limit > 50 {
-		limit = 50
-	}
-
-	// Membership comes from the primary; only the text search runs on the replica, so
-	// replica lag never extends a removed member's access.
-	rooms, err := c.ListUserRoomIDs(ctx, tenantID, userID)
-	if err != nil {
-		return nil, err
-	}
-	if roomID != "" {
-		if !slices.Contains(rooms, roomID) {
-			return []*Message{}, nil
-		}
-		rooms = []string{roomID}
-	}
-	if len(rooms) == 0 {
-		return []*Message{}, nil
-	}
-
-	var sqlText string
-	args := []any{tenantID, MessageEncodingPlainV1}
-	for _, id := range rooms {
-		args = append(args, id)
-	}
-	baseSelect := `
-		SELECT m.id, m.tenant_id, m.room_id, m.seq, m.sender_id, m.sender_name,
-		       m.reply_to_id, m.encoding, m.body, m.edited_at, m.deleted_at, m.idempotency_key, m.created_at
-		FROM messages m
-		WHERE m.tenant_id = ? AND m.encoding = ? AND m.deleted_at IS NULL
-		  AND m.room_id IN (?` + strings.Repeat(", ?", len(rooms)-1) + `)`
-
-	if c.store.driver == "postgres" {
-		sqlText = baseSelect + ` AND to_tsvector('simple', m.body) @@ plainto_tsquery('simple', ?) ORDER BY m.created_at DESC LIMIT ?`
-		args = append(args, query, limit)
-	} else {
-		sqlText = baseSelect + ` AND LOWER(m.body) LIKE LOWER(?) ESCAPE '\' ORDER BY m.created_at DESC LIMIT ?`
-		args = append(args, "%"+escapeLike(query)+"%", limit)
-	}
-
-	readDB := c.store.read()
-	rows, err := readDB.QueryContext(ctx, c.store.rebind(sqlText), args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	out := make([]*Message, 0)
-	for rows.Next() {
-		m, err := scanMessage(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, m)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	if err := c.attachAttachments(ctx, readDB, out); err != nil {
-		return nil, err
-	}
-	return out, nil
 }
 
 func (c *chatStore) AddReaction(ctx context.Context, tenantID, roomID, messageID, userID, emoji string) error {

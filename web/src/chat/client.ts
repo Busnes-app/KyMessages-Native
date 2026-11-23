@@ -1,5 +1,6 @@
 import { errorMessage, secureFetch } from '../api';
-import { arr, bool, count, obj, str } from '../dto';
+import { arr, bool, count, obj, opt, str } from '../dto';
+import type { MessageState } from './searchIndex';
 import {
   parseAdminMediaPolicy,
   parseAttachment,
@@ -311,12 +312,6 @@ export async function deletePushSubscription(endpoint: string): Promise<void> {
   );
 }
 
-export async function searchMessages(query: string, roomId?: string): Promise<ChatMessage[]> {
-  const qs = new URLSearchParams({ q: query, limit: '25' });
-  if (roomId) qs.set('room_id', roomId);
-  const data = obj(await apiJSON(`/api/v1/search?${qs.toString()}`, {}, 'Search failed'));
-  return arr(data.messages ?? []).map(parseMessage);
-}
 
 
 
@@ -736,4 +731,15 @@ export class ChatSocket {
       this.connect();
     }, baseMs + jitter);
   }
+}
+
+/** Which of these messages the caller can still read, and their deleted and edit state (no text). */
+export async function fetchMessageStates(ids: string[]): Promise<MessageState[]> {
+  const data = obj(
+    await apiJSON('/api/v1/messages/state', { method: 'POST', body: JSON.stringify({ ids }) }, 'Could not check search results'),
+  );
+  return arr(data.messages ?? []).map((v) => {
+    const o = obj(v);
+    return { id: str(o.id, 128), deleted: bool(o.deleted), edited_at: opt(o.edited_at, count) ?? 0 };
+  });
 }

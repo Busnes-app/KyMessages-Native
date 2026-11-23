@@ -32,8 +32,9 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
 
 **Messaging & realtime.**
 - Direct messages, group channels, threads, reactions, mentions (`@username`, `@here`, `@channel`),
-  typing indicators, read receipts, unread badges, and full-text search (SQLite FTS5 / Postgres
-  `tsvector`).
+  typing indicators, read receipts, unread badges, and message search that runs on the device: each
+  browser indexes the messages it has read in IndexedDB, encrypted at rest, and deletes the index
+  on sign-out. A browser finds only what it has read. The server has no search endpoint.
 - Native WebSocket fan-out (`/api/v1/ws`) with presence and immediate revocation disconnects.
 - File and image attachments stored on local disk (`KY_ATTACHMENTS_DIR`) with SHA-256 content
   hashing, per-upload/per-user/per-tenant quotas, inline image thumbnails, and encrypted backup
@@ -144,6 +145,7 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
 
 - Matrix protocol / Synapse / MAS / Element Web / server-to-server federation (retired; see
   `docs/superpowers/` for historical records).
-- Client-side end-to-end encryption (messages are protected in transit via TLS and stored on the
-  operator's database with server-side full-text search and native attachment storage).
+- Client-side end-to-end encryption, for now: messages are protected in transit via TLS and stored
+  readable in the operator's database until the end-to-end encryption phases ship
+  (`docs/superpowers/specs/2026-11-22-e2ee-design.md`).
 - Call recording or third-party hosted calling SaaS.

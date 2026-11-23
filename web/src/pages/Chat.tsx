@@ -86,6 +86,7 @@ import { ChatSidebar } from '../components/chat/ChatSidebar';
 import { MessageRow } from '../components/chat/MessageRow';
 import { RoomDetailsDrawer, type DrawerTab } from '../components/chat/RoomDetailsDrawer';
 import { CreateChannelModal, SearchModal, StartDMModal } from '../components/chat/ChatModals';
+import { searchIndexFor } from '../chat/searchIndex';
 import { CallAudioLayer, CallStage } from '../components/chat/CallStage';
 import { HybridCallController, type HybridCallSnapshot } from '../rtc/hybridCall';
 
@@ -210,6 +211,38 @@ export const Chat: React.FC<ChatProps> = ({
 
   activeRoomIdRef.current = activeRoomId;
   currentUserRef.current = currentUser;
+
+  // Search runs on this device: index every message as it is read, edited or deleted. Only
+  // messages whose text or state changed since they were last indexed are written again.
+  const indexedRef = useRef(new Map<string, string>());
+  const forgetIndexed = useCallback((id: string | undefined) => {
+    const user = currentUserRef.current;
+    if (!id || !user) return;
+    indexedRef.current.delete(id);
+    void searchIndexFor(user.id)
+      .then((index) => index.remove([id]))
+      .catch(() => undefined);
+  }, []);
+  useEffect(() => {
+    if (!currentUser) return;
+    const changed: ChatMessage[] = [];
+    for (const bucket of Object.values(buckets)) {
+      for (const m of bucket.messages) {
+        const sig = `${m.body}\u0000${m.edited_at ?? ''}\u0000${m.deleted_at ?? ''}\u0000${m.delivery.kind}`;
+        if (indexedRef.current.get(m.id) !== sig) {
+          indexedRef.current.set(m.id, sig);
+          changed.push(m);
+        }
+      }
+    }
+    if (changed.length === 0) return;
+    void searchIndexFor(currentUser.id)
+      .then((index) => index.put(changed))
+      .catch(() => {
+        // Search is best effort: a browser without IndexedDB still chats.
+        for (const m of changed) indexedRef.current.delete(m.id);
+      });
+  }, [buckets, currentUser]);
   bucketsRef.current = buckets;
   roomsRef.current = rooms;
   stagedByRoomRef.current = stagedByRoom;
@@ -605,6 +638,8 @@ export const Chat: React.FC<ChatProps> = ({
           return;
         }
         case 'message.edit': {
+          // Not loaded here: the indexed copy is out of date, so drop it (re-indexed when viewed).
+          if (!bucketsRef.current[event.roomId]) forgetIndexed(event.message?.id);
           if (event.refetch || !event.message) {
             void catchUpRoom(event.roomId);
             return;
@@ -624,6 +659,7 @@ export const Chat: React.FC<ChatProps> = ({
           return;
         }
         case 'message.delete': {
+          forgetIndexed(event.messageId);
           setBuckets((prev) => {
             const current = prev[event.roomId];
             if (!current) return prev;
@@ -784,7 +820,7 @@ export const Chat: React.FC<ChatProps> = ({
         }
       }
     },
-    [catchUpRoom, refreshRoomDetail, refreshRoomsList, scrollToBottom, syncReadCursor],
+    [catchUpRoom, forgetIndexed, refreshRoomDetail, refreshRoomsList, scrollToBottom, syncReadCursor],
   );
 
   // Initial bootstrap + WebSocket connection.
@@ -2530,8 +2566,9 @@ export const Chat: React.FC<ChatProps> = ({
         />
       )}
 
-      {modal === 'search' && (
+      {modal === 'search' && currentUser && (
         <SearchModal
+          userId={currentUser.id}
           rooms={rooms}
           activeRoomId={activeRoomId}
           onClose={() => setModal('none')}

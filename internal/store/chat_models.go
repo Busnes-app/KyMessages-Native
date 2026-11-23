@@ -25,6 +25,15 @@ const (
 	NotifyModeMute     = "mute"
 )
 
+// MessageState is what on-device search checks before showing a hit: whether the message is
+// still there for the reader, and when it was last edited (Unix ms, 0 if never).
+type MessageState struct {
+	ID       string `json:"id"`
+	RoomID   string `json:"room_id"`
+	Deleted  bool   `json:"deleted"`
+	EditedAt int64  `json:"edited_at"`
+}
+
 // Message payload encodings.
 const (
 	MessageEncodingPlainV1    = "plain_v1"

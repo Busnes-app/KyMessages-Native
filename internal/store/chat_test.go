@@ -251,17 +251,6 @@ func TestChatStoreSearch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Bob only sees plain_v1 messages from roomA, never roomB or e2ee_room_v1.
-	hits, err := chat.SearchMessages(ctx, store.DefaultTenantID, "u_bob", "", "invoice", 20)
-	if err != nil || len(hits) != 1 || hits[0].RoomID != roomA.ID {
-		t.Fatalf("bob search = (%+v, %v), want 1 hit in roomA", hits, err)
-	}
-
-	// Wildcard '%' in SQLite LIKE must not match everything.
-	pctHits, err := chat.SearchMessages(ctx, store.DefaultTenantID, "u_bob", "", "999%", 20)
-	if err != nil || len(pctHits) != 0 {
-		t.Fatalf("escaped wildcard search = (%d, %v), want 0", len(pctHits), err)
-	}
 }
 
 func TestChatStoreAttachments(t *testing.T) {
@@ -357,7 +346,7 @@ func TestChatStoreAttachments(t *testing.T) {
 		t.Fatalf("reuse attachment CreateMessage = %v, want ErrAttachmentInvalid", err)
 	}
 
-	// ListMessages, GetMessage, EditMessage, and SearchMessages all hydrate attachments.
+	// ListMessages, GetMessage and EditMessage all hydrate attachments.
 	listed, _, err := chat.ListMessages(ctx, store.MessagePageQuery{RoomID: roomA.ID, Limit: 10})
 	if err != nil || len(listed) != 1 || len(listed[0].Attachments) != 1 {
 		t.Fatalf("ListMessages = (%+v, %v)", listed, err)
@@ -369,10 +358,6 @@ func TestChatStoreAttachments(t *testing.T) {
 	edited, err := chat.EditMessage(ctx, store.DefaultTenantID, roomA.ID, msg.ID, "u_alice", "updated sketch caption")
 	if err != nil || len(edited.Attachments) != 1 {
 		t.Fatalf("EditMessage = (%+v, %v)", edited, err)
-	}
-	hits, err := chat.SearchMessages(ctx, store.DefaultTenantID, "u_bob", roomA.ID, "sketch", 10)
-	if err != nil || len(hits) != 1 || len(hits[0].Attachments) != 1 {
-		t.Fatalf("SearchMessages = (%+v, %v)", hits, err)
 	}
 
 	// Deleting the message clears linked attachment rows.

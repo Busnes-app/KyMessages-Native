@@ -614,6 +614,35 @@ func (s *Server) handleChatRemoveMember(w http.ResponseWriter, r *http.Request) 
 }
 
 // GET /api/v1/rooms/{id}/messages?before=&after=&limit=
+// POST /api/v1/messages/state {ids} answers, for up to 50 message IDs, which ones the caller
+// can still read and when each was last edited. On-device search checks its hits with it, so a
+// message deleted, edited or left behind while this browser was away is never shown.
+func (s *Server) handleChatMessageStates(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	user, _, ok := s.currentUser(r)
+	if !ok {
+		s.writeError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
+	var req struct {
+		IDs []string `json:"ids"`
+	}
+	if json.NewDecoder(r.Body).Decode(&req) != nil || len(req.IDs) == 0 || len(req.IDs) > 50 {
+		s.writeError(w, http.StatusBadRequest, "Name 1 to 50 message IDs")
+		return
+	}
+	states, err := s.store.Chat().MessageStates(r.Context(), tenantID, user.ID, req.IDs)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "Failed to check messages")
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"messages": states})
+}
+
 func (s *Server) handleChatListMessages(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	user, _, ok := s.currentUser(r)
@@ -1008,42 +1037,6 @@ func (s *Server) handleChatMarkRead(w http.ResponseWriter, r *http.Request) {
 		Data:   chat.MustMarshalData(chat.ReadSyncPayload{RoomID: roomID, LastReadSeq: cur}),
 	})
 	s.writeJSON(w, http.StatusOK, map[string]any{"room_id": roomID, "last_read_seq": cur})
-}
-
-// GET /api/v1/search?q=&room_id=&limit=
-func (s *Server) handleChatSearch(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Cache-Control", "no-store")
-	user, _, ok := s.currentUser(r)
-	if !ok {
-		s.writeError(w, http.StatusUnauthorized, "Authentication required")
-		return
-	}
-	tenantID, ok := s.requireUserTenant(w, r, user)
-	if !ok {
-		return
-	}
-	query := strings.TrimSpace(r.URL.Query().Get("q"))
-	if query == "" || len(query) > maxSearchQueryLen {
-		s.writeError(w, http.StatusBadRequest, "q must be 1 to 200 characters")
-		return
-	}
-	roomID := strings.TrimSpace(r.URL.Query().Get("room_id"))
-	limit := 25
-	if v := r.URL.Query().Get("limit"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 || n > 50 {
-			s.writeError(w, http.StatusBadRequest, "limit must be between 1 and 50")
-			return
-		}
-		limit = n
-	}
-
-	hits, err := s.store.Chat().SearchMessages(r.Context(), tenantID, user.ID, roomID, query, limit)
-	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "Search failed")
-		return
-	}
-	s.writeJSON(w, http.StatusOK, map[string]any{"messages": hits})
 }
 
 // POST /api/v1/webhooks/in/{id}: incoming webhooks were removed so every room can be end-to-end
