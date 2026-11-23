@@ -201,3 +201,43 @@ func TestE2EEToDeviceMailbox(t *testing.T) {
 		t.Fatalf("pruned mail left: %+v", left)
 	}
 }
+
+// Concurrent uploads for one device cannot together pass the one-time key cap.
+func TestE2EEOneTimeKeyCapHoldsUnderConcurrentUploads(t *testing.T) {
+	ctx := context.Background()
+	cfg := testdb.Config(t)
+	a, err := store.Open(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+	b, err := store.Open(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	e2eeUser(t, a, "u-a")
+	if err := a.E2EE().UpsertDevice(ctx, device("u-a", "D1", "t1")); err != nil {
+		t.Fatal(err)
+	}
+	batch := func(prefix string) []store.E2EEOneTimeKey {
+		var keys []store.E2EEOneTimeKey
+		for i := range 60 {
+			keys = append(keys, store.E2EEOneTimeKey{KeyID: fmt.Sprintf("%s%02d", prefix, i), Key: "k", Signature: "sig"})
+		}
+		return keys
+	}
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i, st := range []store.Store{a, b} {
+		wg.Go(func() { errs[i] = st.E2EE().AddOneTimeKeys(ctx, "u-a", "D1", batch(fmt.Sprintf("p%d-", i)), 100) })
+	}
+	wg.Wait()
+	n, err := a.E2EE().CountOneTimeKeys(ctx, "u-a", "D1")
+	if err != nil || n > 100 {
+		t.Fatalf("device holds %d one-time keys (cap 100), upload errors %v, %v", n, errs[0], errs[1])
+	}
+	if refused := errors.Is(errs[0], store.ErrE2EETooManyKeys) != errors.Is(errs[1], store.ErrE2EETooManyKeys); !refused || n != 60 {
+		t.Fatalf("want exactly one upload refused and 60 keys stored; got %d keys, errors %v, %v", n, errs[0], errs[1])
+	}
+}

@@ -96,6 +96,13 @@ func (s *e2eeStore) AddOneTimeKeys(ctx context.Context, userID, deviceID string,
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	// Uploads for one device take turns, so the cap count below sees the other's rows. SQLite
+	// already serializes writers; PostgreSQL's READ COMMITTED would let two both pass.
+	if s.store.driver == "postgres" {
+		if _, err := tx.ExecContext(ctx, s.store.rebind(`SELECT 1 FROM e2ee_devices WHERE user_id = ? AND device_id = ? FOR UPDATE`), userID, deviceID); err != nil {
+			return err
+		}
+	}
 	for _, k := range keys {
 		if k.Fallback {
 			// One fallback key per device: a new one replaces the old.

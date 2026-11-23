@@ -41,7 +41,8 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   fallback keys with separate counters, and the `e2ee_to_device` mailbox. `ClaimOneTimeKey`
   deletes one key per call, never the same key twice (`FOR UPDATE SKIP LOCKED` on PostgreSQL),
   and falls back to the fallback key without deleting it. `AddOneTimeKeys` enforces its cap
-  after the insert inside the transaction, so a retried upload never trips it. Mail has no
+  after the insert inside the transaction, so a retried upload never trips it; on PostgreSQL it
+  first locks the device row (`FOR UPDATE`) so concurrent uploads cannot both pass the cap. Mail has no
   cursor: `ToDevice` returns the oldest unacknowledged rows and `AckToDevice` deletes exactly the
   IDs named, because PostgreSQL IDs commit out of order. Only public keys and ciphertext are stored.
 - `store.Open(ctx, cfg)` initializes and auto-migrates the configured database backend.
