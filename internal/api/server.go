@@ -468,9 +468,6 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("PUT /api/v1/to-device", s.handleE2EESendToDevice)
 	s.mux.HandleFunc("GET /api/v1/to-device", s.handleE2EEToDevice)
 	s.mux.HandleFunc("POST /api/v1/to-device/ack", s.handleE2EEAck)
-	s.mux.HandleFunc("GET /api/v1/rooms/{id}/webhooks", s.requireAuthenticated(s.handleChatListWebhooks))
-	s.mux.HandleFunc("POST /api/v1/rooms/{id}/webhooks", s.requireAuthenticated(s.handleChatCreateWebhook))
-	s.mux.HandleFunc("DELETE /api/v1/rooms/{id}/webhooks/{wid}", s.requireAuthenticated(s.handleChatRevokeWebhook))
 	s.mux.HandleFunc("POST /api/v1/webhooks/in/{id}", s.handleChatIncomingWebhook)
 	s.mux.HandleFunc("GET /api/v1/ws", s.handleChatWS)
 

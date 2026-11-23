@@ -269,6 +269,8 @@ ALTER TABLE mfa_challenges ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';`,
 	// End-to-end encryption key server: public device keys, one-time keys, to-device mailbox.
 	{Version: 31, Name: "e2ee_keys", SQLite: e2eeSchema + e2eeToDeviceSQLite, Postgres: e2eeSchema + e2eeToDevicePostgres},
 	{Version: 51, Name: "sso_session_lifecycle", SQLite: ssoLifecycleSchema, Postgres: ssoLifecycleSchema},
+	// Incoming webhooks are removed for end-to-end encryption; each live one leaves an audit row.
+	{Version: 52, Name: "remove_room_webhooks", SQLite: removeRoomWebhooksSchema, Postgres: removeRoomWebhooksSchema},
 }
 
 const multiTenancySchemaSQLite = `
@@ -375,6 +377,13 @@ CREATE TABLE IF NOT EXISTS e2ee_to_device (
 );
 CREATE INDEX IF NOT EXISTS idx_e2ee_to_device_recipient ON e2ee_to_device(recipient_user, recipient_device, id);
 CREATE INDEX IF NOT EXISTS idx_e2ee_to_device_created ON e2ee_to_device(created_at);
+`
+
+const removeRoomWebhooksSchema = `
+INSERT INTO audit_records (user_id, action, resource, details, created_at)
+SELECT created_by, 'webhook.removed', id, 'incoming webhooks removed: rooms are end-to-end encrypted; use a bot', CURRENT_TIMESTAMP
+FROM room_webhooks WHERE revoked_at IS NULL;
+DROP TABLE room_webhooks;
 `
 
 const pushSubscriptionsSchema = `

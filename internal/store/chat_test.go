@@ -218,7 +218,7 @@ func TestChatStoreMessagesSeqIdempotencyPaginationAndReadCursor(t *testing.T) {
 	}
 }
 
-func TestChatStoreSearchAndWebhooks(t *testing.T) {
+func TestChatStoreSearch(t *testing.T) {
 	ctx := context.Background()
 	st := openTestStore(t)
 	chat := st.Chat()
@@ -261,29 +261,6 @@ func TestChatStoreSearchAndWebhooks(t *testing.T) {
 	pctHits, err := chat.SearchMessages(ctx, store.DefaultTenantID, "u_bob", "", "999%", 20)
 	if err != nil || len(pctHits) != 0 {
 		t.Fatalf("escaped wildcard search = (%d, %v), want 0", len(pctHits), err)
-	}
-
-	// Webhooks CRUD.
-	wh := &store.RoomWebhook{
-		RoomID:    roomA.ID,
-		Name:      "CI Alerts",
-		Direction: store.WebhookDirectionIncoming,
-		TokenHash: "deadbeef",
-		CreatedBy: "u_alice",
-	}
-	if err := chat.CreateRoomWebhook(ctx, wh); err != nil {
-		t.Fatalf("CreateRoomWebhook: %v", err)
-	}
-	list, err := chat.ListRoomWebhooks(ctx, store.DefaultTenantID, roomA.ID)
-	if err != nil || len(list) != 1 || list[0].ID != wh.ID {
-		t.Fatalf("ListRoomWebhooks = (%+v, %v)", list, err)
-	}
-	if err := chat.RevokeRoomWebhook(ctx, store.DefaultTenantID, roomA.ID, wh.ID); err != nil {
-		t.Fatalf("RevokeRoomWebhook: %v", err)
-	}
-	listAfter, err := chat.ListRoomWebhooks(ctx, store.DefaultTenantID, roomA.ID)
-	if err != nil || len(listAfter) != 0 {
-		t.Fatalf("ListRoomWebhooks after revoke = (%d, %v), want 0", len(listAfter), err)
 	}
 }
 

@@ -51,12 +51,6 @@ const (
 	P2PPolicySFUOnly = "sfu_only"
 )
 
-// Webhook directions.
-const (
-	WebhookDirectionIncoming = "incoming"
-	WebhookDirectionOutgoing = "outgoing"
-)
-
 // Tenant lifecycle states.
 const (
 	TenantStatusActive    = "active"
@@ -198,21 +192,7 @@ type CreateMessageParams struct {
 	Body            string
 	IdempotencyKey  string
 	AttachmentIDs   []string
-	SkipMemberCheck bool // True only for verified room webhooks or system events
-}
-
-// RoomWebhook represents an incoming or outgoing webhook bound to one room.
-type RoomWebhook struct {
-	ID        string `json:"id"`
-	TenantID  string `json:"tenant_id"`
-	RoomID    string `json:"room_id"`
-	Name      string `json:"name"`
-	Direction string `json:"direction"`
-	TokenHash string `json:"-"`
-	TargetURL string `json:"target_url,omitempty"`
-	CreatedBy string `json:"created_by"`
-	RevokedAt *int64 `json:"revoked_at,omitempty"`
-	CreatedAt int64  `json:"created_at"` // Unix milliseconds
+	SkipMemberCheck bool // True only for system events
 }
 
 // Call transport modes.

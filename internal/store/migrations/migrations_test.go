@@ -358,3 +358,43 @@ func TestRunRefusesAnUnknownDriver(t *testing.T) {
 		t.Fatal("unknown driver accepted")
 	}
 }
+
+// Migration 52 removes incoming webhooks for end-to-end encryption, leaving one audit row per
+// webhook that was still live.
+func TestRemoveRoomWebhooks(t *testing.T) {
+	ctx := context.Background()
+	cfg := testdb.Config(t)
+	driver := "sqlite"
+	if cfg.Driver == "postgres" {
+		driver = "pgx"
+	}
+	db, err := sql.Open(driver, cfg.DSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := migrations.RunThrough(ctx, db, cfg.Driver, 31); err != nil {
+		t.Fatal(err)
+	}
+	exec := func(q string) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx, q); err != nil {
+			t.Fatal(q, err)
+		}
+	}
+	exec(`INSERT INTO tenants (id, slug, display_name, created_at) VALUES ('t1', 't1', 'T', 0)`)
+	exec(`INSERT INTO rooms (id, tenant_id, kind, created_by, created_at) VALUES ('r1', 't1', 'channel', 'u1', 0)`)
+	exec(`INSERT INTO room_webhooks (id, tenant_id, room_id, name, direction, token_hash, created_by, created_at) VALUES ('wh_live', 't1', 'r1', 'CI', 'incoming', 'h1', 'u1', 0)`)
+	exec(`INSERT INTO room_webhooks (id, tenant_id, room_id, name, direction, token_hash, created_by, revoked_at, created_at) VALUES ('wh_old', 't1', 'r1', 'Old', 'incoming', 'h2', 'u1', 5, 0)`)
+	if err := migrations.Run(ctx, db, cfg.Driver); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `SELECT 1 FROM room_webhooks`); err == nil {
+		t.Fatal("room_webhooks still exists")
+	}
+	var n int
+	var who, which string
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*), MIN(user_id), MIN(resource) FROM audit_records WHERE action = 'webhook.removed'`).Scan(&n, &who, &which); err != nil || n != 1 || who != "u1" || which != "wh_live" {
+		t.Fatalf("audit rows = %d (%s, %s) %v, want one for the live webhook", n, who, which, err)
+	}
+}

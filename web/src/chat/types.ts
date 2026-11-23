@@ -140,16 +140,6 @@ export interface ChatMessage {
   delivery: MessageDeliveryState;
 }
 
-export interface ChatRoomWebhook {
-  id: string;
-  room_id: string;
-  name: string;
-  direction: string;
-  created_by: string;
-  revoked_at?: number;
-  created_at: number;
-}
-
 export type CallMode = 'p2p_mesh' | 'sfu_livekit';
 
 export interface CallPeer {
@@ -428,19 +418,6 @@ export function parseMessage(v: unknown): ChatMessage {
     reactions: opt(o.reactions, (list) => arr(list).map(parseReactionSummary)) ?? [],
     attachments: opt(o.attachments, (list) => arr(list).map(parseAttachment)) ?? [],
     delivery: { kind: 'synced' },
-  };
-}
-
-export function parseWebhook(v: unknown): ChatRoomWebhook {
-  const o = obj(v);
-  return {
-    id: str(o.id, 128),
-    room_id: str(o.room_id, 128),
-    name: str(o.name, 255),
-    direction: opt(o.direction, (s) => str(s, 32)) ?? 'incoming',
-    created_by: opt(o.created_by, (s) => str(s, 128)) ?? '',
-    revoked_at: opt(o.revoked_at, num),
-    created_at: opt(o.created_at, num) ?? 0,
   };
 }
 

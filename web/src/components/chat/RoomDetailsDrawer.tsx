@@ -14,28 +14,22 @@ import {
   MessageSquare,
   PanelRightClose,
   Search,
-  Trash2,
   UserMinus,
   UserPlus,
   Users,
   Video,
-  Webhook,
   X,
 } from 'lucide-react';
 import type {
   ChatDirectoryUser,
   ChatMessage,
   ChatRoomDetail,
-  ChatRoomWebhook,
   LobbyGuest,
   NotifyMode,
 } from '../../chat/types';
 import {
   addRoomMember,
-  createRoomWebhook,
-  fetchRoomWebhooks,
   removeRoomMember,
-  revokeRoomWebhook,
   updateRoomInfo,
   updateRoomNotifyMode,
 } from '../../chat/client';
@@ -137,16 +131,11 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
   const [memberFilter, setMemberFilter] = useState('');
   const [addUserId, setAddUserId] = useState('');
   const [busyAction, setBusyAction] = useState(false);
-  const [webhooks, setWebhooks] = useState<ChatRoomWebhook[]>([]);
-  const [webhookName, setWebhookName] = useState('');
-  const [createdToken, setCreatedToken] = useState<{ id: string; token: string } | null>(null);
-  const [copiedCurl, setCopiedCurl] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
   const [guestLink, setGuestLink] = useState('');
   const [copiedGuestLink, setCopiedGuestLink] = useState(false);
   const [confirmLeave, setConfirmLeave] = useState(false);
   const [confirmRemoveId, setConfirmRemoveId] = useState<string | null>(null);
-  const [confirmRevokeId, setConfirmRevokeId] = useState<string | null>(null);
   const [decidingGuestIds, setDecidingGuestIds] = useState<Record<string, boolean>>({});
   const [admittingAll, setAdmittingAll] = useState(false);
   const [err, setErr] = useState('');
@@ -174,9 +163,7 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
     setCopiedGuestLink(false);
     setConfirmLeave(false);
     setConfirmRemoveId(null);
-    setConfirmRevokeId(null);
     setDecidingGuestIds({});
-    setCreatedToken(null);
     setMemberFilter('');
     setErr('');
   }, [room?.id]);
@@ -196,24 +183,6 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
     }
   }, [room?.id, detail?.member.notify_mode]);
 
-  useEffect(() => {
-    if (!room || !canModerate || isDM) {
-      setWebhooks([]);
-      return;
-    }
-    let cancelled = false;
-    void fetchRoomWebhooks(room.id)
-      .then((list) => {
-        if (!cancelled) setWebhooks(list);
-      })
-      .catch(() => {
-        // Non-moderators or transient errors stay quiet here.
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [room?.id, canModerate, isDM]);
-
   const userLookup = useMemo(() => new Map(directory.map((u) => [u.id, u])), [directory]);
   const memberIdSet = useMemo(() => new Set((detail?.members ?? []).map((m) => m.user_id)), [detail?.members]);
   const addableUsers = useMemo(
@@ -221,10 +190,6 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
     [directory, memberIdSet],
   );
   const sharedLinks = useMemo(() => extractSharedLinks(messages), [messages]);
-  const activeWebhookCount = useMemo(
-    () => webhooks.filter((w) => !w.revoked_at).length,
-    [webhooks],
-  );
   const visibleMembers = useMemo(() => {
     const members = detail?.members ?? [];
     const q = memberFilter.trim().toLowerCase();
@@ -300,38 +265,6 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
     }
   };
 
-  const handleCreateWebhook = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!room || !webhookName.trim()) return;
-    setBusyAction(true);
-    setErr('');
-    try {
-      const created = await createRoomWebhook(room.id, webhookName.trim());
-      setWebhookName('');
-      setCreatedToken({ id: created.webhook.id, token: created.token });
-      setWebhooks((prev) => [created.webhook, ...prev]);
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : 'Could not create webhook');
-    } finally {
-      setBusyAction(false);
-    }
-  };
-
-  const handleRevokeWebhook = async (webhookId: string) => {
-    if (!room) return;
-    setBusyAction(true);
-    setErr('');
-    try {
-      await revokeRoomWebhook(room.id, webhookId);
-      setConfirmRevokeId(null);
-      setWebhooks((prev) => prev.map((w) => (w.id === webhookId ? { ...w, revoked_at: Date.now() } : w)));
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : 'Could not revoke webhook');
-    } finally {
-      setBusyAction(false);
-    }
-  };
-
   const handleLobbyDecision = async (guestId: string, admit: boolean) => {
     if (!onDecideLobby || decidingGuestIds[guestId]) return;
     setDecidingGuestIds((prev) => ({ ...prev, [guestId]: true }));
@@ -353,18 +286,6 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
       await onAdmitAllLobby();
     } finally {
       setAdmittingAll(false);
-    }
-  };
-
-  const copyCurl = async () => {
-    if (!createdToken) return;
-    const cmd = `curl -X POST ${window.location.origin}/api/v1/webhooks/in/${createdToken.id} \\\n  -H "Authorization: Bearer ${createdToken.token}" \\\n  -H "Content-Type: application/json" \\\n  -d '{"text":"Hello from webhook"}'`;
-    try {
-      await navigator.clipboard.writeText(cmd);
-      setCopiedCurl(true);
-      setTimeout(() => setCopiedCurl(false), 1800);
-    } catch {
-      // Clipboard unavailable.
     }
   };
 
@@ -395,7 +316,7 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
     }
   };
 
-  const sharedBadgeCount = sharedLinks.length + (canModerate && !isDM ? activeWebhookCount : 0);
+  const sharedBadgeCount = sharedLinks.length;
 
   return (
     <aside className="chat-drawer" aria-label="Room panel">
@@ -940,100 +861,6 @@ export const RoomDetailsDrawer: React.FC<RoomDetailsDrawerProps> = ({
                   )}
                 </section>
 
-                {!isDM && canModerate && (
-                  <section className="chat-drawer-section">
-                    <h4>
-                      <Webhook size={13} style={{ display: 'inline', verticalAlign: '-2px', marginRight: 5 }} />
-                      Incoming webhooks
-                    </h4>
-                    <form onSubmit={handleCreateWebhook} className="chat-drawer-inline-form">
-                      <input
-                        aria-label="New webhook name"
-                        placeholder="CI Deploy Bot"
-                        value={webhookName}
-                        onChange={(e) => setWebhookName(e.target.value)}
-                        maxLength={100}
-                      />
-                      <button
-                        type="submit"
-                        className="btn-secondary"
-                        disabled={busyAction || !webhookName.trim()}
-                      >
-                        Add
-                      </button>
-                    </form>
-
-                    {createdToken && (
-                      <div className="chat-webhook-secret" role="status">
-                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                          <strong>Token shown once</strong>
-                          <button
-                            type="button"
-                            className="btn-secondary"
-                            onClick={() => void copyCurl()}
-                            style={{ padding: '0.2rem 0.5rem', fontSize: '0.72rem' }}
-                          >
-                            {copiedCurl ? <Check size={12} /> : <Copy size={12} />}
-                            {copiedCurl ? 'Copied' : 'Copy curl'}
-                          </button>
-                        </div>
-                        <pre>{`POST /api/v1/webhooks/in/${createdToken.id}\nAuthorization: Bearer ${createdToken.token}`}</pre>
-                      </div>
-                    )}
-
-                    {webhooks.length === 0 ? (
-                      <p className="chat-drawer-muted">No incoming webhooks yet.</p>
-                    ) : (
-                      <div>
-                        {webhooks.map((wh) => {
-                          const confirming = confirmRevokeId === wh.id;
-                          return (
-                            <div key={wh.id} className="chat-member-row">
-                              <div className="chat-member-copy">
-                                <div className="chat-member-name">{wh.name}</div>
-                                <div className="chat-member-role">
-                                  {wh.revoked_at ? 'Revoked' : 'Active · Bearer auth'}
-                                </div>
-                              </div>
-                              {!wh.revoked_at && !confirming && (
-                                <button
-                                  type="button"
-                                  className="chat-icon-btn"
-                                  disabled={busyAction}
-                                  title={`Revoke ${wh.name}`}
-                                  aria-label={`Revoke ${wh.name}`}
-                                  onClick={() => setConfirmRevokeId(wh.id)}
-                                >
-                                  <Trash2 size={14} />
-                                </button>
-                              )}
-                              {!wh.revoked_at && confirming && (
-                                <div className="chat-member-actions">
-                                  <button
-                                    type="button"
-                                    className="ky-lobby-btn is-deny"
-                                    disabled={busyAction}
-                                    onClick={() => void handleRevokeWebhook(wh.id)}
-                                  >
-                                    Revoke?
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className="chat-icon-btn"
-                                    aria-label="Cancel"
-                                    onClick={() => setConfirmRevokeId(null)}
-                                  >
-                                    <X size={13} />
-                                  </button>
-                                </div>
-                              )}
-                            </div>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </section>
-                )}
               </div>
             )}
           </>

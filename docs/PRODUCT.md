@@ -38,8 +38,10 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
 - File and image attachments stored on local disk (`KY_ATTACHMENTS_DIR`) with SHA-256 content
   hashing, per-upload/per-user/per-tenant quotas, inline image thumbnails, and encrypted backup
   mirroring.
-- Incoming room webhooks (`/api/v1/webhooks/in/{id}`) with hashed bearer tokens and per-org status
-  enforcement.
+- Incoming room webhooks are removed: rooms are becoming end-to-end encrypted, and the server cannot
+  encrypt for a webhook. `/api/v1/webhooks/in/{id}` answers `410 gone` to every sender; integrations
+  post through a bot (Bots & Agents). Migration 52 left an audit row (`webhook.removed`) per live
+  webhook.
 
 **Voice, video & KyCalendar meetings.**
 - Hybrid calling: direct peer-to-peer WebRTC (signaled over `/api/v1/ws`) for 1:1 / small calls,
@@ -99,7 +101,7 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
   event never undoes a newer one, and deletion is never undone. Tenant status is read from the
   primary database, never a read replica.
 - Deactivation, deletion, or org suspension immediately revokes sessions, push subscriptions, and
-  active WebSocket connections, and blocks API calls, incoming webhooks, and guest meeting links.
+  active WebSocket connections, and blocks API calls and guest meeting links.
   No new session, MFA challenge or pairing is issued to an inactive org, including one in flight
   when the suspension lands. Org suspension or deletion also ejects that org's meeting guests, waiting or admitted, from the
   lobby, their sockets and their calls on every server instance.

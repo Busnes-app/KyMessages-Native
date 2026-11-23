@@ -306,7 +306,7 @@ type AgentStore interface {
 	DeleteAgent(ctx context.Context, id string) error
 }
 
-// ChatStore handles multi-tenant native KyMessages tenants, rooms, messages, reactions, and webhooks.
+// ChatStore handles multi-tenant native KyMessages tenants, rooms, messages and reactions.
 type ChatStore interface {
 	// Tenants
 	CreateTenant(ctx context.Context, t *Tenant) error
@@ -370,12 +370,6 @@ type ChatStore interface {
 	SumAttachmentBytesByTenant(ctx context.Context, tenantID string) (int64, error)
 	SumPendingAttachmentBytesByUploader(ctx context.Context, tenantID, uploaderID string) (int64, error)
 	PurgeOrphanAttachments(ctx context.Context, olderThanMilli int64, limit int) ([]string, error)
-
-	// Webhooks
-	CreateRoomWebhook(ctx context.Context, w *RoomWebhook) error
-	GetRoomWebhook(ctx context.Context, webhookID string) (*RoomWebhook, error)
-	ListRoomWebhooks(ctx context.Context, tenantID, roomID string) ([]*RoomWebhook, error)
-	RevokeRoomWebhook(ctx context.Context, tenantID, roomID, webhookID string) error
 
 	// Call Sessions
 	CreateCallSession(ctx context.Context, cs *CallSession) error

@@ -534,7 +534,7 @@ func TestMultiTenantDirectoryWebhookAndOrgLifecycle(t *testing.T) {
 		t.Fatalf("expected sso.org_mismatch audit log, got len=%d err=%v", len(logs), err)
 	}
 
-	// 4. Create session, room, incoming webhook, and guest link in org-alpha; also a user in org-beta.
+	// 4. Create session, room, and guest link in org-alpha; also a user in org-beta.
 	evaTok := "tok_eva_" + uuid.NewString()
 	if err := st.Sessions().CreateSession(context.Background(), &store.Session{
 		UserID:    eva.ID,
@@ -560,20 +560,6 @@ func TestMultiTenantDirectoryWebhookAndOrgLifecycle(t *testing.T) {
 		} `json:"room"`
 	}
 	_ = json.Unmarshal(rec.Body.Bytes(), &roomCreated)
-
-	rec = doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+roomCreated.Room.ID+"/webhooks", evaTok, map[string]any{
-		"name": "CI Bot",
-	}, nil)
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("create webhook = %d: %s", rec.Code, rec.Body.String())
-	}
-	var whCreated struct {
-		Webhook struct {
-			ID string `json:"id"`
-		} `json:"webhook"`
-		Token string `json:"token"`
-	}
-	_ = json.Unmarshal(rec.Body.Bytes(), &whCreated)
 
 	rec = doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+roomCreated.Room.ID+"/meeting/guest-link", evaTok, nil, nil)
 	if rec.Code != http.StatusOK && rec.Code != http.StatusCreated {
@@ -626,7 +612,7 @@ func TestMultiTenantDirectoryWebhookAndOrgLifecycle(t *testing.T) {
 		t.Fatalf("guest hello: %v", err)
 	}
 
-	// 5. org.suspended revokes sessions and blocks API, incoming webhook, and guest link for org-alpha.
+	// 5. org.suspended revokes sessions and blocks API and guest link for org-alpha.
 	suspendBody := []byte(`{"org_id":"00000000-0000-4000-8000-00000000000a","revision":1}`)
 	if rec := postSync("org.suspended", suspendBody); rec.Code != http.StatusOK {
 		t.Fatalf("org.suspended = %d: %s", rec.Code, rec.Body.String())
@@ -658,11 +644,6 @@ func TestMultiTenantDirectoryWebhookAndOrgLifecycle(t *testing.T) {
 		t.Fatalf("session issued for a suspended org: err=%v, want ErrNotFound", err)
 	}
 
-	// Incoming webhook for suspended org returns 403.
-	if rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/webhooks/in/"+whCreated.Webhook.ID, whCreated.Token, map[string]any{"body": "blocked"}, nil); rec.Code != http.StatusForbidden {
-		t.Fatalf("incoming webhook for suspended org = %d, want 403: %s", rec.Code, rec.Body.String())
-	}
-
 	// Guest meeting link for suspended org returns 404.
 	guestReq := httptest.NewRequest(http.MethodGet, "/api/meet/"+guestCreated.GuestToken, nil)
 	guestRec := httptest.NewRecorder()
@@ -685,9 +666,6 @@ func TestMultiTenantDirectoryWebhookAndOrgLifecycle(t *testing.T) {
 	}
 	if rec := doBearerJSON(t, srv, http.MethodGet, "/api/v1/rooms", evaTok2, nil, nil); rec.Code != http.StatusOK {
 		t.Fatalf("org-alpha rooms after org.unsuspended = %d, want 200: %s", rec.Code, rec.Body.String())
-	}
-	if rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/webhooks/in/"+whCreated.Webhook.ID, whCreated.Token, map[string]any{"body": "restored"}, nil); rec.Code != http.StatusCreated {
-		t.Fatalf("incoming webhook after org.unsuspended = %d, want 201: %s", rec.Code, rec.Body.String())
 	}
 
 	// 7. org.deleted permanently blocks org-alpha.
@@ -763,8 +741,6 @@ func TestMultiTenantCrossOrgUserPaths(t *testing.T) {
 			{http.MethodPost, "/api/v1/rooms/" + rm + "/read"},
 			{http.MethodPut, "/api/v1/rooms/" + rm + "/notifications"},
 			{http.MethodGet, "/api/v1/rooms/" + rm + "/attachments"},
-			{http.MethodGet, "/api/v1/rooms/" + rm + "/webhooks"},
-			{http.MethodPost, "/api/v1/rooms/" + rm + "/webhooks"},
 			{http.MethodGet, "/api/v1/rooms/" + rm + "/calls/state"},
 			{http.MethodPost, "/api/v1/rooms/" + rm + "/calls/join"},
 			{http.MethodPost, "/api/v1/rooms/" + rm + "/calls/escalate"},
