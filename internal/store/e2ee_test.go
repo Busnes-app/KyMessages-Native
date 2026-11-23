@@ -84,7 +84,7 @@ func TestE2EEOneTimeKeysClaimOnceAcrossReplicas(t *testing.T) {
 		t.Fatal(err)
 	}
 	var keys []store.E2EEOneTimeKey
-	for i := range 10 {
+	for i := range 20 {
 		keys = append(keys, store.E2EEOneTimeKey{KeyID: fmt.Sprintf("k%02d", i), Key: fmt.Sprintf("v%02d", i), Signature: "sig"})
 	}
 	keys = append(keys, store.E2EEOneTimeKey{KeyID: "fb1", Key: "fallback-1", Signature: "sig", Fallback: true})
@@ -100,7 +100,8 @@ func TestE2EEOneTimeKeysClaimOnceAcrossReplicas(t *testing.T) {
 	seen := map[string]int{}
 	fallbacks := 0
 	var wg sync.WaitGroup
-	for i := range 30 {
+	// 60 claimants for 20 keys: more than claimRetries rounds of one winner each could serve.
+	for i := range 60 {
 		st := a
 		if i%2 == 1 {
 			st = b
@@ -120,8 +121,8 @@ func TestE2EEOneTimeKeysClaimOnceAcrossReplicas(t *testing.T) {
 		})
 	}
 	wg.Wait()
-	if len(seen) != 10 || fallbacks != 20 {
-		t.Fatalf("claimed %d distinct keys and %d fallbacks, want 10 and 20: %v", len(seen), fallbacks, seen)
+	if len(seen) != 20 || fallbacks != 40 {
+		t.Fatalf("claimed %d distinct keys and %d fallbacks, want 20 and 40: %v", len(seen), fallbacks, seen)
 	}
 	for key, n := range seen {
 		if n != 1 || key == "swapped" {

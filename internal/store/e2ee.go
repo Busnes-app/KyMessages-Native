@@ -12,8 +12,9 @@ type e2eeStore struct {
 	store *SQLStore
 }
 
-// claimRetries bounds the race where another replica deletes the one-time key this claim
-// picked: each retry picks the next remaining key.
+// claimRetries bounds the rounds a claim waits while every remaining one-time key is locked by
+// other in-flight claims. On PostgreSQL SKIP LOCKED gives concurrent claims different keys, so a
+// round fails only when all remaining keys are being claimed at that moment.
 const claimRetries = 8
 
 func (s *e2eeStore) UpsertDevice(ctx context.Context, d *E2EEDevice) error {
@@ -131,10 +132,15 @@ func (s *e2eeStore) CountOneTimeKeys(ctx context.Context, userID, deviceID strin
 }
 
 func (s *e2eeStore) ClaimOneTimeKey(ctx context.Context, userID, deviceID string) (*E2EEOneTimeKey, error) {
+	// SQLite serializes writers; PostgreSQL must not send every claim at the same lowest key.
+	lock := ""
+	if s.store.driver == "postgres" {
+		lock = " FOR UPDATE SKIP LOCKED"
+	}
 	claim := s.store.rebind(`
 		DELETE FROM e2ee_one_time_keys
 		WHERE user_id = ? AND device_id = ? AND fallback = 0 AND key_id = (
-			SELECT key_id FROM e2ee_one_time_keys WHERE user_id = ? AND device_id = ? AND fallback = 0 ORDER BY key_id LIMIT 1)
+			SELECT key_id FROM e2ee_one_time_keys WHERE user_id = ? AND device_id = ? AND fallback = 0 ORDER BY key_id LIMIT 1` + lock + `)
 		RETURNING key_id, key_value, signature`)
 	for range claimRetries {
 		var k E2EEOneTimeKey
