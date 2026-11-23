@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { Chat } from './Chat';
-import { deliverKey, fakeEnvelope, resetFakeE2EE, setFakeUnavailable } from '../chat/e2eeFake';
+import { deliverKey, fakeEnvelope, holdFakeOpens, resetFakeE2EE, setFakeUnavailable } from '../chat/e2eeFake';
 
 // Pages run without the WebAssembly core; crypto/engine.test.ts covers the real one.
 vi.mock('../chat/e2ee', () => import('../chat/e2eeFake'));
@@ -226,6 +226,33 @@ describe('Native Chat page', () => {
     act(() => deliverKey('s_bob'));
     expect(await screen.findByText(/This message was encrypted for another room\./)).toBeTruthy();
     expect(screen.queryByText(/Encryption is not available in this browser yet\./)).toBeNull();
+
+    // A deletion that lands while a retried open is still running stays deleted.
+    act(() => {
+      ws.emit({
+        t: 'message.new',
+        room: 'rm_gen',
+        seq: 5,
+        d: {
+          id: 'msg_5', tenant_id: 'default', room_id: 'rm_gen', seq: 5, sender_id: 'u_bob', sender_name: 'Bob',
+          encoding: 'e2ee_room_v1', body: fakeEnvelope({ room_id: 'rm_gen', type: 'text', body: 'removed by a moderator' }, 's_mod'),
+          created_at: 1_700_000_040_000, reactions: [],
+        },
+      });
+    });
+    expect(await screen.findByText("Waiting for this message's key")).toBeTruthy();
+    const release = holdFakeOpens();
+    act(() => deliverKey('s_mod'));
+    act(() => {
+      ws.emit({ t: 'message.delete', room: 'rm_gen', seq: 6, d: { id: 'msg_5', deleted_at: 1_700_000_050_000 } });
+    });
+    expect(await screen.findByText('Message deleted')).toBeTruthy();
+    await act(async () => {
+      release();
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(screen.queryByText('removed by a moderator')).toBeNull();
+    expect(screen.getByText('Message deleted')).toBeTruthy();
 
     // Instant auth revocation notifies parent shell.
     act(() => {

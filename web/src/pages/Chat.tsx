@@ -266,10 +266,13 @@ export const Chat: React.FC<ChatProps> = ({
             for (const [rid, b] of Object.entries(prev)) {
               next[rid] = {
                 ...b,
-                // Only replace what is still unopened: an edit may have landed meanwhile.
+                // Only fill in what is still unopened and not deleted: an edit or a deletion may
+                // have landed meanwhile. Merge just what opening sets, so the row keeps its later
+                // state (deletion, reactions, pins).
                 messages: b.messages.map((m) => {
                   const o = opened.get(m.id);
-                  return o && m.envelope === o.envelope && m.e2ee?.kind !== 'decrypted' && e2eeLabel(m) !== e2eeLabel(o) ? o : m;
+                  if (!o || m.deleted_at || m.envelope !== o.envelope || m.e2ee?.kind === 'decrypted' || e2eeLabel(m) === e2eeLabel(o)) return m;
+                  return { ...m, body: o.body, reply_to_id: o.reply_to_id, e2ee: o.e2ee };
                 }),
               };
             }

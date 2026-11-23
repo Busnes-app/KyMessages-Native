@@ -64,6 +64,19 @@ export async function openMessage(m: ChatMessage): Promise<ChatMessage> {
   return { ...m, body: inner.body, reply_to_id: inner.reply_to_id, e2ee: { kind: 'decrypted' } };
 }
 
-export function openMessages(list: ChatMessage[]): Promise<ChatMessage[]> {
+let held: Promise<void> | undefined;
+
+/** Holds openMessages (as a slow decrypt would) until the returned release is called. */
+export function holdFakeOpens(): () => void {
+  let release = () => undefined as void;
+  held = new Promise((r) => (release = r));
+  return () => {
+    held = undefined;
+    release();
+  };
+}
+
+export async function openMessages(list: ChatMessage[]): Promise<ChatMessage[]> {
+  if (held) await held;
   return Promise.all(list.map(openMessage));
 }
