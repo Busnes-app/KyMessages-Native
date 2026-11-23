@@ -87,7 +87,7 @@ import { MessageRow } from '../components/chat/MessageRow';
 import { RoomDetailsDrawer, type DrawerTab } from '../components/chat/RoomDetailsDrawer';
 import { CreateChannelModal, SearchModal, StartDMModal } from '../components/chat/ChatModals';
 import { searchIndexFor } from '../chat/searchIndex';
-import { onRoomKeys, openMessages, receiveRoomKeys, roomMembershipChanged, startE2EE, UNAVAILABLE } from '../chat/e2ee';
+import { onRoomKeys, openMessages, receiveRoomKeys, roomMembershipChanged, setMembershipLive, startE2EE, UNAVAILABLE } from '../chat/e2ee';
 import { CallAudioLayer, CallStage } from '../components/chat/CallStage';
 import { HybridCallController, type HybridCallSnapshot } from '../rtc/hybridCall';
 
@@ -254,7 +254,9 @@ export const Chat: React.FC<ChatProps> = ({
         );
         if (retry.length === 0) return;
         void openMessages(retry).then((list) => {
-          const opened = new Map(list.filter((m) => m.e2ee?.kind !== 'waiting').map((m) => [m.id, m]));
+          // A row that said encryption was unavailable becomes "waiting" if its key is still missing.
+          const wasUnavailable = new Set(retry.filter((m) => m.e2ee?.kind === 'failed').map((m) => m.id));
+          const opened = new Map(list.filter((m) => m.e2ee?.kind !== 'waiting' || wasUnavailable.has(m.id)).map((m) => [m.id, m]));
           if (opened.size === 0) return;
           setBuckets((prev) => {
             const next: Record<string, RoomMessageBucket> = {};
@@ -264,7 +266,7 @@ export const Chat: React.FC<ChatProps> = ({
                 // Only replace what is still unopened: an edit may have landed meanwhile.
                 messages: b.messages.map((m) => {
                   const o = opened.get(m.id);
-                  return o && m.envelope === o.envelope && m.e2ee?.kind !== 'decrypted' ? o : m;
+                  return o && m.envelope === o.envelope && m.e2ee?.kind !== 'decrypted' && m.e2ee?.kind !== o.e2ee?.kind ? o : m;
                 }),
               };
             }
@@ -928,6 +930,8 @@ export const Chat: React.FC<ChatProps> = ({
 
     const sock = new ChatSocket({
       onStatus: (status) => {
+        // Membership events arrive only over a live socket; without one, encryption re-lists members.
+        setMembershipLive(status === 'live');
         if (!cancelled) setWsStatus(status);
       },
       onEvent: (ev) => {

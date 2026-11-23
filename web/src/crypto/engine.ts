@@ -235,6 +235,9 @@ function withLock<T>(name: string, fn: () => Promise<T>): Promise<T> {
 export class CryptoEngine {
   private readonly listeners = new Set<(sessionIds: string[]) => void>();
   private readonly roomDevices = new Map<string, { at: number; members: string[]; devices: Target[] }>();
+  // Device lists are cached only while membership events can reach this tab (its WebSocket is
+  // live); otherwise a removal could be missed and the removed member keep getting the key.
+  private membershipLive = true;
 
   private constructor(
     readonly userId: string,
@@ -394,11 +397,21 @@ export class CryptoEngine {
 
   private async devicesInRoom(roomId: string): Promise<{ members: string[]; devices: Target[] }> {
     const cached = this.roomDevices.get(roomId);
-    if (cached && Date.now() - cached.at < DEVICE_LIST_TTL_MS) return cached;
+    if (cached && this.membershipLive && Date.now() - cached.at < DEVICE_LIST_TTL_MS) return cached;
     const members = [...new Set(await this.server.roomMembers(roomId))];
     const entry = { at: Date.now(), members, devices: await this.verifiedDevices(members) };
-    this.roomDevices.set(roomId, entry);
+    if (this.membershipLive) this.roomDevices.set(roomId, entry);
     return entry;
+  }
+
+  /**
+   * Says whether membership events are reaching this tab. While they are not (the WebSocket is
+   * down or reconnecting) every send lists members again, and losing the connection drops what
+   * was cached, so a removal missed meanwhile still rotates the session on the next send.
+   */
+  setMembershipLive(live: boolean): void {
+    if (!live) this.roomDevices.clear();
+    this.membershipLive = live;
   }
 
   /**

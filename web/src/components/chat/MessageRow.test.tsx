@@ -260,6 +260,9 @@ describe('MessageRow', () => {
       row({ ...baseMsg, sender_id: 'bot_1', sender_name: 'Triage Bot' });
       expect(screen.getByText('Not encrypted (bot)')).toBeTruthy();
       expect(screen.queryByText('Sent before encryption')).toBeNull();
+      cleanup();
+      row({ ...baseMsg, sender_id: 'webhook:wh_1', sender_name: 'CI' });
+      expect(screen.getByText('Not encrypted (webhook)')).toBeTruthy();
     });
 
     it('shows a decrypted message without a label, but marks its files as not encrypted', () => {

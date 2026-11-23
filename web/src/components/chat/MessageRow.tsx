@@ -16,6 +16,7 @@ export function plaintextLabel(msg: ChatMessage): string | null {
   if (msg.encoding !== 'plain_v1') return null;
   if (isBotSender(msg.sender_id)) return 'Not encrypted (bot)';
   if (isGuestSender(msg.sender_id)) return 'Not encrypted (guest)';
+  if (isWebhookSender(msg.sender_id)) return 'Not encrypted (webhook)';
   return 'Sent before encryption';
 }
 

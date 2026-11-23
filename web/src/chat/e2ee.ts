@@ -108,6 +108,7 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
       await deleteCryptoStore(userId);
       e = await CryptoEngine.open(userId, httpKeyServer, await openCryptoStore(userId));
     }
+    e.setMembershipLive(membershipLive);
     e.onKeys(() => {
       for (const fn of keyListeners) fn();
     });
@@ -145,6 +146,14 @@ export function onRoomKeys(fn: () => void): () => void {
 /** Reads the device mailbox: on start, on a `to_device` wake and after a reconnect. */
 export function receiveRoomKeys(): void {
   void engine().then((e) => e.receive()).catch(() => undefined);
+}
+
+let membershipLive = false;
+
+/** Tells the device whether membership events are arriving (the chat WebSocket is live). */
+export function setMembershipLive(live: boolean): void {
+  membershipLive = live;
+  void current?.engine.then((e) => e.setMembershipLive(live)).catch(() => undefined);
 }
 
 /** Lists the room's devices again before the next send; rotates its session when someone left. */

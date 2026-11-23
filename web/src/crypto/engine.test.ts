@@ -173,6 +173,40 @@ describe('encrypted rooms between two client engines', () => {
     expect(parseEnvelope(after.body)!.session_id).not.toBe(parseEnvelope(before.body)!.session_id);
   });
 
+  it('rotates after a removal missed while the connection was down', async () => {
+    const server = new FakeKeyServer();
+    const alice = await device(server, 'u_alice');
+    const bob = await device(server, 'u_bob');
+    const carol = await device(server, 'u_carol');
+    server.join('r1', 'u_alice', 'u_bob', 'u_carol');
+    const before = await send('r1', alice, 'all three');
+    // The socket drops; carol is removed meanwhile and the room.member event never arrives.
+    alice.setMembershipLive(false);
+    server.leave('r1', 'u_carol');
+    // Reconnected well inside the device-list cache's lifetime.
+    alice.setMembershipLive(true);
+    const after = await send('r1', alice, 'carol is gone');
+    expect(parseEnvelope(after.body)!.session_id).not.toBe(parseEnvelope(before.body)!.session_id);
+    await bob.receive();
+    await carol.receive();
+    expect(await read(bob, after)).toBe('carol is gone');
+    expect(await read(carol, after)).toBe('waiting');
+  });
+
+  it('lists members again for every send while the connection is down', async () => {
+    const server = new FakeKeyServer();
+    const alice = await device(server, 'u_alice');
+    const carol = await device(server, 'u_carol');
+    server.join('r1', 'u_alice', 'u_carol');
+    alice.setMembershipLive(false);
+    const before = await send('r1', alice, 'one');
+    server.leave('r1', 'u_carol');
+    const after = await send('r1', alice, 'two');
+    expect(parseEnvelope(after.body)!.session_id).not.toBe(parseEnvelope(before.body)!.session_id);
+    await carol.receive();
+    expect(await read(carol, after)).toBe('waiting');
+  });
+
   it('rotates after 100 messages and after 7 days', async () => {
     const server = new FakeKeyServer();
     const alice = await device(server, 'u_alice');
