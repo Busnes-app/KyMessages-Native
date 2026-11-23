@@ -23,6 +23,11 @@ func (s *SQLStore) InvalidateRestoredGrants(ctx context.Context) error {
 		`DELETE FROM device_pairings`,
 		`DELETE FROM push_subscriptions`,
 		`DELETE FROM attachment_upload_reservations`,
+		// A one-time key claimed after the backup would be handed out again, but its device already
+		// spent the private half; restored mail was already read. Devices re-upload one-time keys
+		// when their count runs low. Fallback keys are never consumed, so they stay.
+		`DELETE FROM e2ee_one_time_keys WHERE fallback = 0`,
+		`DELETE FROM e2ee_to_device`,
 	} {
 		if _, err := tx.ExecContext(ctx, query); err != nil {
 			return err
@@ -35,7 +40,7 @@ func (s *SQLStore) InvalidateRestoredGrants(ctx context.Context) error {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, s.rebind(`INSERT INTO audit_records (action, details, created_at) VALUES (?, ?, ?)`),
-		"restore.grants_invalidated", "Sessions, challenges, pairings, push subscriptions, active calls, and bot tokens invalidated. Users sign in again and rotate bot tokens.", now); err != nil {
+		"restore.grants_invalidated", "Sessions, challenges, pairings, push subscriptions, active calls, bot tokens, one-time encryption keys and undelivered encryption mail invalidated. Users sign in again and rotate bot tokens.", now); err != nil {
 		return err
 	}
 	return tx.Commit()

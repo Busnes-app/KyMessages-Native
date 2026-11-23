@@ -54,6 +54,18 @@ func seedGrants(t *testing.T, st store.Store) (roomID, callID, agentID string) {
 	}, 20); err != nil {
 		t.Fatal(err)
 	}
+	dev := &store.E2EEDevice{TenantID: store.DefaultTenantID, UserID: "u", DeviceID: "D1", Curve25519: "c", Ed25519: "e", Signature: "s"}
+	if err := st.E2EE().UpsertDevice(ctx, dev); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.E2EE().AddOneTimeKeys(ctx, "u", "D1", []store.E2EEOneTimeKey{
+		{KeyID: "k1", Key: "spent-after-backup", Signature: "s"}, {KeyID: "fb", Key: "fallback", Signature: "s", Fallback: true},
+	}, 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.E2EE().SendToDevice(ctx, []store.E2EEToDevice{{TenantID: store.DefaultTenantID, RecipientUserID: "u", RecipientDeviceID: "D1", SenderUserID: "u", SenderDeviceID: "D1", Type: "olm.v1", Content: "already read"}}); err != nil {
+		t.Fatal(err)
+	}
 	return room.ID, cs.ID, agent.ID
 }
 
@@ -68,6 +80,15 @@ func TestRestoreInvalidatesGrants(t *testing.T) {
 	}
 	if _, err := st.Sessions().GetSession(ctx, "session"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatal("session survived", err)
+	}
+	if n, _ := st.E2EE().CountOneTimeKeys(ctx, "u", "D1"); n != 0 {
+		t.Fatalf("%d restored one-time keys survived", n)
+	}
+	if k, err := st.E2EE().ClaimOneTimeKey(ctx, "u", "D1"); err != nil || !k.Fallback {
+		t.Fatalf("after restore the claim = %+v %v, want the kept fallback key", k, err)
+	}
+	if mail, _ := st.E2EE().ToDevice(ctx, "u", "D1", 10); len(mail) != 0 {
+		t.Fatalf("restored to-device mail survived: %+v", mail)
 	}
 	if _, _, err := st.Sessions().ConsumeMFAChallenge(ctx, "challenge"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatal("challenge survived", err)
