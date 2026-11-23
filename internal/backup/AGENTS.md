@@ -7,11 +7,11 @@ what differs per product: a `Settings` adapter over `store.SettingsStore`, a `Se
 deployment key, the payload the scaffold seals (`Collect`) and its drill checks (`Checks`).
 
 ## Ownership
-Owns the settings adapter (`settings.go`), payload collection (`payload.go`), Matrix dumps and
-config collection plus expanded-size accounting (`matrix.go`, `size.go`), loading a restored
-Matrix half into a fresh stack (`matrix_restore.go`),
-restore-drill checks (`drill.go`), the cross-process backup lock and drill entry point (`run_drill.go`). It holds no private key, no share, and no pairing state of its own — those
-live in `recoveryclient` and in the settings rows it reads and writes through the adapter.
+Owns the settings adapter (`settings.go`), payload collection and expanded-size accounting
+(`payload.go`, `size.go`), attachment mirroring (`attachments.go`), restore-drill checks
+(`drill.go`), and the cross-process backup lock and drill entry point (`run_drill.go`). It holds
+no private key, no share, and no pairing state of its own — those live in `recoveryclient` and
+in the settings rows it reads and writes through the adapter.
 
 ## Local Contracts
 - `Settings` maps `store.ErrNotFound` to `recoveryclient.ErrNotFound`; every other error passes
@@ -29,38 +29,11 @@ live in `recoveryclient` and in the settings rows it reads and writes through th
   (`data/recovery.pub`, only when paired).
 - `Collect` adds `data/vapid.key` (0600) when present, so restored browsers keep the same push identity; restore still deletes every push subscription.
 - Chat attachments never enter the capsule. `MirrorAttachments` copies each blob in `KY_ATTACHMENTS_DIR` to `<KY_BACKUP_DIR>/attachments` (nothing without a backup directory), encrypted one at a time with AES-256-GCM under the write-once `data/attachments.key`. Only `Collect` creates that key (`EnsureAttachmentKey`, whenever it exists or blobs do) and seals it (`AttachmentKeyPath`); the mirror only loads it, and without one mirrors nothing (`KeyMissing`) until the next capsule carries it, so no mirror is encrypted under a key no capsule holds. Blobs no longer live move to the mirror's `.pruned` and are deleted after `DefaultMirrorPruneRetention` (7 days); pruning is skipped while the live directory is empty and the mirror is not (`PruneSkipped`), so a start before `restore-attachments` cannot wipe it. `RestoreAttachments` decrypts active mirror blobs through `os.Root`; `RestoreAttachmentsForKeys` (used by `restore-attachments` with `LoadReferencedAttachmentKeys` from `ky_server.db`) restores only DB-referenced blobs from the active mirror and `.pruned` without overwriting active blobs or resurrecting unreferenced deleted blobs.
-- With Matrix enabled `Collect` adds `data/media.key` (write-once, `MediaKeyPath`), `matrix/<sub>/<file>`
-  for secrets, synapse, federation (skipped while absent: an upgraded stack before its `matrix-init` re-run), mas, element and postgres, plus livekit (including private TURN certificate/key copies) when calling is configured (dot-files skipped; never
-  `secrets/postgres_password`, the superuser's: a fresh volume needs none and `matrix-init`
-  regenerates it), and `pg_dump --format=custom`
-  parts `matrix/dumps/{mas,synapse}.dump.NNN` (MAS first, 64 MiB parts) run as `kybackup`: the child
-  gets only `PGPASSWORD` and `PGCONNECT_TIMEOUT`. The Synapse dump excludes `e2e_one_time_keys_json`
-  data. A dump failure fails the run. Recipe key `pg_dumps` lists the bases; `Checks` requires
-  gapless parts, the `matrixRequired()` members (media key, signing key, Synapse and MAS configs,
-  `init.sql`, `kybackup-role.sql`, and each `restoreDBs` owner password under `matrix/secrets/`)
-  and runs `checkDump` on each joined dump (`DumpCheckTimeout` each), the same check
-  `MatrixRestore.Run` refuses on: the drill must never pass a capsule restore-matrix refuses.
 - The expanded limit counts tar framing (`Measure`) and holds back 1 MiB, because ky-primitives
   v0.8.0 `Seal` undercounts against `Open` (Busnes-app/ky-primitives#20). A payload past it fails
   with `*SizeError` (wraps `capsule.ErrCapsuleTooLarge`; its message rounds the size up and
   names the enforced 255 MiB) before sealing. `CollectForRun` records
   the measured size in `backup_last_expanded_bytes`; `LastSize` warns from 75% of 256 MiB.
-- `MatrixRestore.Run` (`kymessages restore-matrix`) checks everything before writing: both
-  owner passwords from `matrix/secrets`, gapless parts with no stray, `checkDump` per dump
-  (`pg_restore --list` refusing every extension entry except MAS's trusted `pg_trgm`
-  (`EXTENSION - pg_trgm` and `COMMENT - EXTENSION pg_trgm`, which the owner restores; no
-  superuser), and a full read, `pg_restore --file=/dev/null`, since `--list` misses a truncated
-  or missing last part),
-  zero user relations in `mas` and `synapse` (`CountRelations`, host or host:port), and unless
-  `SkipMedia` an empty media store owned by the process's uid:gid, the media key
-  (`keyfile.Load`, so the process must own it) and every media file (`media.Restore` with
-  write false). Then `pg_restore` as each owner, MAS first, `--no-owner --no-privileges
-  --single-transaction --exit-on-error`, child env only `PGPASSWORD` and `PGCONNECT_TIMEOUT`;
-  then media. No owner password reaches argv or an error, and tool stderr in errors drops
-  CONTEXT/DETAIL lines (row data). A refusal on a populated stack names what `down -v` deletes.
-  After a success (media restored, or `SkipMedia`) it removes `<MatrixDir>/dumps` and says so;
-  any failure keeps them for the retry. A removal that fails (Compose mounts `/matrix`
-  read-only) is printed for the operator and does not fail the restore.
 - `Checks(dir, opened)` reads the opened capsule's manifest, normalizes JSON lists and
   fails malformed or incomplete recipes. Required files include all capsule members and
   the database, settings and encryption key; SQLite integrity and required environment
@@ -68,7 +41,7 @@ live in `recoveryclient` and in the settings rows it reads and writes through th
   SQLite opens read-only and missing/empty databases fail.
 - `Lock(dataDir)` takes a non-blocking OS advisory lock on `<data dir>/backup.lock`. Every
   scheduled run, HTTP and CLI deposit, export and drill holds it from before `Collect` to the
-  end (the scheduler and `deposit` also across the media mirror): the lib's run lock is per
+  end (the scheduler and `deposit` also across the attachment mirror): the lib's run lock is per
   process, so a cron `deposit` would otherwise race the server, and each holder keeps a whole
   payload in memory. Contention returns `ErrBusy`, which wraps `recoveryclient.ErrInProgress`.
   Unlock or process exit releases it. Keep the lock file in place. The Unix lock matches the
@@ -89,7 +62,6 @@ live in `recoveryclient` and in the settings rows it reads and writes through th
   their contracts are in the `recoveryclient` README. `client_test.go` pins only what this
   package's wiring buys: `KY_BACKUP_ALLOW_PRIVATE_RECOVERY` admits RFC1918 and CGNAT and
   nothing else.
-
 - Managed capsules require `installer/client.secret`, `installer/directory.secret` and
   `installer/credential-paths.json` (original destination mapping). Missing/unsafe credentials
   fail collection. Drills inspect the restored database read-only and require these members
@@ -105,4 +77,4 @@ live in `recoveryclient` and in the settings rows it reads and writes through th
   no recovery private key.
 
 ## Child DOX Index
-- [media/AGENTS.md](media/AGENTS.md): encrypted media mirror and monthly archives.
+None.

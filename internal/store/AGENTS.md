@@ -17,8 +17,8 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
 - `CompletePasswordChange` atomically compares the old password, updates a flagged local account, clears the flag, deletes sessions/MFA challenges/device pairings and records `auth.password_changed`. Session/MFA/pairing issuance locks the same user row against the verified hash and, for an org-bound account, the `tenants` row while it is active, so a suspension either refuses the grant or sweeps it; MFA challenges persist the creation-time password hash, and consumption returns that snapshot to reject stale completions. Migration 4 discards preexisting challenges because their credential snapshot is unknown.
 - `ResetAdminPassword` reactivates a local administrator with the replacement flag set and shares the atomic grant purge and audit path with `CompletePasswordChange`; it also works for disabled accounts.
 - `InvalidateRestoredGrants` runs only on an offline restored database: atomically
-  delete sessions, MFA challenges, device pairings and push subscriptions, and audit `restore.grants_invalidated`.
-  Users sign in again.
+  delete sessions, MFA challenges, device pairings and push subscriptions, revoke active agent
+  tokens, and audit `restore.grants_invalidated`. Users sign in again.
 - Migrations 5–12 and 17–19 built the retired messaging stack; migration 21 drops its tables
   (children first), `messaging.*` audit rows and the three `messages_*` backup settings, and
   is idempotent. Migrations are append-only: keep their SQL.
@@ -31,13 +31,10 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
 - `CreateUser`, `CreateDirectoryUser` and `ApplyDirectoryProfile` check the username against every other row first (inside the directory transaction) and return `ErrUsernameTaken` (wraps `ErrAlreadyExists`) on both engines; a refused directory write rolls back with its event ID. A write that loses a race to a concurrent insert meets the UNIQUE constraint instead; `uniqueError` maps that engine error (SQLite `users.username`, Postgres `users_username_key`) to `ErrUsernameTaken` too, any other unique violation to `ErrAlreadyExists` (`unique_internal_test.go`).
 - `GetLocalUserByUsername` returns only `sso_provider = 'local'` rows, preferring an exact-case match. Usernames are unique only case-sensitively, so password login and `init-admin` must never resolve an SSO row.
 - Migrations 15 and 16 add `directory_sync_state` (provider, subject, last applied directory revision). It is deliberately not a users column: it outlives deletion as a tombstone. Migration 16 discarded earlier timestamp-based rows and added `directory_sync_events`, the permanent set of delivered directory event IDs per provider (applied or superseded). It grows by one row per directory change, which is small for the target team size. `ApplyDirectoryProfile`, `CreateDirectoryUser` and `DeleteDirectoryUser` advance it with a conditional upsert and write the user in the same transaction.
-- `DirectoryStatuses(provider)` maps each subject to its user status, or `deleted` for a tombstone row with no user; `matrixsync` plans from it. Subjects are not unique: of several rows, a non-active status wins (fail closed).
+- `DirectoryStatuses(provider)` maps each subject to its user status, or `deleted` for a tombstone row with no user. Subjects are not unique: of several rows, a non-active status wins (fail closed). Owned dedicated administrators project as inactive without changing their console role or independent local operators.
 - Migration 20 renames the stored suite provider `kysignon` to `kyidentity` in `users.sso_provider`, `directory_sync_state` and `directory_sync_events`; its SQL is idempotent.
 - Migration 14 rebuilds `device_pairings` without the six-digit code column; pending pairings (90 s) are dropped on upgrade.
-- Migration 22 adds `agents`, the chat agent registry (`AgentStore`): username, MAS user ID and
-  device ID each unique (`ErrAlreadyExists`), owner subject, current MAS personal session ID and
-  `token_state` (`active` with a session ID; `revoked` or `expired` with none, enforced on every
-  write). It never holds a token. `SetAgentToken` and `DeleteAgent` answer `ErrNotFound` for no row.
+- Migration 24 replaces the legacy `agents` table with the native chat bot/agent registry (`AgentStore`): `user_id`, unique `username`, `owner_user_id`, SHA-256 `token_hash`, and `token_state` (`active` with a non-empty hash; `revoked` or `expired` with an empty hash, enforced on every write). It never stores a plaintext token. `SetAgentToken` and `DeleteAgent` answer `ErrNotFound` for no row.
 - `store.Open(ctx, cfg)` initializes and auto-migrates the configured database backend.
   `migrations.Run` refuses with `ErrNewerSchema` a database whose `schema_migrations` holds a
   version above this build's newest (image rollback, or a capsule from a newer build), before
@@ -57,9 +54,7 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   pairing creation fenced on an earlier snapshot fail. `CreatePairing` takes that snapshot too.
 - Native user/settings writers cannot change installer-owned authority. Managed browser
   sessions require the exact retained issuer/subject/user/role binding. Directory deletion
-  retains the row as `deleted` for MAS deactivation; it cannot be reactivated.
-- `DirectoryStatuses` projects owned dedicated administrators as inactive for ordinary
-  Matrix chat/calls, without changing their console role or independent local operators.
+  retains the row as `deleted`; it cannot be reactivated.
 
 ## Verification
 - `go test -v ./internal/store/...`

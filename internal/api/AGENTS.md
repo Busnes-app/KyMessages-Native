@@ -27,7 +27,7 @@ Owns HTTP routing, request parsing, session cookie validation, CORS headers, and
   warnings. Keep raw audit/error details out of this DTO. A failed audit lookup is
   a visible `last_run_error`, not an invented success or empty history. This result
   is separate from the last successful remote receipt.
-- Backup handlers seal the server capsule; `last_run` reads the `admin.backup_run` audit action. Status also carries `capsule_size` and, with Matrix, `media_last_run` (from `admin.backup_media`, classified fields only). A `*backup.SizeError` is a 413 naming size and member.
+- Backup handlers seal the server capsule; `last_run` reads the `admin.backup_run` audit action. Status also carries `capsule_size`. A `*backup.SizeError` is a 413 naming size and member.
 - Backup routes and theme writes are admin-only: capsules and settings carry site data and secrets. Export, pair-remote, deposit, unpair, pin-key and schedule use `requireFreshAdmin`: step-up is a sign-in from the last 10 minutes (`stepUpWindow`), which repeats the password, plus TOTP once the local admin has enabled it, or the suite login for SSO admins; older sessions get 403 `reauthentication_required` with one generic message ("Confirm it's you: ..."), shared by every step-up route. `Session.CreatedAt` is the credential time: a session minted by `pair/verify` inherits the initiating session's time via `IssueDerivedSession`, so pairing cannot refresh an old session. SSO sessions carry the ID token's signed `auth_time` (zero when missing, which never passes); a KyIdentity admin's refusal includes `reauth_url` `/api/sso/kyidentity/login?fresh=1`, which forces `prompt=login` and `max_age=0`. Drill and status stay `requireAdmin`. The pin is write-once, so a stolen session pinning its own key first would own every later capsule. Routes are registered with method patterns, and because the `/api/` catch-all answers any method, tests pin that a wrong method never reaches a backup handler rather than expecting 405.
 
 | Method | Path | Handler | Response |
@@ -54,155 +54,43 @@ Owns HTTP routing, request parsing, session cookie validation, CORS headers, and
 - `POST /api/devices/pair/poll` (unauthenticated; CSRF applies when a session cookie is sent) takes the same secret as a strict JSON body `{"secret"}` (`decodeStrict`, 4 KiB) and answers only status, expiry and device name. The secret redeems a session, so it never travels in a URL: `GET` answers 405 with `Allow: POST` (an exception to the 404-for-wrong-method rule, so old clients fail loudly) and a query-string secret is ignored (`pair_poll_test.go`).
 - `GET /api/admin/scim/users` (`scim_admin.go`, `requireAdmin`, `no-store`) answers `{enabled, token_set, users:[{id, username, display_name, email, status}]}`: the `sso_provider = 'scim'` rows read from the store (the console holds no SCIM bearer token), and whether `KY_SCIM_TOKEN` is set. The token is never in the reply (`scim_admin_test.go`).
 - CORS permits only the exact configured `KY_APP_URL` origin and credentialed browser writes require matching CSRF cookie/header tokens.
-- API request bodies are capped at 1 MiB and all responses receive baseline CSP, anti-framing, MIME-sniffing, and referrer-policy headers. HSTS (`includeSubDomains`, with secure cookies) is sent only when `r.Host` matches the `KY_APP_URL` host (`hostMatches`): the Matrix server name is often the apex, and a year of HSTS there breaks plain-http services under it (`TestHSTSOnlyOnTheAppHost`).
+- API request bodies are capped at 1 MiB and all responses receive baseline CSP, anti-framing, MIME-sniffing, and referrer-policy headers. HSTS (`includeSubDomains`, with secure cookies) is sent only when `r.Host` matches the `KY_APP_URL` host (`hostMatches`) so other hosts served alongside the app do not receive an unintended HSTS pin (`TestHSTSOnlyOnTheAppHost`).
 - KyIdentity accounts are matched by subject only, never by username. The directory webhook answers 409 for `sso.ErrSyncUsernameConflict` (never 500, which KyIdentity fences). The sign-in callback auto-provisions only on `store.ErrNotFound`; a username another account holds is a JSON 409 naming it, audited `sso.login_conflict` (resource the username, details `subject="..."`), with no session and no change to that account (`TestSSOSignInRefusesUsernameHeldByLocalAccount`).
 - Web Push (`push_handlers.go`, session-authenticated, `no-store`): `GET /api/v1/push/subscriptions` lists the caller's subscriptions and the VAPID public key; `POST` registers one (bots 403; endpoint and keys validated; the store locks the caller's session, so a revoked session gets 401; at most 20 per user, the least recently registered evicted); `DELETE` removes one by endpoint. `PUT /api/v1/rooms/{id}/notifications` sets the member's `notify_mode` (`all`, `mentions`, `mute`). `POST /api/auth/logout` takes an optional `{"push_endpoint"}` and deletes that subscription with the session. Message and call fan-out runs in `pushAsync`, off the request path and counted in `detached`; `WaitDetached` then closes the dispatcher, which can add up to 10s to shutdown.
-- `Server.OnDirectoryChange(fn)` registers a callback run after each acknowledged KyIdentity directory webhook (never after a refused one); it must not block, as the sender is waiting. `cmd/server` passes the Matrix offboarding syncer's `Wake`.
-- `POST /api/matrix/rtc/{sfu/get,get_token}` authenticates an explicit Matrix OpenID token
-  against the fixed internal Synapse origin, or, for a server on the effective federation
-  allow-list (owner decision D3, 2026-10-11), against that server's
-  `/_matrix/federation/v1/openid/userinfo` found through its `/.well-known/matrix/server`
-  (else `<name>:8448`; no SRV), with `fedHTTP`: dial-time refusal of Synapse's default
-  blocklist ranges (`blockedPeerRanges`, plus unspecified and IPv4-mapped), no proxy, 8 s,
-  4 KiB, no redirects except up to three https ones for the well-known (the spec says to
-  follow them; mozilla.org answers 301). Any other server is refused before any network call; the token's
-  `sub` must belong to the server that verified it. A local caller must be active in the
-  directory and MAS, and gets the LiveKit room created; a remote caller only joins a room that
-  already exists (a local user started the call; 403 otherwise, never `Create`). Both need
-  Matrix room membership in a room that is not closed (`RoomAdmin.Blocked`: a closed room
-  keeps its remote members) before a scoped 15-second grant. These two exact paths alone use CORS `*`, no credentials,
-  no cookie authentication/CSRF, bounded JSON and per-IP throttling. They are `tracked` so the
-  shutdown drain covers their store reads. Caller URLs and delayed-delegation fields are not used.
-  `ReconcileCalls` removes inactive accounts, users of servers no longer on the effective
-  allow-list (at once, without waiting for Synapse to restart), removed room members and
-  everyone in a closed room's call through LiveKit. It fails closed: when MAS or the directory
-  cannot confirm local users, every local participant is removed, and with unreadable
-  federation settings every remote one. Access evictions run first for every room (no Synapse
-  call), then membership for the rooms with someone left, through one `AsConsole` session per
-  run. A room whose participants or membership cannot be read is skipped and its error joined;
-  one with invalid metadata keeps nobody. A missing room has no members; other read failures
-  remain failures (`rtc_reconcile_test.go`). `cmd/server` gives each run `callReconcileTimeout`
-  (30s). Errors and logs omit caller tokens.
-- `GET /.well-known/matrix/client` (unauthenticated, registered before the SPA catch-all) returns `{"m.homeserver":{"base_url":<KY_MATRIX_HOST>}}` plus `org.matrix.msc4143.rtc_foci` pointing at the console call-authorizer when calling is configured, with `Access-Control-Allow-Origin: *`, no credentials header and no HSTS; JSON 404 when Matrix is not configured. `ServeHTTP` answers its `OPTIONS` preflight from any origin, the app's own included (200, `*`, no credentials), before the app-origin preflight rule (`wellknown_test.go`).
-- `GET /api/settings` always carries `chat_url` (the Element origin, empty when Matrix is not configured) in the public tier; the members' "Open chat" link reads it.
-- `GET /api/settings` tiers its payload: public fields for the login screen, `db_driver`/`scim_enabled` for any session, and `extra_settings` for admins only; KyRecovery tokens are omitted in both sealed and legacy plaintext forms, dropped by the `kyrecovery_token` key prefix rather than by literal key name. `extra_settings` never carries the keys in `notExtra` (`brand_logo`, served at `/app-icon.png`; the sync records `kyidentity_webhook_last` and `matrix_sweep_last`, served by sync-status). `app_name` is the effective name (`brand_name`, else `KY_APP_NAME`; the default on a store error).
-- Console routes (table below: `matrix_handlers.go`, `health_handlers.go`, `audit_handlers.go`, `room_handlers.go`, `branding_handlers.go`, `sync_handlers.go`) are admin-only and `no-store`; the fresh ones are `requireFreshAdmin`, `tracked` and run on a detached context. `/api/admin/health` probes in parallel: without Matrix only `kymessages` and `database`; with Matrix also `synapse`, `mas`, `element`, `postgres`, `livekit` (when calling is configured, authenticated `ListRooms`, runtime version unknown) and `synapse-admin`, which proves Synapse admin access through `MatrixAdmin.AsConsole` and `RoomAdmin`, a `synapseadmin.Client` on the probes' Synapse origin. Audit `kind` is `auth|backup|branding|matrix|scim`; a present but empty or unknown value is 400; details are returned to admins, accepted. `limit` is 1-100, `offset` non-negative. Matrix routes answer 404 `matrix_disabled` until `SetMatrixAdmin` is called; `cmd/server` passes the same `matrixsync.Client` the sweep uses, so both share one token. Path IDs must be ULIDs. Audit kinds map to action prefixes: `auth` = `auth.`, `device.`, `sso.`; `backup` = `backup.`, `admin.backup_`, `restore.`; `branding` = `admin.brand_`; `matrix` = `matrix.`, `agent.`; `scim` = `scim.`. Rows with no user show actor `system`; `scim.*` rows show `scim` (their user ID is the provisioned user). Actor and target are clipped to 200 bytes of valid UTF-8 (`clip200`), outcome to 1024, details to 4096 and IP to 64 (`clipTo`), because stored fields are unbounded and the web refuses a page with an oversized field. Finish audits `matrix.session_end` with resource the MXID (empty when MAS could not name the user) and details `outcome=... session=... kind=...` (`outcome` is `ended`, `already_ended`, `error: ...` or `refused: no user`); the outcome is shortened by whole runes until details fit AuditSafe's 200 bytes. Session IP and user agent are shown to admins and never logged or audited. Room routes act through `MatrixAdmin.AsConsole` and `RoomAdmin`; `search` is at most 255 bytes, `closed` is Synapse's block flag, read per listed room, `remote_members` is joined minus joined-local members (people on other servers keep a closed room), and a close or delete is polled via delete-status. Close is final (block, members leave, history kept; no reopen); closing a closed, empty room is `already_closed`. The steps before the final Close or Delete get `roomChangeTimeout` (2m); that call gets its own `roomStartTimeout` (30s), and if it fails other than by Synapse's refusal the jobs are read again and a job not listed before is answered and audited as `started` with its `delete_id` (a lost reply must not hide an irreversible purge); with none listed, a failure that is not Synapse's own answer is audited as `error: no reply, the job may have started: ...`. The sum stays inside the 5-minute console session. The reply's write deadline is `roomWriteTimeout`: the budget plus `roomAfterBudget` (detached mint and revoke, final call, jobs recheck, audit write) plus 5s to write. Delete's body is exactly one JSON object with only `confirm` (unknown fields and trailing data are 400). Delete rechecks `confirm` against `confirm_text` (the name as shown, clipped to 200 bytes, or the room ID when the name is empty, starts or ends with whitespace, or holds control or format characters), then starts the purge. Delete removes no media: Synapse attributes to a room any local media its plaintext events name (forwarded images, an upgraded room's avatar, a reference planted by a member), which other rooms may still use, so the room's attachments and avatars stay in the media store. A change is refused with 409 while a listed job is scheduled or active, and on Synapse's own 400 "already in progress". Room IDs are checked against `roomIDPattern` (`!opaque[:server[:port]]`, at most 255 bytes, never `/`) before any Synapse call; otherwise 400. Errors: 404 `No such room`, 502 `Synapse admin access is not working: <cause>`. They audit `matrix.room_close` and `matrix.room_delete` with resource the room ID and details `outcome="..." [delete_id="..."]` via `auditFields` (outcome first, all quoted, shortened to 200 bytes); outcomes `started`, `already_closed`, `refused: confirmation does not match`, `refused: a close or delete is running`, `error: ...`. A malformed body or invalid ID is not audited. Room names and member lists are never logged or audited. The audit view's outcome comes from `detailOutcome`, which trusts an outcome only when the whole details string is `key="quoted"` tokens separated by single spaces; older unquoted rows show none.
+- `Server.OnDirectoryChange(fn)` registers a callback run after each acknowledged KyIdentity directory webhook (never after a refused one); it must not block, as the sender is waiting.
+- `GET /api/settings` tiers its payload: public fields for the login screen, `db_driver`/`scim_enabled` for any session, and `extra_settings` for admins only; KyRecovery tokens are omitted in both sealed and legacy plaintext forms, dropped by the `kyrecovery_token` key prefix rather than by literal key name. `extra_settings` never carries the keys in `notExtra` (`brand_logo`, served at `/app-icon.png`; `kyidentity_webhook_last`) or `installer.*` keys. `app_name` is the effective name (`brand_name`, else `KY_APP_NAME`; the default on a store error).
+- Console routes (`health_handlers.go`, `audit_handlers.go`, `branding_handlers.go`, `agent_handlers.go`) are admin-only and `no-store`; the fresh ones are `requireFreshAdmin`, `tracked` and run on a detached context. `/api/admin/health` probes `kymessages`, `database`, and (when `KY_LIVEKIT_*` is configured) `livekit` in parallel. Audit `kind` is `auth|backup|branding|agents|scim`; a present but empty or unknown value is 400. `limit` is 1-100, `offset` non-negative. Audit kinds map to action prefixes: `auth` = `auth.`, `device.`, `sso.`; `backup` = `backup.`, `admin.backup_`, `restore.`; `branding` = `admin.brand_`; `agents` = `agent.`; `scim` = `scim.`. Rows with no user show actor `system`; `scim.*` rows show `scim` (their user ID is the provisioned user). Actor and target are clipped to 200 bytes of valid UTF-8 (`clip200`), outcome to 1024, details to 4096 and IP to 64 (`clipTo`). The audit view's outcome comes from `detailOutcome`, which trusts an outcome only when the whole details string is `key="quoted"` tokens separated by single spaces; older unquoted rows show none.
 
 | Method | Path | Handler | Guard | Response |
 |---|---|---|---|---|
-| GET | `/api/admin/matrix/users?search&offset&limit` | `handleMatrixUsers` | admin | MAS users joined to the KyIdentity directory; status `active\|locked\|deactivated\|not_linked` |
-| GET | `/api/admin/matrix/users/{id}/sessions` | `handleMatrixUserSessions` | admin | the user's MAS sessions |
-| POST | `/api/admin/matrix/sessions/{kind}/{id}/finish` | `handleMatrixSessionFinish` | fresh | `ended` or `already_ended` |
-| GET | `/api/admin/health` | `handleHealth` | admin | per-component status, version, Compose pin, error |
+| GET | `/api/admin/health` | `handleHealth` | admin | per-component status, version, error |
 | GET | `/api/admin/audit?kind&offset&limit` | `handleAudit` | admin | `{records, total, offset, limit}`, newest first |
-| GET | `/api/admin/matrix/sync-status` | `handleSyncStatus` | admin | `{webhook, rejected, sweep, kyidentity_url}` |
-| GET | `/api/admin/matrix/rooms?search&offset&limit` | `handleRooms` | admin | `{rooms, total, offset, limit}` |
-| GET | `/api/admin/matrix/rooms/{id}` | `handleRoom` | admin | `{room, members, members_total, confirm_text, jobs}`; at most 1000 members, never messages |
-| GET | `/api/admin/matrix/rooms/{id}/delete-status` | `handleRoomJobs` | admin | `{jobs:[{delete_id, status}]}`; the room need not exist |
-| POST | `/api/admin/matrix/rooms/{id}/close` | `handleRoomClose` | fresh | `{outcome: started\|already_closed, delete_id}` |
-| POST | `/api/admin/matrix/rooms/{id}/delete` | `handleRoomDelete` | fresh | as close; body `{"confirm":...}` |
-| GET | `/api/admin/branding` | `handleBranding` | admin | `{name, stored_name, default_name, logo, element}` |
+| GET | `/api/admin/branding` | `handleBranding` | admin | `{name, stored_name, default_name, logo}` |
 | PUT | `/api/admin/branding/name` | `handleBrandName` | fresh | the branding view |
 | PUT | `/api/admin/branding/logo` | `handleBrandLogo` | fresh | the branding view |
 | DELETE | `/api/admin/branding/logo` | `handleBrandLogoReset` | fresh | the branding view |
 
-- Branding (`branding_handlers.go`): `GET /api/admin/branding` (admin, `no-store`) answers `{name, stored_name, default_name, logo:{custom, sha256, size}, element}`; `element` (`{brand?, error?, served?, served_error?, restart_hint}`: `brand` read from Element's file, with the last reconcile error while the brand differs; `served` the brand Element serves, fetched from `<Element>/config.json` with the probes' client (no proxy, no redirects, `probeTimeout`, 64 KiB, only `brand` parsed via `branding.ParseBrand`), else `served_error`) is present only with Matrix configured. Element's image serves a copy made at start, so `served` lags a rename until Element restarts; `restart_hint` is `KY_MATRIX_ELEMENT_RESTART_HINT`, the command Settings shows for that. `PUT /api/admin/branding/name` (`{"name"}`, strict; blank resets to `KY_APP_NAME`; 400 when `branding.ValidateName` refuses), `PUT /api/admin/branding/logo` (raw body: 415 unless `image/png`, 413 over 1 MiB through the handler's own `MaxBytesReader`, 400 when `branding.NormalizePNG` refuses) and `DELETE /api/admin/branding/logo` are `requireFreshAdmin`, `tracked`, run on a detached 10 s context and answer the same view. Settings: `brand_name`, and `brand_logo` (base64 of the normalised PNG); both travel in the capsule. The effective name is display only: capsules, pairing, local copies and backup status keep `KY_APP_NAME` (`TestBrandNameNeverRenamesTheService`). Audit `admin.brand_name` (`outcome old new`, names clipped to 40 bytes) and `admin.brand_logo` (`outcome sha256 size`, or `outcome="reset"`), success and failure after authentication and input parsing; refusals are `refused: <reason>`, never the bytes. A malformed name body is not audited.
-- `Server.ReconcileBrand` patches Element's `brand` (`<KY_MATRIX_DIR>/element/config.json`) to the effective name under `brandMu`, the file's only writer in this process: after each name save, and from `cmd/server`'s maintenance loop at start and every minute. It never creates the file, writes only on change, refuses to write on a store read error, and logs a failure once per streak; the saved name stands, and Settings shows Element's value and the error. It is a no-op without Matrix.
-- Federation (`federation_handlers.go`, `federation_presets.go`; owner decisions D1–D5 in
-  `docs/superpowers/plans/2026-10-11-federation-opt-in.md`). Settings `federation_level`
-  (`closed` default, `manual`, `curated`), `federation_servers` and `federation_presets` (JSON
-  lists of server names) are the source of truth. The effective allow-list is the manual
-  servers plus, at `curated` only, ticked presets still in this release's compiled
-  `federationPresets` (never fetched; only entries that passed the vetting criteria in that
-  file, with the evidence and check date beside each; `TestShippedFederationPresetsAreWellFormed`); `closed` is empty. `ReconcileFederation` writes Synapse's federation file
-  (`<KY_MATRIX_DIR>/federation/federation.yaml`) through `matrixinit.WriteFederation` under
-  `fedMu`, only on change and never after a settings read error (a broken store neither opens
-  nor closes federation); it runs after each change and from `cmd/server`'s maintenance loop at
-  start and every minute, so hand edits are undone. Synapse applies the file at its next start:
-  the view's `restart_hint` is `KY_MATRIX_SYNAPSE_RESTART_HINT`. Before each write the servers it
-  takes off (the old file's allow-list minus the new) join setting `federation_unapplied` (a
-  server allowed again leaves it); the view's `unapplied` lists them until the running Synapse is
-  seen refusing each one. `synapseRefuses` sends Synapse a federation request claiming that
-  origin with a bogus signature: Synapse checks its allow-list before the signature, so 403
-  `M_FORBIDDEN` (not allowed) or 404 `M_UNRECOGNIZED` (not federating) means applied; anything
-  else, a timeout or Synapse down keeps it listed. It runs (under `fedMu`, `probeTimeout` each, in
-  parallel) on `GET /api/admin/federation` and after each `ReconcileFederation`, never after a
-  change. While a server is still allowed, its probe makes Synapse fetch that server's keys
-  (`federation_pending_test.go`). Routes are `requireAdmin`;
-  changes are `tracked`, detached (`fedTimeout`) and audited (`matrix.federation_level`
-  resource the new level, `matrix.federation_server` and `matrix.federation_preset` resource
-  the name, details `outcome=...`: `changed from <level>`, `added`, `removed`, `ticked`,
-  `unticked`, `unchanged`, `refused: ...`, `error: ...`). A change that widens (a higher level,
-  an added server, a ticked preset) needs a sign-in from the last `stepUpWindow`, checked in
-  `fedChange` before anything is saved (`writeStepUp`, the same refusal as
-  `requireFreshAdmin`); narrowing never does, so closing is always one click. Names are
-  lowercased and trimmed, then refused unless a `matrixinit.ValidServerName` that is not an IP
-  literal or this server's own name; at most `matrixinit.MaxFederationServers` servers and
-  presets together. `GET /.well-known/matrix/server` (public discovery like the client file: `publicDiscovery` sets CORS `*`, no credentials, no HSTS, and answers its preflight from any origin) answers
-  `{"m.server":"<KY_MATRIX_HOST host>:443"}` (its port when set) at `manual` or `curated`, else
-  JSON 404, as on a server without federation. `GET /api/admin/federation/status` probes each
-  effective server through one `AsConsole` session in parallel, `fedProbeTimeout` each (the
-  account checks have `fedSetupBudget`; the probes start fresh after the mint; the write
-  deadline, `fedStatusWriteTimeout`, sums setup, mint, probes, revoke and the write), with
-  `GET /_matrix/client/v3/profile/@kymessages-federation-check:<name>` on Synapse: 200 or 404
-  `M_NOT_FOUND` `connected`; 403 `M_FORBIDDEN` `not_allowed` (either side's allow-list,
-  ours included until Synapse restarts; message text is never matched); 404 `M_UNRECOGNIZED`
-  `federation_off`; 502 `unreachable` (Synapse's default blocklist refuses private
-  addresses the same way); anything else `unknown`. Measured on Synapse 1.162 (plan Task 0).
-  The app opens no outbound connection for it.
+- Branding (`branding_handlers.go`): `GET /api/admin/branding` (admin, `no-store`) answers `{name, stored_name, default_name, logo:{custom, sha256, size}}`. `PUT /api/admin/branding/name` (`{"name"}`, strict; blank resets to `KY_APP_NAME`; 400 when `branding.ValidateName` refuses), `PUT /api/admin/branding/logo` (raw body: 415 unless `image/png`, 413 over 1 MiB through the handler's own `MaxBytesReader`, 400 when `branding.NormalizePNG` refuses) and `DELETE /api/admin/branding/logo` are `requireFreshAdmin`, `tracked`, run on a detached 10 s context and answer the same view. Settings: `brand_name`, and `brand_logo` (base64 of the normalised PNG); both travel in the capsule. The effective name is display only: capsules, pairing, local copies and backup status keep `KY_APP_NAME` (`TestBrandNameNeverRenamesTheService`). Audit `admin.brand_name` (`outcome old new`, names clipped to 40 bytes) and `admin.brand_logo` (`outcome sha256 size`, or `outcome="reset"`), success and failure after authentication and input parsing; refusals are `refused: <reason>`, never the bytes. A malformed name body is not audited.
+- Agents (`agent_handlers.go`): native chat bot/agent accounts in `store.Agents()`, scoped to the caller's tenant in multi-tenant mode. Create takes `{name, owner}` strictly: `name` matches `^agent-[a-z0-9-]{1,32}$`; `owner` is the ID of an active non-bot user in the same org. Tokens have the `kybot_` prefix; only the SHA-256 hash is stored. Create and rotate are the only replies with a plaintext token (`no-store`, with `agentskill.Config` blocks per runtime for `KY_APP_URL` and the owner's username); it is never stored, logged or audited. All changes are `tracked`, run detached (`agentTimeout`) and audit `agent.create|rotate|revoke|delete`. `ExpireIdleAgents` (hourly from `cmd/server`) revokes active tokens unused for 90 days (`agentIdle`) or whose owner is no longer active, auditing `agent.expire`.
 
 | Method | Path | Handler | Guard | Response |
 |---|---|---|---|---|
-| GET | `/api/admin/federation` | `handleFederation` | admin | `{level, server_name, servers:[{name}], presets:[{name, operator, open_signup, source, checked, ticked}], restart_hint, file_error?, unapplied:[name]}` |
-| GET | `/api/admin/federation/status` | `handleFederationStatus` | admin | `{statuses: {name: connected\|not_allowed\|federation_off\|unreachable\|unknown}}` |
-| PUT | `/api/admin/federation/level` | `handleFederationLevel` | admin; fresh to widen | the view; body `{"level"}` |
-| POST | `/api/admin/federation/servers` | `handleFederationAddServer` | fresh | the view; body `{"name"}` |
-| DELETE | `/api/admin/federation/servers/{name}` | `handleFederationRemoveServer` | admin | the view; 404 when not listed |
-| PUT | `/api/admin/federation/presets/{name}` | `handleFederationPreset` | admin; fresh to tick | the view; body `{"ticked"}`; 404 for an unlisted preset |
-
-- Agents (`agent_handlers.go`; plan `docs/superpowers/plans/2026-10-14-agent-accounts.md`):
-  chat agent accounts in the `store.Agents()` registry, through `MatrixAdmin`'s agent methods;
-  404 `matrix_disabled` without Matrix. Create takes `{name, owner}` strictly: `name` matches
-  `^agent-[a-z0-9-]{1,32}$`; `owner` is the KyMessages ID of an active KyIdentity member who
-  has a MAS account (else 409); refused when MAS holds the name (`matrixsync.ErrNameTaken`) or a
-  member's email gives the same localpart (`localpart`, mirroring matrixinit's claims
-  template). It creates the MAS user, a random 16-char `[A-Z0-9]` device and a personal session
-  with no expiry; if the row cannot be written the session is revoked (the unregistered MAS user
-  is locked by the sweep). Rotate regenerates a live session on the same device, or with no
-  session (revoked, expired: Synapse deleted the device) mints one on a new device. Revoke and
-  delete revoke the session (deleting the device); delete then deactivates the MAS user and
-  drops the row. Create and rotate are the only replies with a token (`no-store`, with
-  `agentskill.Config` blocks per runtime for the owner's MXID and `KY_MATRIX_HOST`); it is
-  never stored, logged or audited. All changes are `tracked`, run detached (`2*masTimeout`) and
-  audit `agent.create|rotate|revoke|delete` with resource the agent's MXID and details
-  `outcome=...` (`created`, `rotated`, `reissued on a new device`, `revoked`, `deleted`,
-  `refused: ...`, `error: ...`). Path IDs are UUIDs (400 otherwise, 404 unknown).
-  `ExpireIdleAgents` (hourly from `cmd/server`) revokes active tokens whose `Activity.Since` is
-  90 days old (`agentIdle`), state `expired`, audit `agent.expire` (no user, details with
-  `idle_since`); an unreadable activity never revokes and is returned as an error. The call
-  authorizer never sees agents as active (no KyIdentity link), so agents get no LiveKit grant.
-
-| Method | Path | Handler | Guard | Response |
-|---|---|---|---|---|
-| GET | `/api/admin/agents` | `handleAgents` | admin | `{agents:[{id, username, mxid, device_id, owner:{id, username, display_name, mxid, status}, token_state, locked, last_used_at, last_used_error?, created_at}], owners:[...], idle_days}` |
+| GET | `/api/admin/agents` | `handleAgents` | admin | `{agents:[{id, user_id, username, display_name, owner:{id, username, display_name, status}, token_state, last_used_at, created_at}], owners:[...], idle_days}` |
 | GET | `/api/admin/agents/skill` | `handleAgentSkill` | admin | the skill folder as `application/zip` |
 | POST | `/api/admin/agents` | `handleAgentCreate` | fresh | `{agent, token, configs:{openclaw, hermes}}` |
 | POST | `/api/admin/agents/{id}/rotate` | `handleAgentRotate` | fresh | as create |
-| POST | `/api/admin/agents/{id}/revoke` | `handleAgentRevoke` | admin (one click, like narrowing federation) | `{outcome:"revoked"}` |
+| POST | `/api/admin/agents/{id}/revoke` | `handleAgentRevoke` | admin | `{outcome:"revoked"}` |
 | DELETE | `/api/admin/agents/{id}` | `handleAgentDelete` | fresh | `{outcome:"deleted"}` |
 
-- `GET /app-icon.png` (public: the login page and Element's sign-in page) serves the stored logo as `image/png` with `Cache-Control: no-cache` and an `ETag` of the quoted SHA-256 (304 on `If-None-Match`, via `http.ServeContent`), else the embedded stamp, also `no-cache`, so a new logo or a reset shows on the next load.
-- `GET /api/admin/matrix/sync-status` (`sync_handlers.go`; admin, `no-store`; 404 `matrix_disabled` without Matrix) answers `{webhook: sso.WebhookRecord|null, rejected: sso.Rejections, sweep: matrixsync.SweepRecord|null, kyidentity_url}`. It only reads the records; their only writers are `internal/sso` and `internal/matrixsync`. An unreadable record shows as null. `kyidentity_url` is `KY_KYIDENTITY_ISSUER`. Hints are the page's.
-
+- `GET /app-icon.png` (public) serves the stored logo as `image/png` with `Cache-Control: no-cache` and an `ETag` of the quoted SHA-256 (304 on `If-None-Match`, via `http.ServeContent`), else the embedded stamp, also `no-cache`, so a new logo or a reset shows on the next load.
 - Private installer IPC validates the live snapshot and reports pending graceful activation;
   it is separate from public HTTP. Its transport answers any refusal with a generic 409, so
   `ApplyInstaller` logs the reason as `[INSTALLER] setup refused: ...`
   (`TestInstallerRefusalReasonIsLogged`); bundles carry file references, so no reason holds a secret. `GET /api/installer/network` deliberately exposes only
   `clientIp`, `proxyHeadersTrusted`, `scheme`, with `no-store`, using native peer trust.
 - `POST /api/installer/directory` and the managed suite sync alias verify the protected
-  HMAC credential before owned, revision-fenced authority updates and wake the MAS sweep.
-- Managed owner settings omit ordinary `chat_url`; installer ownership is omitted from
-  `extra_settings`. MAS assignment separation remains a central composition gate.
+  HMAC credential before owned, revision-fenced authority updates.
+- Installer ownership settings (`installer.*`) are omitted from `extra_settings`.
 
 ## Verification
 - `go test -v ./internal/api/...` (`authz_test.go` pins the per-role exposure of every privileged route; `backup_test.go` the backup routes, on SQLite only because a run snapshots the database)
