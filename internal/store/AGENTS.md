@@ -36,6 +36,18 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
 - Migration 20 renames the stored suite provider `kysignon` to `kyidentity` in `users.sso_provider`, `directory_sync_state` and `directory_sync_events`; its SQL is idempotent.
 - Migration 14 rebuilds `device_pairings` without the six-digit code column; pending pairings (90 s) are dropped on upgrade.
 - Migration 24 replaces the legacy `agents` table with the native chat bot/agent registry (`AgentStore`): `user_id`, unique `username`, `owner_user_id`, SHA-256 `token_hash`, and `token_state` (`active` with a non-empty hash; `revoked` or `expired` with an empty hash, enforced on every write). It never stores a plaintext token. `SetAgentToken` and `DeleteAgent` answer `ErrNotFound` for no row.
+- Migration 31 adds the end-to-end encryption key server (`E2EEStore`): `e2ee_devices`
+  (identity keys never change; a different upload is `ErrE2EEKeyMismatch`), `e2ee_one_time_keys`
+  keyed by `(user_id, device_id, fallback, key_id)` because vodozemac numbers one-time and
+  fallback keys with separate counters, and the `e2ee_to_device` mailbox. `ClaimOneTimeKey`
+  marks one key per call `claimed` (a tombstone, so a retried upload cannot republish it; the
+  rows go with the device), never the same key twice (`FOR UPDATE SKIP LOCKED` on PostgreSQL);
+  while keys remain but are all locked by other claims it retries with a short backoff (2 s
+  budget), and only with none left does it return the live fallback key, without deleting it. A new fallback key retires the old one as a tombstone, so a stale retry cannot restore a retired fallback. `AddOneTimeKeys` enforces its cap
+  after the insert inside the transaction, so a retried upload never trips it; on PostgreSQL it
+  first locks the device row (`FOR UPDATE`) so concurrent uploads cannot both pass the cap. Mail has no
+  cursor: `ToDevice` returns the oldest unacknowledged rows and `AckToDevice` deletes exactly the
+  IDs named, because PostgreSQL IDs commit out of order. Only public keys and ciphertext are stored.
 - `store.Open(ctx, cfg)` initializes and auto-migrates the configured database backend.
   `migrations.Run` refuses with `ErrNewerSchema` a database whose `schema_migrations` holds a
   version above this build's newest (image rollback, or a capsule from a newer build), before

@@ -97,6 +97,7 @@ jobs:
             Vulnerability scan
             End-to-end smoke test
             Docker image build & run
+            Crypto core (Rust/WASM)
         run: |
           set -euo pipefail
           sha="$(git rev-parse HEAD)"

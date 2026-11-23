@@ -61,7 +61,13 @@ WAL archiving) alongside off-host copies of `data/encryption.key`, `data/attachm
 After extraction, `kymessages restore` verifies a nonempty SQLite file and a valid 32-byte hex
 deployment key, runs migrations (refusing a database created by a newer build: restore with that
 build or newer), and in one transaction invalidates all pre-backup sessions, MFA challenges,
-device pairings, and Web Push subscriptions while recording `restore.grants_invalidated`.
+device pairings, and Web Push subscriptions while recording `restore.grants_invalidated`. It
+also marks every end-to-end encryption one-time key claimed and deletes all to-device mail: a
+key claimed after the backup would otherwise be handed out again although its device already
+spent it, and restored mail was already read. The claimed keys stay as tombstones, so a device
+retrying an old upload cannot publish them again. Fallback keys are retired too, since a device may
+have rotated past the restored one. Devices upload new one-time keys when their count runs low,
+and a new fallback key when the upload response says `has_fallback_key: false`.
 
 If extraction or preparation fails, extracted files are removed via directory handle and the
 command exits non-zero; nothing partial is left to serve. Repeat into a fresh empty directory.

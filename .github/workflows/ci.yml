@@ -138,6 +138,36 @@ jobs:
         run: npm audit --audit-level=high
         working-directory: web
 
+  crypto:
+    name: Crypto core (Rust/WASM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: web/crypto
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # rust-toolchain.toml pins the compiler and the wasm32 target; rustup installs them.
+      - name: wasm-bindgen-cli
+        run: cargo install --locked wasm-bindgen-cli --version 0.2.130
+
+      - name: Tests (wasm under Node)
+        run: cargo test --locked
+
+      - name: Clippy
+        run: rustup component add clippy && cargo clippy --locked --all-targets -- -D warnings
+
+      # The committed module is what web/dist bundles; it must be what this source builds.
+      - name: Committed web/src/crypto/pkg matches source
+        run: |
+          ./build.sh
+          dirty="$(git status --porcelain -- ../src/crypto/pkg)"
+          if [ -n "$dirty" ]; then printf '%s\n' "$dirty"; git diff --stat -- ../src/crypto/pkg; exit 1; fi
+
   browser:
     name: Browser regressions (production server)
     runs-on: ubuntu-latest

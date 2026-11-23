@@ -266,6 +266,8 @@ ALTER TABLE mfa_challenges ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';`,
 	{Version: 29, Name: "suite_replay_events", SQLite: suiteReplayEventsSchema, Postgres: suiteReplayEventsSchema},
 	// Coarse suite status inputs (KyCalendar busy blocks, KyPost out-of-office, manual status).
 	{Version: 30, Name: "suite_presence", SQLite: presenceSchema, Postgres: presenceSchema},
+	// End-to-end encryption key server: public device keys, one-time keys, to-device mailbox.
+	{Version: 31, Name: "e2ee_keys", SQLite: e2eeSchema + e2eeToDeviceSQLite, Postgres: e2eeSchema + e2eeToDevicePostgres},
 }
 
 const multiTenancySchemaSQLite = `
@@ -310,6 +312,68 @@ CREATE TABLE IF NOT EXISTS presence (
 	busy TEXT NOT NULL DEFAULT '',
 	PRIMARY KEY (tenant_id, user_id)
 );
+`
+
+// Only public keys and ciphertext live here (docs/superpowers/specs/2026-11-22-e2ee-design.md).
+const e2eeSchema = `
+CREATE TABLE IF NOT EXISTS e2ee_devices (
+	user_id VARCHAR(64) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	device_id VARCHAR(64) NOT NULL,
+	tenant_id VARCHAR(64) NOT NULL,
+	curve25519 VARCHAR(64) NOT NULL,
+	ed25519 VARCHAR(64) NOT NULL,
+	signature VARCHAR(128) NOT NULL,
+	created_at BIGINT NOT NULL,
+	PRIMARY KEY (user_id, device_id)
+);
+CREATE INDEX IF NOT EXISTS idx_e2ee_devices_tenant ON e2ee_devices(tenant_id, user_id);
+CREATE TABLE IF NOT EXISTS e2ee_one_time_keys (
+	user_id VARCHAR(64) NOT NULL,
+	device_id VARCHAR(64) NOT NULL,
+	key_id VARCHAR(64) NOT NULL,
+	key_value VARCHAR(64) NOT NULL,
+	signature VARCHAR(128) NOT NULL,
+	fallback INTEGER NOT NULL DEFAULT 0,
+	-- A claimed key stays as a tombstone, so a retried upload cannot publish it again.
+	claimed INTEGER NOT NULL DEFAULT 0,
+	-- vodozemac numbers one-time and fallback keys with separate counters, so IDs collide.
+	PRIMARY KEY (user_id, device_id, fallback, key_id),
+	FOREIGN KEY (user_id, device_id) REFERENCES e2ee_devices(user_id, device_id) ON DELETE CASCADE
+);
+`
+
+const e2eeToDeviceSQLite = `
+CREATE TABLE IF NOT EXISTS e2ee_to_device (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	tenant_id VARCHAR(64) NOT NULL,
+	recipient_user VARCHAR(64) NOT NULL,
+	recipient_device VARCHAR(64) NOT NULL,
+	sender_user VARCHAR(64) NOT NULL,
+	sender_device VARCHAR(64) NOT NULL,
+	type VARCHAR(64) NOT NULL,
+	content TEXT NOT NULL,
+	created_at BIGINT NOT NULL,
+	FOREIGN KEY (recipient_user, recipient_device) REFERENCES e2ee_devices(user_id, device_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_e2ee_to_device_recipient ON e2ee_to_device(recipient_user, recipient_device, id);
+CREATE INDEX IF NOT EXISTS idx_e2ee_to_device_created ON e2ee_to_device(created_at);
+`
+
+const e2eeToDevicePostgres = `
+CREATE TABLE IF NOT EXISTS e2ee_to_device (
+	id BIGSERIAL PRIMARY KEY,
+	tenant_id VARCHAR(64) NOT NULL,
+	recipient_user VARCHAR(64) NOT NULL,
+	recipient_device VARCHAR(64) NOT NULL,
+	sender_user VARCHAR(64) NOT NULL,
+	sender_device VARCHAR(64) NOT NULL,
+	type VARCHAR(64) NOT NULL,
+	content TEXT NOT NULL,
+	created_at BIGINT NOT NULL,
+	FOREIGN KEY (recipient_user, recipient_device) REFERENCES e2ee_devices(user_id, device_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_e2ee_to_device_recipient ON e2ee_to_device(recipient_user, recipient_device, id);
+CREATE INDEX IF NOT EXISTS idx_e2ee_to_device_created ON e2ee_to_device(created_at);
 `
 
 const pushSubscriptionsSchema = `
