@@ -116,7 +116,9 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   purge deletes a deleted org's attachments in batches (`PurgeAttachmentBatch`, the caller deletes
   the blobs, then `DeleteAttachmentRows`), then every other row child first (`PurgeTenantRows`,
   under the upload commit's tenant lock), and after the caller deletes the org's blob prefix it
-  marks the org purged (`MarkTenantPurged`, audited `tenancy.org_purged`). The `tenants` row stays
+  removes every per-person erasure workflow row (`user_subjects`, `pending_blob_deletes`,
+  `user_erasure_state`, `user_erasure_actors`) in the row transaction, then marks the org purged
+  (`MarkTenantPurged`, audited `tenancy.org_purged`). The `tenants` row stays
   as a tombstone. With `ActiveUploader`, a commit also needs its org active, so an upload in
   flight when its org is deleted commits nothing. `ApplyTenantLifecycle` clears `missing_since`.
   Room webhooks go by the `rooms` cascade (the E2EE build drops that table); a new table with

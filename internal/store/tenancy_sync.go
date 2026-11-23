@@ -171,6 +171,7 @@ func (c *chatStore) PurgeTenantRows(ctx context.Context, tenantID string) error 
 		{`DELETE FROM users WHERE org_id = ?`, []any{tenantID}},
 		{`DELETE FROM user_subjects WHERE org_id = ?`, []any{tenantID}},
 		{`DELETE FROM pending_blob_deletes WHERE tenant_id = ?`, []any{tenantID}},
+		{`DELETE FROM user_erasure_actors WHERE tenant_id = ?`, []any{tenantID}},
 		{`DELETE FROM user_erasure_state WHERE tenant_id = ?`, []any{tenantID}},
 	} {
 		if _, err := tx.ExecContext(ctx, c.store.rebind(s.q), s.args...); err != nil {
