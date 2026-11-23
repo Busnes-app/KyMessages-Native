@@ -351,12 +351,13 @@ export const SearchModal: React.FC<SearchModalProps> = ({ userId, rooms, activeR
       return;
     }
     let cancelled = false;
+    const abort = new AbortController();
     setSearching(true);
     setHits([]);
     setErr('');
     const timer = setTimeout(() => {
       void searchIndexFor(userId)
-        .then((index) => index.search(trimmed, scopeCurrent && activeRoomId ? activeRoomId : undefined))
+        .then((index) => index.search(trimmed, scopeCurrent && activeRoomId ? activeRoomId : undefined, 50, abort.signal))
         .then((res) => {
           if (!cancelled) setHits(res);
         })
@@ -370,6 +371,7 @@ export const SearchModal: React.FC<SearchModalProps> = ({ userId, rooms, activeR
 
     return () => {
       cancelled = true;
+      abort.abort();
       clearTimeout(timer);
     };
   }, [query, scopeCurrent, activeRoomId, userId]);

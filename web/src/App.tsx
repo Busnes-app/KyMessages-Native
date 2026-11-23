@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Loader2, Mic, MicOff } from 'lucide-react';
 import { AppHeader } from './components/AppHeader';
 import { Dashboard } from './pages/Dashboard';
@@ -20,7 +20,7 @@ import './ky-ui/tokens.css';
 import './ky-ui/navigation.css';
 import { errorMessage, secureFetch } from './api';
 import { browserPushEndpoint, unsubscribeBrowserPush } from './chat/push';
-import { forgetSearchIndex } from './chat/searchIndex';
+import { announceSignOut, forgetSearchIndex, onSignOutElsewhere } from './chat/searchIndex';
 import { parseSettings, parseUser, type SessionUser, type SiteSettings } from './dto';
 import { ErrorBoundary } from './components/ErrorBoundary';
 
@@ -34,6 +34,26 @@ export const App: React.FC = () => {
   const meetToken = extractMeetToken();
   const [user, setUser] = useState<SessionUser | null>(null);
   const [notice, setNotice] = useState('');
+  const signedInRef = useRef(false);
+  signedInRef.current = user !== null;
+
+  // Leaving the signed-in app: unmount it (so nothing reopens the search index), then delete the
+  // index and say if that failed, so a shared browser is not left holding readable history.
+  const leave = useCallback(async (message: string) => {
+    setActiveCallSummary(null);
+    setUser(null);
+    try {
+      await forgetSearchIndex();
+      setNotice(message);
+    } catch {
+      setNotice(`${message} This browser could not delete its message search index: close every KyMessages tab, then sign in and out again.`.trim());
+    }
+  }, []);
+
+  // A sign-out in another tab signs this one out too, even if its WebSocket missed the revocation.
+  useEffect(() => onSignOutElsewhere(() => {
+    if (signedInRef.current) void leave('You signed out in another tab.');
+  }), [leave]);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState<boolean>(!meetToken);
   const [activeTab, setActiveTab] = useState<string>('chat');
@@ -114,9 +134,9 @@ export const App: React.FC = () => {
       });
       if (!res.ok) throw new Error(await errorMessage(res, 'Sign-out failed'));
       if (pushEndpoint) void unsubscribeBrowserPush();
-      void forgetSearchIndex();
-      setActiveCallSummary(null);
-      setUser(null);
+      signedInRef.current = false;
+      announceSignOut();
+      await leave('');
     } catch (err) {
       setError(`You are still signed in: ${err instanceof Error ? err.message : 'sign-out failed'}`);
     }
@@ -203,12 +223,7 @@ export const App: React.FC = () => {
               onOpenSettings={() => setActiveTab('settings')}
               onLogout={handleLogout}
               onActiveCallChange={setActiveCallSummary}
-              onAuthRevoked={() => {
-                void forgetSearchIndex();
-                setActiveCallSummary(null);
-                setUser(null);
-                setNotice('Your session ended. Sign in again to continue.');
-              }}
+              onAuthRevoked={() => void leave('Your session ended. Sign in again to continue.')}
             />
           </ErrorBoundary>
         </main>

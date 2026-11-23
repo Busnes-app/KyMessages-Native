@@ -144,7 +144,7 @@ describe('SearchModal', () => {
     fireEvent.change(box, { target: { value: 'budget' } });
     await act(() => new Promise((r) => setTimeout(r, 300)));
     expect(searchIndexFor).toHaveBeenCalledWith('me');
-    expect(searchMessages).toHaveBeenCalledWith('budget', undefined);
+    expect(searchMessages).toHaveBeenCalledWith('budget', undefined, 50, expect.any(AbortSignal));
     expect(await screen.findAllByRole('option')).toHaveLength(2);
     expect(screen.getByRole('listbox', { name: 'Search results' })).toBeTruthy();
     await waitFor(() => expect(activeOption(box)).toMatch(/Budget review moves/));
