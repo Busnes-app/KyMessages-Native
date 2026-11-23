@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"time"
 )
@@ -40,16 +39,22 @@ WHERE a.tenant_id = ? AND (a.uploader_id = ?
 	return out, rows.Err()
 }
 
-// ErasureTarget is the account a KyIdentity subject was, from its row or, once the row is gone,
-// from user_subjects.
-func (c *chatStore) ErasureTarget(ctx context.Context, provider, subject string) (*User, error) {
-	var u User
-	err := c.store.db.QueryRowContext(ctx, c.store.rebind(`SELECT user_id, org_id FROM user_subjects WHERE provider = ? AND subject = ?`), provider, subject).Scan(&u.ID, &u.OrgID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNotFound
+// ErasureTargets lists every account a KyIdentity subject had whose row is gone (user_subjects).
+func (c *chatStore) ErasureTargets(ctx context.Context, provider, subject string) ([]*User, error) {
+	rows, err := c.store.db.QueryContext(ctx, c.store.rebind(`SELECT user_id, org_id FROM user_subjects WHERE provider = ? AND subject = ? ORDER BY user_id`), provider, subject)
+	if err != nil {
+		return nil, err
 	}
-	u.SSOProvider, u.SSOSubject = provider, subject
-	return &u, err
+	defer rows.Close()
+	var out []*User
+	for rows.Next() {
+		u := &User{SSOProvider: provider, SSOSubject: subject}
+		if err := rows.Scan(&u.ID, &u.OrgID); err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
 }
 
 // DeactivateForErasure is erasure's first step: the account stops serving before anything is

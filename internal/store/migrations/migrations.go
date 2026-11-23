@@ -298,7 +298,7 @@ CREATE TABLE user_subjects (
     subject VARCHAR(255) NOT NULL,
     user_id VARCHAR(64) NOT NULL,
     org_id VARCHAR(64) NOT NULL,
-    PRIMARY KEY (provider, subject)
+    PRIMARY KEY (provider, subject, user_id)
 );
 CREATE TABLE pending_blob_deletes (
     tenant_id VARCHAR(64) NOT NULL,

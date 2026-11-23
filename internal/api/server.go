@@ -292,6 +292,18 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 		callMgr.RevokeTenant(context.Background(), tenantID)
 	})
 	kyidentity.OnTenantRevoked(chatHub.RevokeTenant)
+	if cfg.Tenancy.IsMultiTenant() && st != nil {
+		// A call seat may live on a replica that holds none of the user's sockets: every
+		// replica drops a revoked user's seats, and reconciliation catches a missed revocation.
+		chatHub.SetUserRevokeHandler(func(userID string) { callMgr.HandleDisconnect(userID, 0) })
+		callMgr.SetUserCheck(func(ctx context.Context, userID string) (bool, error) {
+			u, err := st.Users().GetUserByID(ctx, userID)
+			if errors.Is(err, store.ErrNotFound) {
+				return false, nil
+			}
+			return err == nil && u.Status == "active", err
+		})
+	}
 	scimSrv.OnUserRevoked(revokeUser)
 
 	s.routes()

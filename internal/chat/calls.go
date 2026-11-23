@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -95,6 +96,10 @@ type CallManager struct {
 	livekit       *rtc.Client
 	stunURLs      []string
 	stepDownDelay time.Duration
+
+	// userActive, when set, reports whether a member's account still serves; reconciliation
+	// takes out of their calls the peers whose account does not (a missed revocation).
+	userActive func(ctx context.Context, userID string) (bool, error)
 
 	mu        sync.Mutex
 	calls     map[string]*activeCall       // roomID -> call
@@ -397,9 +402,16 @@ func (m *CallManager) RevokeTenant(ctx context.Context, tenantID string) {
 	}
 }
 
+// SetUserCheck registers the account check ReconcileTenants applies to member peers.
+func (m *CallManager) SetUserCheck(fn func(ctx context.Context, userID string) (bool, error)) {
+	m.userActive = fn
+}
+
 // ReconcileTenants takes the peers of every call whose org is no longer active out of their
-// calls, so a tenant.revoked notification this pod missed still takes effect.
+// calls, so a tenant.revoked notification this pod missed still takes effect, and with a user
+// check the member peers whose account no longer serves, for a missed user revocation.
 func (m *CallManager) ReconcileTenants(ctx context.Context) {
+	defer m.reconcileUsers(ctx)
 	m.mu.Lock()
 	tenants := map[string]struct{}{}
 	for _, c := range m.calls {
@@ -410,6 +422,26 @@ func (m *CallManager) ReconcileTenants(ctx context.Context) {
 		tenant, err := m.chatStore.GetTenant(ctx, tenantID)
 		if err == nil && tenant.Status != store.TenantStatusActive {
 			m.RevokeTenant(ctx, tenantID)
+		}
+	}
+}
+
+func (m *CallManager) reconcileUsers(ctx context.Context) {
+	if m.userActive == nil {
+		return
+	}
+	m.mu.Lock()
+	users := make([]string, 0, len(m.userCalls))
+	for uid := range m.userCalls {
+		if !strings.HasPrefix(uid, "guest_") {
+			users = append(users, uid)
+		}
+	}
+	m.mu.Unlock()
+	for _, uid := range users {
+		// Only a definite answer removes anyone: an outage must not end every call.
+		if ok, err := m.userActive(ctx, uid); err == nil && !ok {
+			m.HandleDisconnect(uid, 0)
 		}
 	}
 }

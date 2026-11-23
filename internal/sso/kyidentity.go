@@ -301,25 +301,37 @@ func (k *KyIdentityClient) applyErasure(ctx context.Context, body []byte) error 
 	}
 	k.syncMu.Lock()
 	defer k.syncMu.Unlock()
+	// Every local account the subject ever had: the current row, and any whose row went
+	// (user.deleted first, a repeat, or a recreation under a new ID).
+	var targets []*store.User
 	user, err := k.store.Users().GetUserBySSO(ctx, "kyidentity", in.ID)
-	if errors.Is(err, store.ErrNotFound) {
-		// The account row may be gone (user.deleted first, or a repeat): its data may not be.
-		user, err = k.store.Chat().ErasureTarget(ctx, "kyidentity", in.ID)
+	if err == nil {
+		targets = append(targets, user)
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return err
 	}
-	if errors.Is(err, store.ErrNotFound) {
-		return nil // never held
-	}
+	past, err := k.store.Chat().ErasureTargets(ctx, "kyidentity", in.ID)
 	if err != nil {
 		return err
 	}
-	if user.OrgID != strings.TrimSpace(in.OrgID) {
-		k.auditOrgMismatch(ctx, in.ID, user.OrgID, in.OrgID)
-		return nil
+	for _, p := range past {
+		if user == nil || p.ID != user.ID {
+			targets = append(targets, p)
+		}
 	}
-	if k.onUserErased == nil {
+	if k.onUserErased == nil && len(targets) > 0 {
 		return errors.New("sso: user.erased has no handler")
 	}
-	return k.onUserErased(ctx, user)
+	for _, t := range targets {
+		if t.OrgID != strings.TrimSpace(in.OrgID) {
+			k.auditOrgMismatch(ctx, in.ID, t.OrgID, in.OrgID)
+			continue
+		}
+		if err := k.onUserErased(ctx, t); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (k *KyIdentityClient) applyOrgLifecycle(ctx context.Context, eventType string, body []byte) error {

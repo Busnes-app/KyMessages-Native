@@ -481,7 +481,7 @@ func rememberSubject(ctx context.Context, s *SQLStore, tx *sql.Tx, user *User) e
 	if user.ID == "" || user.OrgID == "" || user.SSOSubject == "" {
 		return nil
 	}
-	_, err := tx.ExecContext(ctx, s.rebind(`INSERT INTO user_subjects (provider, subject, user_id, org_id) VALUES (?, ?, ?, ?) ON CONFLICT (provider, subject) DO NOTHING`),
+	_, err := tx.ExecContext(ctx, s.rebind(`INSERT INTO user_subjects (provider, subject, user_id, org_id) VALUES (?, ?, ?, ?) ON CONFLICT (provider, subject, user_id) DO NOTHING`),
 		user.SSOProvider, user.SSOSubject, user.ID, user.OrgID)
 	return err
 }

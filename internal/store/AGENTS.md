@@ -125,7 +125,7 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   `sso.user_erased` names only `user:<id>`.
 - Migration 60 (`erasure_state`) adds `pending_blob_deletes` and `user_subjects (provider, subject, user_id, org_id)`: `DeleteDirectoryUser`
   and `EraseUser` record an org-bound account's mapping before its row goes, so an erasure after
-  `user.deleted`, or a repeat, still finds the person's data (`ErasureTarget`). Single-mode
+  `user.deleted`, a repeat, or a recreation under a new ID still finds every account the person had (`ErasureTargets`; the key is provider, subject and user ID). Single-mode
   accounts (no org) are never recorded.
 - `AttachmentQuotaLimits.ActiveUploader` (multi mode) makes `CommitAttachmentWithQuota` refuse
   (`ErrForbidden`) an uploader whose account no longer serves.

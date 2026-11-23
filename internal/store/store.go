@@ -396,7 +396,7 @@ type ChatStore interface {
 	RaisePoolSeq(ctx context.Context, tenantID string, seq int64) error
 	// Erasure of one person (multi mode, erase.go): blobs first, then rows.
 	ErasureBlobs(ctx context.Context, tenantID, userID string) ([]BlobRef, error)
-	ErasureTarget(ctx context.Context, provider, subject string) (*User, error)
+	ErasureTargets(ctx context.Context, provider, subject string) ([]*User, error)
 	DeactivateForErasure(ctx context.Context, userID string) error
 	EraseUser(ctx context.Context, tenantID string, user *User) ([]BlobRef, error)
 	PendingBlobDeletes(ctx context.Context, limit int) ([]BlobRef, error)

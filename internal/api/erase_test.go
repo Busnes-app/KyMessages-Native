@@ -335,3 +335,36 @@ func TestErasureQueuesStragglerBlobs(t *testing.T) {
 		t.Fatalf("queue after sweep: %v", q)
 	}
 }
+
+// A subject deleted and then recreated under a new local ID: user.erased erases both accounts.
+func TestUserErasedCoversARecreatedAccount(t *testing.T) {
+	ctx := context.Background()
+	srv, _, st, _ := newReplicas(t, withPool(t, &fakePool{headroom: 1 << 20}))
+	old, oldTok := createOrgUser(t, st, "usr_rc_old", "rcold", "user", replicaOrgA)
+	bob, bobTok := createOrgUser(t, st, "usr_rc_bob", "rcbob", "user", replicaOrgA)
+	room := roomOf(t, doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", oldTok, map[string]any{"kind": store.RoomKindChannel, "name": "c", "member_ids": []string{bob.ID}}, nil))
+	if rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room+"/messages", oldTok, map[string]any{"body": "from the first account"}, nil); rec.Code != http.StatusCreated {
+		t.Fatal(rec.Code)
+	}
+	// user.deleted, then the same subject comes back as a new account.
+	if _, err := st.Users().DeleteDirectoryUser(ctx, old, store.DirectoryEvent{ID: "ev-del", Revision: 5}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Users().CreateUser(ctx, &store.User{ID: "usr_rc_new", Username: "rcnew", Role: "user", Status: "active", SSOProvider: "kyidentity", SSOSubject: old.SSOSubject, OrgID: replicaOrgA}); err != nil {
+		t.Fatal(err)
+	}
+	if rec := postErased(t, srv, old.SSOSubject, replicaOrgA); rec.Code != http.StatusOK {
+		t.Fatalf("user.erased = %d", rec.Code)
+	}
+	if _, err := st.Users().GetUserByID(ctx, "usr_rc_new"); err == nil {
+		t.Fatal("the recreated account was kept")
+	}
+	rec := doBearerJSON(t, srv, http.MethodGet, "/api/v1/rooms/"+room+"/messages", bobTok, nil, nil)
+	var p struct {
+		Messages []store.Message `json:"messages"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &p)
+	if len(p.Messages) != 1 || p.Messages[0].Body != "" || p.Messages[0].DeletedAt == nil {
+		t.Fatalf("the first account's message survived: %+v", p.Messages)
+	}
+}
