@@ -607,12 +607,17 @@ func (s *Server) PurgeDeletedOrgs(ctx context.Context, held func() bool) error {
 		if !held() {
 			return nil
 		}
+		// Rows first (under the upload commit's lock, so no commit lands after), then the whole
+		// prefix, which also takes any blob an in-flight upload wrote, then the purged mark.
+		if err := chat.PurgeTenantRows(ctx, id); err != nil {
+			return err
+		}
 		if s.blobs != nil {
 			if err := s.blobs.DeletePrefix(id); err != nil && !errors.Is(err, blobs.ErrInvalidKey) {
 				return err
 			}
 		}
-		if err := chat.PurgeTenantRows(ctx, id); err != nil {
+		if err := chat.MarkTenantPurged(ctx, id); err != nil {
 			return err
 		}
 	}

@@ -42,6 +42,7 @@ type fakeDirectory struct {
 	orgs   []listedOrg
 	erased []erasedSubject
 	down   bool
+	page   int // entries per page when set: answers carry next, and a cursor resumes
 }
 
 func (f *fakeDirectory) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -56,6 +57,15 @@ func (f *fakeDirectory) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	since, _ := strconv.ParseInt(r.URL.Query().Get("since"), 10, 64)
+	if c := r.URL.Query().Get("cursor"); c != "" {
+		since, _ = strconv.ParseInt(c, 10, 64)
+	}
+	page := func(n int) (int, string) {
+		if f.page == 0 || n <= f.page {
+			return n, ""
+		}
+		return f.page, "more"
+	}
 	switch r.URL.Path {
 	case "/api/suite/orgs":
 		out := []listedOrg{}
@@ -64,7 +74,12 @@ func (f *fakeDirectory) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				out = append(out, o)
 			}
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"orgs": out})
+		n, next := page(len(out))
+		out = out[:n]
+		if next != "" {
+			next = strconv.FormatInt(out[n-1].Revision, 10)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"orgs": out, "next": next})
 	case "/api/suite/erased":
 		out := []erasedSubject{}
 		for _, s := range f.erased {
@@ -72,7 +87,12 @@ func (f *fakeDirectory) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				out = append(out, s)
 			}
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"subjects": out})
+		n, next := page(len(out))
+		out = out[:n]
+		if next != "" {
+			next = strconv.FormatInt(out[n-1].Revision, 10)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"subjects": out, "next": next})
 	default:
 		http.NotFound(w, r)
 	}
@@ -339,5 +359,123 @@ func TestTenancyStartupSync(t *testing.T) {
 	}
 	if e.kyid.FullSyncDue(ctx) {
 		t.Fatal("a successful start-up read did not record the full sync")
+	}
+}
+
+// A newer lifecycle event wins over a missing org's stale "active" listing.
+func TestTenancySyncStaleListingCannotUndoANewerSuspension(t *testing.T) {
+	ctx := context.Background()
+	e := newSyncEnv(t)
+	for i := range 10 {
+		if _, err := e.st.Chat().EnsureTenant(ctx, syncOrgID(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.dir.list(listedAll(10)...)
+	if err := e.kyid.SyncTenancy(ctx, true, false); err != nil {
+		t.Fatal(err)
+	}
+	e.dir.list(listedAll(10, 3)...)
+	if err := e.kyid.SyncTenancy(ctx, true, false); err != nil || e.status(t, syncOrgID(3)) != store.TenantStatusSuspended {
+		t.Fatalf("missing org not held: %v", err)
+	}
+	// A real suspension, newer than the list's revision 13, lands while it is missing.
+	if changed, err := e.st.Chat().ApplyTenantLifecycle(ctx, syncOrgID(3), store.TenantStatusSuspended, 999); err != nil || !changed {
+		t.Fatalf("suspension: %v %v", changed, err)
+	}
+	e.dir.list(listedAll(10)...) // the stale snapshot lists it active at 13
+	if err := e.kyid.SyncTenancy(ctx, true, false); err != nil {
+		t.Fatal(err)
+	}
+	if e.status(t, syncOrgID(3)) != store.TenantStatusSuspended {
+		t.Fatal("a stale active listing undid a newer suspension")
+	}
+}
+
+// failOnceSessions fails the first session revocation.
+type failOnceSessions struct {
+	store.SessionStore
+	failed bool
+}
+
+func (f *failOnceSessions) DeleteUserSessions(ctx context.Context, userID string) error {
+	if !f.failed {
+		f.failed = true
+		return errors.New("injected")
+	}
+	return f.SessionStore.DeleteUserSessions(ctx, userID)
+}
+
+type failOnceStore struct {
+	store.Store
+	sessions *failOnceSessions
+}
+
+func (f *failOnceStore) Sessions() store.SessionStore { return f.sessions }
+
+// A revocation that failed after the status committed is retried on the next read of the same
+// listing: revocation follows the resulting status, not whether this read changed it.
+func TestTenancySyncRetriesAFailedRevocation(t *testing.T) {
+	ctx := context.Background()
+	e := newSyncEnv(t)
+	org := syncOrgID(0)
+	_, tok := createOrgUser(t, e.st, "usr_rv", "rvuser", "user", org)
+	kyid := sso.NewKyIdentityClient(e.cfg.SSO, &failOnceStore{Store: e.st, sessions: &failOnceSessions{SessionStore: e.st.Sessions()}})
+	kyid.SetTenancy(e.cfg.Tenancy)
+	e.dir.list(listedOrg{ID: org, Status: "suspended", Revision: 20})
+	if err := kyid.SyncTenancy(ctx, false, false); err == nil {
+		t.Fatal("a failed revocation reported success")
+	}
+	if err := kyid.SyncTenancy(ctx, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if rec := doBearerJSON(t, e.srv, http.MethodGet, "/api/v1/rooms", tok, nil, nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("session after the retried revocation = %d, want 401", rec.Code)
+	}
+	if err := e.st.Chat().SetTenantStatus(ctx, org, store.TenantStatusActive); err != nil {
+		t.Fatal(err)
+	}
+	if rec := doBearerJSON(t, e.srv, http.MethodGet, "/api/v1/rooms", tok, nil, nil); rec.Code != http.StatusUnauthorized {
+		t.Fatal("the surviving session came back when the org resumed")
+	}
+}
+
+// Both lists are read to their end, however many pages: a person on the 101st page of the erased
+// list is erased, and an org on a page past suitedir's bound is not taken for missing.
+func TestTenancySyncReadsEveryPage(t *testing.T) {
+	ctx := context.Background()
+	e := newSyncEnv(t)
+	e.kyid.OnUserErased(func(ctx context.Context, u *store.User) error {
+		_, err := e.st.Chat().EraseUser(ctx, u.OrgID, u)
+		return err
+	})
+	org := syncOrgID(0)
+	last, _ := createOrgUser(t, e.st, "usr_last", "lastpage", "user", org)
+	var subjects []erasedSubject
+	for i := range 100 {
+		subjects = append(subjects, erasedSubject{Sub: fmt.Sprintf("sub-never-held-%d", i), OrgID: org, Revision: int64(i + 1)})
+	}
+	subjects = append(subjects, erasedSubject{Sub: last.SSOSubject, OrgID: org, Revision: 101})
+	var orgs []listedOrg
+	for i := range 102 { // suitedir stops after 100 pages; 2 past it fit inside the guard
+		orgs = append(orgs, listedOrg{ID: syncOrgID(i), Status: "active", Revision: int64(i + 1)})
+		if _, err := e.st.Chat().EnsureTenant(ctx, syncOrgID(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.dir.mu.Lock()
+	e.dir.page, e.dir.erased, e.dir.orgs = 1, subjects, orgs
+	e.dir.mu.Unlock()
+	if err := e.kyid.StartupSync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.kyid.SyncTenancy(ctx, true, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.st.Users().GetUserByID(ctx, last.ID); err == nil {
+		t.Fatal("the person on the 101st page was not erased")
+	}
+	if e.activeCount(t) != 102 {
+		t.Fatalf("orgs past the page bound were taken for missing: %d active", e.activeCount(t))
 	}
 }

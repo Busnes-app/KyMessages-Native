@@ -63,18 +63,31 @@ func (k *KyIdentityClient) SyncTenancy(ctx context.Context, full, startup bool) 
 	if !full {
 		since = k.storedRevision(ctx, settingOrgsRevision)
 	}
-	orgs, next, err := dir.Orgs(ctx, since)
-	if err != nil {
-		return err
+	// suitedir.Orgs stops at its page bound with a revision below the last listed; continue from
+	// there until a call ends on its own, so a full read is complete before anything is decided.
+	var orgs []suitedir.Org
+	next := since
+	for {
+		page, n, err := dir.Orgs(ctx, next)
+		if err != nil {
+			return err
+		}
+		orgs = append(orgs, page...)
+		done := len(page) == 0 || n >= page[len(page)-1].Revision
+		if !done && n <= next {
+			return errors.New("sso: org list did not advance")
+		}
+		next = n
+		if done {
+			break
+		}
 	}
 	for _, o := range orgs {
 		if err := k.applyListedOrg(ctx, o); err != nil {
 			return err // the revision stays, so the next run applies it again
 		}
 	}
-	// A call cut at its page bound returns a revision below the last listed: not complete.
-	complete := len(orgs) == 0 || next >= orgs[len(orgs)-1].Revision
-	if full && complete {
+	if full {
 		if err := k.checkMissing(ctx, orgs, startup); err != nil {
 			return err
 		}
@@ -86,7 +99,7 @@ func (k *KyIdentityClient) SyncTenancy(ctx context.Context, full, startup bool) 
 		return err
 	}
 	now := strconv.FormatInt(time.Now().Unix(), 10)
-	if full && complete {
+	if full {
 		if err := settings.SetSetting(ctx, SettingFullSyncAt, now); err != nil {
 			return err
 		}
@@ -124,7 +137,7 @@ func (k *KyIdentityClient) applyListedOrg(ctx context.Context, o suitedir.Org) e
 		return err
 	}
 	if missing && status == store.TenantStatusActive {
-		if found, err := chat.ClearTenantMissing(ctx, o.ID); err != nil {
+		if found, err := chat.ClearTenantMissing(ctx, o.ID, o.Revision); err != nil {
 			return err
 		} else if found {
 			k.auditSync(ctx, "tenancy.org_found", o.ID, "")
@@ -134,11 +147,17 @@ func (k *KyIdentityClient) applyListedOrg(ctx context.Context, o suitedir.Org) e
 			return err
 		}
 	}
-	changed, err := chat.ApplyTenantLifecycle(ctx, o.ID, status, o.Revision)
+	if _, err := chat.ApplyTenantLifecycle(ctx, o.ID, status, o.Revision); err != nil {
+		return err
+	}
+	// Revoke from the resulting state, not from whether this read changed it: a revocation that
+	// failed last time (the revision then stays unstored) is retried. Revoking an org with no
+	// grants is a no-op.
+	tenant, err := chat.GetTenant(ctx, o.ID)
 	if err != nil {
 		return err
 	}
-	if changed && status != store.TenantStatusActive {
+	if tenant.Status != store.TenantStatusActive {
 		return k.revokeTenant(ctx, o.ID)
 	}
 	return nil
@@ -197,7 +216,9 @@ func (k *KyIdentityClient) syncErased(ctx context.Context, full bool) error {
 		since = k.storedRevision(ctx, settingErasedRevision)
 	}
 	stored := since
-	for page := 0; page < 100; page++ {
+	// No page cap: each entry must advance the revision, so the walk ends; stopping early would
+	// record a sync that left erased subjects unerased.
+	for {
 		var body struct {
 			Subjects []struct {
 				Sub      string `json:"sub"`

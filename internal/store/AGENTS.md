@@ -114,8 +114,11 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   `Pool` and never reads the columns.
 - Migration 61 adds `tenants.missing_since` and `tenants.purged_at` (`tenancy_sync.go`). The org
   purge deletes a deleted org's attachments in batches (`PurgeAttachmentBatch`, the caller deletes
-  the blobs, then `DeleteAttachmentRows`), then every other row child first and marks it purged
-  (`PurgeTenantRows`, audited `tenancy.org_purged`). The `tenants` row stays as a tombstone.
+  the blobs, then `DeleteAttachmentRows`), then every other row child first (`PurgeTenantRows`,
+  under the upload commit's tenant lock), and after the caller deletes the org's blob prefix it
+  marks the org purged (`MarkTenantPurged`, audited `tenancy.org_purged`). The `tenants` row stays
+  as a tombstone. With `ActiveUploader`, a commit also needs its org active, so an upload in
+  flight when its org is deleted commits nothing. `ApplyTenantLifecycle` clears `missing_since`.
   Room webhooks go by the `rooms` cascade (the E2EE build drops that table); a new table with
   `tenant_id` must join `PurgeTenantRows`.
 - `ErasureBlobs` and `EraseUser` (`erase.go`, multi mode `user.erased`) delete one person's data:

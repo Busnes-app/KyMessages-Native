@@ -44,9 +44,11 @@ func (c *chatStore) MarkTenantMissing(ctx context.Context, tenantID string, nowM
 	return c.changed(ctx, `UPDATE tenants SET status = 'suspended', missing_since = ? WHERE id = ? AND status = 'active'`, nowMs, tenantID)
 }
 
-// ClearTenantMissing serves a missing org again once KyIdentity lists it as active.
-func (c *chatStore) ClearTenantMissing(ctx context.Context, tenantID string) (bool, error) {
-	return c.changed(ctx, `UPDATE tenants SET status = 'active', missing_since = NULL WHERE id = ? AND missing_since IS NOT NULL AND status = 'suspended'`, tenantID)
+// ClearTenantMissing serves a missing org again once KyIdentity lists it as active at revision,
+// unless a newer lifecycle event applied since (which also clears the flag, see
+// ApplyTenantLifecycle): a stale listing never undoes a newer suspension.
+func (c *chatStore) ClearTenantMissing(ctx context.Context, tenantID string, revision int64) (bool, error) {
+	return c.changed(ctx, `UPDATE tenants SET status = 'active', missing_since = NULL WHERE id = ? AND missing_since IS NOT NULL AND status = 'suspended' AND lifecycle_revision <= ?`, tenantID, revision)
 }
 
 // ForgetTenantMissing drops the missing flag when KyIdentity lists the org with another status,
@@ -112,14 +114,19 @@ func (c *chatStore) DeleteAttachmentRows(ctx context.Context, tenantID string, r
 }
 
 // PurgeTenantRows deletes the rest of a deleted org's data, child tables first, once its
-// attachments are gone, and marks it purged. The tenants row stays as a tombstone, so a late
-// event cannot bring the org back. It does nothing for an org that is not deleted.
+// attachments are gone. The tenants row stays as a tombstone, so a late event cannot bring the
+// org back. It does nothing for an org that is not deleted or already purged.
 func (c *chatStore) PurgeTenantRows(ctx context.Context, tenantID string) error {
 	tx, err := c.store.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	// The upload commit's lock: a commit in flight finishes first, and later ones see the org
+	// deleted and commit nothing.
+	if err := c.lockAttachmentQuotaTx(ctx, tx, tenantID); err != nil {
+		return err
+	}
 	var one int
 	if err := tx.QueryRowContext(ctx, c.store.rebind(`SELECT 1 FROM tenants WHERE id = ? AND status = 'deleted' AND purged_at IS NULL`), tenantID).Scan(&one); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -153,10 +160,28 @@ func (c *chatStore) PurgeTenantRows(ctx context.Context, tenantID string) error 
 		{`DELETE FROM users WHERE org_id = ?`, []any{tenantID}},
 		{`DELETE FROM user_subjects WHERE org_id = ?`, []any{tenantID}},
 		{`DELETE FROM pending_blob_deletes WHERE tenant_id = ?`, []any{tenantID}},
-		{`UPDATE tenants SET purged_at = ? WHERE id = ?`, []any{time.Now().UnixMilli(), tenantID}},
-		{`INSERT INTO audit_records (action, resource, details, created_at) VALUES ('tenancy.org_purged', ?, '', ?)`, []any{"tenant:" + tenantID, time.Now().UTC()}},
 	} {
 		if _, err := tx.ExecContext(ctx, c.store.rebind(s.q), s.args...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// MarkTenantPurged records that a deleted org's rows and blobs are gone (the purge's last step,
+// after its blob prefix is deleted, so a failure before it reruns the whole purge).
+func (c *chatStore) MarkTenantPurged(ctx context.Context, tenantID string) error {
+	tx, err := c.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx, c.store.rebind(`UPDATE tenants SET purged_at = ? WHERE id = ? AND status = 'deleted' AND purged_at IS NULL`), time.Now().UnixMilli(), tenantID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 1 {
+		if _, err := tx.ExecContext(ctx, c.store.rebind(`INSERT INTO audit_records (action, resource, details, created_at) VALUES ('tenancy.org_purged', ?, '', ?)`), "tenant:"+tenantID, time.Now().UTC()); err != nil {
 			return err
 		}
 	}

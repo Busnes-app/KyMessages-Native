@@ -70,8 +70,9 @@ Owns HTTP routing, request parsing, session cookie validation, CORS headers, and
   and call reconciliation removes member peers whose account no longer serves
   (`CallManager.SetUserCheck`, `TestUserRevocationDropsRemoteCallSeats`).
 - `PurgeDeletedOrgs` is the leased `org_purge` job: per deleted org, attachment blobs then rows in
-  batches of 200, re-checking the lease before each batch, then `DeletePrefix`, then
-  `store.PurgeTenantRows` (`TestTenancySyncDeletedOrgIsPurged`). `SyncTenancy` is the leased
+  batches of 200, re-checking the lease before each batch, then `store.PurgeTenantRows`, then
+  `DeletePrefix` (which takes any blob an in-flight upload wrote), then `MarkTenantPurged`
+  (`TestTenancySyncDeletedOrgIsPurged`). `SyncTenancy` is the leased
   `tenancy_sync` job (incremental, full once a day); `StartupTenancySync` runs before serving.
 - The org storage pool (`pool.go`, multi mode, customer orgs only; the staff org and org-less
   operators are exempt). Uploads check KyIdentity's grant (`AttachmentQuotaLimits.Pool`), and

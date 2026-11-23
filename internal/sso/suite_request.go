@@ -81,6 +81,9 @@ func (k *KyIdentityClient) SuiteRequest(ctx context.Context, method, path string
 }
 
 func isLoopback(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
 }
