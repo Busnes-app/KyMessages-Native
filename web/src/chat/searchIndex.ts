@@ -74,6 +74,8 @@ async function atRestKey(db: IDBDatabase): Promise<CryptoKey> {
 
 export class SearchIndex {
   private closed = false;
+  // Writes run one at a time, in call order: a slow batch can never land after a newer edit.
+  private writes: Promise<unknown> = Promise.resolve();
 
   private constructor(
     private readonly db: IDBDatabase,
@@ -108,8 +110,18 @@ export class SearchIndex {
     if (this.closed) throw new DOMException('The search index was closed', 'InvalidStateError');
   }
 
+  private serial(fn: () => Promise<void>): Promise<void> {
+    const run = this.writes.then(fn, fn);
+    this.writes = run.catch(() => undefined);
+    return run;
+  }
+
   /** Indexes readable messages and drops the entry of any message that is no longer indexable. */
-  async put(messages: ChatMessage[]): Promise<void> {
+  put(messages: ChatMessage[]): Promise<void> {
+    return this.serial(() => this.write(messages));
+  }
+
+  private async write(messages: ChatMessage[]): Promise<void> {
     this.live();
     const keep: Entry[] = [];
     const drop: string[] = [];
@@ -136,8 +148,11 @@ export class SearchIndex {
   }
 
   /** Drops entries, for messages deleted or edited while their room was not loaded here. */
-  async remove(ids: string[]): Promise<void> {
-    if (ids.length === 0) return;
+  remove(ids: string[]): Promise<void> {
+    return ids.length === 0 ? Promise.resolve() : this.serial(() => this.drop(ids));
+  }
+
+  private async drop(ids: string[]): Promise<void> {
     this.live();
     const tx = this.db.transaction(STORE, 'readwrite');
     const store = tx.objectStore(STORE);
@@ -189,16 +204,29 @@ export class SearchIndex {
   /**
    * Newest first: messages whose text or sender contains every word of query. Reads a page at a
    * time, decrypts each page in parallel, and stops at `limit` hits or when `signal` aborts.
+   * `verify` vets matches in batches of at most `limit`; a rejected match never takes a place
+   * from an older one that is still valid.
    */
-  async search(query: string, roomId?: string, limit = 50, signal?: AbortSignal): Promise<SearchHit[]> {
+  async search(query: string, roomId?: string, limit = 50, signal?: AbortSignal, verify = async (h: SearchHit[]) => h): Promise<SearchHit[]> {
     const words = query.toLowerCase().split(/\s+/).filter(Boolean);
     if (words.length === 0) return [];
     const hits: SearchHit[] = [];
+    let pending: SearchHit[] = [];
+    // True once `limit` verified hits are in.
+    const flush = async () => {
+      const batch = pending;
+      pending = [];
+      for (const h of batch.length ? await verify(batch) : []) if (hits.push(h) >= limit) return true;
+      return false;
+    };
     let before: IDBValidKey[] | undefined;
     for (;;) {
       signal?.throwIfAborted();
       const entries = await this.page(roomId, before, PAGE);
-      if (entries.length === 0) return hits;
+      if (entries.length === 0) {
+        await flush();
+        return hits;
+      }
       const last = entries[entries.length - 1];
       before = roomId ? [roomId, last.created_at, last.id] : [last.created_at, last.id];
       const plain = await Promise.all(
@@ -209,9 +237,14 @@ export class SearchIndex {
       );
       for (const m of plain) {
         const text = `${m.body}\n${m.sender_name}`.toLowerCase();
-        if (words.every((w) => text.includes(w)) && hits.push(m) >= limit) return hits;
+        if (!words.every((w) => text.includes(w))) continue;
+        pending.push(m);
+        if (pending.length >= limit - hits.length && (await flush())) return hits;
       }
-      if (entries.length < PAGE) return hits;
+      if (entries.length < PAGE) {
+        await flush();
+        return hits;
+      }
     }
   }
 }

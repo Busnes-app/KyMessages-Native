@@ -1,6 +1,6 @@
 import 'fake-indexeddb/auto';
 import { afterEach, describe, expect, it } from 'vitest';
-import { forgetSearchIndex, freshHits, type MessageState, SearchIndex, searchIndexFor } from './searchIndex';
+import { forgetSearchIndex, freshHits, type MessageState, SearchIndex, type SearchHit, searchIndexFor } from './searchIndex';
 import type { ChatMessage } from './types';
 
 const msg = (id: string, room: string, body: string, created: number, extra: Partial<ChatMessage> = {}): ChatMessage => ({
@@ -128,6 +128,31 @@ describe('on-device search index', () => {
     expect((await index.search('quarterly')).map((h) => h.id)).toEqual(['kept']);
     // If the server cannot be asked, nothing unverified is shown.
     await expect(freshHits(index, await index.search('quarterly'), async () => { throw new Error('offline'); })).rejects.toThrow('offline');
+  });
+
+  it('keeps searching past rejected hits until the limit holds only verified ones', async () => {
+    const index = await searchIndexFor('u-alice');
+    // The newest 55 matches were deleted while this browser was away; 5 older ones are fine.
+    await index.put(Array.from({ length: 60 }, (_, i) => msg(`m${i}`, 'r1', 'standup notes', i + 1)));
+    const asked: number[] = [];
+    const verify = async (h: SearchHit[]) => {
+      asked.push(h.length);
+      return h.filter((x) => Number(x.id.slice(1)) < 5);
+    };
+    const hits = await index.search('standup', undefined, 50, undefined, verify);
+    expect(hits.map((h) => h.id)).toEqual(['m4', 'm3', 'm2', 'm1', 'm0']);
+    // Never more IDs per check than the server accepts (50).
+    expect(Math.max(...asked)).toBeLessThanOrEqual(50);
+  });
+
+  it('applies writes in call order, so a slow batch never overwrites a newer edit', async () => {
+    const index = await searchIndexFor('u-alice');
+    const batch = Array.from({ length: 300 }, (_, i) => msg(`m${i}`, 'r1', `filler ${i}`, i + 1));
+    batch.push(msg('x', 'r1', 'old wording', 1000));
+    const first = index.put(batch); // still encrypting when the edit arrives
+    const edit = index.put([msg('x', 'r1', 'new wording', 1000, { edited_at: 2000 })]);
+    await Promise.all([first, edit]);
+    expect((await index.search('wording')).map((h) => h.body)).toEqual(['new wording']);
   });
 
   it('drops an earlier copy when a message stops being indexable without being deleted', async () => {

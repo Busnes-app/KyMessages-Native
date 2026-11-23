@@ -358,11 +358,8 @@ export const SearchModal: React.FC<SearchModalProps> = ({ userId, rooms, activeR
     setErr('');
     const timer = setTimeout(() => {
       void searchIndexFor(userId)
-        .then(async (index) => {
-          const hits = await index.search(trimmed, scopeCurrent && activeRoomId ? activeRoomId : undefined, 50, abort.signal);
-          // Show only what the server still vouches for (fails closed if it cannot be asked).
-          return freshHits(index, hits, fetchMessageStates);
-        })
+        // Show only what the server still vouches for (fails closed if it cannot be asked).
+        .then((index) => index.search(trimmed, scopeCurrent && activeRoomId ? activeRoomId : undefined, 50, abort.signal, (h) => freshHits(index, h, fetchMessageStates)))
         .then((res) => {
           if (!cancelled) setHits(res);
         })
