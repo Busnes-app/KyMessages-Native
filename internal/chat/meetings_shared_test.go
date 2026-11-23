@@ -3,6 +3,7 @@ package chat
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"github.com/Busnes-app/ky_server_base/internal/config"
 	"github.com/Busnes-app/ky_server_base/internal/rtc"
 	"io"
@@ -326,5 +327,79 @@ func ageSharedPresence(t *testing.T, cfg config.DatabaseConfig, id string) {
 	defer db.Close()
 	if _, err := db.Exec("UPDATE meeting_guest_sessions SET seen_at = 0 WHERE guest_id = "+ph, id); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSharedLobbyDepartureAfterPollingStops(t *testing.T) {
+	ctx := context.Background()
+	dbCfg := testdb.Config(t)
+	st, err := store.Open(ctx, dbCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	res, err := st.Chat().UpsertMeeting(ctx, store.UpsertMeetingParams{ID: "departure", TenantID: store.DefaultTenantID, OrganizerSub: "host", Title: "Departure"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	removed := 0
+	lk := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/RemoveParticipant") {
+			removed++
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer lk.Close()
+	bus := &captureBus{}
+	hub := NewHub(bus)
+	calls := NewCallManager(st.Chat(), hub, rtc.NewClient(lk.URL, "testkey", "testsecret1234567890"), nil)
+	l := NewLobbyManager(hub, calls)
+	l.UseShared(st.GuestSessions())
+	l.SetLeaveGrace(time.Hour)
+	var callbacks []func()
+	l.afterFunc = func(_ time.Duration, f func()) *time.Timer {
+		callbacks = append(callbacks, f)
+		timer := time.AfterFunc(24*time.Hour, func() {})
+		t.Cleanup(func() { timer.Stop() })
+		return timer
+	}
+	guest, err := l.Knock(ctx, &store.MeetingGuest{MeetingID: "departure", GuestKey: "guest"}, res.Meeting, nil, "Guest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Decide(ctx, res.Meeting.RoomID, guest.GuestID, "host", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := calls.Join(ctx, JoinCallRequest{TenantID: store.DefaultTenantID, RoomID: res.Meeting.RoomID, UserID: guest.GuestID, IsGuest: true, Audio: true, ProtectIP: true}); err != nil {
+		t.Fatal(err)
+	}
+	l.HandleDisconnect(guest.GuestID, 0)
+	if _, ok := l.GetBySecret(guest.SessionSecret); !ok {
+		t.Fatal("poll lost the session")
+	}
+	callbacks[0]() // first deadline while polling: it must schedule another deadline
+	if len(callbacks) != 2 || removed != 0 {
+		t.Fatalf("polling: scheduled %d timers, evicted %d", len(callbacks), removed)
+	}
+	ageSharedPresence(t, dbCfg, guest.GuestID)
+	callbacks[1]() // polling stopped, presence elapsed
+	callbacks[1]() // a stale callback cannot repeat the departure
+	left := 0
+	for _, ev := range bus.snapshot() {
+		if ev.Type == EventLobbyKnock {
+			var p LobbyKnockPayload
+			if json.Unmarshal(ev.Data, &p) == nil && p.Status == "left" {
+				left++
+			}
+		}
+	}
+	if left != 1 || removed != 1 {
+		t.Fatalf("departure events=%d, SFU removals=%d; want one each", left, removed)
+	}
+	if state := calls.GetState(res.Meeting.RoomID); state != nil && len(state.Peers) > 0 {
+		t.Fatal("departed guest retained call seat")
+	}
+	if _, ok := l.GetBySecret(guest.SessionSecret); ok {
+		t.Fatal("departed session still resolves")
 	}
 }

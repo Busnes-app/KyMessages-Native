@@ -55,6 +55,7 @@ type LobbyManager struct {
 	calls      *CallManager
 	leaveGrace time.Duration
 	now        func() time.Time
+	afterFunc  func(time.Duration, func()) *time.Timer
 
 	mu           sync.Mutex
 	bySecret     map[string]*GuestSession            // sessionSecret -> session
@@ -82,6 +83,7 @@ func NewLobbyManager(hub *Hub, calls *CallManager) *LobbyManager {
 		calls:        calls,
 		leaveGrace:   DefaultGuestLeaveGrace,
 		now:          time.Now,
+		afterFunc:    time.AfterFunc,
 		bySecret:     make(map[string]*GuestSession),
 		byGuestID:    make(map[string]*GuestSession),
 		byRoom:       make(map[string]map[string]*GuestSession),

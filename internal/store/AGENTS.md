@@ -127,3 +127,5 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
 
 ## Child DOX Index
 None.
+
+- Shared leave timers rearm while a disconnected guest keeps polling. The eventual database delete emits one departure and evicts the call seat; deterministic scheduler callbacks cover polling beyond the first timer and later inactivity.

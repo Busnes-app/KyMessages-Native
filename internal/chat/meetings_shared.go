@@ -157,37 +157,55 @@ func (l *LobbyManager) heartbeat() {
 
 func (l *LobbyManager) disconnectShared(guestID string) {
 	l.mu.Lock()
+	defer l.mu.Unlock()
 	delete(l.live, guestID)
 	if t := l.timers[guestID]; t != nil {
 		t.Stop()
 	}
-	// One inactivity rule for timers and reads: the session ends once nobody (socket heartbeat
-	// or authenticated request, on any replica) refreshed it for the presence window.
+	l.armDepartureLocked(guestID)
+}
+
+// A poll can keep a disconnected guest alive past the first timer. Rearm until the database
+// actually removes the session, so eventual departure still emits its event and removes media.
+func (l *LobbyManager) armDepartureLocked(guestID string) {
 	live := l.leaveGrace + l.leaveGrace/4
 	var timer *time.Timer
-	timer = time.AfterFunc(live, func() {
+	timer = l.afterFunc(live, func() {
 		l.mu.Lock()
-		if l.timers[guestID] == timer {
-			delete(l.timers, guestID)
+		if l.timers[guestID] != timer {
+			l.mu.Unlock()
+			return
 		}
+		delete(l.timers, guestID)
+		_, connected := l.live[guestID]
 		l.mu.Unlock()
+		if connected {
+			return
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), sharedLobbyTimeout)
 		defer cancel()
 		rows, err := l.db.DeleteIfUnseen(ctx, guestID, live)
-		if err != nil {
+		if err != nil || len(rows) == 0 {
+			// A missing row already departed elsewhere. An error or a refreshed row needs a retry.
+			_, lookupErr := l.db.ByID(ctx, guestID, l.now().UnixMilli(), live)
+			if lookupErr == store.ErrNotFound {
+				return
+			}
+			l.mu.Lock()
+			if _, connected := l.live[guestID]; !connected && l.timers[guestID] == nil {
+				l.armDepartureLocked(guestID)
+			}
+			l.mu.Unlock()
 			return
 		}
 		for _, s := range rows {
 			l.evictLiveGuest(ctx, s.RoomID, s.GuestID)
 			if l.hub != nil {
-				_ = l.hub.PublishRoom(ctx, s.RoomID, Event{Type: EventLobbyKnock, RoomID: s.RoomID, Data: MustMarshalData(LobbyKnockPayload{
-					MeetingID: s.MeetingID, RoomID: s.RoomID, GuestID: s.GuestID, DisplayName: s.DisplayName, KnockedAt: s.KnockedAt, Status: "left",
-				})})
+				_ = l.hub.PublishRoom(ctx, s.RoomID, Event{Type: EventLobbyKnock, RoomID: s.RoomID, Data: MustMarshalData(LobbyKnockPayload{MeetingID: s.MeetingID, RoomID: s.RoomID, GuestID: s.GuestID, DisplayName: s.DisplayName, KnockedAt: s.KnockedAt, Status: "left"})})
 			}
 		}
 	})
 	l.timers[guestID] = timer
-	l.mu.Unlock()
 }
 
 // presence is how long a session stays usable after the last refresh by any replica: the
