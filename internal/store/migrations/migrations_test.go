@@ -359,7 +359,7 @@ func TestRunRefusesAnUnknownDriver(t *testing.T) {
 	}
 }
 
-// Migration 32 removes incoming webhooks for end-to-end encryption, leaving one audit row per
+// Migration 52 removes incoming webhooks for end-to-end encryption, leaving one audit row per
 // webhook that was still live.
 func TestRemoveRoomWebhooks(t *testing.T) {
 	ctx := context.Background()

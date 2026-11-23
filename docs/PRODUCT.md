@@ -40,7 +40,7 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
   mirroring.
 - Incoming room webhooks are removed: rooms are becoming end-to-end encrypted, and the server cannot
   encrypt for a webhook. `/api/v1/webhooks/in/{id}` answers `410 gone` to every sender; integrations
-  post through a bot (Bots & Agents). Migration 32 left an audit row (`webhook.removed`) per live
+  post through a bot (Bots & Agents). Migration 52 left an audit row (`webhook.removed`) per live
   webhook.
 
 **Voice, video & KyCalendar meetings.**
