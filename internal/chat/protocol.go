@@ -38,7 +38,9 @@ const (
 )
 
 // Event is the single envelope used on both the internal event bus (in-memory or
-// PostgreSQL LISTEN/NOTIFY) and server-to-client WebSocket frames.
+// PostgreSQL LISTEN/NOTIFY) and server-to-client WebSocket frames. UserID is the recipient:
+// Dispatch sends an event that has it to that user only, so a room event leaves it empty and
+// puts any actor ID in Data.
 type Event struct {
 	Type   string          `json:"t"`
 	RoomID string          `json:"room,omitempty"`
