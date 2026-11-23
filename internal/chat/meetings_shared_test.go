@@ -111,7 +111,7 @@ func TestSharedLobbyAdmissionLapsesWithoutAnyReplica(t *testing.T) {
 	}
 	l := NewLobbyManager(NewHub(&captureBus{}), nil)
 	l.UseShared(st.GuestSessions())
-	l.SetLeaveGrace(40 * time.Millisecond)
+	l.SetLeaveGrace(400 * time.Millisecond) // presence window 500 ms
 	s, err := l.Knock(ctx, &store.MeetingGuest{MeetingID: "m", GuestKey: "k"}, res.Meeting, nil, "Visitor")
 	if err != nil {
 		t.Fatal(err)
@@ -123,7 +123,7 @@ func TestSharedLobbyAdmissionLapsesWithoutAnyReplica(t *testing.T) {
 		t.Fatalf("fresh admission: %+v %v", got, ok)
 	}
 	// No socket anywhere, no timer: the replica that held it is gone.
-	time.Sleep(80 * time.Millisecond)
+	time.Sleep(time.Second)
 	if _, ok := l.GetBySecret(s.SessionSecret); ok {
 		t.Fatal("an admission nobody refreshed outlived the leave grace")
 	}
@@ -158,12 +158,12 @@ func TestSharedLobbyPollingGuestStaysWaiting(t *testing.T) {
 	}
 	l := NewLobbyManager(NewHub(&captureBus{}), nil)
 	l.UseShared(st.GuestSessions())
-	l.SetLeaveGrace(200 * time.Millisecond)
+	l.SetLeaveGrace(400 * time.Millisecond)
 	s, err := l.Knock(ctx, &store.MeetingGuest{MeetingID: "m", GuestKey: "k"}, res.Meeting, nil, "Visitor")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for range 8 { // 800 ms, well past the 250 ms presence window
+	for range 12 { // 1.2 s, well past the 500 ms presence window
 		time.Sleep(100 * time.Millisecond)
 		if _, ok := l.GetBySecret(s.SessionSecret); !ok {
 			t.Fatal("a polling guest lapsed")
