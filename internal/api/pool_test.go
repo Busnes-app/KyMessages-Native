@@ -178,7 +178,7 @@ func TestPoolStaleGrantFailsClosed(t *testing.T) {
 		t.Fatalf("upload within the grant's lifetime, KyIdentity down = %d", rec.Code)
 	}
 	// Age the grant past its lifetime.
-	seq, _ := e.st.Chat().NextPoolSeq(ctx, replicaOrgA)
+	seq, _, _ := e.st.Chat().NextPoolReport(ctx, replicaOrgA)
 	if err := e.st.Chat().SetPoolGrant(ctx, replicaOrgA, seq, 1000, 1<<20, time.Now().Add(-time.Second).UnixMilli()); err != nil {
 		t.Fatal(err)
 	}

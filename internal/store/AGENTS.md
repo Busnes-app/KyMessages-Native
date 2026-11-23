@@ -105,7 +105,7 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   from that.
 - `GetAllSettings` returns any row scan error rather than omitting the row. `SetSettingOnce` stores a value only when the key is unset and returns the stored one, so the first replica wins (`blobs.store_id`).
 - Migration 59 adds the org storage pool to `tenants`: `pool_seq` (each report's sequence,
-  `NextPoolSeq`, so it rises across replicas), and KyIdentity's latest grant
+  `NextPoolReport`, which takes it and the usage snapshot in one transaction, so it rises across replicas and a later sequence never carries an older total), and KyIdentity's latest grant
   (`pool_ceiling_bytes`, `pool_expires_at` in Unix ms, `pool_reported_bytes`). `SetPoolGrant`
   applies only to the latest numbered report; `RaisePoolSeq` follows a higher stale sequence.
   With `AttachmentQuotaLimits.Pool`, `ReserveAttachmentQuota` and `CommitAttachmentWithQuota`

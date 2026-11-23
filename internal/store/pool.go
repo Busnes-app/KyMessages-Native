@@ -63,15 +63,31 @@ func nullPtr(n sql.NullInt64) *int64 {
 	return &v
 }
 
-// NextPoolSeq takes tenantID's next report sequence from the shared database, so it rises
-// across replicas and lease handovers whatever their clocks say.
-func (c *chatStore) NextPoolSeq(ctx context.Context, tenantID string) (int64, error) {
-	var seq int64
-	err := c.store.db.QueryRowContext(ctx, c.store.rebind(`UPDATE tenants SET pool_seq = pool_seq + 1 WHERE id = ? RETURNING pool_seq`), tenantID).Scan(&seq)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, ErrNotFound
+// NextPoolReport takes tenantID's next report sequence from the shared database (so it rises
+// across replicas and lease handovers, whatever their clocks say) and the usage that report
+// carries, in one transaction. The sequence update holds the tenant row until commit, so a
+// later sequence always reads a later snapshot: KyIdentity, which keeps the highest sequence,
+// never keeps an older total.
+func (c *chatStore) NextPoolReport(ctx context.Context, tenantID string) (seq, used int64, err error) {
+	tx, err := c.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, 0, err
 	}
-	return seq, err
+	defer func() { _ = tx.Rollback() }()
+	err = tx.QueryRowContext(ctx, c.store.rebind(`UPDATE tenants SET pool_seq = pool_seq + 1 WHERE id = ? RETURNING pool_seq`), tenantID).Scan(&seq)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	if err := tx.QueryRowContext(ctx, c.store.rebind(`SELECT
+	COALESCE((SELECT SUM(size_bytes) FROM attachments WHERE tenant_id = ?), 0) +
+	COALESCE((SELECT SUM(reserved_bytes) FROM attachment_upload_reservations WHERE tenant_id = ? AND expires_at > ?), 0)`),
+		tenantID, tenantID, nowMilli()).Scan(&used); err != nil {
+		return 0, 0, err
+	}
+	return seq, used, tx.Commit()
 }
 
 // SetPoolGrant stores KyIdentity's grant for the report with seq, unless a later report was

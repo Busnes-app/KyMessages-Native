@@ -390,7 +390,7 @@ type ChatStore interface {
 	PurgeOrphanAttachments(ctx context.Context, olderThanMilli int64, limit int) ([]BlobRef, error)
 	// Org storage pool (multi mode, pool.go).
 	PoolUsages(ctx context.Context, nowMs int64, tenantID string) ([]PoolUsage, error)
-	NextPoolSeq(ctx context.Context, tenantID string) (int64, error)
+	NextPoolReport(ctx context.Context, tenantID string) (seq, used int64, err error)
 	SetPoolGrant(ctx context.Context, tenantID string, seq, reportedBytes, ceilingBytes, expiresAtMs int64) error
 	RaisePoolSeq(ctx context.Context, tenantID string, seq int64) error
 	// AttachmentTenant returns the org of the attachment stored under blobKey.

@@ -134,12 +134,12 @@ func (s *Server) reportPool(ctx context.Context, usages []store.PoolUsage) error
 		reports := make([]poolReport, 0, len(batch))
 		used := make(map[string]int64, len(batch))
 		for _, u := range batch {
-			seq, err := chat.NextPoolSeq(ctx, u.TenantID)
+			seq, now, err := chat.NextPoolReport(ctx, u.TenantID)
 			if err != nil {
 				return err
 			}
-			reports = append(reports, poolReport{OrgID: u.TenantID, UsedBytes: u.UsedBytes, Seq: seq, WantBytes: poolWantBytes})
-			used[u.TenantID] = u.UsedBytes
+			reports = append(reports, poolReport{OrgID: u.TenantID, UsedBytes: now, Seq: seq, WantBytes: poolWantBytes})
+			used[u.TenantID] = now
 		}
 		sentAt := time.Now()
 		results, err := s.postPoolReports(ctx, reports)
