@@ -254,3 +254,79 @@ func TestSSOPushRegistrationSerializesWithSIDLogout(t *testing.T) {
 		}
 	}
 }
+
+func TestUnprovisionedLogoutFenceRetainsIssuerScope(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Now().UTC()
+	if user, _, err := st.Sessions().ApplySSOLogout(ctx, "https://identity-a.example", "new-sub", "", "new-sid", "before-provision", now.Unix()); err != nil || user != "" {
+		t.Fatal("unprovisioned logout", user, err)
+	}
+	u := &store.User{ID: "new-user", Username: "new-user", SSOProvider: "kyidentity", SSOSubject: "new-sub", Role: "user", Status: "active"}
+	if err := st.Users().CreateUser(ctx, u); err != nil {
+		t.Fatal(err)
+	}
+	generation, err := st.Sessions().SSOGeneration(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess := &store.Session{SSOSession: store.SSOSession{Issuer: "https://identity-a.example", SID: "new-sid", IssuedAt: now.Unix() + 1, Generation: generation}, UserID: u.ID, TokenHash: "new", CreatedAt: now, ExpiresAt: now.Add(time.Hour)}
+	if err := st.Sessions().CreateSession(ctx, sess, ""); !errors.Is(err, store.ErrNotFound) {
+		t.Fatal("pre-provision sid fence ignored", err)
+	}
+	sess.Issuer = "https://identity-b.example"
+	if err := st.Sessions().CreateSession(ctx, sess, ""); err != nil {
+		t.Fatal("another issuer's fence applied", err)
+	}
+}
+
+func TestFirstSessionIssuanceSerializesWithLogoutAcrossConnections(t *testing.T) {
+	ctx := context.Background()
+	cfg := testdb.Config(t)
+	first, err := store.Open(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := store.Open(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	for _, scope := range []string{"first-sid", ""} {
+		generation, err := first.Sessions().SSOGeneration(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC()
+		u := &store.User{ID: "first-" + scope, Username: "first-" + scope, SSOProvider: "kyidentity", SSOSubject: "first-" + scope, Role: "user", Status: "active"}
+		sess := &store.Session{SSOSession: store.SSOSession{Issuer: "https://identity.example", SID: "first-sid", IssuedAt: now.Unix(), Generation: generation}, UserID: u.ID, TokenHash: u.ID, CreatedAt: now, ExpiresAt: now.Add(time.Hour)}
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		var issueErr, logoutErr error
+		go func() {
+			defer wg.Done()
+			<-start
+			if issueErr = first.Users().CreateUser(ctx, u); issueErr == nil {
+				issueErr = first.Sessions().CreateSession(ctx, sess, "")
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			_, _, logoutErr = second.Sessions().ApplySSOLogout(ctx, "https://identity.example", u.SSOSubject, "", scope, u.ID, now.Unix())
+		}()
+		close(start)
+		wg.Wait()
+		if logoutErr != nil {
+			t.Fatal(logoutErr)
+		}
+		if issueErr != nil && !errors.Is(issueErr, store.ErrNotFound) {
+			t.Fatal(issueErr)
+		}
+		if _, err := first.Sessions().GetSession(ctx, u.ID); !errors.Is(err, store.ErrNotFound) {
+			t.Fatal("first session survived concurrent logout", err)
+		}
+	}
+}

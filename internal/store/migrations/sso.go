@@ -9,12 +9,23 @@ CREATE TABLE directory_mfa_resets (
     restore_generation BIGINT NOT NULL, reset_key TEXT NOT NULL,
     PRIMARY KEY (provider, subject, restore_generation, reset_key)
 );
+ALTER TABLE sessions ADD COLUMN sso_issuer TEXT NOT NULL DEFAULT '';
 ALTER TABLE sessions ADD COLUMN sso_sid TEXT NOT NULL DEFAULT '';
 ALTER TABLE sessions ADD COLUMN sso_issued_at BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE sessions ADD COLUMN sso_generation BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE device_pairings ADD COLUMN sso_issuer TEXT NOT NULL DEFAULT '';
 ALTER TABLE device_pairings ADD COLUMN sso_sid TEXT NOT NULL DEFAULT '';
 ALTER TABLE device_pairings ADD COLUMN sso_issued_at BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE device_pairings ADD COLUMN sso_generation BIGINT NOT NULL DEFAULT 0;
+CREATE TABLE sso_identities (
+    subject TEXT NOT NULL, org_id TEXT NOT NULL,
+    PRIMARY KEY (subject, org_id)
+);
+CREATE TABLE sso_subject_revocations (
+    issuer TEXT NOT NULL, subject TEXT NOT NULL, org_id TEXT NOT NULL,
+    sid TEXT NOT NULL, issued_before BIGINT NOT NULL, generation BIGINT NOT NULL,
+    PRIMARY KEY (issuer, subject, org_id, sid)
+);
 CREATE TABLE sso_logout_events (
     issuer TEXT NOT NULL,
     jti TEXT NOT NULL,

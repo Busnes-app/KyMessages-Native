@@ -21,26 +21,60 @@ func checkSSOFence(ctx context.Context, st *SQLStore, tx *sql.Tx, userID string,
 	err := tx.QueryRowContext(ctx, st.rebind(`SELECT COUNT(*) FROM sso_revocations WHERE user_id = ? AND
         ((sid <> '' AND (sid = ? OR ? = '')) OR (sid = '' AND (issued_before >= ? OR generation > ?)))`),
 		userID, binding.SID, binding.SID, binding.IssuedAt, binding.Generation).Scan(&count)
+	if err != nil {
+		return err
+	}
+	if count > 0 {
+		return ErrNotFound
+	}
+	err = tx.QueryRowContext(ctx, st.rebind(`SELECT COUNT(*) FROM sso_subject_revocations r JOIN users u ON u.id = ?
+        WHERE u.sso_provider = 'kyidentity' AND r.subject = u.sso_subject AND r.org_id = u.org_id AND (r.issuer = ? OR ? = '')
+        AND ((r.sid <> '' AND (r.sid = ? OR ? = '')) OR (r.sid = '' AND (r.issued_before >= ? OR r.generation > ?)))`),
+		userID, binding.Issuer, binding.Issuer, binding.SID, binding.SID, binding.IssuedAt, binding.Generation).Scan(&count)
 	if err == nil && count > 0 {
 		return ErrNotFound
 	}
 	return err
 }
 
-func recordSSOFence(ctx context.Context, st *SQLStore, tx *sql.Tx, userID, sid string, issuedAt int64) error {
-	// A single counter orders callback starts against revocations across replicas without
-	// relying on their wall clocks. Only revocations write it; sign-ins read the primary.
+// The identity row exists before an account does. Both logout and grant issuance lock it
+// before the user row, so first-login provisioning cannot race past a logout fence.
+func lockSSOIdentity(ctx context.Context, st *SQLStore, tx *sql.Tx, subject, orgID string) error {
+	_, err := tx.ExecContext(ctx, st.rebind(`INSERT INTO sso_identities (subject,org_id) VALUES (?,?) ON CONFLICT (subject,org_id) DO UPDATE SET subject=excluded.subject`), subject, orgID)
+	return err
+}
+
+func nextSSOGeneration(ctx context.Context, tx *sql.Tx) (int64, error) {
+	// Only revocations advance this counter; ordinary callback starts read the primary.
 	if _, err := tx.ExecContext(ctx, "UPDATE sso_generation SET generation = generation + 1 WHERE id = 1"); err != nil {
-		return err
+		return 0, err
 	}
 	var generation int64
-	if err := tx.QueryRowContext(ctx, "SELECT generation FROM sso_generation WHERE id = 1").Scan(&generation); err != nil {
+	err := tx.QueryRowContext(ctx, "SELECT generation FROM sso_generation WHERE id = 1").Scan(&generation)
+	return generation, err
+}
+
+func recordSSOFence(ctx context.Context, st *SQLStore, tx *sql.Tx, userID, sid string, issuedAt int64) error {
+	generation, err := nextSSOGeneration(ctx, tx)
+	if err != nil {
 		return err
 	}
-	_, err := tx.ExecContext(ctx, st.rebind(`INSERT INTO sso_revocations (user_id, sid, issued_before, generation) VALUES (?, ?, ?, ?)
-        ON CONFLICT (user_id, sid) DO UPDATE SET
-        issued_before = CASE WHEN sso_revocations.issued_before > excluded.issued_before THEN sso_revocations.issued_before ELSE excluded.issued_before END,
-        generation = excluded.generation`), userID, sid, issuedAt, generation)
+	_, err = tx.ExecContext(ctx, st.rebind(`INSERT INTO sso_revocations (user_id,sid,issued_before,generation) VALUES (?,?,?,?)
+        ON CONFLICT (user_id,sid) DO UPDATE SET
+        issued_before=CASE WHEN sso_revocations.issued_before>excluded.issued_before THEN sso_revocations.issued_before ELSE excluded.issued_before END,
+        generation=excluded.generation`), userID, sid, issuedAt, generation)
+	return err
+}
+
+func recordSubjectFence(ctx context.Context, st *SQLStore, tx *sql.Tx, issuer, subject, orgID, sid string, issuedAt int64) error {
+	generation, err := nextSSOGeneration(ctx, tx)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, st.rebind(`INSERT INTO sso_subject_revocations (issuer,subject,org_id,sid,issued_before,generation) VALUES (?,?,?,?,?,?)
+        ON CONFLICT (issuer,subject,org_id,sid) DO UPDATE SET
+        issued_before=CASE WHEN sso_subject_revocations.issued_before>excluded.issued_before THEN sso_subject_revocations.issued_before ELSE excluded.issued_before END,
+        generation=excluded.generation`), issuer, subject, orgID, sid, issuedAt, generation)
 	return err
 }
 
@@ -83,34 +117,38 @@ func (s *sessionStore) ApplySSOLogout(ctx context.Context, issuer, subject, orgI
 		return "", nil, err
 	}
 	defer tx.Rollback()
-	// Lock by subject and org, never by sid alone. A mismatched event changes nothing.
-	result, err := tx.ExecContext(ctx, s.store.rebind(`UPDATE users SET id = id
-        WHERE sso_provider = 'kyidentity' AND sso_subject = ? AND org_id = ?`), subject, orgID)
-	if err != nil {
+	if err := lockSSOIdentity(ctx, s.store, tx, subject, orgID); err != nil {
 		return "", nil, err
 	}
-	n, err := result.RowsAffected()
-	if err != nil {
+	// Compare every existing binding before spending the jti or retaining any fence.
+	// An absent account is allowed: the verified identity still owns a durable logout.
+	var userID, accountOrg string
+	var count int
+	if err := tx.QueryRowContext(ctx, s.store.rebind(`SELECT COUNT(*),COALESCE(MAX(id),''),COALESCE(MAX(org_id),'') FROM users WHERE sso_provider='kyidentity' AND sso_subject=?`), subject).Scan(&count, &userID, &accountOrg); err != nil {
 		return "", nil, err
 	}
-	if n != 1 {
+	if count > 1 || (count == 1 && accountOrg != orgID) {
 		return "", nil, ErrNotFound
 	}
-	var userID string
-	if err := tx.QueryRowContext(ctx, s.store.rebind(`SELECT id FROM users WHERE sso_provider = 'kyidentity' AND sso_subject = ? AND org_id = ?`), subject, orgID).Scan(&userID); err != nil {
-		return "", nil, err
+	if count == 1 {
+		if err := oneRow(tx.ExecContext(ctx, s.store.rebind(`UPDATE users SET id=id WHERE id=? AND sso_provider='kyidentity' AND sso_subject=? AND org_id=?`), userID, subject, orgID)); err != nil {
+			return "", nil, err
+		}
 	}
-	result, err = tx.ExecContext(ctx, s.store.rebind(`INSERT INTO sso_logout_events (issuer, jti) VALUES (?, ?) ON CONFLICT (issuer, jti) DO NOTHING`), issuer, jti)
+	result, err := tx.ExecContext(ctx, s.store.rebind(`INSERT INTO sso_logout_events (issuer, jti) VALUES (?, ?) ON CONFLICT (issuer, jti) DO NOTHING`), issuer, jti)
 	if err != nil {
 		return "", nil, err
 	}
-	if n, err = result.RowsAffected(); err != nil {
+	if n, err := result.RowsAffected(); err != nil {
 		return "", nil, err
 	} else if n != 1 {
 		return "", nil, ErrAlreadyExists
 	}
-	if err := recordSSOFence(ctx, s.store, tx, userID, sid, issuedAt); err != nil {
+	if err := recordSubjectFence(ctx, s.store, tx, issuer, subject, orgID, sid, issuedAt); err != nil {
 		return "", nil, err
+	}
+	if userID == "" {
+		return "", nil, tx.Commit()
 	}
 	predicate := "user_id = ?"
 	args := []any{userID}

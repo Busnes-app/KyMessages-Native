@@ -10,9 +10,10 @@ Owns HTTP routing, request parsing, session cookie validation, CORS headers, and
 - `POST /api/sso/kyidentity/logout` is public and CSRF-exempt: its credential is the verified
   logout_token form field (64 KiB maximum, exactly one). Refused tokens/replays return 400;
   unavailable storage returns 503. Accepted logout publishes session-specific WS revocations
-  across pods. Register this URI on the KyIdentity OAuth client.
+  across pods. Verified logouts for an unprovisioned subject retain an identity fence for
+  the first callback; they do not create an account. Register this URI on the KyIdentity OAuth client.
 - The SSO callback reads the database revocation generation before exchange and carries the
-  verified IdP sid/iat into session issuance. Both device pairing steps inherit that binding.
+  verified IdP issuer/sid/iat into session issuance. Both device pairing steps inherit that binding.
 - Installer directory events narrow canonical org_id in multi mode before calling the store;
   its transaction compares the subject/account binding before revision or authority changes.
 

@@ -92,7 +92,7 @@ func TestSSOLogoutContractAcrossReplicas(t *testing.T) {
 		}
 		sessions[sid] = c
 		saved, err := st.Sessions().GetSession(ctx, crypto.SHA256Hex([]byte(c.Value)))
-		if err != nil || saved.SID != sid {
+		if err != nil || saved.SID != sid || saved.Issuer != idp.issuer {
 			t.Fatalf("sid not retained: %+v %v", saved, err)
 		}
 	}
@@ -115,7 +115,7 @@ func TestSSOLogoutContractAcrossReplicas(t *testing.T) {
 			t.Fatalf("pair verify: %d %s", w.Code, w.Body.String())
 		}
 		saved, err := st.Sessions().GetSession(ctx, crypto.SHA256Hex([]byte(derived.Value)))
-		if err != nil || saved.SID != "sid-a" {
+		if err != nil || saved.SID != "sid-a" || saved.Issuer != idp.issuer {
 			t.Fatalf("pair lost binding: %+v %v", saved, err)
 		}
 	}
@@ -129,7 +129,6 @@ func TestSSOLogoutContractAcrossReplicas(t *testing.T) {
 	}
 	for name, changes := range map[string]map[string]any{
 		"wrong org":      {"org_id": "00000000-0000-4000-8000-000000000002"},
-		"wrong subject":  {"sub": "other-sub"},
 		"wrong issuer":   {"iss": "https://other.example"},
 		"wrong audience": {"aud": "other-client"},
 		"expired":        {"iat": time.Now().Add(-3 * time.Minute).Unix(), "exp": time.Now().Add(-time.Minute).Unix()},
@@ -152,6 +151,13 @@ func TestSSOLogoutContractAcrossReplicas(t *testing.T) {
 	}
 	if w := idp.logout(second, idp.logoutToken(t, nil, wrongKey)); w.Code != 400 || !live("sid-a") || !live("sid-b") {
 		t.Fatalf("signature: %d", w.Code)
+	}
+	unknown := idp.logoutToken(t, map[string]any{"sub": "unprovisioned-other"}, nil)
+	if w := idp.logout(second, unknown); w.Code != 200 || !live("sid-a") || !live("sid-b") {
+		t.Fatalf("unprovisioned subject affected existing sessions: %d", w.Code)
+	}
+	if w := idp.logout(first, unknown); w.Code != 400 || !live("sid-a") || !live("sid-b") {
+		t.Fatalf("unprovisioned replay affected existing sessions: %d", w.Code)
 	}
 	// Refused org comparison must leave the jti available for a correctly bound event.
 	jti := "org-comparison"
@@ -177,49 +183,68 @@ func TestSSOLogoutContractAcrossReplicas(t *testing.T) {
 }
 
 func TestSSOLogoutFencesInFlightCallback(t *testing.T) {
-	for _, sid := range []string{"sid-a", ""} {
-		t.Run("scope="+sid, func(t *testing.T) {
-			_, st, cfg := setupTestServer(t)
-			cfg.SSO.Enabled = true
-			idp := makeFakeIdP(t, cfg, true)
-			u := &store.User{ID: "logout-user", Username: "logout-user", SSOProvider: "kyidentity", SSOSubject: "logout-sub", Status: "active", Role: "user"}
-			if err := st.Users().CreateUser(context.Background(), u); err != nil {
-				t.Fatal(err)
-			}
-			first, second := api.NewServer(cfg, st), api.NewServer(cfg, st)
-			defer first.CloseChat()
-			defer second.CloseChat()
-			entered, release := make(chan struct{}), make(chan struct{})
-			idp.mu.Lock()
-			idp.onToken = func() { close(entered); <-release }
-			idp.mu.Unlock()
-			done := make(chan *httptest.ResponseRecorder, 1)
-			go func() {
-				done <- idp.signIn(first, map[string]any{"sub": "logout-sub", "sid": "sid-a", "iat": time.Now().Unix() + 1})
-			}()
-			select {
-			case <-entered:
-			case <-time.After(10 * time.Second):
-				t.Fatal("exchange did not start")
-			}
-			changes := map[string]any{"org_id": nil}
-			if sid == "" {
-				changes["sid"] = nil
-			}
-			w := idp.logout(second, idp.logoutToken(t, changes, nil))
-			close(release)
-			if w.Code != 200 {
-				t.Fatalf("logout: %d %s", w.Code, w.Body.String())
-			}
-			select {
-			case w := <-done:
-				if sessionCookie(w) != nil {
-					t.Fatal("in-flight callback issued a session after logout")
+	for _, fixture := range []struct {
+		name               string
+		provisioned, multi bool
+	}{{"existing", true, false}, {"first-login", false, false}, {"first-login-multi", false, true}} {
+		for _, sid := range []string{"sid-a", ""} {
+			t.Run(fixture.name+"/scope="+sid, func(t *testing.T) {
+				_, st, cfg := setupTestServer(t)
+				cfg.SSO.Enabled = true
+				cfg.SSO.AutoProvision = true
+				orgID := ""
+				if fixture.multi {
+					cfg.Tenancy = config.TenancyConfig{Mode: config.TenancyMulti, StaffOrgID: testStaffOrg}
+					orgID = testStaffOrg
 				}
-			case <-time.After(10 * time.Second):
-				t.Fatal("callback did not finish")
-			}
-		})
+				idp := makeFakeIdP(t, cfg, true)
+				if fixture.provisioned {
+					u := &store.User{ID: "logout-user", Username: "logout-user", SSOProvider: "kyidentity", SSOSubject: "logout-sub", OrgID: orgID, Status: "active", Role: "user"}
+					if err := st.Users().CreateUser(context.Background(), u); err != nil {
+						t.Fatal(err)
+					}
+				}
+				first, second := api.NewServer(cfg, st), api.NewServer(cfg, st)
+				defer first.CloseChat()
+				defer second.CloseChat()
+				entered, release := make(chan struct{}), make(chan struct{})
+				idp.mu.Lock()
+				idp.onToken = func() { close(entered); <-release }
+				idp.mu.Unlock()
+				done := make(chan *httptest.ResponseRecorder, 1)
+				claims := map[string]any{"sub": "logout-sub", "sid": "sid-a", "iat": time.Now().Unix() + 1}
+				changes := map[string]any{"org_id": nil}
+				if fixture.multi {
+					claims["org_id"] = orgID
+					changes["org_id"] = orgID
+				}
+				go func() { done <- idp.signIn(first, claims) }()
+				select {
+				case <-entered:
+				case <-time.After(10 * time.Second):
+					t.Fatal("exchange did not start")
+				}
+				if sid == "" {
+					changes["sid"] = nil
+				}
+				w := idp.logout(second, idp.logoutToken(t, changes, nil))
+				close(release)
+				if w.Code != 200 {
+					t.Fatalf("logout: %d %s", w.Code, w.Body.String())
+				}
+				select {
+				case w := <-done:
+					if sessionCookie(w) != nil {
+						t.Fatal("in-flight callback issued a session after logout")
+					}
+					if w.Code != 500 || !strings.Contains(w.Body.String(), "Session creation failed") {
+						t.Fatalf("callback did not reach the issuance fence: %d %s", w.Code, w.Body.String())
+					}
+				case <-time.After(10 * time.Second):
+					t.Fatal("callback did not finish")
+				}
+			})
+		}
 	}
 }
 

@@ -7,7 +7,7 @@ Manages 90-second ephemeral QR-code device pairing protocols and push notificati
 Owns ephemeral PIN code generation, QR payload creation, device verification, and push token linking.
 
 ## Local Contracts
-- KyIdentity pairings retain the initiating session's IdP sid, token iat and shared revocation
+- KyIdentity pairings retain the initiating session's IdP issuer/sid, token iat and shared revocation
   generation; the paired session inherits all three. A logout fence refuses stale issuance.
 
 - Verification rejects inactive or password-restricted accounts and returns the pre-consumption user snapshot; session issuance checks that snapshot against concurrent password replacement.

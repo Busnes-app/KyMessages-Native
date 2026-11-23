@@ -8,7 +8,7 @@ Owns session issuance and verification, TOTP token generation/validation, recove
 
 ## Local Contracts
 - `IssueDerivedSession` carries the optional verified `SSOSession` binding through the
-  database fence check; IdP sid and token issuance/generation stay private to the server.
+  database fence check; IdP issuer/sid and token issuance/generation stay private to the server.
 
 - Sessions for `must_change_password` users authenticate only GET `/api/auth/me` and POST `/api/auth/change-password` or `/api/auth/logout`; private settings and product actions fail closed. Session issuance is bound to the verified password hash and serialized with replacement.
 - Passwords require at least 12 characters (`ValidatePassword`).

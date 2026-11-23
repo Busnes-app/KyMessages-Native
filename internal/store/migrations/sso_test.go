@@ -48,7 +48,7 @@ func TestSSOLifecycleUpgradePreservesExistingGrants(t *testing.T) {
 	}
 	for _, table := range []string{"sessions", "device_pairings"} {
 		var unbound int
-		if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+table+" WHERE sso_sid = '' AND sso_issued_at = 0 AND sso_generation = 0").Scan(&unbound); err != nil || unbound != 2 {
+		if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+table+" WHERE sso_issuer = '' AND sso_sid = '' AND sso_issued_at = 0 AND sso_generation = 0").Scan(&unbound); err != nil || unbound != 2 {
 			t.Fatalf("%s legacy binding: %d (%v)", table, unbound, err)
 		}
 	}

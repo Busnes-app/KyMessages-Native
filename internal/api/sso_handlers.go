@@ -159,7 +159,7 @@ func (s *Server) handleKyIdentityCallback(w http.ResponseWriter, r *http.Request
 	}
 
 	// The session is as fresh as the IdP's signed auth_time; a missing one never passes step-up.
-	_, _, err = s.sessions.IssueDerivedSession(r.Context(), w, r, user, claims.AuthenticatedAt, store.SSOSession{SID: claims.SessionID, IssuedAt: claims.IssuedAt, Generation: generation})
+	_, _, err = s.sessions.IssueDerivedSession(r.Context(), w, r, user, claims.AuthenticatedAt, store.SSOSession{Issuer: claims.Issuer, SID: claims.SessionID, IssuedAt: claims.IssuedAt, Generation: generation})
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Session creation failed")
 		return

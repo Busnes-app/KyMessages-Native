@@ -81,7 +81,8 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
 - KyIdentity back-channel logout (`POST /api/sso/kyidentity/logout`) ends one IdP session
   and its paired-device sessions and bound notification registrations by `sid`, or all of a
   subject's sessions when `sid` is omitted.
-  Shared replay records and issuance fences work across replicas. Configure this URI on the
+  Shared replay records and issuance fences work across replicas, including a first sign-in
+  whose local account has not yet been provisioned. Configure this URI on the
   OAuth client. Existing sessions, pairings and notification registrations stay on upgrade.
   Legacy sessions have no IdP sid: a sid logout also ends every unbound session for its verified
   subject and org. New suite sign-ins require and retain the IdP sid.

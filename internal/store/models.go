@@ -31,6 +31,7 @@ type User struct {
 // SSOSession is the verified IdP binding, inherited unchanged by paired devices.
 // Generation is the shared revocation generation read before code exchange.
 type SSOSession struct {
+	Issuer     string `json:"-"`
 	SID        string `json:"-"`
 	IssuedAt   int64  `json:"-"`
 	Generation int64  `json:"-"`
