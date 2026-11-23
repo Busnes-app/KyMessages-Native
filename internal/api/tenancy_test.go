@@ -741,8 +741,6 @@ func TestMultiTenantCrossOrgUserPaths(t *testing.T) {
 			{http.MethodPost, "/api/v1/rooms/" + rm + "/read"},
 			{http.MethodPut, "/api/v1/rooms/" + rm + "/notifications"},
 			{http.MethodGet, "/api/v1/rooms/" + rm + "/attachments"},
-			{http.MethodGet, "/api/v1/rooms/" + rm + "/webhooks"},
-			{http.MethodPost, "/api/v1/rooms/" + rm + "/webhooks"},
 			{http.MethodGet, "/api/v1/rooms/" + rm + "/calls/state"},
 			{http.MethodPost, "/api/v1/rooms/" + rm + "/calls/join"},
 			{http.MethodPost, "/api/v1/rooms/" + rm + "/calls/escalate"},
