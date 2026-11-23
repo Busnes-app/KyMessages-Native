@@ -227,6 +227,14 @@ func TestSuiteChatReplayAndSignatures(t *testing.T) {
 	if rec := e.do(e.srv, chat); rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), "duplicate") {
 		t.Fatalf("first = %d %s", rec.Code, rec.Body.String())
 	}
+	// An event ID longer than a VARCHAR(255) still records and replays (PostgreSQL included).
+	long := chat
+	long.id = "kypost-chat-" + strings.Repeat("x", 300)
+	for i, want := range []string{`{"url":`, `{"outcome":"duplicate"}`} {
+		if rec := e.do(e.srv, long); rec.Code != http.StatusOK || !strings.HasPrefix(rec.Body.String(), want) {
+			t.Fatalf("long event ID #%d = %d %s", i, rec.Code, rec.Body.String())
+		}
+	}
 	replica := newSuiteServer(t, e.cfg, e.st)
 	for name, srv := range map[string]*api.Server{"same": e.srv, "replica": replica} {
 		if rec := e.do(srv, chat); rec.Code != http.StatusOK || rec.Body.String() != `{"outcome":"duplicate"}`+"\n" {

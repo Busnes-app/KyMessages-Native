@@ -416,22 +416,21 @@ func (k *KyIdentityClient) upsertDirectoryUser(ctx context.Context, in Directory
 // SuiteDirectory returns a client for KyIdentity's suite directory using this app's own OAuth
 // client credentials, or nil when KyIdentity is not configured.
 func (k *KyIdentityClient) SuiteDirectory() (*suitedir.Client, error) {
-	if !k.config.Enabled || k.config.KyIdentityIssuer == "" {
-		return nil, nil
-	}
-	c := &suitedir.Client{
-		Issuer:       k.config.KyIdentityIssuer,
-		ClientID:     k.config.KyIdentityClientID,
-		ClientSecret: k.config.KyIdentitySecret,
-	}
-	if m := k.config.Installer; m != nil {
+	if m := k.config.Installer; m != nil && m.IssuerURL != "" {
 		secret, err := applysetup.Secret(m.ClientSecretFile)
 		if err != nil {
 			return nil, err
 		}
-		c.Issuer, c.ClientID, c.ClientSecret = m.IssuerURL, m.ClientID, secret
+		return &suitedir.Client{Issuer: m.IssuerURL, ClientID: m.ClientID, ClientSecret: secret}, nil
 	}
-	return c, nil
+	if !k.config.Enabled || k.config.KyIdentityIssuer == "" {
+		return nil, nil
+	}
+	return &suitedir.Client{
+		Issuer:       k.config.KyIdentityIssuer,
+		ClientID:     k.config.KyIdentityClientID,
+		ClientSecret: k.config.KyIdentitySecret,
+	}, nil
 }
 
 // EffectiveIssuer returns the canonical KyIdentity issuer URL configured for this server.

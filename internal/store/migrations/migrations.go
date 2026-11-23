@@ -263,7 +263,7 @@ ALTER TABLE mfa_challenges ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';`,
 	// Org lifecycle events apply in KyIdentity's per-org revision order.
 	{Version: 28, Name: "tenant_lifecycle_revision", SQLite: tenantLifecycleRevisionSchema, Postgres: tenantLifecycleRevisionSchema},
 	// Durable replay ledger shared across signed /api/suite/* and /api/meetings/* requests.
-	{Version: 29, Name: "suite_replay_events", SQLite: suiteReplayEventsSchemaSQLite, Postgres: suiteReplayEventsSchemaPostgres},
+	{Version: 29, Name: "suite_replay_events", SQLite: suiteReplayEventsSchema, Postgres: suiteReplayEventsSchema},
 }
 
 const multiTenancySchemaSQLite = `
@@ -282,18 +282,11 @@ const tenantLifecycleRevisionSchema = `
 ALTER TABLE tenants ADD COLUMN lifecycle_revision BIGINT NOT NULL DEFAULT 0;
 `
 
-const suiteReplayEventsSchemaSQLite = `
+// Event IDs are TEXT on both engines: syncauth bounds them only by header size, and an ID the
+// column cannot hold would fail every retry with 503.
+const suiteReplayEventsSchema = `
 CREATE TABLE IF NOT EXISTS suite_replay_events (
 	event_id TEXT PRIMARY KEY,
-	seen_at BIGINT NOT NULL,
-	expires_at BIGINT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_suite_replay_events_expires_at ON suite_replay_events(expires_at);
-`
-
-const suiteReplayEventsSchemaPostgres = `
-CREATE TABLE IF NOT EXISTS suite_replay_events (
-	event_id VARCHAR(255) PRIMARY KEY,
 	seen_at BIGINT NOT NULL,
 	expires_at BIGINT NOT NULL
 );
