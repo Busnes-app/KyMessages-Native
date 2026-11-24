@@ -36,8 +36,9 @@ func ShardChannel(roomID string) string {
 // PostgresBus fans out real-time events across horizontally scaled KyMessages pods using
 // sharded PostgreSQL LISTEN/NOTIFY without requiring Redis or Kafka.
 type PostgresBus struct {
-	dsn      string
-	notifier Notifier
+	dsn           string
+	notifier      Notifier
+	callFragments bool
 
 	readyOnce sync.Once
 	ready     chan struct{}
@@ -50,6 +51,9 @@ func NewPostgresBus(dsn string, notifier Notifier) *PostgresBus {
 		ready:    make(chan struct{}),
 	}
 }
+
+// EnableCallFragments preserves full call control payloads in multi mode. Configure before Run.
+func (b *PostgresBus) EnableCallFragments() { b.callFragments = true }
 
 // Ready returns a channel closed once the initial LISTEN subscriptions are active.
 func (b *PostgresBus) Ready() <-chan struct{} {
@@ -83,22 +87,34 @@ func (b *PostgresBus) PublishRoom(ctx context.Context, roomID string, ev Event) 
 	if ev.RoomID == "" {
 		ev.RoomID = roomID
 	}
-	payload, err := encodeNotifyPayload(ev)
-	if err != nil {
-		return err
-	}
-	return b.notifier.Notify(ctx, ShardChannel(roomID), payload)
+	return b.publish(ctx, ShardChannel(roomID), ev)
 }
 
 func (b *PostgresBus) PublishUser(ctx context.Context, userID string, ev Event) error {
 	if ev.UserID == "" {
 		ev.UserID = userID
 	}
-	payload, err := encodeNotifyPayload(ev)
+	return b.publish(ctx, UserBusChannel, ev)
+}
+
+func (b *PostgresBus) publish(ctx context.Context, channel string, ev Event) error {
+	if !b.callFragments {
+		payload, err := encodeNotifyPayload(ev)
+		if err != nil {
+			return err
+		}
+		return b.notifier.Notify(ctx, channel, payload)
+	}
+	payloads, err := encodeBusNotifications(ev)
 	if err != nil {
 		return err
 	}
-	return b.notifier.Notify(ctx, UserBusChannel, payload)
+	for _, payload := range payloads {
+		if err := b.notifier.Notify(ctx, channel, payload); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Run maintains a dedicated PostgreSQL LISTEN session with exponential-backoff reconnect.
@@ -145,16 +161,19 @@ func (b *PostgresBus) listenOnce(ctx context.Context, onEvent func(Event)) error
 	}
 	b.readyOnce.Do(func() { close(b.ready) })
 
+	var calls callNotifyDecoder
 	for {
 		notif, err := conn.WaitForNotification(ctx)
 		if err != nil {
 			return err
 		}
-		var ev Event
-		if err := json.Unmarshal([]byte(notif.Payload), &ev); err != nil {
-			log.Printf("[CHAT BUS] ignoring malformed notify on %s: %v", notif.Channel, err)
+		ev, err := calls.decode(notif.Payload, time.Now())
+		if err != nil {
+			log.Printf("[CHAT BUS] ignoring malformed notify on %s", notif.Channel)
 			continue
 		}
-		onEvent(ev)
+		if ev != nil {
+			onEvent(*ev)
+		}
 	}
 }

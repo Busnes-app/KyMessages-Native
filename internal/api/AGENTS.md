@@ -7,6 +7,8 @@ Exposes HTTP REST routes, authentication endpoints, Single Sign-On callbacks, SC
 Owns HTTP routing, request parsing, session cookie validation, CORS headers, and error response formatting.
 
 ## Local Contracts
+- `NewServer` enables bounded call-notification chunking only for the multi-mode PostgreSQL bus; single-mode bus wire behavior stays unchanged. Room-owner routing remains separate from this transport prerequisite.
+
 - After multi-mode erasure, a surviving shared-room successor immediately has owner permissions; cleanup failure/retry and duplicate deliveries retain that choice and other members' content. Only owned rooms with no remaining member disappear. `erasure_handover_test.go` exercises real signed deliveries, encrypted member messages, attachments and successor API access.
 
 - An erased KyIdentity subject cannot be auto-provisioned by a later multi-mode sign-in; the database fence returns a generic 403 with no session. Erasure of an unknown subject creates the same permanent fence. Wrong-org erasure leaves the account and its grants unchanged.
