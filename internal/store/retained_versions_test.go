@@ -36,6 +36,9 @@ func retainedFixture(t *testing.T) (*SQLStore, Store, *User, *Attachment) {
 		if _, err := s.Chat().EnsureTenant(ctx, org); err != nil {
 			t.Fatal(err)
 		}
+		if err := s.Chat().ApplyTenantDirectory(ctx, TenantDirectoryEntry{TenantID: org, Status: TenantStatusActive, Enabled: true, Valid: true}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	u := &User{ID: "original-uploader", Username: "original-uploader", OrgID: retainedOrg, SSOProvider: "kyidentity", SSOSubject: "immutable-original-subject", Role: "user", Status: "active"}
 	if err := s.Users().CreateUser(ctx, u); err != nil {

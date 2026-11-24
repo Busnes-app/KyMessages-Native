@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -55,7 +56,7 @@ func TestCellsRefuseAnotherCellsOrgOnEveryWayIn(t *testing.T) {
 
 	// Bob's org holds a bot, a room with a guest link, and a KyCalendar meeting.
 	botTok := auth.AgentTokenPrefix + strings.Repeat("ab", 32)
-	if err := st.Users().CreateUser(ctx, &store.User{ID: "usr_cell_bot", Username: "cell_bot", Role: "bot", Status: "active", SSOProvider: "bot"}); err != nil {
+	if err := st.Users().CreateUser(ctx, &store.User{ID: "usr_cell_bot", Username: "cell_bot", Role: "bot", Status: "active", SSOProvider: "bot", OrgID: replicaOrgB}); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.Agents().CreateAgent(ctx, &store.Agent{ID: "agt_cell", UserID: "usr_cell_bot", Username: "cell_bot", OwnerUserID: bob.ID, TokenHash: crypto.SHA256Hex([]byte(botTok)), TokenState: store.AgentTokenActive, CreatedBy: bob.ID, CreatedAt: time.Now()}); err != nil {
@@ -201,6 +202,11 @@ func TestCellsSyncAdmitsOnlyServedCells(t *testing.T) {
 	}
 	if got := e.status(t, staged); got != store.TenantStatusSuspended {
 		t.Fatalf("another cell's staged org: %s", got)
+	}
+	// Suspended in storage too (not only by readiness), so its grants are revoked.
+	active, err := e.st.Chat().ActiveTenantIDs(ctx)
+	if err != nil || slices.Contains(active, staged) {
+		t.Fatalf("another cell's org stays active: %v %v", active, err)
 	}
 	if _, err := e.st.Chat().GetTenant(ctx, unknown); err == nil {
 		t.Fatal("the listing created another cell's org")
