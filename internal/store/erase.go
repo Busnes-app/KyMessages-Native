@@ -9,15 +9,20 @@ import (
 
 // Erasure (KyIdentity user.erased, multi mode): delete one person's data. Their messages in
 // rooms others still use become tombstones (no body, no name, no attachments; the row keeps
-// the thread's order). A DM whose other member is gone too is deleted whole. Blobs go first
+// the thread's order). Owned rooms and DMs with no other member are deleted whole. Blobs go first
 // (ErasureBlobs), then the rows (EraseUser), so an interrupted run leaves rows naming every
 // blob still there, and a rerun finishes. Both are idempotent.
 
-// goneDMs selects the erased user's DM rooms whose every other member is gone (no live row).
-const goneDMs = `SELECT r.id FROM rooms r JOIN room_members m ON m.room_id = r.id AND m.user_id = ?
-WHERE r.tenant_id = ? AND r.kind = 'dm' AND NOT EXISTS (
-	SELECT 1 FROM room_members o JOIN users u ON u.id = o.user_id
-	WHERE o.room_id = r.id AND o.user_id <> ? AND u.status <> 'deleted')`
+// goneErasureRooms selects DMs and owned rooms with no remaining member. Disabled members
+// still own their content; only a missing or erased account stops counting as a member.
+const goneErasureRooms = `SELECT r.id FROM rooms r CROSS JOIN (SELECT ? AS user_id) actor
+WHERE r.tenant_id = ? AND (
+ r.created_by = actor.user_id OR EXISTS (SELECT 1 FROM room_members m
+ WHERE m.tenant_id = r.tenant_id AND m.room_id = r.id AND m.user_id = actor.user_id
+ AND (r.kind = 'dm' OR m.role = 'owner')))
+AND NOT EXISTS (SELECT 1 FROM room_members o JOIN users u ON u.id = o.user_id
+ WHERE o.tenant_id = r.tenant_id AND o.room_id = r.id AND o.user_id <> actor.user_id AND o.user_id NOT IN (SELECT user_id FROM user_erasure_actors
+ WHERE tenant_id = r.tenant_id AND owner_user_id = ?) AND u.status <> 'deleted')`
 
 // ErasureBlobs lists every blob an erasure of userID removes.
 func (c *chatStore) ErasureBlobs(ctx context.Context, tenantID, userID string) ([]BlobRef, error) {
@@ -38,8 +43,8 @@ func (c *chatStore) ErasureBlobs(ctx context.Context, tenantID, userID string) (
 
 func (c *chatStore) erasureActorBlobs(ctx context.Context, tenantID, actorID, ownerID string) ([]BlobRef, error) {
 	rows, err := c.store.db.QueryContext(ctx, c.store.rebind(`SELECT a.id, a.tenant_id, a.blob_key FROM attachments a
- WHERE a.tenant_id = ? AND (a.uploader_id = ? OR a.message_id IN (SELECT id FROM messages WHERE tenant_id = ? AND sender_id = ?) OR a.room_id IN (`+goneDMs+`))
- UNION SELECT '',tenant_id,blob_key FROM pending_blob_deletes WHERE tenant_id = ? AND user_id = ?`), tenantID, actorID, tenantID, actorID, actorID, tenantID, actorID, tenantID, ownerID)
+ WHERE a.tenant_id = ? AND (a.uploader_id = ? OR a.message_id IN (SELECT id FROM messages WHERE tenant_id = ? AND sender_id = ?) OR a.room_id IN (`+goneErasureRooms+`))
+ UNION SELECT '',tenant_id,blob_key FROM pending_blob_deletes WHERE tenant_id = ? AND user_id = ?`), tenantID, actorID, tenantID, actorID, actorID, tenantID, ownerID, tenantID, ownerID)
 	if err != nil {
 		return nil, err
 	}
@@ -139,6 +144,9 @@ func (c *chatStore) EraseUser(ctx context.Context, tenantID string, user *User) 
 	if err := c.rememberErasureActors(ctx, tx, tenantID, userID); err != nil {
 		return nil, err
 	}
+	if err := c.handoverErasureRooms(ctx, tx, tenantID, userID); err != nil {
+		return nil, err
+	}
 	actors, err := c.erasureActors(ctx, tx, tenantID, userID)
 	if err != nil {
 		return nil, err
@@ -163,7 +171,7 @@ func (c *chatStore) eraseActorTx(ctx context.Context, tx *sql.Tx, tenantID, user
 		sql  string
 		args []any
 	}{
-		{`DELETE FROM attachments WHERE room_id IN (` + goneDMs + `) RETURNING id, tenant_id, blob_key`, []any{userID, tenantID, userID}},
+		{`DELETE FROM attachments WHERE room_id IN (` + goneErasureRooms + `) RETURNING id, tenant_id, blob_key`, []any{userID, tenantID, ownerID}},
 		{`DELETE FROM attachments WHERE tenant_id = ? AND (uploader_id = ? OR message_id IN (SELECT id FROM messages WHERE tenant_id = ? AND sender_id = ?)) RETURNING id, tenant_id, blob_key`, []any{tenantID, userID, tenantID, userID}},
 	} {
 		rows, err := tx.QueryContext(ctx, c.store.rebind(q.sql), q.args...)
@@ -194,10 +202,10 @@ func (c *chatStore) eraseActorTx(ctx context.Context, tx *sql.Tx, tenantID, user
 		q    string
 		args []any
 	}{
-		// DMs nobody else uses: everything left in them goes.
-		{`DELETE FROM message_reactions WHERE message_id IN (SELECT id FROM messages WHERE room_id IN (` + goneDMs + `))`, []any{userID, tenantID, userID}},
-		{`DELETE FROM messages WHERE room_id IN (` + goneDMs + `)`, []any{userID, tenantID, userID}},
-		{`DELETE FROM rooms WHERE id IN (` + goneDMs + `)`, []any{userID, tenantID, userID}},
+		// DMs and owned rooms nobody else uses: everything left in them goes.
+		{`DELETE FROM message_reactions WHERE message_id IN (SELECT id FROM messages WHERE room_id IN (` + goneErasureRooms + `))`, []any{userID, tenantID, ownerID}},
+		{`DELETE FROM messages WHERE room_id IN (` + goneErasureRooms + `)`, []any{userID, tenantID, ownerID}},
+		{`DELETE FROM rooms WHERE id IN (` + goneErasureRooms + `)`, []any{userID, tenantID, ownerID}},
 		// Elsewhere: tombstones, and nothing of theirs reacted.
 		{`UPDATE messages SET body = '', sender_name = '', deleted_at = COALESCE(deleted_at, ?) WHERE tenant_id = ? AND sender_id = ?`, []any{now, tenantID, userID}},
 		{`DELETE FROM message_reactions WHERE user_id = ?`, []any{userID}},
