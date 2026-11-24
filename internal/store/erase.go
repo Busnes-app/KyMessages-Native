@@ -266,7 +266,8 @@ func (c *chatStore) PendingBlobDeletes(ctx context.Context, limit int) ([]BlobRe
 	return out, rows.Err()
 }
 
-// ClearPendingBlobDeletes drops successful deletes and records each completed erasure once.
+// ClearPendingBlobDeletes drops erased blobs (every version gone: Backend.Erase) and their
+// retained charges, and records each completed erasure once.
 // The completion transition and audit share the cleanup transaction, on every replica.
 func (c *chatStore) ClearPendingBlobDeletes(ctx context.Context, refs []BlobRef) error {
 	tx, err := c.store.db.BeginTx(ctx, nil)
@@ -291,12 +292,9 @@ func (c *chatStore) ClearPendingBlobDeletes(ctx context.Context, refs []BlobRef)
 		}
 	}
 	for _, r := range refs {
-		var retained int
-		if err := tx.QueryRowContext(ctx, c.store.rebind(`SELECT COUNT(*) FROM retained_attachment_versions WHERE tenant_id=? AND blob_key=?`), r.TenantID, r.Key).Scan(&retained); err != nil {
+		// The caller erased every version of r, so its retained charge goes too.
+		if _, err := tx.ExecContext(ctx, c.store.rebind(`DELETE FROM retained_attachment_versions WHERE tenant_id = ? AND blob_key = ?`), r.TenantID, r.Key); err != nil {
 			return err
-		}
-		if retained != 0 {
-			return ErrObjectCleanupPending
 		}
 		if _, err := tx.ExecContext(ctx, c.store.rebind(`DELETE FROM pending_blob_deletes WHERE tenant_id = ? AND blob_key = ?`), r.TenantID, r.Key); err != nil {
 			return err

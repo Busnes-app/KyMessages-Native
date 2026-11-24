@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Busnes-app/ky-primitives/recoveryclient"
+	"github.com/Busnes-app/ky-primitives/s3"
 	"github.com/Busnes-app/ky-primitives/syncauth"
 	"github.com/Busnes-app/ky_server_base/internal/auth"
 	"github.com/Busnes-app/ky_server_base/internal/blobs"
@@ -221,13 +222,23 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 		}
 	})
 
-	var blobStore *blobs.Store
+	var blobStore blobs.Backend
 	var blobsErr error
 	attDir := strings.TrimSpace(cfg.Attachments.Dir)
 	if attDir == "" && strings.TrimSpace(cfg.Database.DataDir) != "" {
 		attDir = filepath.Join(cfg.Database.DataDir, "attachments")
 	}
-	if attDir != "" {
+	if obj := cfg.Attachments.ObjectStore; obj != nil && cfg.Tenancy.IsMultiTenant() {
+		// The bucket holds every org; the local directory is only private scratch.
+		client, err := s3.New(obj.S3)
+		if err == nil {
+			blobStore, err = blobs.NewS3Store(client, obj.SealKey, filepath.Join(attDir, ".s3-scratch"), cfg.Attachments.MaxUploadBytes)
+		}
+		if err != nil {
+			blobsErr = err
+			log.Printf("[ATTACHMENTS] failed to initialize object storage: %v", err)
+		}
+	} else if attDir != "" {
 		newStore := blobs.NewStore
 		if cfg.Tenancy.IsMultiTenant() {
 			newStore = blobs.NewOrgStore
@@ -266,7 +277,7 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 		accountAttempts: attemptLimiter{m: make(map[string]attemptWindow)},
 	}
 
-	if blobStore != nil {
+	if blobStore != nil && blobsErr == nil {
 		s.blobs = blobStore
 	}
 	if cfg.Tenancy.IsMultiTenant() && st != nil {

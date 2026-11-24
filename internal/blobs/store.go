@@ -38,15 +38,19 @@ type PutResult struct {
 	SizeBytes int64
 	SHA256Hex string
 	MimeType  string
+	VersionID string // the object store's version; empty on disk
 }
 
 // Backend is what the attachment routes need from blob storage. Every call names the blob's
 // org: a backend with the org layout keeps each org under orgs/<tenant_id>/att/, so one org's
-// blobs are one prefix (DeletePrefix), and a flat backend ignores it.
+// blobs are one prefix (DeletePrefix), and a flat backend ignores it. Delete removes the
+// current version only (a user's own delete); Erase and DeletePrefix remove every version
+// (erasure and purge).
 type Backend interface {
 	Put(tenantID, key string, r io.Reader, maxBytes int64) (PutResult, error)
 	Open(tenantID, key string) (io.ReadSeekCloser, int64, error)
 	Delete(tenantID, key string) error
+	Erase(tenantID, key string) error
 	DeletePrefix(tenantID string) error
 	SweepStaleTemps(olderThan time.Duration) int
 }
@@ -289,6 +293,9 @@ func (s *Store) Delete(tenantID, key string) error {
 	}
 	return err
 }
+
+// Erase is Delete: a disk store keeps no versions.
+func (s *Store) Erase(tenantID, key string) error { return s.Delete(tenantID, key) }
 
 // DeletePrefix removes every blob of tenantID, orphans included (org layout only; a flat
 // store has no per-org prefix and refuses).

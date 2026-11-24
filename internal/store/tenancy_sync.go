@@ -145,7 +145,8 @@ func (c *chatStore) PurgeTenantRows(ctx context.Context, tenantID string) error 
 		}
 		return err
 	}
-	if err := c.requireNoRetainedVersionsTx(ctx, tx, tenantID); err != nil {
+	// The prefix delete that follows removes every version these rows charged.
+	if _, err := tx.ExecContext(ctx, c.store.rebind(`DELETE FROM retained_attachment_versions WHERE tenant_id = ?`), tenantID); err != nil {
 		return err
 	}
 	if err := queueCallSeatsTx(ctx, c.store, tx, `call_seats.tenant_id=?`, tenantID); err != nil {

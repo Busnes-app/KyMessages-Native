@@ -3,6 +3,7 @@ package config_test
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -426,6 +427,70 @@ func TestTenancyModeFromEnv(t *testing.T) {
 		}
 		if _, err := config.LoadForTenancy(config.TenancyMulti); err != nil {
 			t.Fatalf("push off needs no VAPID key: %v", err)
+		}
+	})
+
+	// Object storage: all of KY_ATTACHMENTS_S3_* or none, multi mode only, no secret in errors.
+	t.Run("object_store", func(t *testing.T) {
+		const secret = "s3-secret-never-printed"
+		s3Env := func(t *testing.T) {
+			multiEnv(t)
+			dir := os.Getenv("KY_DATA_DIR")
+			seal := filepath.Join(dir, "seal.key")
+			if err := os.WriteFile(seal, []byte(strings.Repeat("ef", 32)+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			secretFile := filepath.Join(dir, "s3.secret")
+			if err := os.WriteFile(secretFile, []byte(secret+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("KY_ATTACHMENTS_S3_ENDPOINT", "https://objects.example.test")
+			t.Setenv("KY_ATTACHMENTS_S3_REGION", "us-east-2")
+			t.Setenv("KY_ATTACHMENTS_S3_BUCKET", "kymessages")
+			t.Setenv("KY_ATTACHMENTS_S3_ACCESS_KEY", "access-id")
+			t.Setenv("KY_ATTACHMENTS_S3_SECRET_FILE", secretFile)
+			t.Setenv("KY_ATTACHMENTS_S3_SEAL_KEY_FILE", seal)
+		}
+		s3Env(t)
+		cfg, err := config.LoadForTenancy(config.TenancyMulti)
+		if err != nil {
+			t.Fatal(err)
+		}
+		obj := cfg.Attachments.ObjectStore
+		if obj == nil || obj.S3.SecretKey != secret || obj.S3.Bucket != "kymessages" || len(obj.SealKey) != 32 {
+			t.Fatalf("object store: %+v", obj)
+		}
+		if printed := fmt.Sprintf("%v %+v %#v", obj, *obj, cfg.Attachments); strings.Contains(printed, secret) || strings.Contains(printed, "efef") {
+			t.Fatal("a secret is printable")
+		}
+		for _, tc := range []struct{ name, value string }{
+			{"KY_ATTACHMENTS_S3_ENDPOINT", "http://objects.example.test"},
+			{"KY_ATTACHMENTS_S3_ENDPOINT", "https://user:" + secret + "@objects.example.test"},
+			{"KY_ATTACHMENTS_S3_ENDPOINT", ""},
+			{"KY_ATTACHMENTS_S3_REGION", ""},
+			{"KY_ATTACHMENTS_S3_BUCKET", "a/b"},
+			{"KY_ATTACHMENTS_S3_SECRET_FILE", ""},
+			{"KY_ATTACHMENTS_S3_SECRET", secret}, // with the file too: ambiguous
+			{"KY_ATTACHMENTS_S3_SEAL_KEY_FILE", ""},
+			{"KY_ATTACHMENTS_S3_SEAL_KEY_FILE", os.Getenv("KY_ATTACHMENTS_S3_SECRET_FILE")},
+		} {
+			s3Env(t)
+			t.Setenv(tc.name, tc.value)
+			_, err := config.LoadForTenancy(config.TenancyMulti)
+			if err == nil || strings.Contains(err.Error(), secret) {
+				t.Errorf("%s=%q: %v", tc.name, tc.value, err)
+			}
+		}
+		// Single mode never takes object storage, even fully configured.
+		s3Env(t)
+		t.Setenv("KY_DB_DRIVER", "sqlite")
+		if _, err := config.LoadForTenancy(config.TenancySingle); err == nil || !strings.Contains(err.Error(), "multi only") {
+			t.Fatalf("single mode accepted object storage: %v", err)
+		}
+		t.Setenv("KY_ATTACHMENTS_S3_SEAL_KEY_FILE", "")
+		t.Setenv("KY_ATTACHMENTS_S3_ENDPOINT", "")
+		if _, err := config.LoadForTenancy(config.TenancySingle); err == nil {
+			t.Fatal("single mode accepted a partial object store setting")
 		}
 	})
 

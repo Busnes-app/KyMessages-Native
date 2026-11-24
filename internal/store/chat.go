@@ -1012,6 +1012,9 @@ func (c *chatStore) DeleteMessage(ctx context.Context, tenantID, roomID, message
 		); err != nil {
 			return nil, err
 		}
+		if err := c.retainVersionsTx(ctx, tx, `a.tenant_id = ? AND a.room_id = ? AND a.message_id = ?`, tenantID, roomID, messageID); err != nil {
+			return nil, err
+		}
 		if _, err := tx.ExecContext(ctx,
 			c.store.rebind(`DELETE FROM attachments WHERE tenant_id = ? AND room_id = ? AND message_id = ?`),
 			tenantID, roomID, messageID,
@@ -1175,11 +1178,11 @@ func (c *chatStore) CreateAttachment(ctx context.Context, a *Attachment) error {
 		a.CreatedAt = nowMilli()
 	}
 	q := c.store.rebind(`
-		INSERT INTO attachments (id, tenant_id, room_id, message_id, uploader_id, blob_key, filename, mime_type, size_bytes, sha256_hex, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		INSERT INTO attachments (id, tenant_id, room_id, message_id, uploader_id, blob_key, filename, mime_type, size_bytes, sha256_hex, created_at, version_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	_, err := c.store.db.ExecContext(ctx, q,
 		a.ID, a.TenantID, a.RoomID, nullString(a.MessageID), a.UploaderID,
-		a.BlobKey, a.Filename, a.MimeType, a.SizeBytes, a.SHA256Hex, a.CreatedAt,
+		a.BlobKey, a.Filename, a.MimeType, a.SizeBytes, a.SHA256Hex, a.CreatedAt, a.VersionID,
 	)
 	return uniqueError(err)
 }
@@ -1486,11 +1489,11 @@ func (c *chatStore) CommitAttachmentWithQuota(ctx context.Context, reservationID
 	}
 
 	insQ := c.store.rebind(`
-		INSERT INTO attachments (id, tenant_id, room_id, message_id, uploader_id, blob_key, filename, mime_type, size_bytes, sha256_hex, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		INSERT INTO attachments (id, tenant_id, room_id, message_id, uploader_id, blob_key, filename, mime_type, size_bytes, sha256_hex, created_at, version_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if _, err := tx.ExecContext(ctx, insQ,
 		a.ID, a.TenantID, a.RoomID, nullString(a.MessageID), a.UploaderID,
-		a.BlobKey, a.Filename, a.MimeType, a.SizeBytes, a.SHA256Hex, a.CreatedAt,
+		a.BlobKey, a.Filename, a.MimeType, a.SizeBytes, a.SHA256Hex, a.CreatedAt, a.VersionID,
 	); err != nil {
 		return uniqueError(err)
 	}

@@ -19,4 +19,5 @@ CREATE TABLE retained_attachment_versions (
 );
 CREATE INDEX retained_attachment_versions_attachment ON retained_attachment_versions(tenant_id, attachment_id, version_id);
 CREATE INDEX retained_attachment_versions_uploader ON retained_attachment_versions(tenant_id, uploader_id);
+ALTER TABLE attachments ADD COLUMN version_id TEXT NOT NULL DEFAULT '';
 `

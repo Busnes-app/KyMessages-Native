@@ -45,6 +45,7 @@ func TestRetainedVersionUpgradePreservesLiveContentAndGrants(t *testing.T) {
 			{`SELECT COUNT(*) FROM sessions WHERE token_hash='session' AND user_id='owner'`, 1},
 			{`SELECT COUNT(*) FROM attachments WHERE id='file' AND tenant_id='default' AND room_id='room' AND uploader_id='owner' AND blob_key='key' AND filename='name.bin' AND size_bytes=321 AND sha256_hex='digest'`, 1},
 			{`SELECT COUNT(*) FROM retained_attachment_versions`, 0},
+			{`SELECT COUNT(*) FROM attachments WHERE id='file' AND version_id=''`, 1},
 		} {
 			var got int
 			if err := db.QueryRowContext(ctx, check.q).Scan(&got); err != nil || got != check.want {

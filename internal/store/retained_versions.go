@@ -5,8 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"time"
-
-	"github.com/Busnes-app/ky_server_base/internal/config"
 )
 
 var ErrObjectCleanupPending = errors.New("attachment object cleanup pending")
@@ -22,56 +20,17 @@ type RetainedAttachmentVersion struct {
 	RetainedAt                                    int64
 }
 
-// DeleteAttachmentRetainingVersion atomically replaces the live quota charge
-// with a retained one. A future S3 coordinator must supply the exact DATA version
-// receipt after fencing its remote delete; a delete-marker ID is not that receipt.
-// No current HTTP route calls this method. It never permanently deletes data.
-func (c *chatStore) DeleteAttachmentRetainingVersion(ctx context.Context, tenantID, attachmentID, versionID string) error {
-	if !config.IsCanonicalUUID(tenantID) || attachmentID == "" || versionID == "" || versionID == "null" {
-		return ErrInvalidInput
-	}
-	tx, err := c.store.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if err := c.lockAttachmentQuotaTx(ctx, tx, tenantID); err != nil {
-		return err
-	}
-	// Replays after live-row deletion retain the original receipt. A new
-	// receipt needs live provenance; this method never guesses it after deletion.
-	var exists int
-	err = tx.QueryRowContext(ctx, c.store.rebind(`SELECT 1 FROM retained_attachment_versions WHERE tenant_id=? AND attachment_id=? AND version_id=?`), tenantID, attachmentID, versionID).Scan(&exists)
-	if err == nil {
-		return tx.Commit()
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return err
-	}
-	q := `SELECT a.blob_key,a.uploader_id,u.sso_provider,u.sso_subject,a.size_bytes,a.sha256_hex
- FROM attachments a JOIN users u ON u.id=a.uploader_id
- WHERE a.tenant_id=? AND a.id=? AND (u.org_id=? OR (u.org_id='' AND u.sso_provider='bot'))`
-	if c.store.driver == "postgres" {
-		q += ` FOR UPDATE OF a,u`
-	}
-	var v RetainedAttachmentVersion
-	err = tx.QueryRowContext(ctx, c.store.rebind(q), tenantID, attachmentID, tenantID).Scan(&v.BlobKey, &v.UploaderID, &v.UploaderProvider, &v.UploaderSubject, &v.SizeBytes, &v.SHA256Hex)
-	if errors.Is(err, sql.ErrNoRows) {
-		return ErrNotFound
-	}
-	if err != nil {
-		return err
-	}
-	_, err = tx.ExecContext(ctx, c.store.rebind(`INSERT INTO retained_attachment_versions
+// retainVersionsTx records the object-store version of each attachment row matched by
+// where (over attachments a) before the caller deletes the rows, so the bucket's retained
+// copy stays charged to the org and findable by erasure (§9.4). Disk rows have no version
+// and retain nothing. Uploader provenance is a snapshot: it outlives the account row.
+func (c *chatStore) retainVersionsTx(ctx context.Context, tx *sql.Tx, where string, args ...any) error {
+	_, err := tx.ExecContext(ctx, c.store.rebind(`INSERT INTO retained_attachment_versions
  (tenant_id,attachment_id,blob_key,version_id,uploader_id,uploader_provider,uploader_subject,size_bytes,sha256_hex,retained_at)
- VALUES (?,?,?,?,?,?,?,?,?,?)`), tenantID, attachmentID, v.BlobKey, versionID, v.UploaderID, v.UploaderProvider, v.UploaderSubject, v.SizeBytes, v.SHA256Hex, time.Now().UnixMilli())
-	if err != nil {
-		return err
-	}
-	if _, err = tx.ExecContext(ctx, c.store.rebind(`DELETE FROM attachments WHERE tenant_id=? AND id=?`), tenantID, attachmentID); err != nil {
-		return err
-	}
-	return tx.Commit()
+ SELECT a.tenant_id,a.id,a.blob_key,a.version_id,a.uploader_id,COALESCE(u.sso_provider,''),COALESCE(u.sso_subject,''),a.size_bytes,a.sha256_hex,?
+ FROM attachments a LEFT JOIN users u ON u.id=a.uploader_id
+ WHERE a.version_id<>'' AND `+where+` ON CONFLICT DO NOTHING`), append([]any{time.Now().UnixMilli()}, args...)...)
+	return err
 }
 
 // RetainedAttachmentVersions is an org-scoped workflow inventory. The API must

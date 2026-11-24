@@ -251,9 +251,10 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 		MimeType:   putRes.MimeType,
 		SizeBytes:  putRes.SizeBytes,
 		SHA256Hex:  putRes.SHA256Hex,
+		VersionID:  putRes.VersionID,
 	}
 	if err := s.store.Chat().CommitAttachmentWithQuota(r.Context(), res.ID, att, limits); err != nil {
-		_ = s.blobs.Delete(tenantID, putRes.Key)
+		_ = s.blobs.Erase(tenantID, putRes.Key)
 		if s.writePoolError(w, err) {
 			return
 		}
@@ -435,7 +436,8 @@ func (s *Server) handleChatDeleteAttachment(w http.ResponseWriter, r *http.Reque
 		}
 		return
 	}
-	_ = s.blobs.Delete(tenantID, blobKey)
+	// Never sent: no retained copy is kept (§9.4 retains posted files).
+	_ = s.blobs.Erase(tenantID, blobKey)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -461,7 +463,7 @@ func (s *Server) SweepOrphanAttachments(ctx context.Context, now time.Time) (int
 			return deleted, err
 		}
 		for _, key := range keys {
-			_ = s.blobs.Delete(key.TenantID, key.Key)
+			_ = s.blobs.Erase(key.TenantID, key.Key) // never sent
 			deleted++
 		}
 		if len(keys) < 200 {
@@ -560,7 +562,7 @@ func (s *Server) drainPendingBlobDeletes(ctx context.Context) error {
 	var done []store.BlobRef
 	var failed []error
 	for _, ref := range refs {
-		if err := s.blobs.Delete(ref.TenantID, ref.Key); err != nil && !errors.Is(err, blobs.ErrInvalidKey) {
+		if err := s.blobs.Erase(ref.TenantID, ref.Key); err != nil && !errors.Is(err, blobs.ErrInvalidKey) {
 			failed = append(failed, err)
 			continue
 		}
@@ -574,7 +576,7 @@ func (s *Server) deleteBlobs(refs []store.BlobRef) error {
 		return nil
 	}
 	for _, ref := range refs {
-		if err := s.blobs.Delete(ref.TenantID, ref.Key); err != nil && !errors.Is(err, blobs.ErrInvalidKey) {
+		if err := s.blobs.Erase(ref.TenantID, ref.Key); err != nil && !errors.Is(err, blobs.ErrInvalidKey) {
 			return err
 		}
 	}
@@ -608,7 +610,7 @@ func (s *Server) PurgeDeletedOrgs(ctx context.Context, held func() bool) error {
 			}
 			if s.blobs != nil {
 				for _, ref := range refs {
-					if err := s.blobs.Delete(ref.TenantID, ref.Key); err != nil && !errors.Is(err, blobs.ErrInvalidKey) {
+					if err := s.blobs.Erase(ref.TenantID, ref.Key); err != nil && !errors.Is(err, blobs.ErrInvalidKey) {
 						return err
 					}
 				}
