@@ -509,3 +509,46 @@ func TestRoomCallReconciliationEndsLastExpiredSeatAndRetriesFailure(t *testing.T
 		})
 	}
 }
+
+func TestRoomCallInitialSeatFailureLeavesNoOrphan(t *testing.T) {
+	for _, failure := range []string{"missing_session", "nonmember"} {
+		t.Run(failure, func(t *testing.T) {
+			ctx := context.Background()
+			st, room, requests := seedRoutedCall(t)
+			m := NewCallManager(st.Chat(), NewHub(&captureBus{}), nil, nil)
+			m.EnableRoomRouting()
+			invalid := requests[0]
+			if failure == "missing_session" {
+				invalid.SessionHash = "missing-session"
+			} else {
+				// Membership is checked after the tentative call insert; refusal must roll it back.
+				if _, err := st.Chat().RemoveRoomMember(ctx, routedOrg, room, invalid.UserID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if response, err := m.Join(ctx, invalid); err == nil || response != nil {
+				t.Fatalf("invalid initial seat admitted: %+v %v", response, err)
+			}
+			if session, err := st.Chat().GetActiveCallSession(ctx, routedOrg, room); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("failed initial seat left an active call: %+v %v", session, err)
+			}
+			if state := m.GetState(room); state != nil {
+				t.Fatalf("failed initial seat cached: %+v", state)
+			}
+			first, err := m.Join(ctx, requests[1])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !first.Started {
+				t.Fatal("first admitted participant did not start call")
+			}
+			second, err := m.Join(ctx, requests[1])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if second.Started || second.CallID != first.CallID {
+				t.Fatalf("rejoin split call: %+v %+v", first, second)
+			}
+		})
+	}
+}

@@ -49,6 +49,13 @@ func (c *chatStore) UpdateTenantMediaPolicy(ctx context.Context, tenantID, polic
 // ---------------------------------------------------------------------
 
 func (c *chatStore) CreateCallSession(ctx context.Context, cs *CallSession) error {
+	prepareCallSession(cs)
+	return c.withCallLease(ctx, cs, func(db execQuerier) error {
+		return c.insertCallSession(ctx, db, cs)
+	})
+}
+
+func prepareCallSession(cs *CallSession) {
 	cs.TenantID = normalizeTenant(cs.TenantID)
 	if cs.ID == "" {
 		cs.ID = "call_" + uuid.Must(uuid.NewV7()).String()
@@ -62,15 +69,16 @@ func (c *chatStore) CreateCallSession(ctx context.Context, cs *CallSession) erro
 	if cs.StartedAt == 0 {
 		cs.StartedAt = nowMilli()
 	}
-	return c.withCallLease(ctx, cs, func(db execQuerier) error {
-		_, err := db.ExecContext(ctx, c.store.rebind(`
-		INSERT INTO call_sessions (id, tenant_id, room_id, mode, epoch, sfu_sticky, livekit_room, started_by, started_at, ended_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
-			cs.ID, cs.TenantID, cs.RoomID, cs.Mode, cs.Epoch, boolToInt(cs.SFUSticky),
-			nullString(cs.LiveKitRoom), cs.StartedBy, cs.StartedAt, cs.EndedAt,
-		)
-		return err
-	})
+}
+
+func (c *chatStore) insertCallSession(ctx context.Context, db execQuerier, cs *CallSession) error {
+	_, err := db.ExecContext(ctx, c.store.rebind(`
+	INSERT INTO call_sessions (id, tenant_id, room_id, mode, epoch, sfu_sticky, livekit_room, started_by, started_at, ended_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+		cs.ID, cs.TenantID, cs.RoomID, cs.Mode, cs.Epoch, boolToInt(cs.SFUSticky),
+		nullString(cs.LiveKitRoom), cs.StartedBy, cs.StartedAt, cs.EndedAt,
+	)
+	return err
 }
 
 func (c *chatStore) GetActiveCallSession(ctx context.Context, tenantID, roomID string) (*CallSession, error) {

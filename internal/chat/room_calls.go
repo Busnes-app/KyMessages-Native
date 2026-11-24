@@ -238,15 +238,16 @@ func (m *CallManager) joinOwned(ctx context.Context, req JoinCallRequest) (*Join
 	if mode == store.CallModeSFULiveKit && (session.LiveKitRoom == "" || changed) {
 		session.LiveKitRoom = mediaRoom(session)
 	}
+	seat := store.CallSeat{UserID: req.UserID, PeerID: peerID, SessionHash: req.SessionHash, Guest: req.IsGuest}
 	if created {
-		err = m.chatStore.CreateCallSession(ctx, &session)
+		err = m.chatStore.CreateOwnedCallSession(ctx, &session, seat)
 	} else {
 		err = m.chatStore.UpdateCallSession(ctx, &session)
+		if err == nil {
+			err = m.chatStore.PutCallSeat(ctx, &session, seat)
+		}
 	}
 	if err != nil {
-		return nil, err
-	}
-	if err := m.chatStore.PutCallSeat(ctx, &session, store.CallSeat{UserID: req.UserID, PeerID: peerID, SessionHash: req.SessionHash, Guest: req.IsGuest}); err != nil {
 		return nil, err
 	}
 	completed := false
