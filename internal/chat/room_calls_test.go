@@ -195,8 +195,16 @@ func TestRoomOwnerConcurrentJoinsAndSessionConfinement(t *testing.T) {
 	}
 	before = len(events)
 	m.HandleClientFrame(ctx, requests[0].UserID, false, frame)
-	if len(bus.snapshot()) != before {
-		t.Fatal("revoked session signaled")
+	events = bus.snapshot()[before:]
+	if len(events) != 1 || events[0].Type != EventCallState {
+		t.Fatalf("revoked session produced more than its roster revocation: %+v", events)
+	}
+	var roster CallStatePayload
+	if err := json.Unmarshal(events[0].Data, &roster); err != nil {
+		t.Fatal(err)
+	}
+	if len(roster.Peers) != 1 || roster.Peers[0].UserID != requests[1].UserID {
+		t.Fatalf("revoked session remained in roster: %+v", roster)
 	}
 	if len(m.GetState(room).Peers) != 1 {
 		t.Fatal("primary revocation did not remove cached peer")
@@ -439,7 +447,8 @@ func TestRoomCallReconciliationEndsLastExpiredSeatAndRetriesFailure(t *testing.T
 			ctx := context.Background()
 			st, room, requests := seedRoutedCall(t)
 			wrapped := &failEmptyCallEnd{ChatStore: st.Chat(), fail: failFirst}
-			m := NewCallManager(wrapped, NewHub(&captureBus{}), fakeLiveKitClient(t), nil)
+			bus := &captureBus{}
+			m := NewCallManager(wrapped, NewHub(bus), fakeLiveKitClient(t), nil)
 			m.EnableRoomRouting()
 			requests[0].ProtectIP = true
 			first, err := m.Join(ctx, requests[0])
@@ -463,6 +472,17 @@ func TestRoomCallReconciliationEndsLastExpiredSeatAndRetriesFailure(t *testing.T
 			if failFirst {
 				if err := m.ClaimRoom(ctx, routedOrg, room); !errors.Is(err, errEmptyCallEnd) {
 					t.Fatalf("end failure not returned: %v", err)
+				}
+				var revoked CallStatePayload
+				for _, event := range bus.snapshot() {
+					if event.Type == EventCallState && event.RoomID == room {
+						if err := json.Unmarshal(event.Data, &revoked); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+				if revoked.CallID != first.CallID || revoked.Active || len(revoked.Peers) != 0 {
+					t.Fatalf("end failure withheld revocation: %+v", revoked)
 				}
 			}
 			m.ReconcileTenants(ctx)

@@ -114,7 +114,19 @@ func (m *CallManager) ownedRoom(ctx context.Context, tenant, room string) (*acti
 	if !empty && len(cached.peers) > 0 {
 		m.maybeScheduleStepDownLocked(room, cached)
 	}
+	var roster CallStatePayload
+	if len(removed) > 0 {
+		roster = m.buildStateLocked(cached, !empty)
+		if empty {
+			// Retain retry state internally, but never advertise invalid peers.
+			roster.Peers = []CallPeerState{}
+		}
+	}
 	m.mu.Unlock()
+	if len(removed) > 0 {
+		// Roster revocation must not wait for media cleanup or an epoch change.
+		m.broadcastState(ctx, room, roster)
+	}
 	if empty {
 		// Keep the invalid cached peers until the durable end commits, so a failure retries.
 		// A newly recovered owner has no cached peers and still permits a fresh rejoin.
@@ -123,9 +135,7 @@ func (m *CallManager) ownedRoom(ctx context.Context, tenant, room string) (*acti
 		}
 		m.mu.Lock()
 		m.forgetRoomLocked(room)
-		state := m.buildStateLocked(cached, false)
 		m.mu.Unlock()
-		m.broadcastState(ctx, room, state)
 		return nil, m.DrainCleanup(ctx, tenant, "")
 	}
 	if err := m.DrainCleanup(ctx, tenant, ""); err != nil {

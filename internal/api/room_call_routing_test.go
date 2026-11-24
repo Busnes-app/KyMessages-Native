@@ -271,3 +271,46 @@ func TestGuestLookupFailureReturnsErrorWithoutPanic(t *testing.T) {
 		})
 	}
 }
+
+func TestP2PReconciliationPublishesRosterAfterRemoteMemberRemoval(t *testing.T) {
+	a, b, st, _ := newReplicas(t)
+	alice, token := createOrgUser(t, st, "roster-alice", "rosteralice", "user", replicaOrgA)
+	bob, bobToken := createOrgUser(t, st, "roster-bob", "rosterbob", "user", replicaOrgA)
+	room := roomOf(t, doBearerJSON(t, a, http.MethodPost, "/api/v1/rooms", token, map[string]any{"kind": "channel", "name": "Roster", "member_ids": []string{bob.ID}}, nil))
+	path := "/api/v1/rooms/" + room + "/calls/"
+	for _, userToken := range []string{token, bobToken} {
+		response := doBearerJSON(t, a, http.MethodPost, path+"join", userToken, map[string]bool{"audio": true}, nil)
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"mode":"p2p_mesh"`) {
+			t.Fatalf("P2P join: %d %s", response.Code, response.Body.String())
+		}
+	}
+	server := httptest.NewServer(a)
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	socket, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+path+"ws", &websocket.DialOptions{HTTPHeader: http.Header{"Authorization": []string{"Bearer " + token}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socket.CloseNow()
+	if event := readWSEvent(t, socket); event.Type != chat.EventHello {
+		t.Fatalf("hello: %+v", event)
+	}
+	removed := doBearerJSON(t, b, http.MethodDelete, "/api/v1/rooms/"+room+"/members/"+bob.ID, token, nil, nil)
+	if removed.Code != http.StatusOK {
+		t.Fatalf("remote removal: %d %s", removed.Code, removed.Body.String())
+	}
+	// Room-state acquisition runs the same primary reconciliation as the owner tick.
+	response := doBearerJSON(t, a, http.MethodGet, path+"state", token, nil, nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("reconcile: %d %s", response.Code, response.Body.String())
+	}
+	event := readWSEvent(t, socket)
+	var state chat.CallStatePayload
+	if err := json.Unmarshal(event.Data, &state); err != nil {
+		t.Fatal(err)
+	}
+	if event.Type != chat.EventCallState || state.Mode != store.CallModeP2PMesh || len(state.Peers) != 1 || state.Peers[0].UserID != alice.ID {
+		t.Fatalf("survivor roster: %+v %+v", event, state)
+	}
+}

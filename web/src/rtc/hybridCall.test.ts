@@ -367,6 +367,34 @@ describe('HybridCallController SFU/P2P handoff', () => {
     expect(audio.readyState).toBe('ended');
   });
 
+  it('closes an existing P2P connection when the authoritative roster removes that peer', async () => {
+    class PeerConnection {
+      static instances: PeerConnection[] = [];
+      close = vi.fn();
+      constructor() { PeerConnection.instances.push(this); }
+    }
+    class EmptyStream {
+      getTracks() { return []; }
+      getAudioTracks() { return []; }
+      getVideoTracks() { return []; }
+    }
+    vi.stubGlobal('RTCPeerConnection', PeerConnection);
+    vi.stubGlobal('MediaStream', EmptyStream);
+    const self = { peer_id: 'z-local', user_id: 'local', display_name: 'Local', is_guest: false,
+      audio: false, video: false, screen_share: false, protect_ip: false, joined_at: 1 };
+    const remote = { ...self, peer_id: 'a-remote', user_id: 'remote' };
+    const controller = new HybridCallController({ localUserId: 'local', localDisplayName: 'Local',
+      isGuest: false, socket: () => null, onChange: () => undefined });
+    await controller.start({ call_id: 'c', room_id: 'r', peer_id: self.peer_id, mode: 'p2p_mesh',
+      epoch: 1, sfu_sticky: false, ice_servers: [], peers: [self, remote] },
+      { audio: false, video: false, protectIp: false });
+    expect(PeerConnection.instances).toHaveLength(1);
+    controller.handleCallState({ call_id: 'c', room_id: 'r', mode: 'p2p_mesh', epoch: 1,
+      sfu_sticky: false, active: true, peers: [self] });
+    expect(PeerConnection.instances[0].close).toHaveBeenCalledTimes(1);
+    controller.dispose();
+  });
+
   it('refuses a socket path outside the joined room', () => {
     const reply = { call_id: 'c', room_id: 'one', mode: 'p2p_mesh', peers: [], ice_servers: [] };
     expect(() => parseCallJoinResponse({ ...reply, call_ws_path: '/api/v1/rooms/two/calls/ws' })).toThrow('Invalid call socket path');
