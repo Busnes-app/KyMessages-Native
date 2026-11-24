@@ -1,12 +1,13 @@
 # Blobs
 
 ## Purpose
-Stores chat attachment bytes on local disk, outside the web root, for `internal/api`'s attachment routes.
+Owns attachment storage outside the web root: the active disk backend, shared ciphertext codec and gated object-storage adapters.
 
 ## Ownership
 Owns the shared attachment ciphertext codec, the on-disk blob directory (`KY_ATTACHMENTS_DIR`), blob key validation and the upload MIME decision. Quotas and staged/posted state live in `internal/store`; the encrypted backup mirror lives in `internal/backup`.
 
 ## Local Contracts
+- Private `sealedObjects` consumes the shared `ky-primitives/s3` client for bounded conditional ciphertext writes and exact-version verified reads. Each write stages in its own directory, preserves MIME/hash rules and authenticates the complete org/object key. Reads verify size, GCM and expected digest before exposing a private seekable file; close removes it. Missing version/ETag is uncertain receipt data, never a failed-write proof. This is not an active `Backend`: durable admission/operation/version fencing, accounting, replica erasure, cache ownership and runtime wiring remain required before hosted use.
 - `Sealer` owns the existing mirror v1 encoding: 12-byte nonce, AES-256-GCM ciphertext/tag, authenticated with `kymessages-attachments/v1` plus NUL and the exact caller identity. The mirror uses its flat blob key; org-scoped object callers must bind the full org/object key. Only an authenticated complete blob may become readable. This codec does not select an object backend or enable hosted startup.
 - `NewStore` creates the directory (0700) and proves it writable. `api.NewServer` records a failure (`BlobsError`; attachment routes answer 503 and bootstrap reports `available: false`), and `cmd/server` then fails startup.
 - Keys are flat identifiers (`ValidKey`: no slashes or dots). Every access goes through `os.OpenRoot` on the store directory.
