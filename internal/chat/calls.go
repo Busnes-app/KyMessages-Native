@@ -89,9 +89,10 @@ type activeCall struct {
 
 type callPeer struct {
 	CallPeerState
-	sessionHash   string
-	issuedEpoch   int
-	migratedEpoch int
+	sessionHash     string
+	issuedEpoch     int
+	migratedEpoch   int
+	disconnectTimer *time.Timer
 }
 
 // CallManager coordinates hybrid P2P-first / LiveKit SFU voice and video calls.

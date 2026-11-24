@@ -18,12 +18,13 @@ const roomOwnerTTL = 90 * time.Second
 // Room affinity keeps each room's latency-sensitive seats and SDP on one process. The
 // database holds a fenced recovery record, not a second distributed signaling engine.
 type roomRouting struct {
-	holder string
-	locks  [64]sync.Mutex // bounded stripes; colliding rooms only serialize control operations
+	holder    string
+	afterFunc func(time.Duration, func()) *time.Timer
+	locks     [64]sync.Mutex // bounded stripes; colliding rooms only serialize control operations
 }
 
 func (m *CallManager) EnableRoomRouting() {
-	m.routing = &roomRouting{holder: uuid.NewString()}
+	m.routing = &roomRouting{holder: uuid.NewString(), afterFunc: time.AfterFunc}
 }
 
 func (m *CallManager) lockRoom(room string) func() {
@@ -171,6 +172,9 @@ func (m *CallManager) forgetRoomLocked(room string) {
 
 func (m *CallManager) removePeerLocked(room string, c *activeCall, id string) {
 	p := c.peers[id]
+	if p.disconnectTimer != nil {
+		p.disconnectTimer.Stop()
+	}
 	delete(c.peers, id)
 	if calls := m.userCalls[p.UserID]; calls != nil {
 		delete(calls, room)
@@ -286,6 +290,9 @@ func (m *CallManager) joinOwned(ctx context.Context, req JoinCallRequest) (respo
 	c.session = session
 	c.tenant = *tenant
 	peer.issuedEpoch = session.Epoch
+	if previous != nil && previous.disconnectTimer != nil {
+		previous.disconnectTimer.Stop()
+	}
 	c.peers[peerID] = peer
 	m.calls[req.RoomID] = c
 	if m.userCalls[req.UserID] == nil {
@@ -361,16 +368,64 @@ func (m *CallManager) migrateOwnedPeers(ctx context.Context, c *activeCall, reas
 	return nil
 }
 
-// HandleRoomDisconnect removes only the seat belonging to the disconnected session.
-// Another session or a replacement generation cannot be evicted by a late callback.
+// HandleRoomDisconnect allows the existing 20s guest/reconnect window for transport
+// loss only. Explicit leave and primary revocation still remove seats immediately.
 func (m *CallManager) HandleRoomDisconnect(user, room, hash string) {
+	defer m.lockRoom(room)()
+	if m.hub != nil && m.hub.HasRoomCallSocket(user, room, hash) {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c := m.calls[room]
+	if c == nil || c.ending {
+		return
+	}
+	for _, peer := range c.peers {
+		if peer.UserID != user || peer.sessionHash != hash {
+			continue
+		}
+		m.scheduleRoomDisconnectLocked(user, room, hash, peer)
+		return
+	}
+}
+
+func (m *CallManager) scheduleRoomDisconnectLocked(user, room, hash string, peer *callPeer) {
+	if peer.disconnectTimer != nil {
+		peer.disconnectTimer.Stop()
+	}
+	peer.disconnectTimer = m.routing.afterFunc(DefaultGuestLeaveGrace, func() { m.expireRoomDisconnect(user, room, hash, peer) })
+}
+
+func (m *CallManager) expireRoomDisconnect(user, room, hash string, expected *callPeer) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = m.leaveOwned(ctx, room, user, hash, true)
+	defer m.lockRoom(room)()
+	m.mu.Lock()
+	c := m.calls[room]
+	current := c != nil && c.peers[expected.PeerID] == expected
+	if current {
+		expected.disconnectTimer = nil
+	}
+	m.mu.Unlock()
+	if !current {
+		return
+	} // Rejoin replaced the peer, even if its socket is still opening.
+	if err := m.leaveOwnedLocked(ctx, room, user, hash, true); err != nil {
+		m.mu.Lock()
+		if c := m.calls[room]; c != nil && c.peers[expected.PeerID] == expected {
+			m.scheduleRoomDisconnectLocked(user, room, hash, expected)
+		}
+		m.mu.Unlock()
+	}
 }
 
 func (m *CallManager) leaveOwned(ctx context.Context, room, user, hash string, disconnected bool) error {
 	defer m.lockRoom(room)()
+	return m.leaveOwnedLocked(ctx, room, user, hash, disconnected)
+}
+
+func (m *CallManager) leaveOwnedLocked(ctx context.Context, room, user, hash string, disconnected bool) error {
 	if disconnected && m.hub != nil && m.hub.HasRoomCallSocket(user, room, hash) {
 		return nil
 	}

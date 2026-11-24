@@ -608,3 +608,102 @@ func TestRoomCallFailedInitialMediaCreationEndsAndRetries(t *testing.T) {
 		})
 	}
 }
+
+type failCallDeparture struct {
+	store.ChatStore
+	fail bool
+}
+
+func (s *failCallDeparture) QueueOwnedCallSeatRemoval(ctx context.Context, cs *store.CallSession, seat store.CallSeat) error {
+	if s.fail {
+		s.fail = false
+		return errors.New("injected departure storage failure")
+	}
+	return s.ChatStore.QueueOwnedCallSeatRemoval(ctx, cs, seat)
+}
+
+func TestRoomCallTransientDisconnectPreservesCallForRecovery(t *testing.T) {
+	ctx := context.Background()
+	st, room, requests := seedRoutedCall(t)
+	hub := NewHub(&captureBus{})
+	wrapped := &failCallDeparture{ChatStore: st.Chat()}
+	m := NewCallManager(wrapped, hub, nil, nil)
+	m.EnableRoomRouting()
+	var expire func()
+	scheduled := 0
+	m.routing.afterFunc = func(delay time.Duration, callback func()) *time.Timer {
+		if delay != DefaultGuestLeaveGrace {
+			t.Fatalf("recovery grace: %s", delay)
+		}
+		scheduled++
+		expire = callback
+		timer := time.NewTimer(time.Hour)
+		t.Cleanup(func() { timer.Stop() })
+		return timer
+	}
+	hub.EnableRoomCalls(m.HandleRoomDisconnect)
+	first, err := m.Join(ctx, requests[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	global := &Client{hub: hub, userID: requests[0].UserID, tenantID: routedOrg, sessionHash: requests[0].SessionHash, rooms: map[string]struct{}{}, stop: make(chan struct{})}
+	socket := &Client{hub: hub, userID: requests[0].UserID, tenantID: routedOrg, sessionHash: requests[0].SessionHash, callRoomID: room, rooms: map[string]struct{}{}, stop: make(chan struct{})}
+	if !hub.register(global, []string{room}) || !hub.register(socket, []string{room}) {
+		t.Fatal("socket registration refused")
+	}
+	hub.unregister(socket)
+	if state := m.GetState(room); state == nil || state.CallID != first.CallID {
+		t.Fatal("transient transport loss ended the call before recovery")
+	}
+	next, err := m.Join(ctx, requests[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Started || next.CallID != first.CallID {
+		t.Fatal("recovery started a different call")
+	}
+	if expire == nil {
+		t.Fatal("missing bounded disconnect cleanup")
+	}
+	expire() // Already queued before the rejoin replaced the peer.
+	if state := m.GetState(room); state == nil || state.CallID != first.CallID {
+		t.Fatal("stale timer evicted rejoined peer")
+	}
+	// A second transport loss without recovery must end the call when grace expires.
+	m.HandleRoomDisconnect(requests[0].UserID, room, requests[0].SessionHash)
+	wrapped.fail = true
+	expire()
+	if m.GetState(room) == nil || scheduled != 3 {
+		t.Fatal("failed disconnect cleanup was not retained for retry")
+	}
+	expire()
+	if m.GetState(room) != nil {
+		t.Fatal("abandoned call survived disconnect grace")
+	}
+	if _, err := st.Chat().GetActiveCallSession(ctx, routedOrg, room); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("abandoned durable call: %v", err)
+	}
+}
+
+func TestRoomCallRevocationBypassesReconnectGrace(t *testing.T) {
+	ctx := context.Background()
+	st, room, requests := seedRoutedCall(t)
+	m := NewCallManager(st.Chat(), NewHub(&captureBus{}), nil, nil)
+	m.EnableRoomRouting()
+	if _, err := m.Join(ctx, requests[0]); err != nil {
+		t.Fatal(err)
+	}
+	m.HandleRoomDisconnect(requests[0].UserID, room, requests[0].SessionHash)
+	if err := st.Sessions().DeleteSession(ctx, requests[0].SessionHash); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ClaimRoom(ctx, routedOrg, room); err != nil {
+		t.Fatal(err)
+	}
+	if m.GetState(room) != nil {
+		t.Fatal("revoked primary seat was retained for reconnect grace")
+	}
+	if _, err := st.Chat().GetActiveCallSession(ctx, routedOrg, room); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("revoked durable call remained: %v", err)
+	}
+}
