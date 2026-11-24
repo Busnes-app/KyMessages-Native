@@ -75,11 +75,28 @@ function makeFakeStream(tracks: MediaStreamTrack[]): MediaStream {
   } as unknown as MediaStream;
 }
 
+class WireSocket {
+  static OPEN = 1;
+  static instances: WireSocket[] = [];
+  readyState = 0;
+  onopen: (() => void) | null = null;
+  onclose: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  onmessage: ((event: { data: string }) => void) | null = null;
+  sent: string[] = [];
+  constructor(readonly url: string) { WireSocket.instances.push(this); }
+  open() { this.readyState = 1; this.onopen?.(); }
+  emit(value: unknown) { this.onmessage?.({ data: JSON.stringify(value) }); }
+  send(value: string) { this.sent.push(value); }
+  close() { this.readyState = 3; this.onclose?.(); }
+}
+
 describe('HybridCallController SFU/P2P handoff', () => {
   const origMediaDevices = navigator.mediaDevices;
 
   beforeEach(() => {
     mockRoomInstances.length = 0;
+    WireSocket.instances.length = 0;
     mockDisconnect.mockReset().mockResolvedValue(undefined);
     mockPublishTrack.mockReset().mockResolvedValue(undefined);
     mockConnect.mockReset().mockResolvedValue(undefined);
@@ -248,21 +265,6 @@ describe('HybridCallController SFU/P2P handoff', () => {
   });
   it('keeps room signaling separate and rebinds media after owner recovery', async () => {
     vi.useFakeTimers();
-    class WireSocket {
-      static OPEN = 1;
-      static instances: WireSocket[] = [];
-      readyState = 0;
-      onopen: (() => void) | null = null;
-      onclose: (() => void) | null = null;
-      onerror: (() => void) | null = null;
-      onmessage: ((event: { data: string }) => void) | null = null;
-      sent: string[] = [];
-      constructor(readonly url: string) { WireSocket.instances.push(this); }
-      open() { this.readyState = 1; this.onopen?.(); }
-      emit(value: unknown) { this.onmessage?.({ data: JSON.stringify(value) }); }
-      send(value: string) { this.sent.push(value); }
-      close() { this.readyState = 3; this.onclose?.(); }
-    }
     vi.stubGlobal('WebSocket', WireSocket);
     const audio = makeFakeTrack('audio');
     Object.defineProperty(navigator, 'mediaDevices', {
@@ -312,6 +314,51 @@ describe('HybridCallController SFU/P2P handoff', () => {
     controller.dispose();
     expect(recovered.readyState).toBe(3);
     expect(audio.readyState).toBe('ended');
+  });
+
+  it('ignores retired SFU epochs after a room-routed step-down', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('WebSocket', WireSocket);
+    const audio = makeFakeTrack('audio');
+    Object.defineProperty(navigator, 'mediaDevices', {
+      value: { getUserMedia: vi.fn().mockResolvedValue(makeFakeStream([audio])) }, configurable: true,
+    });
+    const response: CallJoinResponse = {
+      call_id: 'call_stepdown', room_id: 'room_stepdown', peer_id: 'peer_current',
+      call_ws_path: '/api/v1/rooms/room_stepdown/calls/ws', mode: 'sfu_livekit', epoch: 2,
+      sfu_sticky: false, ice_servers: [], livekit_url: 'wss://lk.example.test', livekit_token: 'epoch_2', peers: [],
+    };
+    const modes: string[] = [];
+    const controller = new HybridCallController({ localUserId: 'alice', localDisplayName: 'Alice', isGuest: false,
+      socket: () => null, rejoin: vi.fn().mockResolvedValue(response), onChange: (state) => modes.push(state.mode) });
+    try {
+      const started = controller.start(response, { audio: true, video: false, protectIp: false });
+      const wire = WireSocket.instances[0];
+      wire.open(); wire.emit({ t: 'hello' });
+      await started;
+      expect(mockConnect).toHaveBeenCalledTimes(1);
+      await controller.handleMigrate({ call_id: response.call_id, room_id: response.room_id,
+        epoch: 3, target_mode: 'p2p_mesh', reason: 'step_down' });
+      expect(modes[modes.length - 1]).toBe('p2p_mesh');
+      expect(audio.readyState).toBe('live');
+      await controller.handleMigrate({ call_id: response.call_id, room_id: response.room_id,
+        epoch: 2, target_mode: 'sfu_livekit', livekit_url: response.livekit_url, livekit_token: 'retired_epoch_2' });
+      expect(mockConnect).toHaveBeenCalledTimes(1);
+      expect(modes[modes.length - 1]).toBe('p2p_mesh');
+      // A newer P2P epoch must also fence old media when no handoff is needed.
+      await controller.handleMigrate({ call_id: response.call_id, room_id: response.room_id,
+        epoch: 5, target_mode: 'p2p_mesh' });
+      await controller.handleMigrate({ call_id: response.call_id, room_id: response.room_id,
+        epoch: 4, target_mode: 'sfu_livekit', livekit_url: response.livekit_url, livekit_token: 'retired_epoch_4' });
+      expect(mockConnect).toHaveBeenCalledTimes(1);
+      await controller.handleMigrate({ call_id: response.call_id, room_id: response.room_id,
+        epoch: 6, target_mode: 'sfu_livekit', livekit_url: response.livekit_url, livekit_token: 'current_epoch_6' });
+      expect(mockConnect).toHaveBeenLastCalledWith(response.livekit_url, 'current_epoch_6');
+      expect(mockConnect).toHaveBeenCalledTimes(2);
+      expect(modes[modes.length - 1]).toBe('sfu_livekit');
+    } finally {
+      controller.dispose();
+    }
   });
 
   it('refuses a socket path outside the joined room', () => {
