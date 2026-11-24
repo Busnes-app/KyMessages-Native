@@ -449,6 +449,8 @@ func TestTenancyModeFromEnv(t *testing.T) {
 			t.Setenv("KY_ATTACHMENTS_S3_BUCKET", "kymessages")
 			t.Setenv("KY_ATTACHMENTS_S3_ACCESS_KEY", "access-id")
 			t.Setenv("KY_ATTACHMENTS_S3_SECRET_FILE", secretFile)
+			t.Setenv("KY_ATTACHMENTS_S3_SECRET", "") // each case starts from the same valid set
+			t.Setenv("KY_ATTACHMENTS_S3_ACCESS_KEY_FILE", "")
 			t.Setenv("KY_ATTACHMENTS_S3_SEAL_KEY_FILE", seal)
 		}
 		s3Env(t)
