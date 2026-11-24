@@ -367,6 +367,71 @@ describe('HybridCallController SFU/P2P handoff', () => {
     expect(audio.readyState).toBe('ended');
   });
 
+  it.each(['same-seat', 'replacement-seat', 'refused'])('recovers P2P answerer signaling without silently dropping media (%s)', async (scenario) => {
+    vi.useFakeTimers();
+    class WireSocket {
+      static OPEN = 1;
+      static instances: WireSocket[] = [];
+      readyState = 0;
+      onopen: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+      onmessage: ((event: { data: string }) => void) | null = null;
+      constructor() { WireSocket.instances.push(this); }
+      open() { this.readyState = 1; this.onopen?.(); }
+      emit(value: unknown) { this.onmessage?.({ data: JSON.stringify(value) }); }
+      send() {}
+      close() { this.readyState = 3; this.onclose?.(); }
+    }
+    class PeerConnection {
+      static instances: PeerConnection[] = [];
+      connectionState = 'connected';
+      close = vi.fn();
+      constructor() { PeerConnection.instances.push(this); }
+    }
+    class EmptyStream {
+      getTracks() { return []; }
+      getAudioTracks() { return []; }
+      getVideoTracks() { return []; }
+    }
+    vi.stubGlobal('WebSocket', WireSocket);
+    vi.stubGlobal('RTCPeerConnection', PeerConnection);
+    vi.stubGlobal('MediaStream', EmptyStream);
+    const self = { peer_id: 'z-answerer', user_id: 'local', display_name: 'Local', is_guest: false,
+      audio: false, video: false, screen_share: false, protect_ip: false, joined_at: 1 };
+    const remote = { ...self, peer_id: 'a-offerer', user_id: 'remote' };
+    const response: CallJoinResponse = { call_id: 'c', room_id: 'r', peer_id: self.peer_id, mode: 'p2p_mesh',
+      call_ws_path: '/api/v1/rooms/r/calls/ws', epoch: 1, sfu_sticky: false, ice_servers: [], peers: [self, remote] };
+    const rejoin = vi.fn().mockResolvedValue(response);
+    const snapshots: Array<{ notice: string }> = [];
+    const controller = new HybridCallController({ localUserId: 'local', localDisplayName: 'Local', isGuest: false,
+      socket: () => null, rejoin, onChange: (snapshot) => snapshots.push(snapshot) });
+    const started = controller.start(response, { audio: false, video: false, protectIp: false });
+    await Promise.resolve();
+    const first = WireSocket.instances[0];
+    first.open(); first.emit({ t: 'hello' });
+    await started;
+    const connection = PeerConnection.instances[0];
+    expect(PeerConnection.instances).toHaveLength(1);
+    if (scenario === 'replacement-seat') rejoin.mockResolvedValue({ ...response, peer_id: 'zz-replacement' });
+    if (scenario === 'refused') rejoin.mockRejectedValue(new Error('seat refused'));
+    first.close();
+    await vi.advanceTimersByTimeAsync(1400);
+    const recovered = WireSocket.instances[1];
+    recovered.open(); recovered.emit({ t: 'hello' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(rejoin).toHaveBeenCalledTimes(2);
+    if (scenario === 'same-seat') {
+      expect(connection.close).not.toHaveBeenCalled();
+      expect(PeerConnection.instances).toHaveLength(1);
+      expect(snapshots.at(-1)?.notice).toBe('');
+    } else {
+      expect(connection.close).toHaveBeenCalledTimes(1);
+      if (scenario === 'refused') expect(snapshots.at(-1)?.notice).toContain('interrupted');
+      else expect(PeerConnection.instances).toHaveLength(2);
+    }
+    controller.dispose();
+  });
+
   it('closes an existing P2P connection when the authoritative roster removes that peer', async () => {
     class PeerConnection {
       static instances: PeerConnection[] = [];

@@ -172,14 +172,25 @@ export class HybridCallController {
     if (this.disposed || this.recovering || !this.opts.rejoin) return;
     this.recovering = true;
     try {
-      this.closeAllPeerConnections();
-      await this.disconnectLiveKit();
+      // A signaling-only reconnect must not destroy a still-live P2P answerer's link.
+      // Keep it until the authoritative rejoin tells us whether the call/seat changed.
+      if (this.mode !== 'p2p_mesh') {
+        this.closeAllPeerConnections();
+        await this.disconnectLiveKit();
+      }
       if (this.disposed) return;
       const response = await this.opts.rejoin({
         audio: this.audioEnabled, video: this.videoEnabled, screenShare: this.screenShareEnabled,
         protectIp: this.protectIp || this.protectIpPending,
       });
       if (this.disposed) return;
+      const sameP2PSeat = this.mode === 'p2p_mesh' && response.mode === 'p2p_mesh'
+        && response.call_id === this.callId && (response.peer_id || this.opts.localUserId) === this.myPeerId;
+      if (!sameP2PSeat) {
+        this.closeAllPeerConnections();
+        await this.disconnectLiveKit();
+        if (this.disposed) return;
+      }
       this.callId = response.call_id;
       this.myPeerId = response.peer_id || this.opts.localUserId;
       this.epoch = response.epoch ?? 0;
@@ -193,6 +204,8 @@ export class HybridCallController {
       }
       this.notice = '';
     } catch {
+      this.closeAllPeerConnections();
+      await this.disconnectLiveKit();
       this.notice = 'Call connection interrupted — leave and join again to reconnect.';
     } finally {
       this.recovering = false;
