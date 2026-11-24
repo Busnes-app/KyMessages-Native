@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"sort"
 	"time"
 )
 
@@ -44,7 +45,8 @@ func (c *chatStore) ErasureBlobs(ctx context.Context, tenantID, userID string) (
 func (c *chatStore) erasureActorBlobs(ctx context.Context, tenantID, actorID, ownerID string) ([]BlobRef, error) {
 	rows, err := c.store.db.QueryContext(ctx, c.store.rebind(`SELECT a.id, a.tenant_id, a.blob_key FROM attachments a
  WHERE a.tenant_id = ? AND (a.uploader_id = ? OR a.message_id IN (SELECT id FROM messages WHERE tenant_id = ? AND sender_id = ?) OR a.room_id IN (`+goneErasureRooms+`))
- UNION SELECT '',tenant_id,blob_key FROM pending_blob_deletes WHERE tenant_id = ? AND user_id = ?`), tenantID, actorID, tenantID, actorID, actorID, tenantID, ownerID, tenantID, ownerID)
+ UNION SELECT '',tenant_id,blob_key FROM pending_blob_deletes WHERE tenant_id = ? AND user_id = ?
+ UNION SELECT '',tenant_id,blob_key FROM retained_attachment_versions WHERE tenant_id = ? AND uploader_id = ?`), tenantID, actorID, tenantID, actorID, actorID, tenantID, ownerID, tenantID, ownerID, tenantID, actorID)
 	if err != nil {
 		return nil, err
 	}
@@ -135,6 +137,9 @@ func (c *chatStore) EraseUser(ctx context.Context, tenantID string, user *User) 
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := c.lockAttachmentQuotaTx(ctx, tx, tenantID); err != nil {
+		return nil, err
+	}
 	if err := rememberSubject(ctx, c.store, tx, &User{ID: userID, OrgID: tenantID, SSOProvider: user.SSOProvider, SSOSubject: user.SSOSubject}); err != nil {
 		return nil, err
 	}
@@ -170,6 +175,23 @@ func (c *chatStore) eraseActorTx(ctx context.Context, tx *sql.Tx, tenantID, user
 		return nil, err
 	}
 	var late []BlobRef
+	// Retained files survive the ordinary delete and have no live attachment row.
+	// Keep them retryable even if an earlier discovery ran before that deletion.
+	rows, err := tx.QueryContext(ctx, c.store.rebind(`SELECT tenant_id,blob_key FROM retained_attachment_versions WHERE tenant_id=? AND uploader_id=?`), tenantID, userID)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var ref BlobRef
+		if err := rows.Scan(&ref.TenantID, &ref.Key); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		late = append(late, ref)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return nil, err
+	}
 	for _, q := range []struct {
 		sql  string
 		args []any
@@ -252,13 +274,36 @@ func (c *chatStore) ClearPendingBlobDeletes(ctx context.Context, refs []BlobRef)
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	// Cleanup and retention share quota ownership. Lock each org in stable order
+	// so a multi-org sweep cannot race a newly retained charge or another sweep.
+	orgs := make(map[string]bool)
 	for _, r := range refs {
+		orgs[r.TenantID] = true
+	}
+	ordered := make([]string, 0, len(orgs))
+	for org := range orgs {
+		ordered = append(ordered, org)
+	}
+	sort.Strings(ordered)
+	for _, org := range ordered {
+		if err := c.lockAttachmentQuotaTx(ctx, tx, org); err != nil {
+			return err
+		}
+	}
+	for _, r := range refs {
+		var retained int
+		if err := tx.QueryRowContext(ctx, c.store.rebind(`SELECT COUNT(*) FROM retained_attachment_versions WHERE tenant_id=? AND blob_key=?`), r.TenantID, r.Key).Scan(&retained); err != nil {
+			return err
+		}
+		if retained != 0 {
+			return ErrObjectCleanupPending
+		}
 		if _, err := tx.ExecContext(ctx, c.store.rebind(`DELETE FROM pending_blob_deletes WHERE tenant_id = ? AND blob_key = ?`), r.TenantID, r.Key); err != nil {
 			return err
 		}
 	}
 	rows, err := tx.QueryContext(ctx, c.store.rebind(`UPDATE user_erasure_state SET completed_at = ? WHERE completed_at IS NULL AND NOT EXISTS (SELECT 1 FROM pending_blob_deletes p WHERE p.tenant_id = user_erasure_state.tenant_id AND p.user_id = user_erasure_state.user_id)
- AND NOT EXISTS (SELECT 1 FROM pending_call_evictions p WHERE p.tenant_id=user_erasure_state.tenant_id AND (p.user_id=user_erasure_state.user_id OR p.user_id IN(SELECT a.user_id FROM user_erasure_actors a WHERE a.tenant_id=p.tenant_id AND a.owner_user_id=user_erasure_state.user_id))) RETURNING user_id`), time.Now().UnixMilli())
+ AND NOT EXISTS (SELECT 1 FROM pending_call_evictions p WHERE p.tenant_id=user_erasure_state.tenant_id AND (p.user_id=user_erasure_state.user_id OR p.user_id IN(SELECT a.user_id FROM user_erasure_actors a WHERE a.tenant_id=p.tenant_id AND a.owner_user_id=user_erasure_state.user_id))) AND NOT EXISTS (SELECT 1 FROM retained_attachment_versions v WHERE v.tenant_id=user_erasure_state.tenant_id AND (v.uploader_id=user_erasure_state.user_id OR v.uploader_id IN (SELECT a.user_id FROM user_erasure_actors a WHERE a.tenant_id=v.tenant_id AND a.owner_user_id=user_erasure_state.user_id))) RETURNING user_id`), time.Now().UnixMilli())
 	if err != nil {
 		return err
 	}

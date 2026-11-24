@@ -145,6 +145,9 @@ func (c *chatStore) PurgeTenantRows(ctx context.Context, tenantID string) error 
 		}
 		return err
 	}
+	if err := c.requireNoRetainedVersionsTx(ctx, tx, tenantID); err != nil {
+		return err
+	}
 	if err := queueCallSeatsTx(ctx, c.store, tx, `call_seats.tenant_id=?`, tenantID); err != nil {
 		return err
 	}
@@ -198,6 +201,12 @@ func (c *chatStore) MarkTenantPurged(ctx context.Context, tenantID string) error
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := c.lockAttachmentQuotaTx(ctx, tx, tenantID); err != nil {
+		return err
+	}
+	if err := c.requireNoRetainedVersionsTx(ctx, tx, tenantID); err != nil {
+		return err
+	}
 	var pending int
 	if err := tx.QueryRowContext(ctx, c.store.rebind(`SELECT COUNT(*) FROM pending_call_evictions WHERE tenant_id=?`), tenantID).Scan(&pending); err != nil {
 		return err

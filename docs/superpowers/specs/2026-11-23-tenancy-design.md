@@ -137,6 +137,7 @@ through an org-bound user or row.
 | `message_reactions`, `meeting_windows`, `meeting_guests` | U | Reached through a T row. |
 | `meetings` | T | Global key on `id` (§8.3). |
 | `push_subscriptions`, `attachment_upload_reservations` | T | `migrations.go:297`, `:315` |
+| `retained_attachment_versions` | T | Migration 66 preparation: independent uploader/version provenance and retained-byte charge; erasure/purge completion refuses uncleared inventory (§9.4). |
 | Postgres full-text index on `messages` | T | Over `plain_v1` rows only (`chat.go:154`). Under E it never indexes ciphertext. |
 
 State outside the database:
@@ -391,6 +392,17 @@ inactive until these checks and the normal tests/review/startup gates are implem
 A person's erasure and an org purge delete every version of each affected object immediately,
 and the same objects on a provider replica. Neither waits for retention. The local attachment
 mirror remains off in multi mode.
+
+**Preparation implemented under the startup gate:** migration 66 adds independent
+`retained_attachment_versions` provenance. The internal ordinary-deletion transition
+atomically replaces the live attachment's quota charge with its exact retained data-version
+charge, preserving uploader ID/provider/subject and opaque receipt; duplicate deliveries do
+not free or double-charge storage. Pool reports and admission include retained bytes, with
+no age-based pruning. Erasure discovery includes this inventory after account/file deletion;
+current-only cleanup cannot clear its durable retry keys or complete an audit, and purge
+cannot hide retained inventory. This is not the complete object write/version ledger:
+remote operation fencing, ambiguous-write reconciliation, all-version/all-copy cleanup and
+the fresh-sign-in member action remain unbuilt. No HTTP route calls this primitive yet.
 
 ### 9.5 What KyMessages needs from ky-primitives
 

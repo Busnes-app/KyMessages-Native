@@ -1293,7 +1293,10 @@ func (c *chatStore) attachmentQuotaUsageTx(ctx context.Context, tx *sql.Tx, tena
 		return 0, 0, err
 	}
 
-	var tenantAtts, tenantRes, pendingAtts, pendingRes int64
+	var tenantAtts, tenantRetained, tenantRes, pendingAtts, pendingRes int64
+	if err := tx.QueryRowContext(ctx, c.store.rebind(`SELECT COALESCE(SUM(size_bytes), 0) FROM retained_attachment_versions WHERE tenant_id = ?`), tenantID).Scan(&tenantRetained); err != nil {
+		return 0, 0, err
+	}
 	if err := tx.QueryRowContext(ctx,
 		c.store.rebind(`SELECT COALESCE(SUM(size_bytes), 0) FROM attachments WHERE tenant_id = ?`),
 		tenantID,
@@ -1318,7 +1321,7 @@ func (c *chatStore) attachmentQuotaUsageTx(ctx context.Context, tx *sql.Tx, tena
 	).Scan(&pendingRes); err != nil {
 		return 0, 0, err
 	}
-	return tenantAtts + tenantRes, pendingAtts + pendingRes, nil
+	return tenantAtts + tenantRetained + tenantRes, pendingAtts + pendingRes, nil
 }
 
 func (c *chatStore) ReserveAttachmentQuota(ctx context.Context, tenantID, uploaderID string, requestedBytes int64, limits AttachmentQuotaLimits, ttl time.Duration) (*AttachmentQuotaReservation, error) {
