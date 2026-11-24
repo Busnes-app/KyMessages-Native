@@ -93,7 +93,9 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
 - E2EE owns migrations 53–54 after merged webhook removal 52; tenancy starts at 55.
   Migration 55 adds `job_leases (name, holder, expires_at)`. `AcquireLease(name, holder, ttl)`
   is one conditional upsert that wins only when the lease is free, expired or already the
-  holder's; it reads the database clock (Unix ms), never a replica's (`TestJobLeaseHandover`).
+  holder's; it reads the database clock (Unix ms), never a replica's (`TestJobLeaseHandover`). `ReleaseLease`
+  deletes only its exact holder's row, so an expired writer cannot release a successor.
+  Multi-mode maintenance prunes expired lease rows, including crashed pool exchanges.
 - Migration 56 rekeys `meetings` by `(tenant_id, id)`; `meeting_windows` and `meeting_guests`
   gain `tenant_id` and reference `meetings (tenant_id, id)`. It rebuilds and renames the three
   tables, one SQL for both engines (`TestMeetingsPerTenantKeyKeepsData`). Every meeting query

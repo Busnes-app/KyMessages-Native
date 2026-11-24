@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Busnes-app/ky_server_base/internal/api"
 	"github.com/Busnes-app/ky_server_base/internal/store"
@@ -127,5 +130,107 @@ func TestDirectorySyncRejectsInvalidQuotasUntilNewRevision(t *testing.T) {
 	got, err = e.st.Chat().GetTenant(ctx, replicaOrgA)
 	if err != nil || got.Status != store.TenantStatusActive || !got.DirectoryReady {
 		t.Fatalf("corrected snapshot not admitted: %+v %v", got, err)
+	}
+}
+
+// Observe the database boundary rather than sleeping until the second replica has
+// actually competed for the same cold pool grant.
+type contendedPoolStore struct {
+	store.Store
+	contended chan<- struct{}
+}
+
+func (s contendedPoolStore) AcquireLease(ctx context.Context, name, holder string, ttl time.Duration) (bool, error) {
+	ok, err := s.Store.AcquireLease(ctx, name, holder, ttl)
+	if !ok && err == nil && strings.HasPrefix(name, "pool-report:") {
+		select {
+		case s.contended <- struct{}{}:
+		default:
+		}
+	}
+	return ok, err
+}
+
+func TestDirectoryQuotaColdGrantOverlap(t *testing.T) {
+	firstReport := make(chan struct{})
+	competing := make(chan struct{}, 1)
+	releaseFirst := make(chan struct{})
+	releaseSecond := make(chan struct{})
+	var firstOnce, secondOnce sync.Once
+	unblockFirst := func() { firstOnce.Do(func() { close(releaseFirst) }) }
+	unblockSecond := func() { secondOnce.Do(func() { close(releaseSecond) }) }
+	defer unblockFirst()
+	defer unblockSecond()
+	pool := &fakePool{headroom: 1 << 20, beforeReply: func(seq int64) {
+		if seq == 1 {
+			close(firstReport)
+			<-releaseFirst
+		} else if seq == 2 {
+			// Before the fix, a second numbered report made the first response
+			// inapplicable before any grant had been stored.
+			select {
+			case competing <- struct{}{}:
+			default:
+			}
+			<-releaseSecond
+		}
+	}}
+	first, second, st, _ := newReplicasWithStore(t, func(st store.Store) store.Store {
+		return contendedPoolStore{Store: st, contended: competing}
+	}, withPool(t, pool))
+	_, token := createOrgUser(t, st, "usr_cold_quota", "coldquota", "user", replicaOrgA)
+	room := roomOf(t, doBearerJSON(t, first, http.MethodPost, "/api/v1/rooms", token, map[string]any{"kind": store.RoomKindChannel, "name": "cold quota"}, nil))
+	entry := store.TenantDirectoryEntry{TenantID: replicaOrgA, Revision: 1, Status: store.TenantStatusActive, Enabled: true, Valid: true, Quotas: store.TenantQuotas{MaxUploadBytes: 4096, MaxPendingUserBytes: 4096}}
+	if err := st.Chat().ApplyTenantDirectory(context.Background(), entry); err != nil {
+		t.Fatal(err)
+	}
+	upload := func(srv *api.Server, result chan<- *httptest.ResponseRecorder) {
+		result <- doMultipartUpload(t, srv, "/api/v1/rooms/"+room+"/attachments", token, "file", "part.txt", make([]byte, 4096))
+	}
+	await := func(ch <-chan struct{}, what string) {
+		t.Helper()
+		select {
+		case <-ch:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("timed out waiting for %s", what)
+		}
+	}
+	one, two := make(chan *httptest.ResponseRecorder, 1), make(chan *httptest.ResponseRecorder, 1)
+	go upload(first, one)
+	await(firstReport, "first pool request")
+	go upload(second, two)
+	await(competing, "second replica at the report boundary")
+	unblockFirst()
+	var a, b *httptest.ResponseRecorder
+	select {
+	case a = <-one:
+	case <-time.After(10 * time.Second):
+		t.Fatal("first upload did not complete")
+	}
+	unblockSecond()
+	select {
+	case b = <-two:
+	case <-time.After(10 * time.Second):
+		t.Fatal("second upload did not complete")
+	}
+	counts := map[int]int{a.Code: 1}
+	counts[b.Code]++
+	if counts[http.StatusCreated] != 1 || counts[http.StatusRequestEntityTooLarge] != 1 {
+		t.Fatalf("cold shared quota: %v; first=%s second=%s", counts, a.Body.String(), b.Body.String())
+	}
+}
+
+func TestPoolReportForAnotherOrgDoesNotWaitOnHeldExchange(t *testing.T) {
+	ctx := context.Background()
+	pool := &fakePool{headroom: 1 << 20}
+	first, second, st, _ := newReplicas(t, withPool(t, pool))
+	// A crashed reporter holds org A until its lease expires; org B must remain usable.
+	if ok, err := st.AcquireLease(ctx, "pool-report:"+replicaOrgA, "unavailable-reporter", time.Minute); err != nil || !ok {
+		t.Fatalf("held exchange: %v %v", ok, err)
+	}
+	_, token := createOrgUser(t, st, "usr_pool_independent", "poolindependent", "user", replicaOrgB)
+	room := roomOf(t, doBearerJSON(t, first, http.MethodPost, "/api/v1/rooms", token, map[string]any{"kind": store.RoomKindChannel, "name": "independent"}, nil))
+	if rec := doMultipartUpload(t, second, "/api/v1/rooms/"+room+"/attachments", token, "file", "ok.txt", []byte("other org")); rec.Code != http.StatusCreated {
+		t.Fatalf("unrelated org blocked: %d %s", rec.Code, rec.Body.String())
 	}
 }

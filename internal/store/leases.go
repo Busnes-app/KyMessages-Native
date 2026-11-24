@@ -27,3 +27,10 @@ WHERE job_leases.expires_at < `+now+` OR job_leases.holder = excluded.holder`), 
 	n, err := res.RowsAffected()
 	return n == 1, err
 }
+
+// ReleaseLease releases only this holder's lease. An expired holder cannot release
+// a successor's lease, and repeating a completed release is harmless.
+func (s *SQLStore) ReleaseLease(ctx context.Context, name, holder string) error {
+	_, err := s.db.ExecContext(ctx, s.rebind(`DELETE FROM job_leases WHERE name = ? AND holder = ?`), name, holder)
+	return err
+}

@@ -43,3 +43,36 @@ func TestJobLeaseHandover(t *testing.T) {
 		t.Fatalf("leases are per job: %v %v", ok, err)
 	}
 }
+
+func TestReleaseLeaseCannotReleaseSuccessor(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	acquire := func(holder string, ttl time.Duration, want bool) {
+		t.Helper()
+		got, err := st.AcquireLease(ctx, "pool-report:test", holder, ttl)
+		if err != nil || got != want {
+			t.Fatalf("acquire %s: %v %v, want %v", holder, got, err, want)
+		}
+	}
+	acquire("old", time.Minute, true)
+	if err := st.ReleaseLease(ctx, "pool-report:test", "other"); err != nil {
+		t.Fatal(err)
+	}
+	acquire("new", time.Minute, false)
+	if err := st.ReleaseLease(ctx, "pool-report:test", "old"); err != nil {
+		t.Fatal(err)
+	}
+	acquire("new", time.Minute, true)
+	for range 2 {
+		if err := st.ReleaseLease(ctx, "pool-report:test", "old"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	acquire("old", time.Minute, false)
+	acquire("new", -time.Second, true) // expire on the database clock, no sleeps
+	acquire("successor", time.Minute, true)
+	if err := st.ReleaseLease(ctx, "pool-report:test", "new"); err != nil {
+		t.Fatal(err)
+	}
+	acquire("old", time.Minute, false)
+}

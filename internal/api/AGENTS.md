@@ -91,7 +91,10 @@ Owns HTTP routing, request parsing, session cookie validation, CORS headers, and
   `KY_ATTACHMENTS_MAX_TOTAL_BYTES` does not apply (startup warns when it is set). An upload with
   no usable grant reports its org once (`POST /api/suite/storage`, Basic suite client
   credentials, HTTPS issuer, no redirects; at most 6 such calls per org per minute) and looks
-  again. Refusals: `413 {"code":"org_storage_full"}`, `503 {"code":"pool_unavailable"}`, never
+  again. The synchronous refresh and periodic reporter share bounded per-org database
+  leases through the entire sequence/snapshot, remote exchange and grant application, so
+  concurrent cold uploads cannot discard their only grant. Different orgs remain independent;
+  expiration, wrong-sequence replies and stale-restore fences still fail closed. Refusals: `413 {"code":"org_storage_full"}`, `503 {"code":"pool_unavailable"}`, never
   naming another app. Deletes, reads, text and calls never check the pool. `RefreshPool` is the
   leased `pool_report` job (every minute): absolute totals for each org whose usage changed, has
   used half its grant, or whose grant is missing or under 10 minutes from expiry.
