@@ -246,7 +246,8 @@ describe('HybridCallController SFU/P2P handoff', () => {
 
     ctrl.dispose();
   });
-  it.each([false, true])('keeps room signaling separate and rebinds media after owner recovery (P2P step-down: %s)', async (stepDown) => {
+  it.each(['normal', 'step-down', 'overlap', 'recovery-overlap', 'dispose'])('keeps room signaling ordered and rebinds media after owner recovery (%s)', async (scenario) => {
+    const stepDown = scenario === 'step-down';
     vi.useFakeTimers();
     class WireSocket {
       static OPEN = 1;
@@ -280,6 +281,7 @@ describe('HybridCallController SFU/P2P handoff', () => {
     const controller = new HybridCallController({ localUserId: 'alice', localDisplayName: 'Alice', isGuest: false,
       socket: () => global, rejoin, onEnded, onChange: () => undefined });
     const started = controller.start(response, { audio: true, video: false, protectIp: true });
+    await Promise.resolve(); // Initial media setup starts on the controller's transition queue.
     const wire = WireSocket.instances[0];
     expect(wire.url).toContain(response.call_ws_path);
     wire.open();
@@ -290,9 +292,48 @@ describe('HybridCallController SFU/P2P handoff', () => {
     await controller.toggleAudio();
     expect(globalMedia).not.toHaveBeenCalled();
     expect(wire.sent.map((raw) => JSON.parse(raw))).toContainEqual(expect.objectContaining({ t: 'call.media', room: 'room_owned', audio: false }));
-    await controller.handleMigrate({ call_id: response.call_id, room_id: response.room_id, epoch: 2,
-      target_mode: 'sfu_livekit', livekit_url: response.livekit_url, livekit_token: 'replacement' });
-    expect(mockConnect).toHaveBeenLastCalledWith(response.livekit_url, 'replacement');
+    if (scenario === 'overlap' || scenario === 'recovery-overlap' || scenario === 'dispose') {
+      let releaseDisconnect: () => void = () => undefined;
+      let markEntered: () => void = () => undefined;
+      const disconnect = new Promise<void>((resolve) => { releaseDisconnect = resolve; });
+      const entered = new Promise<void>((resolve) => { markEntered = resolve; });
+      mockDisconnect.mockImplementationOnce(() => { markEntered(); return disconnect; });
+      const older = controller.handleMigrate({ call_id: response.call_id, room_id: response.room_id, epoch: 2,
+        target_mode: 'sfu_livekit', livekit_url: response.livekit_url, livekit_token: 'replacement' });
+      await entered;
+      if (scenario === 'recovery-overlap') {
+        rejoin.mockResolvedValue({ ...response, epoch: 4, livekit_token: 'recovered' });
+        wire.close();
+        await vi.advanceTimersByTimeAsync(1400);
+        const recovered = WireSocket.instances[1];
+        recovered.open(); recovered.emit({ t: 'hello' });
+        await vi.advanceTimersByTimeAsync(0);
+        releaseDisconnect();
+        await older;
+        await vi.advanceTimersByTimeAsync(0);
+        expect(mockConnect).toHaveBeenLastCalledWith(response.livekit_url, 'recovered');
+        expect(audio.readyState).toBe('live');
+        controller.dispose();
+        return;
+      }
+      const newer = controller.handleMigrate({ call_id: response.call_id, room_id: response.room_id, epoch: 3,
+        target_mode: 'sfu_livekit', livekit_url: response.livekit_url, livekit_token: 'newest' });
+      if (scenario === 'dispose') controller.dispose();
+      // Let a competing handler finish while the older disconnect remains explicitly paused.
+      await vi.advanceTimersByTimeAsync(0);
+      releaseDisconnect();
+      await Promise.all([older, newer]);
+      if (scenario === 'dispose') {
+        expect(mockConnect).toHaveBeenCalledTimes(1);
+        expect(audio.readyState).toBe('ended');
+        return;
+      }
+      expect(mockConnect).toHaveBeenLastCalledWith(response.livekit_url, 'newest');
+    } else {
+      await controller.handleMigrate({ call_id: response.call_id, room_id: response.room_id, epoch: 2,
+        target_mode: 'sfu_livekit', livekit_url: response.livekit_url, livekit_token: 'replacement' });
+      expect(mockConnect).toHaveBeenLastCalledWith(response.livekit_url, 'replacement');
+    }
     const calls = mockConnect.mock.calls.length;
     await controller.handleMigrate({ call_id: response.call_id, room_id: response.room_id, epoch: 1,
       target_mode: 'sfu_livekit', livekit_url: response.livekit_url, livekit_token: 'stale' });

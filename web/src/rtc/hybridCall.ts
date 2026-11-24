@@ -106,6 +106,7 @@ export class HybridCallController {
   private recovering = false;
   private cancelSocketStart: (() => void) | null = null;
   private epoch = 0;
+  private mediaTransition: Promise<void> = Promise.resolve();
 
   isRoomRouted(): boolean {
     return this.roomSocket !== null;
@@ -153,12 +154,27 @@ export class HybridCallController {
     });
   }
 
-  private async recoverRoom(): Promise<void> {
+  // One controller owns one media connection and epoch. Start, recovery and migrations
+  // share that writer so an older async disconnect cannot replace newer credentials.
+  private runMediaTransition(operation: () => Promise<void>): Promise<void> {
+    const next = this.mediaTransition.then(() => {
+      if (!this.disposed) return operation();
+    });
+    this.mediaTransition = next.catch(() => undefined);
+    return next;
+  }
+
+  private recoverRoom(): Promise<void> {
+    return this.runMediaTransition(() => this.recoverMedia());
+  }
+
+  private async recoverMedia(): Promise<void> {
     if (this.disposed || this.recovering || !this.opts.rejoin) return;
     this.recovering = true;
     try {
       this.closeAllPeerConnections();
       await this.disconnectLiveKit();
+      if (this.disposed) return;
       const response = await this.opts.rejoin({
         audio: this.audioEnabled, video: this.videoEnabled, screenShare: this.screenShareEnabled,
         protectIp: this.protectIp || this.protectIpPending,
@@ -199,7 +215,14 @@ export class HybridCallController {
     }
   }
 
-  async start(
+  start(
+    joinResp: CallJoinResponse,
+    initialMedia: { audio: boolean; video: boolean; protectIp: boolean },
+  ): Promise<void> {
+    return this.runMediaTransition(() => this.startMedia(joinResp, initialMedia));
+  }
+
+  private async startMedia(
     joinResp: CallJoinResponse,
     initialMedia: { audio: boolean; video: boolean; protectIp: boolean },
   ): Promise<void> {
@@ -215,6 +238,7 @@ export class HybridCallController {
         throw error;
       }
     }
+    if (this.disposed) return;
     this.epoch = joinResp.epoch ?? 0;
     this.callId = joinResp.call_id;
     this.roomId = joinResp.room_id;
@@ -302,7 +326,11 @@ export class HybridCallController {
   }
 
   /** Called when the server instructs this peer to escalate (P2P -> SFU) or step down (SFU -> P2P). */
-  async handleMigrate(mig: CallMigratePayload): Promise<void> {
+  handleMigrate(mig: CallMigratePayload): Promise<void> {
+    return this.runMediaTransition(() => this.applyMigration(mig));
+  }
+
+  private async applyMigration(mig: CallMigratePayload): Promise<void> {
     if (this.disposed || mig.room_id !== this.roomId || (this.roomSocket && (mig.call_id !== this.callId || (mig.epoch !== undefined && mig.epoch < this.epoch)))) return;
     if (mig.ice_servers && mig.ice_servers.length > 0) {
       this.iceServers = mig.ice_servers;
@@ -313,6 +341,7 @@ export class HybridCallController {
         if (!this.roomSocket || (mig.epoch ?? 0) <= this.epoch) return;
         await this.disconnectLiveKit();
       }
+      if (this.disposed) return;
       this.epoch = mig.epoch ?? this.epoch;
       this.clearProtectIpTimer();
       this.migrating = true;
@@ -363,6 +392,7 @@ export class HybridCallController {
         }
         this.reconcileP2PPeers();
         await this.disconnectLiveKit();
+        if (this.disposed) return;
         this.signalSocket()?.sendCallMigrated(this.roomId, this.callId, mig.epoch);
       } finally {
         this.migrating = false;
