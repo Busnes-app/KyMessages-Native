@@ -552,3 +552,59 @@ func TestRoomCallInitialSeatFailureLeavesNoOrphan(t *testing.T) {
 		})
 	}
 }
+
+func TestRoomCallFailedInitialMediaCreationEndsAndRetries(t *testing.T) {
+	for _, failure := range []string{"end", "retry_end", "retry_cleanup"} {
+		t.Run(failure, func(t *testing.T) {
+			endFailure := failure == "retry_end"
+			ctx := context.Background()
+			st, room, requests := seedRoutedCall(t)
+			var failCreate atomic.Bool
+			failCreate.Store(true)
+			var failDelete atomic.Bool
+			failDelete.Store(failure == "retry_cleanup")
+			sfu := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/CreateRoom") && failCreate.Swap(false) {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					return
+				}
+				if strings.HasSuffix(r.URL.Path, "/DeleteRoom") && failDelete.Swap(false) {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					return
+				}
+				_, _ = w.Write([]byte(`{}`))
+			}))
+			defer sfu.Close()
+			wrapped := &failEmptyCallEnd{ChatStore: st.Chat(), fail: endFailure}
+			m := NewCallManager(wrapped, NewHub(&captureBus{}), rtc.NewClient(sfu.URL, "test", "test-secret"), nil)
+			m.EnableRoomRouting()
+			requests[0].ProtectIP = true
+			response, err := m.Join(ctx, requests[0])
+			if err == nil || response != nil {
+				t.Fatalf("failed media creation admitted: %v", err)
+			}
+			if endFailure && !errors.Is(err, errEmptyCallEnd) {
+				t.Fatalf("failed rollback was hidden: %v", err)
+			}
+			if !endFailure {
+				if call, err := st.Chat().GetActiveCallSession(ctx, routedOrg, room); !errors.Is(err, store.ErrNotFound) {
+					t.Fatalf("failed media creation left active call: %+v %v", call, err)
+				}
+			}
+			if m.GetState(room) != nil || m.Stats().ActiveCalls != 0 {
+				t.Fatal("failed initial setup was advertised as an active call")
+			}
+			// An unsuccessful durable end must be retried before the next join can be admitted.
+			next, err := m.Join(ctx, requests[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !next.Started {
+				t.Fatal("first successful join recovered an orphan")
+			}
+			if len(next.Peers) != 1 {
+				t.Fatalf("failed first join leaked a peer: %d", len(next.Peers))
+			}
+		})
+	}
+}
