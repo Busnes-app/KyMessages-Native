@@ -380,6 +380,14 @@ org pool until a person explicitly removes it. PR 6 must extend the usage ledger
 those retained bytes and provide explicit removal; attachment-row totals alone are insufficient
 once versions survive a row deletion. Provider lifecycle rules must not silently delete versions.
 
+**Owner-selected permission (2026-11-24):** member-initiated permanent removal of a retained
+file version is allowed only to the original uploader, after a fresh KyIdentity sign-in.
+Existing attachment-delete rights alone do not authorize it; room ownership or an
+administrator role cannot substitute for the uploader check. Persist exact uploader
+provenance across ordinary attachment/account deletion and verify freshness from the
+KyIdentity authentication, not a new local or derived session. Keep the member-facing action
+inactive until these checks and the normal tests/review/startup gates are implemented.
+
 A person's erasure and an org purge delete every version of each affected object immediately,
 and the same objects on a provider replica. Neither waits for retention. The local attachment
 mirror remains off in multi mode.
