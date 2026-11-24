@@ -190,6 +190,7 @@ export const Chat: React.FC<ChatProps> = ({
   const [pushBusy, setPushBusy] = useState(false);
 
   const activeCallsRef = useRef(activeCalls);
+  const callRevisionsRef = useRef<Record<string, number>>({});
   const socketRef = useRef<ChatSocket | null>(null);
   const callCtrlRef = useRef<HybridCallController | null>(null);
   const callStageRef = useRef<HTMLElement | null>(null);
@@ -217,6 +218,16 @@ export const Chat: React.FC<ChatProps> = ({
   activeRoomIdRef.current = activeRoomId;
   currentUserRef.current = currentUser;
   activeCallsRef.current = activeCalls;
+
+  const updateCallState = useCallback((roomId: string, state: CallState | null) => {
+    const next = { ...activeCallsRef.current };
+    if (!state || state.ended || state.active === false || state.peers.length === 0) delete next[roomId];
+    else next[roomId] = state;
+    // Advance synchronously with the event, before a pending bootstrap can complete.
+    callRevisionsRef.current[roomId] = (callRevisionsRef.current[roomId] ?? 0) + 1;
+    activeCallsRef.current = next;
+    setActiveCalls(next);
+  }, []);
 
   // Search runs on this device: index every message as it is read, edited or deleted. Only
   // messages whose text or state changed since they were last indexed are written again.
@@ -762,6 +773,7 @@ export const Chat: React.FC<ChatProps> = ({
           // Every send lists the room's devices afresh; a departure also starts a new session.
           if (event.action === 'removed') roomMemberLeft(event.roomId);
           if (self && event.action === 'removed') {
+            updateCallState(event.roomId, null);
             setRooms((prev) => prev.filter((r) => r.id !== event.roomId));
             if (activeRoomIdRef.current === event.roomId) {
               setActiveRoomId(null);
@@ -790,6 +802,7 @@ export const Chat: React.FC<ChatProps> = ({
           return;
         }
         case 'room.closed': {
+          updateCallState(event.roomId, null);
           setRooms((prev) =>
             prev.map((r) => (r.id === event.roomId ? { ...r, closed_at: r.closed_at ?? Date.now() } : r)),
           );
@@ -828,15 +841,7 @@ export const Chat: React.FC<ChatProps> = ({
         case 'call.state': {
           const st = event.state;
           const isEnded = Boolean(st.ended || st.active === false);
-          setActiveCalls((prev) => {
-            if (isEnded || st.peers.length === 0) {
-              if (!(st.room_id in prev)) return prev;
-              const next = { ...prev };
-              delete next[st.room_id];
-              return next;
-            }
-            return { ...prev, [st.room_id]: st };
-          });
+          updateCallState(st.room_id, st);
           callCtrlRef.current?.handleCallState(st);
           if (isEnded && callRoomIdRef.current === st.room_id) {
             callCtrlRef.current?.dispose();
@@ -882,7 +887,7 @@ export const Chat: React.FC<ChatProps> = ({
         }
       }
     },
-    [catchUpRoom, forgetIndexed, refreshRoomDetail, refreshRoomsList, scrollToBottom, syncReadCursor],
+    [catchUpRoom, forgetIndexed, refreshRoomDetail, refreshRoomsList, scrollToBottom, syncReadCursor, updateCallState],
   );
 
   // Initial bootstrap + WebSocket connection.
@@ -894,7 +899,7 @@ export const Chat: React.FC<ChatProps> = ({
     const init = async () => {
       try {
         const [boot, users] = await Promise.all([
-          fetchBootstrap(),
+          fetchBootstrap(() => ({ calls: activeCallsRef.current, revisions: callRevisionsRef.current })),
           fetchDirectoryUsers().catch(() => [] as ChatDirectoryUser[]),
         ]);
         if (cancelled) return;
@@ -916,6 +921,7 @@ export const Chat: React.FC<ChatProps> = ({
         for (const [rid, c] of Object.entries(boot.active_calls)) {
           if (!c.ended && c.active !== false && c.peers.length > 0) callMap[rid] = c;
         }
+        activeCallsRef.current = callMap;
         setActiveCalls(callMap);
         if (boot.rooms.length > 0) {
           const queryRoom = new URLSearchParams(window.location.search).get('room');
@@ -963,7 +969,7 @@ export const Chat: React.FC<ChatProps> = ({
         if (cancelled) return;
         void (async () => {
           try {
-            const boot = await fetchBootstrap(() => activeCallsRef.current);
+            const boot = await fetchBootstrap(() => ({ calls: activeCallsRef.current, revisions: callRevisionsRef.current }));
             if (cancelled) return;
             // Mail may have arrived while offline, or the device may not have started.
             void startE2EE(boot.user.id).then(receiveRoomKeys, () => undefined);
@@ -972,6 +978,7 @@ export const Chat: React.FC<ChatProps> = ({
             for (const [rid, c] of Object.entries(boot.active_calls)) {
               if (!c.ended && c.active !== false && c.peers.length > 0) callMap[rid] = c;
             }
+            activeCallsRef.current = callMap;
             setActiveCalls(callMap);
             const activeCallRoom = callRoomIdRef.current;
             const myUid = currentUserRef.current?.id;
@@ -1649,17 +1656,11 @@ export const Chat: React.FC<ChatProps> = ({
       });
       callCtrlRef.current = ctrl;
       await ctrl.start(joinResp, { audio: true, video: withVideo, protectIp: false });
-      setActiveCalls((prev) => ({
-        ...prev,
-        [roomId]: {
-          call_id: joinResp.call_id,
-          room_id: roomId,
-          mode: joinResp.mode,
-          sfu_sticky: joinResp.sfu_sticky,
-          peers: joinResp.peers,
-          ended: false,
-        },
-      }));
+      updateCallState(roomId, {
+        call_id: joinResp.call_id, room_id: roomId, mode: joinResp.mode,
+        epoch: joinResp.epoch, sfu_sticky: joinResp.sfu_sticky,
+        peers: joinResp.peers, ended: false,
+      });
     } catch (e) {
       setBannerError(e instanceof Error ? e.message : 'Could not join call');
     } finally {
