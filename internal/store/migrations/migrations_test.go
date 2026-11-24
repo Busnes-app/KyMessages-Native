@@ -547,3 +547,54 @@ func TestErasedSubjectUpgradeRetainsPermanentFences(t *testing.T) {
 		t.Fatalf("single-mode account changed: %v", err)
 	}
 }
+
+func TestCallRoutingUpgradePreservesSingleModeCallRecords(t *testing.T) {
+	ctx := context.Background()
+	cfg := testdb.Config(t)
+	driver := "sqlite"
+	if cfg.Driver == "postgres" {
+		driver = "pgx"
+	}
+	db, err := sql.Open(driver, cfg.DSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := migrations.RunThrough(ctx, db, cfg.Driver, 63); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`INSERT INTO rooms(id,tenant_id,kind,created_by,created_at) VALUES ('legacy-call-room','default','channel','legacy-owner',123)`,
+		`INSERT INTO call_sessions(id,tenant_id,room_id,mode,epoch,sfu_sticky,livekit_room,started_by,started_at,ended_at) VALUES ('legacy-call','default','legacy-call-room','sfu_livekit',7,1,'legacy-sfu','legacy-owner',123,456)`,
+	} {
+		if _, err := db.ExecContext(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	type record struct {
+		id, mode, room, starter string
+		epoch, sticky           int
+		started, ended          int64
+	}
+	read := func() record {
+		t.Helper()
+		var r record
+		if err := db.QueryRowContext(ctx, `SELECT id,mode,livekit_room,started_by,epoch,sfu_sticky,started_at,ended_at FROM call_sessions WHERE id='legacy-call'`).Scan(&r.id, &r.mode, &r.room, &r.starter, &r.epoch, &r.sticky, &r.started, &r.ended); err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	before := read()
+	if err := migrations.Run(ctx, db, cfg.Driver); err != nil {
+		t.Fatal(err)
+	}
+	if after := read(); after != before {
+		t.Fatalf("single-mode call changed on upgrade: %+v -> %+v", before, after)
+	}
+	for _, table := range []string{"call_room_owners", "call_seats", "pending_call_evictions"} {
+		var n int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+table).Scan(&n); err != nil || n != 0 {
+			t.Fatalf("single mode gained %s state: %d %v", table, n, err)
+		}
+	}
+}

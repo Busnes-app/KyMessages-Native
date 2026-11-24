@@ -18,6 +18,20 @@ func (s *SQLStore) InvalidateRestoredGrants(ctx context.Context) error {
 	}
 	defer tx.Rollback()
 	now := time.Now().UTC()
+	// These tables contain only multi-mode state. Retain old media targets before restored
+	// call records are ended, so a fresh owner cannot inherit an old admission or bearer.
+	if _, err := tx.ExecContext(ctx, `INSERT INTO pending_call_evictions(tenant_id,livekit_room,peer_id,user_id)
+ SELECT DISTINCT c.tenant_id,c.livekit_room,'','' FROM call_sessions c
+ WHERE c.livekit_room IS NOT NULL AND c.livekit_room<>'' AND EXISTS(SELECT 1 FROM call_room_owners o WHERE o.room_id=c.room_id AND o.tenant_id=c.tenant_id)
+ ON CONFLICT DO NOTHING`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM call_seats`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE call_room_owners SET expires_at=0,generation=generation+1`); err != nil {
+		return err
+	}
 	for _, query := range []string{
 		`DELETE FROM sessions`,
 		`DELETE FROM mfa_challenges`,

@@ -29,6 +29,7 @@ import (
 	"github.com/Busnes-app/ky_server_base/internal/sso"
 	"github.com/Busnes-app/ky_server_base/internal/store"
 	"github.com/Busnes-app/ky_server_base/web"
+	"github.com/google/uuid"
 )
 
 // recoveryClient is the KyRecovery client as the handlers use it, narrowed so tests can stand
@@ -292,8 +293,25 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 		lobbyMgr.RevokeTenant(context.Background(), tenantID)
 		callMgr.RevokeTenant(context.Background(), tenantID)
 	})
-	kyidentity.OnTenantRevoked(chatHub.RevokeTenant)
+	kyidentity.OnTenantRevoked(func(ctx context.Context, tenantID string) error {
+		if cfg.Tenancy.IsMultiTenant() && st != nil {
+			if err := st.Chat().QueueTenantCallSeatRemoval(ctx, tenantID); err != nil {
+				return err
+			}
+		}
+		if err := chatHub.RevokeTenant(ctx, tenantID); err != nil {
+			return err
+		}
+		if cfg.Tenancy.IsMultiTenant() {
+			return callMgr.DrainCleanup(ctx, tenantID, "")
+		}
+		return nil
+	})
 	if cfg.Tenancy.IsMultiTenant() && st != nil {
+		cleanupHolder := uuid.NewString()
+		callMgr.SetCleanupLease(func(ctx context.Context) (bool, error) {
+			return st.AcquireLease(ctx, "call_cleanup", cleanupHolder, time.Minute)
+		})
 		// A call seat may live on a replica that holds none of the user's sockets: every
 		// replica drops a revoked user's seats, and reconciliation catches a missed revocation.
 		chatHub.SetUserRevokeHandler(func(userID string) { callMgr.HandleDisconnect(userID, 0) })

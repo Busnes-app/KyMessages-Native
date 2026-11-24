@@ -221,16 +221,18 @@ const (
 
 // CallSession tracks an active or completed voice/video call in a room.
 type CallSession struct {
-	ID          string `json:"id"`
-	TenantID    string `json:"tenant_id"`
-	RoomID      string `json:"room_id"`
-	Mode        string `json:"mode"`
-	Epoch       int    `json:"epoch"`
-	SFUSticky   bool   `json:"sfu_sticky"`
-	LiveKitRoom string `json:"livekit_room,omitempty"`
-	StartedBy   string `json:"started_by"`
-	StartedAt   int64  `json:"started_at"`
-	EndedAt     *int64 `json:"ended_at,omitempty"`
+	OwnerID         string `json:"-"`
+	OwnerGeneration int64  `json:"-"`
+	ID              string `json:"id"`
+	TenantID        string `json:"tenant_id"`
+	RoomID          string `json:"room_id"`
+	Mode            string `json:"mode"`
+	Epoch           int    `json:"epoch"`
+	SFUSticky       bool   `json:"sfu_sticky"`
+	LiveKitRoom     string `json:"livekit_room,omitempty"`
+	StartedBy       string `json:"started_by"`
+	StartedAt       int64  `json:"started_at"`
+	EndedAt         *int64 `json:"ended_at,omitempty"`
 }
 
 // Meeting represents a KyCalendar-backed or standalone native meeting room.
@@ -292,4 +294,19 @@ type BlobRef struct {
 	ID       string // the attachment row, where known
 	TenantID string
 	Key      string
+}
+
+// CallLease is the fenced owner of one room, on the database clock.
+type CallLease struct {
+	TenantID, RoomID, Holder string
+	Generation               int64
+}
+
+// CallEviction retires an SFU room. PeerID/UserID retain its opaque erasure cause.
+type CallEviction struct{ TenantID, LiveKitRoom, PeerID, UserID string }
+
+// CallSeat binds a human to the verified originating session; guests use their lobby identity.
+type CallSeat struct {
+	UserID, PeerID, SessionHash string
+	Guest                       bool
 }

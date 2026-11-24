@@ -145,6 +145,15 @@ func (c *chatStore) PurgeTenantRows(ctx context.Context, tenantID string) error 
 		}
 		return err
 	}
+	if err := queueCallSeatsTx(ctx, c.store, tx, `call_seats.tenant_id=?`, tenantID); err != nil {
+		return err
+	}
+	// Retain every SFU room before its call/room rows disappear. Cleanup must finish before
+	// MarkTenantPurged may hide this org from later attempts.
+	if _, err := tx.ExecContext(ctx, c.store.rebind(`INSERT INTO pending_call_evictions(tenant_id,livekit_room,peer_id,user_id)
+ SELECT DISTINCT tenant_id,livekit_room,'','' FROM call_sessions WHERE tenant_id=? AND livekit_room IS NOT NULL AND livekit_room<>'' ON CONFLICT DO NOTHING`), tenantID); err != nil {
+		return err
+	}
 	members := `SELECT id FROM users WHERE org_id = ?`
 	for _, s := range []struct {
 		q    string
@@ -189,6 +198,13 @@ func (c *chatStore) MarkTenantPurged(ctx context.Context, tenantID string) error
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	var pending int
+	if err := tx.QueryRowContext(ctx, c.store.rebind(`SELECT COUNT(*) FROM pending_call_evictions WHERE tenant_id=?`), tenantID).Scan(&pending); err != nil {
+		return err
+	}
+	if pending != 0 {
+		return ErrCallCleanupPending
+	}
 	res, err := tx.ExecContext(ctx, c.store.rebind(`UPDATE tenants SET purged_at = ? WHERE id = ? AND status = 'deleted' AND purged_at IS NULL`), time.Now().UnixMilli(), tenantID)
 	if err != nil {
 		return err

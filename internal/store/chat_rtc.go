@@ -62,13 +62,15 @@ func (c *chatStore) CreateCallSession(ctx context.Context, cs *CallSession) erro
 	if cs.StartedAt == 0 {
 		cs.StartedAt = nowMilli()
 	}
-	_, err := c.store.db.ExecContext(ctx, c.store.rebind(`
+	return c.withCallLease(ctx, cs, func(db execQuerier) error {
+		_, err := db.ExecContext(ctx, c.store.rebind(`
 		INSERT INTO call_sessions (id, tenant_id, room_id, mode, epoch, sfu_sticky, livekit_room, started_by, started_at, ended_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
-		cs.ID, cs.TenantID, cs.RoomID, cs.Mode, cs.Epoch, boolToInt(cs.SFUSticky),
-		nullString(cs.LiveKitRoom), cs.StartedBy, cs.StartedAt, cs.EndedAt,
-	)
-	return err
+			cs.ID, cs.TenantID, cs.RoomID, cs.Mode, cs.Epoch, boolToInt(cs.SFUSticky),
+			nullString(cs.LiveKitRoom), cs.StartedBy, cs.StartedAt, cs.EndedAt,
+		)
+		return err
+	})
 }
 
 func (c *chatStore) GetActiveCallSession(ctx context.Context, tenantID, roomID string) (*CallSession, error) {
@@ -104,19 +106,25 @@ func (c *chatStore) GetActiveCallSession(ctx context.Context, tenantID, roomID s
 
 func (c *chatStore) UpdateCallSession(ctx context.Context, cs *CallSession) error {
 	tenantID := normalizeTenant(cs.TenantID)
-	res, err := c.store.db.ExecContext(ctx, c.store.rebind(`
-		UPDATE call_sessions
-		SET mode = ?, epoch = ?, sfu_sticky = ?, livekit_room = ?
-		WHERE tenant_id = ? AND id = ? AND ended_at IS NULL`),
-		cs.Mode, cs.Epoch, boolToInt(cs.SFUSticky), nullString(cs.LiveKitRoom), tenantID, cs.ID,
-	)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return c.withCallLease(ctx, cs, func(db execQuerier) error {
+		q := `UPDATE call_sessions SET mode=?,epoch=?,sfu_sticky=?,livekit_room=? WHERE tenant_id=? AND id=? AND ended_at IS NULL`
+		args := []any{cs.Mode, cs.Epoch, boolToInt(cs.SFUSticky), nullString(cs.LiveKitRoom), tenantID, cs.ID}
+		if cs.OwnerID != "" {
+			q += ` AND room_id=? AND epoch<=?`
+			args = append(args, cs.RoomID, cs.Epoch)
+		}
+		res, err := db.ExecContext(ctx, c.store.rebind(q), args...)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			if cs.OwnerID != "" {
+				return ErrCallStateStale
+			}
+			return ErrNotFound
+		}
+		return nil
+	})
 }
 
 func (c *chatStore) EndCallSession(ctx context.Context, tenantID, callID string, endedAt int64) error {

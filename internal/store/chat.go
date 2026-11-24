@@ -480,6 +480,9 @@ func (c *chatStore) RemoveRoomMember(ctx context.Context, tenantID, roomID, user
 			return "", err
 		}
 	}
+	if err := queueCallSeatsTx(ctx, c.store, tx, `call_seats.tenant_id=? AND call_seats.room_id=? AND call_seats.user_id=?`, tenantID, roomID, userID); err != nil {
+		return "", err
+	}
 	res, err := tx.ExecContext(ctx, c.store.rebind(`DELETE FROM room_members WHERE tenant_id = ? AND room_id = ? AND user_id = ?`), tenantID, roomID, userID)
 	if err := oneRow(res, err); err != nil {
 		return "", err
