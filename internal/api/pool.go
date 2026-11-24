@@ -77,13 +77,16 @@ func (s *Server) postPoolReports(ctx context.Context, reports []poolReport) (map
 // lockPoolReport serializes exchanges for the one shared org/app grant across
 // replicas. Sequence fencing alone cannot make an older cold response usable while
 // a newer request is still in flight. Wait only within the report's deadline.
-func (s *Server) lockPoolReport(ctx context.Context, name, holder string) error {
+func (s *Server) lockPoolReport(ctx context.Context, name, holder string, wait bool) error {
 	tick := time.NewTicker(10 * time.Millisecond)
 	defer tick.Stop()
 	for {
 		ok, err := s.store.AcquireLease(ctx, name, holder, 2*poolSyncTimeout)
 		if err != nil || ok {
 			return err
+		}
+		if !wait {
+			return store.ErrPoolUnavailable
 		}
 		select {
 		case <-ctx.Done():
@@ -93,14 +96,14 @@ func (s *Server) lockPoolReport(ctx context.Context, name, holder string) error 
 	}
 }
 
-// reportPool sends usages and stores each org's answer. PoolUsages returns orgs in
-// ID order, so overlapping batches take their per-org leases in the same order.
+// reportPool is the periodic reporter: contended orgs retry on a later tick without
+// holding up other orgs or later batches. A single upload may wait for its own exchange.
 func (s *Server) reportPool(ctx context.Context, usages []store.PoolUsage) error {
 	var blocked []error
 	for len(usages) > 0 {
 		batch := usages[:min(len(usages), poolReportBatch)]
 		usages = usages[len(batch):]
-		if err := s.reportPoolBatch(ctx, batch); err != nil {
+		if err := s.reportPoolBatch(ctx, batch, false); err != nil {
 			if !errors.Is(err, store.ErrPoolUnavailable) {
 				return err
 			}
@@ -110,7 +113,7 @@ func (s *Server) reportPool(ctx context.Context, usages []store.PoolUsage) error
 	return errors.Join(blocked...)
 }
 
-func (s *Server) reportPoolBatch(ctx context.Context, batch []store.PoolUsage) error {
+func (s *Server) reportPoolBatch(ctx context.Context, batch []store.PoolUsage, wait bool) error {
 	ctx, cancel := context.WithTimeout(ctx, poolSyncTimeout)
 	defer cancel()
 	holder := uuid.NewString()
@@ -130,7 +133,11 @@ func (s *Server) reportPoolBatch(ctx context.Context, batch []store.PoolUsage) e
 	var blocked []error
 	for _, u := range batch {
 		name := "pool-report:" + u.TenantID
-		if err := s.lockPoolReport(ctx, name, holder); err != nil {
+		if err := s.lockPoolReport(ctx, name, holder, wait); err != nil {
+			if errors.Is(err, store.ErrPoolUnavailable) {
+				blocked = append(blocked, err)
+				continue
+			}
 			return err
 		}
 		held = append(held, name)
@@ -217,7 +224,7 @@ func (s *Server) refreshOrgPool(ctx context.Context, tenantID string) error {
 	if err != nil {
 		return err
 	}
-	if err := s.reportPool(ctx, usage); err != nil {
+	if err := s.reportPoolBatch(ctx, usage, true); err != nil {
 		log.Printf("[POOL] storage report failed: %v", err)
 		return err
 	}

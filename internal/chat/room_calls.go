@@ -89,6 +89,7 @@ func (m *CallManager) ownedRoom(ctx context.Context, tenant, room string) (*acti
 	changed := fresh.Epoch != cached.session.Epoch || fresh.Mode != cached.session.Mode
 	cached.session = *fresh
 	// Primary seat deletion is authoritative even when this process missed its bus event.
+	var removed []string
 	for id, peer := range cached.peers {
 		valid := false
 		for _, seat := range seats {
@@ -101,13 +102,32 @@ func (m *CallManager) ownedRoom(ctx context.Context, tenant, room string) (*acti
 			changed = true
 		}
 		if !valid {
+			removed = append(removed, id)
+		}
+	}
+	empty := len(cached.peers) > 0 && len(removed) == len(cached.peers)
+	if !empty {
+		for _, id := range removed {
 			m.removePeerLocked(room, cached, id)
 		}
 	}
-	if len(cached.peers) > 0 {
+	if !empty && len(cached.peers) > 0 {
 		m.maybeScheduleStepDownLocked(room, cached)
 	}
 	m.mu.Unlock()
+	if empty {
+		// Keep the invalid cached peers until the durable end commits, so a failure retries.
+		// A newly recovered owner has no cached peers and still permits a fresh rejoin.
+		if err := m.chatStore.EndOwnedCallSession(ctx, &cached.session, 0); err != nil {
+			return nil, err
+		}
+		m.mu.Lock()
+		m.forgetRoomLocked(room)
+		state := m.buildStateLocked(cached, false)
+		m.mu.Unlock()
+		m.broadcastState(ctx, room, state)
+		return nil, m.DrainCleanup(ctx, tenant, "")
+	}
 	if err := m.DrainCleanup(ctx, tenant, ""); err != nil {
 		return nil, err
 	}
@@ -150,20 +170,14 @@ func (m *CallManager) joinOwned(ctx context.Context, req JoinCallRequest) (*Join
 	if err != nil || tenant.Status != store.TenantStatusActive {
 		return nil, ErrTenantInactive
 	}
-	created := c == nil
-	if created {
-		lease, err := m.chatStore.AcquireCallRoom(ctx, req.TenantID, req.RoomID, m.routing.holder, roomOwnerTTL)
-		if err != nil {
-			return nil, err
-		}
-		c = &activeCall{session: store.CallSession{ID: "call_" + uuid.Must(uuid.NewV7()).String(), TenantID: req.TenantID, RoomID: req.RoomID, Mode: store.CallModeP2PMesh, Epoch: 1, StartedBy: req.UserID, OwnerID: lease.Holder, OwnerGeneration: lease.Generation}, tenant: *tenant, peers: make(map[string]*callPeer)}
-	}
 	m.mu.Lock()
 	var previous *callPeer
-	for _, p := range c.peers {
-		if p.UserID == req.UserID {
-			previous = p
-			break
+	if c != nil {
+		for _, p := range c.peers {
+			if p.UserID == req.UserID {
+				previous = p
+				break
+			}
 		}
 	}
 	m.mu.Unlock()
@@ -177,6 +191,14 @@ func (m *CallManager) joinOwned(ctx context.Context, req JoinCallRequest) (*Join
 			return nil, err
 		}
 		previous = nil
+	}
+	created := c == nil
+	if created {
+		lease, err := m.chatStore.AcquireCallRoom(ctx, req.TenantID, req.RoomID, m.routing.holder, roomOwnerTTL)
+		if err != nil {
+			return nil, err
+		}
+		c = &activeCall{session: store.CallSession{ID: "call_" + uuid.Must(uuid.NewV7()).String(), TenantID: req.TenantID, RoomID: req.RoomID, Mode: store.CallModeP2PMesh, Epoch: 1, StartedBy: req.UserID, OwnerID: lease.Holder, OwnerGeneration: lease.Generation}, tenant: *tenant, peers: make(map[string]*callPeer)}
 	}
 	peerID := "peer_" + uuid.Must(uuid.NewV7()).String()
 	if previous != nil {
@@ -355,6 +377,9 @@ func (m *CallManager) leaveOwned(ctx context.Context, room, user, hash string, d
 		c, err = m.ownedRoom(ctx, c.session.TenantID, room)
 		if err != nil {
 			return err
+		}
+		if c == nil {
+			return nil // Primary reconciliation already ended and cleaned the empty call.
 		}
 	}
 	m.mu.Lock()

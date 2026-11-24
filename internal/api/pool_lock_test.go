@@ -36,7 +36,7 @@ func TestPoolReportWaitHonorsCancellation(t *testing.T) {
 	defer cancel()
 	observed := &cancelContendedPoolStore{Store: st, cancel: cancel}
 	srv := &Server{store: observed}
-	if err := srv.lockPoolReport(ctx, "pool-report:held", "waiter"); !errors.Is(err, context.Canceled) {
+	if err := srv.lockPoolReport(ctx, "pool-report:held", "waiter", true); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled wait: %v", err)
 	}
 	if ok, err := st.AcquireLease(context.Background(), "pool-report:held", "stranger", time.Minute); err != nil || ok {

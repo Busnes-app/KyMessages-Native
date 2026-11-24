@@ -234,3 +234,63 @@ func TestPoolReportForAnotherOrgDoesNotWaitOnHeldExchange(t *testing.T) {
 		t.Fatalf("unrelated org blocked: %d %s", rec.Code, rec.Body.String())
 	}
 }
+
+// Bound the old wait path deterministically without sleeping for its production deadline.
+type observeHeldReportStore struct {
+	store.Store
+	held     string
+	attempts *int
+}
+
+func (s observeHeldReportStore) AcquireLease(ctx context.Context, name, holder string, ttl time.Duration) (bool, error) {
+	if name == "pool-report:"+s.held {
+		*s.attempts++
+		if *s.attempts > 1 {
+			return false, context.DeadlineExceeded
+		}
+	}
+	return s.Store.AcquireLease(ctx, name, holder, ttl)
+}
+
+func TestPeriodicPoolReportSkipsContendedOrgAndRenewsOthers(t *testing.T) {
+	for _, held := range []string{replicaOrgA, replicaOrgB} {
+		t.Run(held, func(t *testing.T) {
+			pool := &fakePool{headroom: 1 << 20}
+			attempts := 0
+			a, _, st, _ := newReplicasWithStore(t, func(s store.Store) store.Store {
+				return observeHeldReportStore{Store: s, held: held, attempts: &attempts}
+			}, withPool(t, pool))
+			createOrgUser(t, st, "busy-a", "busya", "user", replicaOrgA)
+			createOrgUser(t, st, "busy-b", "busyb", "user", replicaOrgB)
+			// Use the embedded store to reserve the crashed reporter before observing contention.
+			wrapped := st.(observeHeldReportStore)
+			if ok, err := wrapped.Store.AcquireLease(context.Background(), "pool-report:"+held, "crashed", time.Minute); err != nil || !ok {
+				t.Fatalf("reserve crashed report: %v %v", ok, err)
+			}
+			err := a.RefreshPool(context.Background(), time.Now())
+			if !errors.Is(err, store.ErrPoolUnavailable) {
+				t.Errorf("expected retryable contention: %v", err)
+			}
+			other := replicaOrgA
+			if held == other {
+				other = replicaOrgB
+			}
+			pool.mu.Lock()
+			reports := append([]map[string]any(nil), pool.reports...)
+			pool.mu.Unlock()
+			if len(reports) != 1 || reports[0]["org_id"] != other {
+				t.Fatalf("unrelated org was not reported: %+v", reports)
+			}
+			usage, err := st.Chat().PoolUsages(context.Background(), time.Now().UnixMilli(), other)
+			if err != nil || len(usage) != 1 || usage[0].CeilingBytes == nil {
+				t.Fatalf("unrelated grant not stored: %+v %v", usage, err)
+			}
+			if ok, err := st.AcquireLease(context.Background(), "pool-report:"+other, "next", time.Minute); err != nil || !ok {
+				t.Fatalf("unrelated lease not released: %v %v", ok, err)
+			}
+			if attempts != 1 {
+				t.Fatalf("periodic reporter waited on busy org: %d attempts", attempts)
+			}
+		})
+	}
+}

@@ -416,3 +416,76 @@ func TestRoomCallMissedGuestInviteRevocationCannotRefreshMedia(t *testing.T) {
 	m.calls[meeting.Room.ID].stopStepDownLocked()
 	m.mu.Unlock()
 }
+
+// A transient end failure must leave enough cached state to retry reconciliation.
+type failEmptyCallEnd struct {
+	store.ChatStore
+	fail bool
+}
+
+var errEmptyCallEnd = errors.New("injected empty call end failure")
+
+func (s *failEmptyCallEnd) EndOwnedCallSession(ctx context.Context, cs *store.CallSession, endedAt int64) error {
+	if s.fail {
+		s.fail = false
+		return errEmptyCallEnd
+	}
+	return s.ChatStore.EndOwnedCallSession(ctx, cs, endedAt)
+}
+
+func TestRoomCallReconciliationEndsLastExpiredSeatAndRetriesFailure(t *testing.T) {
+	for _, failFirst := range []bool{false, true} {
+		t.Run(map[bool]string{false: "normal", true: "retry"}[failFirst], func(t *testing.T) {
+			ctx := context.Background()
+			st, room, requests := seedRoutedCall(t)
+			wrapped := &failEmptyCallEnd{ChatStore: st.Chat(), fail: failFirst}
+			m := NewCallManager(wrapped, NewHub(&captureBus{}), fakeLiveKitClient(t), nil)
+			m.EnableRoomRouting()
+			requests[0].ProtectIP = true
+			first, err := m.Join(ctx, requests[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			otherRoom := &store.Room{TenantID: routedOrg, Kind: store.RoomKindChannel, CreatedBy: requests[1].UserID, Name: "Other call"}
+			if err := st.Chat().CreateRoom(ctx, otherRoom, nil); err != nil {
+				t.Fatal(err)
+			}
+			other := requests[1]
+			other.RoomID = otherRoom.ID
+			otherCall, err := m.Join(ctx, other)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Delete only on the primary; omit all best-effort manager callbacks.
+			if err := st.Sessions().DeleteSession(ctx, requests[0].SessionHash); err != nil {
+				t.Fatal(err)
+			}
+			if failFirst {
+				if err := m.ClaimRoom(ctx, routedOrg, room); !errors.Is(err, errEmptyCallEnd) {
+					t.Fatalf("end failure not returned: %v", err)
+				}
+			}
+			m.ReconcileTenants(ctx)
+			if state := m.GetState(room); state != nil {
+				t.Fatalf("empty call stayed active: %+v", state)
+			}
+			if _, err := st.Chat().GetActiveCallSession(ctx, routedOrg, room); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("durable ghost call: %v", err)
+			}
+			if state := m.GetState(otherRoom.ID); state == nil || state.CallID != otherCall.CallID || len(state.Peers) != 1 {
+				t.Fatalf("unrelated call changed: %+v", state)
+			}
+			requests[0].SessionHash = "renewed-session"
+			if err := st.Sessions().CreateSession(ctx, &store.Session{TokenHash: requests[0].SessionHash, UserID: requests[0].UserID, CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(time.Hour)}, ""); err != nil {
+				t.Fatal(err)
+			}
+			next, err := m.Join(ctx, requests[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !next.Started || next.CallID == first.CallID {
+				t.Fatalf("reused ended call: %+v", next)
+			}
+		})
+	}
+}
