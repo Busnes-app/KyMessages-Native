@@ -7,9 +7,12 @@ Exposes HTTP REST routes, authentication endpoints, Single Sign-On callbacks, SC
 Owns HTTP routing, request parsing, session cookie validation, CORS headers, and error response formatting.
 
 ## Local Contracts
+- Guest info, knock and authenticated guest routes handle a storage/lookup error before reading returned rows; generic failures return bounded JSON errors without a panic or database details.
+- Shared guest admission follows the current invitation token hash on primary reads, independently of post-commit revocation events. Re-inviting the same guest key requires a fresh knock/admission; an old cookie or call socket cannot inherit it. Scheduled windows also fence media grants/reconciliation. This changes no single-mode guest route or host/moderator permission model.
+- Hosted member calls use `/api/v1/rooms/{id}/calls/{state,join,leave,escalate,ws}`. Admitted guests use `/api/v1/rooms/{id}/calls/guest/{token}/{join,leave,ws}` with exact token/session/meeting/room binding; token-only guest call writes cannot bypass affinity. The edge must hash the same room ID for every HTTP/WS call route. Ordinary member/guest chat and lobby sockets stay separate. A multi-mode join supplies `call_ws_path`; guest info supplies `call_room_id`, omitted in single mode. HTTP departure reports pending SFU cleanup as 503; revoked in-flight joins return 401 without a grant. Hosted meeting closure atomically fences ownership, ends the call, retains SFU retirement, and deletes guest admissions before post-commit socket revocations; a failed SFU delete returns retryable 503 and cannot be acknowledged as complete. Closed room state reads return no call. See `room_call_routing_test.go` and the gated networking guide.
 - Multi-mode erasure, tenant revocation and org purge drain durable SFU room retirement before acknowledging completion. An SFU failure after row deletion remains retryable and cannot produce a completion audit/terminal purge mark. The shared call-cleanup reconciliation tick is elected with `call_cleanup`; a failed room cannot starve unrelated cleanup batches. `call_cleanup_test.go` exercises a receiving replica without the departed owner's memory, failure/retry and exact-once completion.
 
-- `NewServer` enables bounded call-notification chunking only for the multi-mode PostgreSQL bus; single-mode bus wire behavior stays unchanged. Room-owner routing remains separate from this transport prerequisite.
+- `NewServer` enables bounded call-notification chunking only for the multi-mode PostgreSQL bus; single-mode bus wire behavior stays unchanged. Room ownership is claimed only after exact principal/org/room authorization; wrong owners return retryable 503 `call_owner_unavailable`, with no replica address.
 
 - After multi-mode erasure, a surviving shared-room successor immediately has owner permissions; cleanup failure/retry and duplicate deliveries retain that choice and other members' content. Only owned rooms with no remaining member disappear. `erasure_handover_test.go` exercises real signed deliveries, encrypted member messages, attachments and successor API access.
 
@@ -89,7 +92,10 @@ Owns HTTP routing, request parsing, session cookie validation, CORS headers, and
   `KY_ATTACHMENTS_MAX_TOTAL_BYTES` does not apply (startup warns when it is set). An upload with
   no usable grant reports its org once (`POST /api/suite/storage`, Basic suite client
   credentials, HTTPS issuer, no redirects; at most 6 such calls per org per minute) and looks
-  again. Refusals: `413 {"code":"org_storage_full"}`, `503 {"code":"pool_unavailable"}`, never
+  again. The synchronous refresh and periodic reporter share bounded per-org database
+  leases through the entire sequence/snapshot, remote exchange and grant application, so
+  concurrent cold uploads cannot discard their only grant. Only synchronous single-org refresh waits for contention; periodic batches skip busy orgs and retry them next tick while renewing other orgs and continuing later batches. Different orgs remain independent;
+  expiration, wrong-sequence replies and stale-restore fences still fail closed. Refusals: `413 {"code":"org_storage_full"}`, `503 {"code":"pool_unavailable"}`, never
   naming another app. Deletes, reads, text and calls never check the pool. `RefreshPool` is the
   leased `pool_report` job (every minute): absolute totals for each org whose usage changed, has
   used half its grant, or whose grant is missing or under 10 minutes from expiry.

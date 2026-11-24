@@ -64,6 +64,7 @@ type Store interface {
 	InvalidateRestoredGrants(context.Context) error
 	// AcquireLease takes or renews a background job's lease (multi mode); see leases.go.
 	AcquireLease(ctx context.Context, name, holder string, ttl time.Duration) (bool, error)
+	ReleaseLease(ctx context.Context, name, holder string) error
 	// Multi mode's shared limits, spent proof-of-work and lobby sessions (shared_limits.go,
 	// guest_sessions.go). Single mode keeps them in process memory.
 	BumpAttempt(ctx context.Context, key string, window time.Duration) (int64, error)
@@ -333,6 +334,9 @@ type AgentStore interface {
 
 // ChatStore handles multi-tenant native KyMessages tenants, rooms, messages and reactions.
 type ChatStore interface {
+	QueueOwnedCallSeatRemoval(ctx context.Context, cs *CallSession, seat CallSeat) error
+	RecoverCallSession(ctx context.Context, lease CallLease) (*CallSession, error)
+	CallSeats(ctx context.Context, tenantID, roomID string) ([]CallSeat, error)
 	AcquireCallRoom(ctx context.Context, tenantID, roomID, holder string, ttl time.Duration) (CallLease, error)
 	CallRoomHeld(ctx context.Context, lease CallLease) (bool, error)
 	ReleaseCallRoom(ctx context.Context, lease CallLease) error
@@ -440,6 +444,9 @@ type ChatStore interface {
 
 	// Call Sessions
 	CreateCallSession(ctx context.Context, cs *CallSession) error
+
+	// CreateOwnedCallSession atomically creates the call and admits its first seat.
+	CreateOwnedCallSession(ctx context.Context, cs *CallSession, seat CallSeat) error
 	GetActiveCallSession(ctx context.Context, tenantID, roomID string) (*CallSession, error)
 	UpdateCallSession(ctx context.Context, cs *CallSession) error
 	EndCallSession(ctx context.Context, tenantID, callID string, endedAt int64) error

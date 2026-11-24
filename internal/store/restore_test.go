@@ -188,7 +188,7 @@ func TestRestoreInvalidatesGuestSessions(t *testing.T) {
 	now := time.Now().UnixMilli()
 	gs := st.GuestSessions()
 	if _, err := gs.Create(ctx, "restored-secret", store.GuestSession{GuestID: "g1", TenantID: store.DefaultTenantID, MeetingID: "m",
-		RoomID: res.Meeting.RoomID, GuestKey: "k", DisplayName: "V", Status: "waiting", KnockedAt: now, SeenAt: now, ExpiresAt: now + 3600000}); err != nil {
+		RoomID: res.Meeting.RoomID, GuestKey: "k", InviteHash: storeInviteFixture(t, st, res.Meeting, "k"), DisplayName: "V", Status: "waiting", KnockedAt: now, SeenAt: now, ExpiresAt: now + 3600000}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := gs.Admit(ctx, res.Meeting.RoomID, "g1", "host", now, time.Hour); err != nil {

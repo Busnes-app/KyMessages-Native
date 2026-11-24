@@ -178,6 +178,7 @@ export interface CallState {
 }
 
 export interface CallJoinResponse {
+ call_ws_path?: string;
   call_id: string;
   room_id: string;
   peer_id?: string;
@@ -196,6 +197,7 @@ export interface CallMigratePayload {
   room_id: string;
   epoch?: number;
   target_mode: CallMode;
+  peers?: CallPeer[];
   reason?: string;
   livekit_url?: string;
   livekit_token?: string;
@@ -246,6 +248,7 @@ export interface AdminMediaPolicyResponse {
 }
 
 export interface GuestMeetInfo {
+ call_room_id?: string;
   meeting_title: string;
   closed: boolean;
   in_window: boolean;
@@ -498,7 +501,14 @@ export function parseCallState(v: unknown): CallState {
 
 export function parseCallJoinResponse(v: unknown): CallJoinResponse {
   const o = obj(v);
+  const room = str(o.room_id,128);
+  const path = opt(o.call_ws_path,(value)=>str(value,512));
+  const prefix = `/api/v1/rooms/${encodeURIComponent(room)}/calls/`;
+  if (path && path !== `${prefix}ws` && !(path.startsWith(`${prefix}guest/`) && /^guest\/[A-Za-z0-9_-]{16,128}\/ws$/.test(path.slice(prefix.length)))) {
+    throw new Error('Invalid call socket path');
+  }
   return {
+ call_ws_path: path,
     call_id: str(o.call_id, 128),
     room_id: str(o.room_id, 128),
     peer_id: opt(o.peer_id, (s) => str(s, 128)),
@@ -520,6 +530,7 @@ export function parseCallMigrate(v: unknown): CallMigratePayload {
     room_id: str(o.room_id, 128),
     epoch: opt(o.epoch, num),
     target_mode: oneOf(o.target_mode, CALL_MODES),
+    peers: o.peers !== undefined ? arr(o.peers).map(parseCallPeer) : undefined,
     reason: opt(o.reason, (s) => str(s, 128)),
     livekit_url: opt(o.livekit_url, (s) => str(s, 512)),
     livekit_token: opt(o.livekit_token, (s) => str(s, 4096)),
@@ -580,6 +591,7 @@ export function parseGuestMeetInfo(v: unknown): GuestMeetInfo {
     };
   }
   return {
+ call_room_id: opt(o.call_room_id,(v)=>str(v,128)),
     meeting_title: opt(o.meeting_title, (s) => str(s, 255)) ?? 'Meeting',
     closed: opt(o.closed, bool) ?? false,
     in_window: opt(o.in_window, bool) ?? false,

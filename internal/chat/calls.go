@@ -35,6 +35,7 @@ var (
 
 // JoinCallRequest carries client capabilities and preferences when joining a room call.
 type JoinCallRequest struct {
+	SessionHash string          `json:"-"`
 	TenantID    string          `json:"-"`
 	RoomID      string          `json:"-"`
 	UserID      string          `json:"-"`
@@ -62,6 +63,7 @@ type JoinCallResponse struct {
 	LiveKitToken string          `json:"livekit_token,omitempty"`
 	Peers        []CallPeerState `json:"peers"`
 	Started      bool            `json:"-"`
+	CallWSPath   string          `json:"call_ws_path,omitempty"`
 }
 
 // ICEServer matches the browser RTCIceServer JSON shape.
@@ -82,11 +84,15 @@ type activeCall struct {
 	tenant        store.Tenant
 	peers         map[string]*callPeer // peerID -> peer
 	stepDownTimer *time.Timer
+	ending        bool // routed owner must retry durable end before admitting another join
 }
 
 type callPeer struct {
 	CallPeerState
-	migratedEpoch int
+	sessionHash     string
+	issuedEpoch     int
+	migratedEpoch   int
+	disconnectTimer *time.Timer
 }
 
 // CallManager coordinates hybrid P2P-first / LiveKit SFU voice and video calls.
@@ -101,6 +107,7 @@ type CallManager struct {
 	// takes out of their calls the peers whose account does not (a missed revocation).
 	userActive   func(ctx context.Context, userID string) (bool, error)
 	cleanupLease func(context.Context) (bool, error)
+	routing      *roomRouting
 
 	mu        sync.Mutex
 	calls     map[string]*activeCall       // roomID -> call
@@ -157,8 +164,11 @@ func (m *CallManager) Stats() CallStats {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var s CallStats
-	s.ActiveCalls = len(m.calls)
 	for _, c := range m.calls {
+		if c.ending {
+			continue
+		}
+		s.ActiveCalls++
 		if c.session.Mode == store.CallModeSFULiveKit {
 			s.SFUCalls++
 		} else {
@@ -174,7 +184,7 @@ func (m *CallManager) GetState(roomID string) *CallStatePayload {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	c := m.calls[roomID]
-	if c == nil {
+	if c == nil || c.ending {
 		return nil
 	}
 	st := m.buildStateLocked(c, true)
@@ -183,6 +193,9 @@ func (m *CallManager) GetState(roomID string) *CallStatePayload {
 
 // Join starts or joins the active call in req.RoomID, evaluating P2P vs SFU policy.
 func (m *CallManager) Join(ctx context.Context, req JoinCallRequest) (*JoinCallResponse, error) {
+	if m.routing != nil {
+		return m.joinOwned(ctx, req)
+	}
 	if req.TenantID == "" {
 		req.TenantID = store.DefaultTenantID
 	}
@@ -421,6 +434,10 @@ func (m *CallManager) ReconcileTenants(ctx context.Context) {
 			}
 		}
 	}
+	if m.routing != nil {
+		m.reconcileOwned(ctx)
+		return
+	}
 	defer m.reconcileUsers(ctx)
 	m.mu.Lock()
 	tenants := map[string]struct{}{}
@@ -467,6 +484,10 @@ func (m *CallManager) tenantStillActive(ctx context.Context, tenantID string) bo
 // Leave removes userID from the active call in roomID, ending the call if empty or
 // arming the 60s hysteretic SFU -> P2P step-down timer if conditions now fit P2P.
 func (m *CallManager) Leave(ctx context.Context, roomID, userID string) {
+	if m.routing != nil {
+		_ = m.leaveOwned(ctx, roomID, userID, "", false)
+		return
+	}
 	m.mu.Lock()
 	c := m.calls[roomID]
 	if c == nil {
@@ -524,6 +545,9 @@ func (m *CallManager) Leave(ctx context.Context, roomID, userID string) {
 // ForceEscalate escalates the active call in roomID to LiveKit SFU (e.g. ICE failure or
 // user-requested escalation). Sets SFUSticky=true when reason is "ice_failed".
 func (m *CallManager) ForceEscalate(ctx context.Context, roomID, userID, reason string) (*CallStatePayload, error) {
+	if m.routing != nil {
+		return m.escalateOwned(ctx, roomID, userID, reason)
+	}
 	if reason == "" {
 		reason = "manual"
 	}
@@ -585,6 +609,10 @@ func (m *CallManager) ForceEscalate(ctx context.Context, roomID, userID, reason 
 
 // HandleClientFrame processes inbound WebSocket call.* frames from Hub.
 func (m *CallManager) HandleClientFrame(ctx context.Context, userID string, _ bool, frame ClientFrame) {
+	if m.routing != nil {
+		m.handleOwnedFrame(ctx, userID, frame)
+		return
+	}
 	switch frame.Type {
 	case ClientFrameCallSignal:
 		m.handleSignal(ctx, userID, frame)
@@ -780,6 +808,10 @@ func (m *CallManager) maybeScheduleStepDownLocked(roomID string, c *activeCall) 
 }
 
 func (m *CallManager) executeStepDown(roomID, callID string) {
+	if m.routing != nil {
+		m.stepDownOwned(roomID, callID)
+		return
+	}
 	m.mu.Lock()
 	c := m.calls[roomID]
 	if c == nil || c.session.ID != callID {

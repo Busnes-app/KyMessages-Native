@@ -44,15 +44,19 @@ const (
 // Dispatch sends an event that has it to that user only, so a room event leaves it empty and
 // puts any actor ID in Data.
 type Event struct {
-	Type   string          `json:"t"`
-	RoomID string          `json:"room,omitempty"`
-	Seq    int64           `json:"seq,omitempty"`
-	UserID string          `json:"user_id,omitempty"`
-	Data   json.RawMessage `json:"d,omitempty"`
+	// SessionHash is an internal bus recipient fence, stripped before client delivery.
+	SessionHash string          `json:"session_hash,omitempty"`
+	Type        string          `json:"t"`
+	RoomID      string          `json:"room,omitempty"`
+	Seq         int64           `json:"seq,omitempty"`
+	UserID      string          `json:"user_id,omitempty"`
+	Data        json.RawMessage `json:"d,omitempty"`
 }
 
 // ClientFrame is a client-to-server WebSocket control frame.
 type ClientFrame struct {
+	// Assigned by the authenticated socket, never accepted from JSON.
+	SessionHash string          `json:"-"`
 	Type        string          `json:"t"`
 	RoomID      string          `json:"room,omitempty"`
 	Active      bool            `json:"active,omitempty"`

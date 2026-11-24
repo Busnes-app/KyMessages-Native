@@ -20,12 +20,13 @@ import (
 // fakePool is KyIdentity's POST /api/suite/storage: it grants up to headroom bytes beyond the
 // reported usage, or answers as configured.
 type fakePool struct {
-	mu       sync.Mutex
-	headroom int64
-	answer   string // "" (ok), "stale", "unknown_org", "down", "wrong_seq"
-	staleSeq int64
-	reports  []map[string]any
-	calls    atomic.Int64
+	mu          sync.Mutex
+	headroom    int64
+	answer      string // "" (ok), "stale", "unknown_org", "down", "wrong_seq"
+	staleSeq    int64
+	reports     []map[string]any
+	calls       atomic.Int64
+	beforeReply func(int64) // optional controlled ordering of report responses
 }
 
 func (f *fakePool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -42,6 +43,11 @@ func (f *fakePool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Reports []map[string]any `json:"reports"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
+	if f.beforeReply != nil {
+		for _, rep := range body.Reports {
+			f.beforeReply(int64(rep["seq"].(float64)))
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.answer == "down" {

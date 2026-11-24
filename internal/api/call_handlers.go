@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/Busnes-app/ky_server_base/internal/chat"
@@ -27,6 +28,20 @@ func (s *Server) handleCallState(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireRoomMember(w, r, tenantID, roomID, user.ID); !ok {
 		return
 	}
+	if s.config.Tenancy.IsMultiTenant() {
+		room, err := s.store.Chat().GetRoom(r.Context(), tenantID, roomID)
+		if err != nil {
+			s.writeError(w, http.StatusServiceUnavailable, "Call state is temporarily unavailable")
+			return
+		}
+		if room.ClosedAt != nil {
+			s.writeJSON(w, http.StatusOK, map[string]any{"call": nil, "sfu_available": s.calls.SFUAvailable(), "ice_servers": s.calls.ICEServers()})
+			return
+		}
+	}
+	if !s.requireCallOwner(w, r, tenantID, roomID) {
+		return
+	}
 	state := s.calls.GetState(roomID)
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"call":          state,
@@ -38,7 +53,7 @@ func (s *Server) handleCallState(w http.ResponseWriter, r *http.Request) {
 // POST /api/v1/rooms/{id}/calls/join
 func (s *Server) handleCallJoin(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	user, _, ok := s.currentUser(r)
+	user, sess, ok := s.currentUser(r)
 	if !ok {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
@@ -53,6 +68,10 @@ func (s *Server) handleCallJoin(w http.ResponseWriter, r *http.Request) {
 	}
 	roomID := r.PathValue("id")
 	if _, ok := s.requireRoomMember(w, r, tenantID, roomID, user.ID); !ok {
+		return
+	}
+	if s.config.Tenancy.IsMultiTenant() && user.Role != "user" {
+		s.writeError(w, http.StatusForbidden, "Member account required")
 		return
 	}
 	room, err := s.store.Chat().GetRoom(r.Context(), tenantID, roomID)
@@ -84,8 +103,12 @@ func (s *Server) handleCallJoin(w http.ResponseWriter, r *http.Request) {
 		audio = *body.Audio
 	}
 
+	if !s.requireCallOwner(w, r, tenantID, roomID) {
+		return
+	}
 	resp, err := s.calls.Join(r.Context(), chat.JoinCallRequest{
 		TenantID:    tenantID,
+		SessionHash: sess.TokenHash,
 		RoomID:      roomID,
 		UserID:      user.ID,
 		DisplayName: displayNameFor(user),
@@ -96,6 +119,22 @@ func (s *Server) handleCallJoin(w http.ResponseWriter, r *http.Request) {
 		ProtectIP:   body.ProtectIP,
 		ECDHPubJWK:  body.ECDHPubJWK,
 	})
+	if err != nil && s.config.Tenancy.IsMultiTenant() {
+		valid, checkErr := chatSessionValid(r.Context(), s.store, user.ID, sess.TokenHash)
+		if checkErr == nil && !valid {
+			s.writeError(w, http.StatusUnauthorized, "Authentication required")
+			return
+		}
+		if checkErr != nil {
+			s.writeError(w, http.StatusServiceUnavailable, "Call admission is temporarily unavailable")
+			return
+		}
+	}
+	if errors.Is(err, store.ErrCallOwnerLost) || errors.Is(err, store.ErrCallCleanupPending) || errors.Is(err, store.ErrCallStateStale) {
+		w.Header().Set("Retry-After", "1")
+		s.writeError(w, http.StatusServiceUnavailable, "Call control is temporarily unavailable; retry")
+		return
+	}
 	if errors.Is(err, chat.ErrCallSeatLost) {
 		s.writeError(w, http.StatusConflict, "The call seat ended while joining; join again")
 		return
@@ -131,6 +170,9 @@ func (s *Server) handleCallJoin(w http.ResponseWriter, r *http.Request) {
 			s.dispatchCallPush(ctx, tenantID, roomID, user.ID, starter)
 		})
 	}
+	if s.config.Tenancy.IsMultiTenant() {
+		resp.CallWSPath = "/api/v1/rooms/" + url.PathEscape(roomID) + "/calls/ws"
+	}
 	s.writeJSON(w, http.StatusOK, resp)
 }
 
@@ -150,7 +192,13 @@ func (s *Server) handleCallLeave(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireRoomMember(w, r, tenantID, roomID, user.ID); !ok {
 		return
 	}
-	s.calls.Leave(r.Context(), roomID, user.ID)
+	if !s.requireCallOwner(w, r, tenantID, roomID) {
+		return
+	}
+	if err := s.calls.LeaveCall(r.Context(), roomID, user.ID); err != nil {
+		s.writeError(w, http.StatusServiceUnavailable, "Call departure cleanup is pending; retry")
+		return
+	}
 	s.writeJSON(w, http.StatusOK, map[string]bool{"left": true})
 }
 
@@ -176,6 +224,9 @@ func (s *Server) handleCallEscalate(w http.ResponseWriter, r *http.Request) {
 	if r.Body != nil {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 	}
+	if !s.requireCallOwner(w, r, tenantID, roomID) {
+		return
+	}
 	state, err := s.calls.ForceEscalate(r.Context(), roomID, user.ID, strings.TrimSpace(body.Reason))
 	switch {
 	case errors.Is(err, chat.ErrCallNotActive):
@@ -187,6 +238,9 @@ func (s *Server) handleCallEscalate(w http.ResponseWriter, r *http.Request) {
 			"error": "LiveKit SFU is not configured on this server",
 			"code":  "sfu_unavailable",
 		})
+	case errors.Is(err, store.ErrCallOwnerLost), errors.Is(err, store.ErrCallCleanupPending), errors.Is(err, store.ErrCallStateStale):
+		w.Header().Set("Retry-After", "1")
+		s.writeError(w, http.StatusServiceUnavailable, "Call control is temporarily unavailable; retry")
 	case err != nil:
 		s.writeError(w, http.StatusInternalServerError, "Failed to escalate call")
 	default:
@@ -341,4 +395,18 @@ func (s *Server) handleAdminUpdateMediaPolicy(w http.ResponseWriter, r *http.Req
 			"guest_force_sfu": updated.GuestForceSFU,
 		},
 	})
+}
+
+// Owner contention is retryable without exposing internal replica addresses or permitting
+// a second call. The edge hashes the room segment identically for HTTP and WebSocket.
+func (s *Server) requireCallOwner(w http.ResponseWriter, r *http.Request, tenant, room string) bool {
+	if !s.config.Tenancy.IsMultiTenant() {
+		return true
+	}
+	if err := s.calls.ClaimRoom(r.Context(), tenant, room); err != nil {
+		w.Header().Set("Retry-After", "1")
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Call room is temporarily unavailable; retry through its room route", "code": "call_owner_unavailable"})
+		return false
+	}
+	return true
 }

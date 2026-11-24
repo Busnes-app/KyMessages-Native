@@ -30,6 +30,13 @@ const (
 // newReplicas starts two multi-mode servers on one database, as two replicas would run.
 func newReplicas(t *testing.T, opts ...func(*config.Config)) (a, b *api.Server, st store.Store, cfg *config.Config) {
 	t.Helper()
+	return newReplicasWithStore(t, func(st store.Store) store.Store { return st }, opts...)
+}
+
+// The decorator lets concurrency regressions observe actual independent database
+// handles without substituting their persistence or HTTP behavior.
+func newReplicasWithStore(t *testing.T, decorate func(store.Store) store.Store, opts ...func(*config.Config)) (a, b *api.Server, st store.Store, cfg *config.Config) {
+	t.Helper()
 	db := testdb.Config(t)
 	cfg = &config.Config{
 		Server:   config.ServerConfig{AppName: "KyMessages", AppURL: "https://chat.example.com"},
@@ -51,6 +58,7 @@ func newReplicas(t *testing.T, opts ...func(*config.Config)) (a, b *api.Server, 
 		if err := api.EnsureTenancyMode(context.Background(), s, cfg.Tenancy); err != nil {
 			t.Fatal(err)
 		}
+		s = decorate(s)
 		srv := api.NewServer(cfg, s)
 		t.Cleanup(func() { srv.WaitDetached() })
 		return srv, s

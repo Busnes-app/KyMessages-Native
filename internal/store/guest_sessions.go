@@ -19,6 +19,7 @@ type GuestSession struct {
 	MeetingID   string
 	RoomID      string
 	GuestKey    string
+	InviteHash  string
 	DisplayName string
 	Status      string // "waiting" or "admitted"
 	KnockedAt   int64
@@ -33,11 +34,11 @@ type GuestSessionStore struct{ s *SQLStore }
 // GuestSessions returns the shared lobby session store.
 func (s *SQLStore) GuestSessions() *GuestSessionStore { return &GuestSessionStore{s: s} }
 
-const guestSessionCols = `guest_id, tenant_id, meeting_id, room_id, guest_key, display_name, status, knocked_at, decided_by, seen_at, expires_at`
+const guestSessionCols = `guest_id, tenant_id, meeting_id, room_id, guest_key, invite_hash, display_name, status, knocked_at, decided_by, seen_at, expires_at`
 
 func scanGuestSession(row interface{ Scan(...any) error }) (*GuestSession, error) {
 	var g GuestSession
-	err := row.Scan(&g.GuestID, &g.TenantID, &g.MeetingID, &g.RoomID, &g.GuestKey, &g.DisplayName, &g.Status, &g.KnockedAt, &g.DecidedBy, &g.SeenAt, &g.ExpiresAt)
+	err := row.Scan(&g.GuestID, &g.TenantID, &g.MeetingID, &g.RoomID, &g.GuestKey, &g.InviteHash, &g.DisplayName, &g.Status, &g.KnockedAt, &g.DecidedBy, &g.SeenAt, &g.ExpiresAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -83,6 +84,17 @@ func (g *GuestSessionStore) create(ctx context.Context, secret string, sess Gues
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	// Serialize the admitted/waiting principal with room closure before touching guest rows.
+	if err := oneRow(tx.ExecContext(ctx, g.s.rebind(`UPDATE rooms SET topic=topic WHERE tenant_id=? AND id=? AND closed_at IS NULL`), sess.TenantID, sess.RoomID)); err != nil {
+		return nil, err
+	}
+	var current int
+	if err := tx.QueryRowContext(ctx, g.s.rebind(`SELECT 1 FROM meeting_guests i JOIN meetings m ON m.tenant_id=i.tenant_id AND m.id=i.meeting_id JOIN rooms r ON r.tenant_id=m.tenant_id AND r.id=m.room_id WHERE i.tenant_id=? AND i.meeting_id=? AND i.guest_key=? AND i.token_hash=? AND i.revoked_at IS NULL AND m.room_id=? AND m.closed_at IS NULL AND r.closed_at IS NULL AND `+g.s.meetingWindowSQL("m")), sess.TenantID, sess.MeetingID, sess.GuestKey, sess.InviteHash, sess.RoomID).Scan(&current); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
 	rows, err := tx.QueryContext(ctx, g.s.rebind(`DELETE FROM meeting_guest_sessions WHERE tenant_id = ? AND meeting_id = ? AND guest_key = ? RETURNING `+guestSessionCols),
 		sess.TenantID, sess.MeetingID, sess.GuestKey)
 	if err != nil {
@@ -100,8 +112,8 @@ func (g *GuestSessionStore) create(ctx context.Context, secret string, sess Gues
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 		return nil, err
 	}
-	if _, err := tx.ExecContext(ctx, g.s.rebind(`INSERT INTO meeting_guest_sessions (secret_hash, `+guestSessionCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, `+g.s.dbNowMillis()+`, ?)`),
-		crypto.SHA256Hex([]byte(secret)), sess.GuestID, sess.TenantID, sess.MeetingID, sess.RoomID, sess.GuestKey, sess.DisplayName,
+	if _, err := tx.ExecContext(ctx, g.s.rebind(`INSERT INTO meeting_guest_sessions (secret_hash, `+guestSessionCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, `+g.s.dbNowMillis()+`, ?)`),
+		crypto.SHA256Hex([]byte(secret)), sess.GuestID, sess.TenantID, sess.MeetingID, sess.RoomID, sess.GuestKey, sess.InviteHash, sess.DisplayName,
 		sess.Status, sess.KnockedAt, sess.DecidedBy, sess.ExpiresAt); err != nil {
 		return nil, fmt.Errorf("guest session insert: %w", err)
 	}
@@ -114,7 +126,7 @@ func (g *GuestSessionStore) create(ctx context.Context, secret string, sess Gues
 // some replica refreshed seen_at (database clock) within live. Departure is therefore enforced
 // by the database, not by whichever replica's leave timer happens to run.
 func (g *GuestSessionStore) present() string {
-	return ` AND seen_at > ` + g.s.dbNowMillis() + ` - ?`
+	return ` AND seen_at > ` + g.s.dbNowMillis() + ` - ? AND ` + g.s.liveGuestInviteSQL("meeting_guest_sessions")
 }
 
 func (g *GuestSessionStore) BySecret(ctx context.Context, secret string, nowMs int64, live time.Duration) (*GuestSession, error) {
@@ -135,8 +147,19 @@ func (g *GuestSessionStore) InRoom(ctx context.Context, roomID string, nowMs int
 
 // Admit marks guestID in roomID admitted by actorID.
 func (g *GuestSessionStore) Admit(ctx context.Context, roomID, guestID, actorID string, nowMs int64, live time.Duration) (*GuestSession, error) {
-	return scanGuestSession(g.s.db.QueryRowContext(ctx, g.s.rebind(`UPDATE meeting_guest_sessions SET status = 'admitted', decided_by = ?
-WHERE guest_id = ? AND room_id = ? AND expires_at > ?`+g.present()+` RETURNING `+guestSessionCols), actorID, guestID, roomID, nowMs, live.Milliseconds()))
+	tx, err := g.s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if err := oneRow(tx.ExecContext(ctx, g.s.rebind(`UPDATE rooms SET topic=topic WHERE id=? AND closed_at IS NULL AND tenant_id=(SELECT tenant_id FROM meeting_guest_sessions WHERE guest_id=? AND room_id=?)`), roomID, guestID, roomID)); err != nil {
+		return nil, err
+	}
+	session, err := scanGuestSession(tx.QueryRowContext(ctx, g.s.rebind(`UPDATE meeting_guest_sessions SET status='admitted',decided_by=? WHERE guest_id=? AND room_id=? AND expires_at>?`+g.present()+` RETURNING `+guestSessionCols), actorID, guestID, roomID, nowMs, live.Milliseconds()))
+	if err != nil {
+		return nil, err
+	}
+	return session, tx.Commit()
 }
 
 // Touch records, on the database clock, that each guest has a live socket on the caller's
@@ -190,4 +213,16 @@ func (g *GuestSessionStore) DeleteTenant(ctx context.Context, tenantID string) (
 // DeleteKey removes the session of one invite.
 func (g *GuestSessionStore) DeleteKey(ctx context.Context, tenantID, meetingID, guestKey string) ([]GuestSession, error) {
 	return g.list(ctx, `DELETE FROM meeting_guest_sessions WHERE tenant_id = ? AND meeting_id = ? AND guest_key = ? RETURNING `+guestSessionCols, tenantID, meetingID, guestKey)
+}
+
+// alias is a fixed internal SQL identifier. Invitation binding and scheduling are checked
+// against the primary, independently of whether a revocation notification was delivered.
+func (s *SQLStore) liveGuestInviteSQL(alias string) string {
+	return `EXISTS(SELECT 1 FROM meeting_guests i JOIN meetings m ON m.tenant_id=i.tenant_id AND m.id=i.meeting_id JOIN rooms r ON r.tenant_id=m.tenant_id AND r.id=m.room_id
+ WHERE i.tenant_id=` + alias + `.tenant_id AND i.meeting_id=` + alias + `.meeting_id AND i.guest_key=` + alias + `.guest_key AND i.token_hash=` + alias + `.invite_hash AND i.revoked_at IS NULL AND m.room_id=` + alias + `.room_id AND m.closed_at IS NULL AND r.closed_at IS NULL
+ AND ` + s.meetingWindowSQL("m") + `)`
+}
+
+func (s *SQLStore) meetingWindowSQL(alias string) string {
+	return `(NOT EXISTS(SELECT 1 FROM meeting_windows w WHERE w.tenant_id=` + alias + `.tenant_id AND w.meeting_id=` + alias + `.id) OR EXISTS(SELECT 1 FROM meeting_windows w WHERE w.tenant_id=` + alias + `.tenant_id AND w.meeting_id=` + alias + `.id AND w.starts_at<=` + s.dbNowMillis() + ` AND w.ends_at>=` + s.dbNowMillis() + `))`
 }

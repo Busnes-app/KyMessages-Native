@@ -48,8 +48,54 @@ async function apiJSON(input: string, init: RequestInit = {}, fallback = 'Reques
   return res.json();
 }
 
-export async function fetchBootstrap(): Promise<ChatBootstrap> {
-  return parseBootstrap(await apiJSON('/api/v1/bootstrap', {}, 'Could not load chat'));
+export async function fetchBootstrap(currentCalls?: () => {
+  calls: Readonly<Record<string, CallState>>;
+  revisions: Readonly<Record<string, number>>;
+}): Promise<ChatBootstrap> {
+  const startedRevisions = { ...currentCalls?.().revisions };
+  const boot = parseBootstrap(await apiJSON('/api/v1/bootstrap', {}, 'Could not load chat'));
+  if (boot.tenant.id === 'default') return boot;
+  // The global chat socket/HTTP may reach any pod. Only the room route can supply its
+  // current call roster. Bound fanout and time so an unavailable owner cannot stall chat.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2_000);
+  const rooms = boot.rooms.values();
+  const results = new Map<string, CallState | null>();
+  const readRooms = async () => {
+    for (const room of rooms) {
+      if (controller.signal.aborted) return;
+      try {
+        const reply = obj(await apiJSON(
+          `/api/v1/rooms/${encodeURIComponent(room.id)}/calls/state`,
+          { signal: controller.signal }, 'Could not load call state',
+        ));
+        if (reply.call === null) {
+          results.set(room.id, null);
+        } else {
+          const state = parseCallState(reply.call);
+          if (state.room_id !== room.id) throw new Error('Unexpected call room');
+          results.set(room.id, state);
+        }
+      } catch {
+        // Merge the caller's latest displayed snapshot after all room reads finish.
+      }
+    }
+  };
+  try {
+    await Promise.all(Array.from({ length: 4 }, readRooms));
+    const latest = currentCalls?.();
+    const previous = latest?.calls ?? boot.active_calls;
+    const calls: Record<string, CallState> = {};
+    for (const room of boot.rooms) {
+      const result = results.get(room.id);
+      const changed = (latest?.revisions[room.id] ?? 0) !== (startedRevisions[room.id] ?? 0);
+      const state = changed || result === undefined ? previous[room.id] : result;
+      if (state) calls[room.id] = state;
+    }
+    return { ...boot, active_calls: calls };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function fetchDirectoryUsers(): Promise<ChatDirectoryUser[]> {
@@ -498,10 +544,11 @@ export async function knockGuestMeet(
 export async function joinGuestCall(
   token: string,
   opts: { audio: boolean; video: boolean; screenShare?: boolean; protectIp?: boolean },
+  roomId?: string,
 ): Promise<CallJoinResponse> {
   return parseCallJoinResponse(
     await guestJSON(
-      `/api/meet/${encodeURIComponent(token)}/call/join`,
+      roomId ? `/api/v1/rooms/${encodeURIComponent(roomId)}/calls/guest/${encodeURIComponent(token)}/join` : `/api/meet/${encodeURIComponent(token)}/call/join`,
       {
         method: 'POST',
         body: JSON.stringify({
@@ -516,9 +563,9 @@ export async function joinGuestCall(
   );
 }
 
-export async function leaveGuestCall(token: string): Promise<void> {
+export async function leaveGuestCall(token: string, roomId?: string): Promise<void> {
   await guestJSON(
-    `/api/meet/${encodeURIComponent(token)}/call/leave`,
+    roomId ? `/api/v1/rooms/${encodeURIComponent(roomId)}/calls/guest/${encodeURIComponent(token)}/leave` : `/api/meet/${encodeURIComponent(token)}/call/leave`,
     { method: 'POST', body: '{}' },
     'Could not leave meeting call',
   );

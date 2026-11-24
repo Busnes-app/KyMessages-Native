@@ -535,8 +535,8 @@ are carried whole in 2 KiB notification parts. A bounded decoder keeps at most 1
 events (16 MiB of content), expires them after 10 seconds, and verifies the complete event
 before delivery. User targeting remains unchanged; corrupt/incomplete parts are never client
 frames. Single-mode notification bytes and ordinary message refetch behavior are unchanged.
-This does not provide room-owner routing, call-seat ownership or failover reconstruction;
-PR 4 remains unbuilt until those and the room-scoped WebSocket path are implemented.
+This transport alone does not provide ownership or recovery; the following foundation and
+room-runtime sections describe those separate layers. Hosted qualification remains gated.
 
 ### Call ownership and cleanup foundation (implemented, startup still gated)
 
@@ -551,7 +551,7 @@ the old SFU room before removing seats; retries cannot target a later media epoc
 completion and the terminal org-purge mark wait for SFU cleanup, including when the original
 owner is absent. Offline grant invalidation also fences restored owner leases/seats and queues
 known old media rooms. Single-mode call records and notification/grant wire behavior stay
-unchanged. Runtime room affinity, client call sockets and owner reconstruction remain required
+unchanged. Runtime room affinity, client call sockets and owner reconstruction are implemented in the separate runtime follow-up; hosted qualification and the startup gate remain required
 to finish PR 4.
 
 ## 12. Phased build plan
@@ -629,3 +629,95 @@ Tests each PR must add, beyond its own:
    choice, a KyMessages-only SigV4 client, duplicates signing code.
 9. **`org.unsuspended`:** *Default:* keep accepting it until KyIdentity confirms it never sends it,
    then remove it in its own PR.
+
+
+### Room-affine call runtime (implementation, startup still gated)
+
+Hosted HTTP and WebSocket control now share a literal room-addressed prefix:
+`/api/v1/rooms/{id}/calls/`, including exact-room guest aliases under `guest/{token}/`.
+Authorization precedes ownership discovery. The edge must hash the same room segment to the
+same replica for every call route; chat/lobby sockets remain independent. A live competing
+owner yields retryable 503, never a second call or an internal-address redirect.
+
+Each process renews its 90-second DB-clock room lease during the 30-second reconciliation
+cycle and on control requests. After owner loss a new generation rebuilds call identity,
+mode and sticky policy from `call_sessions`, queues retired SFU media and seats, and advances
+the epoch before admitting new peers. SFU failure keeps cleanup retryable and blocks fresh
+credentials. Browser call sockets reconnect through the room route and rejoin by HTTP for
+fresh peers/credentials; they do not reconstruct SDP or private media keys from the database.
+Primary session/seat checks fence outbound signaling, migration grants and missed revocations.
+Late disconnect callbacks recheck connected replacement sockets after room serialization.
+Cold/reconnected multi-mode bootstrap also refreshes rosters through the room HTTP routes,
+with four reads in flight and a two-second deadline, retaining the last known snapshot on
+read failure. A global pod snapshot is not the call authority. Existing signed meeting close
+atomically fences ownership, ends calls, retains SFU cleanup and removes guest admissions;
+failed cleanup remains retryable before the close is acknowledged. This preserves the
+current close permission boundary and does not choose the future host/moderator model.
+
+Migration 65 binds each shared admission to the exact current invitation token hash. Primary
+reads, admission, signaling/media grants and seat reconciliation revalidate the link, room
+and scheduled window even after missed cleanup or an immediate re-invite of the same key.
+Old experimental shared admissions have no provable binding: the migration queues their
+issued media targets and invalidates those guest rows/seats, preserving human grants/seats.
+They must knock again; the migration never assigns a current token to an old principal.
+Stop old experimental multi processes before upgrading; mixed-version hosted operation is
+not supported while startup is gated. Single mode uses the existing in-memory guest path,
+so its routes, grants and golden/upgrade responses remain unchanged.
+
+This is not a seamless-live-media promise: recovery can interrupt media, and a dead owner
+can retain its lease for up to 90 seconds. Keep the eligible call replica pool stable during
+calls; changing pool membership requires draining/stopping the removed owners so they cease
+renewing before their rooms move. Hosted scale, browser/media and operational qualification
+remain launch work, along with S3. See `docs/Reverse_Proxy_Networking.md` for the gated affinity
+contract. Single mode keeps its original global call socket and responses.
+
+## 15. Owner-approved guest-meeting planning
+
+Owner direction, 2026-11-23: guest-ready meetings are priority 3 of the hosted suite's
+post-critical product work, through **existing KyMessages**, not a second meetings product.
+The immediate change is durable planning. Critical tenancy/isolation, reliability, security,
+launch and startup gates and current fixes take precedence. Current room-affinity, owner
+recovery and guest/session cleanup continue under their existing authorization; this direction
+neither widens those implementations nor makes a hosted-readiness claim.
+
+### Capability inventory before new scope
+
+Static inspection establishes existing code for signed KyCalendar scheduled meetings,
+instant meetings and room guest-link creation (`internal/api/meeting_handlers.go`),
+account-free guest knock/admission and confined browser joins (`GuestMeeting.tsx`),
+WebRTC/optional LiveKit calls, and screen capture/media publication
+(`web/src/rtc/hybridCall.ts`). Lobby admission/denial is currently available to room members
+(`internal/api/call_handlers.go`); it is not proof of a selected host-only moderation model.
+Existing meeting/call and guest-session tests cover their API boundaries; neither those nor
+source inspection establish complete hosted browser/media qualification. Call ownership and
+cleanup are a separate open foundation PR; runtime room routing/reconstruction is in progress.
+
+After critical gates, first run a capability acceptance pass against the resulting implementation:
+external person follows a browser invitation, knocks, receives the intended admission or refusal,
+joins voice/video, shares and stops a screen, loses access on removal/revocation/expiry, and
+recovers or exits predictably across owner failure. Exercise wrong-org and wrong-room links,
+concurrent/replayed decisions, polling/outage protections and session-specific cleanup. Record
+browser/media conditions and results; distinguish built, tested, qualified and planned.
+Then scope only the missing external invitation/join, screen-sharing and host-control work.
+
+### Product decisions still unselected
+
+- The host/moderator permission model: who may admit, remove, lock, end or re-invite guests,
+  and how authority transfers when that person leaves. Existing room-member admission is the
+  current behavior, not an approved final host-control contract.
+- Participant/duration and abuse limits, supported browser/device combinations, and the
+  resulting public meeting promise. Competitor limits do not select ours.
+- Guest media encryption, key distribution/verification and the claims that can be supported.
+  Current message encryption does not establish guest-call E2EE; preserve the existing E6
+  release gate and state the actually verified transport/encryption boundary.
+
+Surface these distinct decisions before implementing a new contract. No deployment, catalog
+expansion, new product/owner, or startup-gate lift follows from this planning amendment.
+
+Research provenance: the suite workspace's
+`zentrimail-site/docs/research/competitor-product-gaps-2026-11-23.md` supplies first-party
+sources (not roadmap authority); the suite root `AGENTS.md` records the approved priority
+order. Owner direction supersedes the research password-vault recommendation: no first-party
+password manager or builder/task, existing-manager compatibility is sufficient and a new
+integration is optional. VPN and AI remain optional with no new work. Those are planning
+constraints, not additional KyMessages feature tasks.

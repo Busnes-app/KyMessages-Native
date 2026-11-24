@@ -109,6 +109,18 @@ Default section order:
 6. Report any docs intentionally left unchanged and why
 
 ## User Preferences
+
+- Hosted suite direction (owner, 2026-11-23): finish critical tenancy, isolation, reliability,
+  security and launch/startup gates first. Then validate and qualify guest-ready meetings in
+  this existing KyMessages product: external-person browser invitation/join links, screen
+  sharing and host controls. Existing implementation is not hosted qualification. Scope and
+  unresolved product decisions live in [the existing tenancy plan §15](docs/superpowers/specs/2026-11-23-tenancy-design.md#15-owner-approved-guest-meeting-planning).
+  The third-party installer catalog's video-call exclusion does not exclude this approved
+  native scope. No second meetings product, first-party password manager or password-manager
+  builder; compatibility with existing managers is sufficient, with no mandatory new
+  integration. VPN/AI remain optional with no new work requested. Preserve guest confinement
+  and evidence-based encryption claims; surface distinct product decisions before selecting
+  their contracts.
 - Bootstrap passwords and passwords installed by `init-admin` must be replaced before privileged use. Operator resets atomically revoke sessions, MFA challenges and device pairings. Untouched existing accounts are not retroactively flagged.
 
 When the user requests a durable behavior change, record it here or in the relevant child AGENTS.md
@@ -168,11 +180,13 @@ When the user requests a durable behavior change, record it here or in the relev
   layout on a shared volume, its store-ID check and the flat-blob relocation) PR 7 (the org
   storage pool, to KyIdentity's `POST /api/suite/storage` grant contract) PR 1a (`export_only`
   tokens refused, `user.erased` deletes a person's data) and PR 1b (tenancy sync from KyIdentity's
-  org and erased lists, the start-up check, the leased org purge) are built. Not built: PR 4
-  (calls across replicas), PR 6 (S3), PR 8 (multi-region). It extends the 2026-11-22
+  org and erased lists, the start-up check, the leased org purge) are built. PR 4 room-call
+  runtime is implemented under the startup gate; hosted media qualification remains. Not built:
+  PR 6 (S3), PR 8 (multi-region). It extends the 2026-11-22
   spec, whose §4 wire contract stays authoritative.
-- Migration 64 supplies fenced room ownership, opaque call-seat linkage and durable SFU room retirement for calls across replicas. A revocation retires the old media address before it can be reused for new credentials; erasure/purge completion waits for cleanup. These primitives do not yet complete room-affine socket/client routing or owner reconstruction; the startup gate remains closed.
-- Multi-mode PostgreSQL call events (`call.signal`, `call.migrate`, `call.state`) retain their full payload up to 128 KiB through 2 KiB notification chunks. Decoding holds at most 128 incomplete events (16 MiB), for 10 seconds, and preserves user targeting. Incomplete/corrupt events never reach clients. Single-mode notifications and ordinary message refetch bytes stay unchanged. This transport prerequisite does not implement room-owner routing.
+- Migration 64 supplies fenced room ownership, opaque call-seat linkage and durable SFU room retirement for calls across replicas. A revocation retires the old media address before it can be reused for new credentials; erasure/purge completion waits for cleanup. Multi-mode runtime adds room-addressed HTTP/WS calls with the same edge room key, 90-second ownership leases renewed by the 30-second reconciliation tick, and call_sessions recovery with fresh media epochs/seats. Global chat sockets remain separate. Once a P2P participant has a room socket, its join refresh asks existing session-bound peers to resend any unanswered offer. Joins retain an existing SFU mode; only delayed step-down retires its media before P2P. Transport-only room-call disconnects allow a 20-second recovery window; rejoin cancels/fences the old peer timer, and failed departure cleanup rearms one bounded timer for retry. Explicit leave and primary revocation bypass that window. A new hosted call and its first authorized seat commit together. Failed external setup ends that new call and drains media cleanup; a failed durable end retains explicit owner-local end intent and is retried before another join. Ending calls are excluded from public snapshots and live metrics. Primary reconciliation publishes reduced call rosters before external cleanup, even without a media epoch change. When it removes the last cached peer, it publishes an inactive empty roster and commits the durable call end before discarding the cache; an end failure remains retryable, and the next join starts a new call. A freshly recovered owner still permits existing-call rejoin. The startup gate remains closed pending complete storage and launch qualification.
+- Multi-mode PostgreSQL call events (`call.signal`, `call.migrate`, `call.state`) retain their full payload up to 128 KiB through 2 KiB notification chunks. Decoding holds at most 128 incomplete events (16 MiB), for 10 seconds, and preserves user targeting. Incomplete/corrupt events never reach clients. Single-mode notifications and ordinary message refetch bytes stay unchanged. Room-owner routing uses the separate room-addressed call socket; this transport preserves its cross-replica recipient fence.
+- Migration 65 binds every shared guest admission to its exact invitation hash. Primary guest reads, admission, call grants and seat reconciliation verify the current invite, room and scheduled window independently of bus cleanup; unverifiable pre-65 shared bindings re-knock. Single mode keeps its in-memory guest path.
 - Multi-mode org admission requires an authoritative, active/enabled KyIdentity directory snapshot. Verified ID tokens and user events never admit an org; stale/conflicting snapshots cannot widen access. Per-app upload and staged-user safety limits narrow install bounds independently of the shared pool. A non-active snapshot persists pending revocation before any newer snapshot can restore access (`internal/store/tenant_directory.go`, migration 62).
 - Erased KyIdentity subjects remain permanently fenced in `erased_subjects` (migration 63), including those never provisioned locally. Account creation/reactivation cannot pass that fence; restore reconciliation applies the erased feed before org admission. Shared-room ownership passes to the longest-standing room admin, else member; only owned rooms with no remaining member are deleted.
 - Single mode must not change: `TestSingleTenantGolden` replays a fixed single-mode script and

@@ -49,9 +49,12 @@ func (s *SQLStore) SpendPoW(ctx context.Context, signature string, expiresAtUnix
 	return n == 1, err
 }
 
-// PruneShared deletes expired attempt windows, spent challenges and guest sessions.
+// PruneShared deletes expired attempt windows, challenges, leases and guest sessions.
 func (s *SQLStore) PruneShared(ctx context.Context) error {
 	now := time.Now()
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM job_leases WHERE expires_at < `+s.dbNowMillis()); err != nil {
+		return err
+	}
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM attempt_counters WHERE reset_at < `+s.dbNowMillis()); err != nil {
 		return err
 	}

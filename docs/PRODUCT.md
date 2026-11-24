@@ -25,7 +25,7 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
   replica, secrets every replica shares, the capsule scheduler off in `multi` (PostgreSQL tooling
   backs it up), sign-in limits and proof-of-work shared by every replica, a meeting ID space per
   org, and meeting guest sessions in PostgreSQL, and attachments stored per org on one shared
-  volume. Calls still need both peers on one replica. Each org's attachments count against its
+  volume. Room-routed calls and owner recovery are implemented under the startup gate; hosted media qualification is pending. Each org's attachments count against its
   KyIdentity storage pool; a full pool refuses new attachments only ("Your plan's storage is
   full"), never reading, deleting, text or calls. Object storage is not built.
 - **Invite-only:** accounts come from KyIdentity (OIDC + signed directory sync webhooks) or local
@@ -67,11 +67,6 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
 - KyCalendar meeting sync (`PUT`/`DELETE /api/meetings/{id}`, signed with `KY_MEETING_SYNC_SECRET`)
   creates meeting-scoped rooms with scheduled time windows, attendee resolution, and external
   guest links (`/api/meet/{token}`) gated by an interactive waiting-room lobby.
-- End-to-end encryption groundwork (not yet in use): a key server holds devices' public keys,
-  claim-once one-time keys and a mailbox of Olm ciphertext between devices in the same org
-  (`/api/v1/keys/*`, `/api/v1/to-device`), and the web app ships the vodozemac crypto core. Messages
-  stay `plain_v1` until the encrypted-rooms phase ships
-  (`docs/superpowers/specs/2026-11-22-e2ee-design.md`).
 - Chat from mail and calendar: `POST /api/suite/chat` (`kypost.chat.open`, `kycalendar.chat.open`)
   answers a same-org colleague's `#dm=<user id>` link, which the PWA opens as a direct message.
   Signed suite requests carry `org_id` only in `KY_TENANCY_MODE=multi`, and every event ID is
@@ -181,3 +176,18 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
   says "end-to-end encrypted" yet (`docs/superpowers/specs/2026-11-22-e2ee-design.md` §10).
   Bot messages, files and messages from before the upgrade are stored readable by the operator.
 - Call recording or third-party hosted calling SaaS.
+
+
+## Planned guest-meeting qualification
+
+Owner-approved hosted suite priority 3 (2026-11-23), after critical tenancy, isolation,
+reliability, security and launch/startup gates: validate existing KyMessages meeting capability,
+then scope external-person browser invitation/join links, screen sharing and host controls.
+This extends the existing product; it does not create another meetings product or expand the
+third-party installer catalog. Existing link/lobby/call/screen-sharing code is not evidence of
+hosted qualification. The [existing tenancy plan §15](superpowers/specs/2026-11-23-tenancy-design.md#15-owner-approved-guest-meeting-planning)
+records the acceptance inventory and still-unselected host permissions, limits and guest-media
+encryption contracts. Guest confinement and the existing call-encryption release gate remain.
+
+No first-party password manager is planned; compatibility with existing managers is sufficient
+and no new integration is required. VPN/AI are optional, with no new work requested.
