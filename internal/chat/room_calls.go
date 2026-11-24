@@ -238,6 +238,11 @@ func (m *CallManager) joinOwned(ctx context.Context, req JoinCallRequest) (respo
 	mode, reason, strict := evaluateCallMode(*tenant, c.session.SFUSticky, candidate)
 	session := c.session
 	m.mu.Unlock()
+	if !created && session.Mode == store.CallModeSFULiveKit && mode == store.CallModeP2PMesh {
+		// Only stepDownOwned may lower privacy after its delay and durable retirement.
+		mode = store.CallModeSFULiveKit
+		strict = true
+	}
 	if mode == store.CallModeSFULiveKit && m.livekit == nil {
 		if strict {
 			return nil, ErrSFUUnavailable
@@ -299,6 +304,7 @@ func (m *CallManager) joinOwned(ctx context.Context, req JoinCallRequest) (respo
 		m.userCalls[req.UserID] = make(map[string]string)
 	}
 	m.userCalls[req.UserID][req.RoomID] = peerID
+	m.maybeScheduleStepDownLocked(req.RoomID, c)
 	state := m.buildStateLocked(c, true)
 	m.mu.Unlock()
 	if changed {
@@ -316,8 +322,38 @@ func (m *CallManager) joinOwned(ctx context.Context, req JoinCallRequest) (respo
 		response.LiveKitToken = m.livekit.JoinToken(session.LiveKitRoom, peerID, req.DisplayName, "", rtc.DefaultTokenTTL)
 	}
 	m.broadcastState(ctx, req.RoomID, state)
+	if mode == store.CallModeP2PMesh && m.hub != nil && m.hub.HasRoomCallSocket(req.UserID, req.RoomID, req.SessionHash) {
+		if err := m.notifyP2PPeerReady(ctx, c, peerID); err != nil {
+			return nil, err
+		}
+	}
 	completed = true
 	return response, nil
+}
+
+// notifyP2PPeerReady asks only existing authenticated seats to resend an unanswered
+// offer after the newcomer's socket exists. It changes no epoch, mode or bearer.
+func (m *CallManager) notifyP2PPeerReady(ctx context.Context, c *activeCall, peerID string) error {
+	m.mu.Lock()
+	session := c.session
+	ready := c.peers[peerID].CallPeerState
+	var peers []callPeer
+	for id, p := range c.peers {
+		if id != peerID {
+			peers = append(peers, *p)
+		}
+	}
+	m.mu.Unlock()
+	for _, p := range peers {
+		if err := m.chatStore.PutCallSeat(ctx, &session, store.CallSeat{UserID: p.UserID, PeerID: p.PeerID, SessionHash: p.sessionHash, Guest: p.IsGuest}); err != nil {
+			return err
+		}
+		notice := CallMigratePayload{CallID: session.ID, RoomID: session.RoomID, Epoch: session.Epoch, TargetMode: store.CallModeP2PMesh, Reason: "peer_signaling_ready", Peers: []CallPeerState{ready}}
+		if err := m.hub.PublishUser(ctx, p.UserID, Event{Type: EventCallMigrate, RoomID: session.RoomID, UserID: p.UserID, SessionHash: p.sessionHash, Data: MustMarshalData(notice)}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func mediaRoom(cs store.CallSession) string { return "ky_" + cs.ID + "_e" + strconv.Itoa(cs.Epoch) }

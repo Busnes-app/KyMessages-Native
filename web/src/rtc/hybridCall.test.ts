@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ChatSocket } from '../chat/client';
-import { parseCallJoinResponse, type CallJoinResponse } from '../chat/types';
+import { parseCallJoinResponse, parseWsEvent, type CallJoinResponse } from '../chat/types';
 import { HybridCallController } from './hybridCall';
 
 const { mockRoomInstances, mockDisconnect, mockPublishTrack, mockConnect } = vi.hoisted(() => ({
@@ -429,6 +429,108 @@ describe('HybridCallController SFU/P2P handoff', () => {
       if (scenario === 'refused') expect(snapshots.at(-1)?.notice).toContain('interrupted');
       else expect(PeerConnection.instances).toHaveLength(2);
     }
+    controller.dispose();
+  });
+
+  it('resends an unanswered offer when the new participant signaling socket becomes ready', async () => {
+    vi.useFakeTimers();
+    class PeerConnection {
+      localDescription: RTCSessionDescriptionInit | null = null;
+      remoteDescription = null;
+      createOffer = vi.fn(async () => ({ type: 'offer' as const, sdp: 'gathered offer' }));
+      setLocalDescription = vi.fn(async (description: RTCSessionDescriptionInit) => { this.localDescription = description; });
+      close = vi.fn();
+      static instances: PeerConnection[] = [];
+      constructor() { PeerConnection.instances.push(this); }
+    }
+    class EmptyStream { getTracks() { return []; } getAudioTracks() { return []; } getVideoTracks() { return []; } }
+    vi.stubGlobal('RTCPeerConnection', PeerConnection);
+    vi.stubGlobal('MediaStream', EmptyStream);
+    const sendCallSignal = vi.fn();
+    const socket = { sendCallSignal } as unknown as ChatSocket;
+    const self = { peer_id: 'a-offerer', user_id: 'local', display_name: 'Local', is_guest: false,
+      audio: false, video: false, screen_share: false, protect_ip: false, joined_at: 1 };
+    const remote = { ...self, peer_id: 'z-answerer', user_id: 'remote' };
+    const controller = new HybridCallController({ localUserId: 'local', localDisplayName: 'Local', isGuest: false,
+      socket: () => socket, onChange: () => undefined });
+    await controller.start({ call_id: 'c', room_id: 'r', peer_id: self.peer_id, mode: 'p2p_mesh',
+      epoch: 1, sfu_sticky: false, ice_servers: [], peers: [self, remote] }, { audio: false, video: false, protectIp: false });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sendCallSignal).toHaveBeenCalledTimes(1); // Lost before the answerer socket existed.
+    const event = parseWsEvent({ t: 'call.migrate', room: 'r', d: { call_id: 'c', room_id: 'r', target_mode: 'p2p_mesh', epoch: 1,
+      reason: 'peer_signaling_ready', peers: [remote] } });
+    if (event?.kind !== 'call.migrate') throw new Error('readiness event rejected');
+    await controller.handleMigrate(event.migrate);
+    expect(sendCallSignal).toHaveBeenCalledTimes(2);
+    expect(sendCallSignal).toHaveBeenLastCalledWith('r', 'c', remote.peer_id, 'offer', expect.objectContaining({ sdp: 'gathered offer' }));
+    expect(PeerConnection.instances).toHaveLength(1);
+    controller.handleCallState({ call_id: 'c', room_id: 'r', mode: 'p2p_mesh', epoch: 1, sfu_sticky: false, peers: [self] });
+    await controller.handleMigrate(event.migrate);
+    expect(sendCallSignal).toHaveBeenCalledTimes(2);
+    expect(PeerConnection.instances).toHaveLength(1); // A stale ready notice cannot recreate the removed peer.
+    controller.dispose();
+  });
+
+  it('queues early offers and rosters until initial identity and microphone are ready', async () => {
+    vi.useFakeTimers();
+    class WireSocket {
+      static OPEN = 1;
+      static instances: WireSocket[] = [];
+      readyState = 0;
+      onopen: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+      onmessage: ((event: { data: string }) => void) | null = null;
+      sent: string[] = [];
+      constructor() { WireSocket.instances.push(this); }
+      open() { this.readyState = 1; this.onopen?.(); }
+      emit(value: unknown) { this.onmessage?.({ data: JSON.stringify(value) }); }
+      send(value: string) { this.sent.push(value); }
+      close() { this.readyState = 3; this.onclose?.(); }
+    }
+    class PeerConnection {
+      static instances: PeerConnection[] = [];
+      signalingState = 'stable';
+      remoteDescription: RTCSessionDescriptionInit | null = null;
+      localDescription: RTCSessionDescriptionInit | null = null;
+      tracks: MediaStreamTrack[] = [];
+      addTrack(track: MediaStreamTrack) { this.tracks.push(track); return { track }; }
+      setRemoteDescription = vi.fn(async (description: RTCSessionDescriptionInit) => { this.remoteDescription = description; });
+      setLocalDescription = vi.fn(async (description: RTCSessionDescriptionInit) => { this.localDescription = description; });
+      createAnswer = vi.fn(async () => ({ type: 'answer' as const, sdp: 'answer with microphone' }));
+      close = vi.fn();
+      constructor() { PeerConnection.instances.push(this); }
+    }
+    vi.stubGlobal('WebSocket', WireSocket);
+    vi.stubGlobal('RTCPeerConnection', PeerConnection);
+    vi.stubGlobal('MediaStream', class { getTracks() { return []; } getVideoTracks() { return []; } getAudioTracks() { return []; } });
+    vi.stubGlobal('RTCSessionDescription', class {
+      type: RTCSdpType; sdp?: string;
+      constructor(value: RTCSessionDescriptionInit) { this.type = value.type; this.sdp = value.sdp; }
+    });
+    let releaseMicrophone: (stream: MediaStream) => void = () => undefined;
+    const microphone = new Promise<MediaStream>((resolve) => { releaseMicrophone = resolve; });
+    Object.defineProperty(navigator, 'mediaDevices', { value: { getUserMedia: vi.fn(() => microphone) }, configurable: true });
+    const self = { peer_id: 'z-answerer', user_id: 'local', display_name: 'Local', is_guest: false,
+      audio: true, video: false, screen_share: false, protect_ip: false, joined_at: 1 };
+    const remote = { ...self, peer_id: 'a-offerer', user_id: 'remote' };
+    const response: CallJoinResponse = { call_id: 'c', room_id: 'r', peer_id: self.peer_id, mode: 'p2p_mesh',
+      call_ws_path: '/api/v1/rooms/r/calls/ws', epoch: 1, sfu_sticky: false, ice_servers: [], peers: [self, remote] };
+    const controller = new HybridCallController({ localUserId: 'local', localDisplayName: 'Local', isGuest: false,
+      socket: () => null, rejoin: async () => response, onChange: () => undefined });
+    const started = controller.start(response, { audio: true, video: false, protectIp: false });
+    await Promise.resolve();
+    const wire = WireSocket.instances[0]; wire.open(); wire.emit({ t: 'hello' });
+    await vi.advanceTimersByTimeAsync(0);
+    wire.emit({ t: 'call.state', room: 'r', d: { ...response, active: true } });
+    wire.emit({ t: 'call.signal', room: 'r', d: { call_id: 'c', from_peer_id: remote.peer_id, to_peer_id: self.peer_id,
+      kind: 'offer', data: { type: 'offer', sdp: 'early offer' } } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(PeerConnection.instances).toHaveLength(0);
+    const audio = makeFakeTrack('audio'); releaseMicrophone(makeFakeStream([audio]));
+    await started; await vi.advanceTimersByTimeAsync(0);
+    expect(PeerConnection.instances).toHaveLength(1);
+    expect(PeerConnection.instances[0].tracks).toEqual([audio]);
+    expect(wire.sent.map((raw) => JSON.parse(raw))).toContainEqual(expect.objectContaining({ t: 'call.signal', kind: 'answer' }));
     controller.dispose();
   });
 

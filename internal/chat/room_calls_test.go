@@ -277,6 +277,23 @@ func TestRoomCallHybridEpochsPersistAcrossEscalationAndStepDown(t *testing.T) {
 	}
 	no := false
 	m.HandleClientFrame(ctx, requests[1].UserID, false, ClientFrame{Type: ClientFrameCallMedia, RoomID: room, CallID: second.CallID, SessionHash: requests[1].SessionHash, ProtectIP: &no})
+	m.mu.Lock()
+	scheduled := m.calls[room].stepDownTimer
+	m.mu.Unlock()
+	requests[1].ProtectIP = false
+	rejoined, err := m.Join(ctx, requests[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rejoined.Mode != store.CallModeSFULiveKit || rejoined.Epoch != second.Epoch {
+		t.Fatal("rejoin bypassed SFU retirement and step-down delay")
+	}
+	m.mu.Lock()
+	unchangedTimer := m.calls[room].stepDownTimer == scheduled
+	m.mu.Unlock()
+	if scheduled == nil || !unchangedTimer {
+		t.Fatal("rejoin replaced scheduled step-down")
+	}
 	// Invoke the scheduled action directly; the production delay stays an hour in this test.
 	m.executeStepDown(room, second.CallID)
 	state := m.GetState(room)
@@ -705,5 +722,49 @@ func TestRoomCallRevocationBypassesReconnectGrace(t *testing.T) {
 	}
 	if _, err := st.Chat().GetActiveCallSession(ctx, routedOrg, room); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("revoked durable call remained: %v", err)
+	}
+}
+
+func TestRoomCallReadySocketRequestsExistingPeerNegotiation(t *testing.T) {
+	ctx := context.Background()
+	st, room, requests := seedRoutedCall(t)
+	bus := &captureBus{}
+	hub := NewHub(bus)
+	m := NewCallManager(st.Chat(), hub, nil, nil)
+	m.EnableRoomRouting()
+	if _, err := m.Join(ctx, requests[0]); err != nil {
+		t.Fatal(err)
+	}
+	newcomer, err := m.Join(ctx, requests[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := len(bus.snapshot())
+	socket := &Client{hub: hub, userID: requests[1].UserID, tenantID: routedOrg, sessionHash: requests[1].SessionHash, callRoomID: room, rooms: map[string]struct{}{}, stop: make(chan struct{})}
+	if !hub.register(socket, []string{room}) {
+		t.Fatal("ready socket refused")
+	}
+	refreshed, err := m.Join(ctx, requests[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.PeerID != newcomer.PeerID {
+		t.Fatal("readiness changed seat identity")
+	}
+	found := false
+	for _, ev := range bus.snapshot()[before:] {
+		if ev.Type != EventCallMigrate {
+			continue
+		}
+		var payload CallMigratePayload
+		if err := json.Unmarshal(ev.Data, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.Reason == "peer_signaling_ready" && ev.UserID == requests[0].UserID && ev.SessionHash == requests[0].SessionHash && len(payload.Peers) == 1 && payload.Peers[0].PeerID == newcomer.PeerID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("socket readiness did not request the dropped initial offer again")
 	}
 }
