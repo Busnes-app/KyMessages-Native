@@ -204,6 +204,7 @@ export class HybridCallController {
         await this.connectLiveKit(response.livekit_url, response.livekit_token);
       } else {
         this.reconcileP2PPeers();
+        if (sameP2PSeat) await this.resendUnansweredOffers(response.peers);
       }
       this.notice = '';
     } catch {
@@ -421,12 +422,7 @@ export class HybridCallController {
       this.epoch = mig.epoch ?? this.epoch;
       if (this.mode === 'p2p_mesh') {
         if (mig.reason === 'peer_signaling_ready') {
-          for (const peer of mig.peers ?? []) {
-            const id = peerKey(peer);
-            if (!this.isSelfPeer(peer) && this.myPeerId < id && this.peersMeta.has(id)) {
-              await this.renegotiatePeer(id, this.ensurePeerConnection(id), true);
-            }
-          }
+          await this.resendUnansweredOffers(mig.peers ?? []);
         }
         return;
       }
@@ -973,6 +969,15 @@ export class HybridCallController {
     };
 
     return entry;
+  }
+
+  private async resendUnansweredOffers(peers: CallPeer[]): Promise<void> {
+    for (const peer of peers) {
+      const id = peerKey(peer);
+      if (!this.isSelfPeer(peer) && this.myPeerId < id && this.peersMeta.has(id)) {
+        await this.renegotiatePeer(id, this.ensurePeerConnection(id), true);
+      }
+    }
   }
 
   private renegotiatePeer(peerId: string, entry: PeerConnEntry, resendUnanswered = false): Promise<void> {

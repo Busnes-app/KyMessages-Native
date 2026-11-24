@@ -367,8 +367,9 @@ describe('HybridCallController SFU/P2P handoff', () => {
     expect(audio.readyState).toBe('ended');
   });
 
-  it.each(['same-seat', 'replacement-seat', 'refused'])('recovers P2P answerer signaling without silently dropping media (%s)', async (scenario) => {
+  it.each(['same-seat', 'replacement-seat', 'refused', 'unanswered-offerer', 'healthy-offerer'])('recovers P2P signaling without silently dropping media (%s)', async (scenario) => {
     vi.useFakeTimers();
+    const isOfferer = scenario.endsWith('offerer');
     class WireSocket {
       static OPEN = 1;
       static instances: WireSocket[] = [];
@@ -379,12 +380,17 @@ describe('HybridCallController SFU/P2P handoff', () => {
       constructor() { WireSocket.instances.push(this); }
       open() { this.readyState = 1; this.onopen?.(); }
       emit(value: unknown) { this.onmessage?.({ data: JSON.stringify(value) }); }
-      send() {}
+      sent: string[] = [];
+      send(value: string) { this.sent.push(value); }
       close() { this.readyState = 3; this.onclose?.(); }
     }
     class PeerConnection {
       static instances: PeerConnection[] = [];
       connectionState = 'connected';
+      remoteDescription: RTCSessionDescriptionInit | null = null;
+      localDescription: RTCSessionDescriptionInit | null = null;
+      createOffer = vi.fn(async () => ({ type: 'offer' as const, sdp: 'unanswered offer' }));
+      setLocalDescription = vi.fn(async (description: RTCSessionDescriptionInit) => { this.localDescription = description; });
       close = vi.fn();
       constructor() { PeerConnection.instances.push(this); }
     }
@@ -396,9 +402,9 @@ describe('HybridCallController SFU/P2P handoff', () => {
     vi.stubGlobal('WebSocket', WireSocket);
     vi.stubGlobal('RTCPeerConnection', PeerConnection);
     vi.stubGlobal('MediaStream', EmptyStream);
-    const self = { peer_id: 'z-answerer', user_id: 'local', display_name: 'Local', is_guest: false,
+    const self = { peer_id: isOfferer ? 'a-offerer' : 'z-answerer', user_id: 'local', display_name: 'Local', is_guest: false,
       audio: false, video: false, screen_share: false, protect_ip: false, joined_at: 1 };
-    const remote = { ...self, peer_id: 'a-offerer', user_id: 'remote' };
+    const remote = { ...self, peer_id: isOfferer ? 'z-answerer' : 'a-offerer', user_id: 'remote' };
     const response: CallJoinResponse = { call_id: 'c', room_id: 'r', peer_id: self.peer_id, mode: 'p2p_mesh',
       call_ws_path: '/api/v1/rooms/r/calls/ws', epoch: 1, sfu_sticky: false, ice_servers: [], peers: [self, remote] };
     const rejoin = vi.fn().mockResolvedValue(response);
@@ -410,7 +416,9 @@ describe('HybridCallController SFU/P2P handoff', () => {
     const first = WireSocket.instances[0];
     first.open(); first.emit({ t: 'hello' });
     await started;
+    await vi.advanceTimersByTimeAsync(0);
     const connection = PeerConnection.instances[0];
+    if (scenario === 'healthy-offerer') connection.remoteDescription = { type: 'answer', sdp: 'already connected' };
     expect(PeerConnection.instances).toHaveLength(1);
     if (scenario === 'replacement-seat') rejoin.mockResolvedValue({ ...response, peer_id: 'zz-replacement' });
     if (scenario === 'refused') rejoin.mockRejectedValue(new Error('seat refused'));
@@ -420,10 +428,12 @@ describe('HybridCallController SFU/P2P handoff', () => {
     recovered.open(); recovered.emit({ t: 'hello' });
     await vi.advanceTimersByTimeAsync(0);
     expect(rejoin).toHaveBeenCalledTimes(2);
-    if (scenario === 'same-seat') {
+    if (scenario === 'same-seat' || isOfferer) {
       expect(connection.close).not.toHaveBeenCalled();
       expect(PeerConnection.instances).toHaveLength(1);
       expect(snapshots.at(-1)?.notice).toBe('');
+      if (scenario === 'healthy-offerer') expect(recovered.sent.map((raw) => JSON.parse(raw)).filter((frame) => frame.kind === 'offer')).toHaveLength(0);
+      if (scenario === 'unanswered-offerer') expect(recovered.sent.map((raw) => JSON.parse(raw))).toContainEqual(expect.objectContaining({ t: 'call.signal', kind: 'offer' }));
     } else {
       expect(connection.close).toHaveBeenCalledTimes(1);
       if (scenario === 'refused') expect(snapshots.at(-1)?.notice).toContain('interrupted');
