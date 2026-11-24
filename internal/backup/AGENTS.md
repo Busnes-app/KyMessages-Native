@@ -14,6 +14,7 @@ no private key, no share, and no pairing state of its own — those live in `rec
 in the settings rows it reads and writes through the adapter.
 
 ## Local Contracts
+- Attachment mirror encryption delegates to `blobs.Sealer`; its v1 bytes, flat-key binding, key ownership and restore behavior remain unchanged. Object-storage key/configuration policy stays outside this package.
 - `Settings` maps `store.ErrNotFound` to `recoveryclient.ErrNotFound`; every other error passes
   through unchanged.
 - `NewSealer` seals the KyRecovery token under the deployment key with label

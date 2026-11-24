@@ -4,9 +4,10 @@
 Stores chat attachment bytes on local disk, outside the web root, for `internal/api`'s attachment routes.
 
 ## Ownership
-Owns the on-disk blob directory (`KY_ATTACHMENTS_DIR`), blob key validation and the upload MIME decision. Quotas and staged/posted state live in `internal/store`; the encrypted backup mirror lives in `internal/backup`.
+Owns the shared attachment ciphertext codec, the on-disk blob directory (`KY_ATTACHMENTS_DIR`), blob key validation and the upload MIME decision. Quotas and staged/posted state live in `internal/store`; the encrypted backup mirror lives in `internal/backup`.
 
 ## Local Contracts
+- `Sealer` owns the existing mirror v1 encoding: 12-byte nonce, AES-256-GCM ciphertext/tag, authenticated with `kymessages-attachments/v1` plus NUL and the exact caller identity. The mirror uses its flat blob key; org-scoped object callers must bind the full org/object key. Only an authenticated complete blob may become readable. This codec does not select an object backend or enable hosted startup.
 - `NewStore` creates the directory (0700) and proves it writable. `api.NewServer` records a failure (`BlobsError`; attachment routes answer 503 and bootstrap reports `available: false`), and `cmd/server` then fails startup.
 - Keys are flat identifiers (`ValidKey`: no slashes or dots). Every access goes through `os.OpenRoot` on the store directory.
 - `Backend` is what the API uses: `Put`, `Open` (an `io.ReadSeekCloser`, so downloads keep ranges), `Delete`, `DeletePrefix` and `SweepStaleTemps`, each naming the blob's org. `*Store` is the disk backend. `NewStore` (single mode) keeps every blob flat and ignores the org; `DeletePrefix` refuses there. `NewOrgStore` (multi mode) keeps each blob at `orgs/<tenant_id>/att/<key>` (org names `^[a-z0-9-]{1,64}$`), so `DeletePrefix` removes one org, orphans included.
