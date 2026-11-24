@@ -79,15 +79,21 @@ func TestMessageDeleteRetainsVersionQuotaAndProvenance(t *testing.T) {
 	}
 	disk.MessageID = dm.ID
 	deleteRetainedMessage(t, s, &disk)
-	// Real shared DB connections, simultaneous duplicate deletes, no polling/sleep.
+	// Real shared DB connections, simultaneous duplicate deletes, no polling/sleep. SQLite has
+	// one writer (single mode), so there the duplicates run in turn.
 	start := make(chan struct{})
 	errs := make(chan error, 8)
 	var wg sync.WaitGroup
+	var serial sync.Mutex
 	for i := range 8 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			<-start
+			if s.driver != "postgres" {
+				serial.Lock()
+				defer serial.Unlock()
+			}
 			st := Store(s)
 			if i%2 == 1 {
 				st = replica

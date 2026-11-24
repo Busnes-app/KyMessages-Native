@@ -48,16 +48,16 @@ func TestS3StoreVersionedIntegration(t *testing.T) {
 		return page.Objects
 	}
 	png := []byte("\x89PNG\r\n\x1a\nnot really an image")
-	for _, k := range []struct{ org, key string }{{orgA, "att_one"}, {orgA, "att_two"}, {orgB, "att_one"}} {
+	for _, k := range []struct{ org, key string }{{orgA, "att_first"}, {orgA, "att_second"}, {orgB, "att_first"}} {
 		res, err := st.Put(k.org, k.key, bytes.NewReader(png), 1<<20)
 		if err != nil || res.VersionID == "" || res.MimeType != "application/octet-stream" {
 			t.Fatalf("put %v: %+v %v", k, res, err)
 		}
 	}
-	if _, err := st.Put(orgA, "att_one", bytes.NewReader(png), 1<<20); !errors.Is(err, s3.ErrAlreadyExists) {
+	if _, err := st.Put(orgA, "att_first", bytes.NewReader(png), 1<<20); !errors.Is(err, s3.ErrAlreadyExists) {
 		t.Fatal("a key was written twice", err)
 	}
-	body, _, err := client.Get(t.Context(), "orgs/"+orgA+"/att/att_one", "")
+	body, _, err := client.Get(t.Context(), "orgs/"+orgA+"/att/att_first", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +66,7 @@ func TestS3StoreVersionedIntegration(t *testing.T) {
 	if bytes.Contains(raw, png[8:]) {
 		t.Fatal("the provider holds plaintext")
 	}
-	f, size, err := st.Open(orgA, "att_one")
+	f, size, err := st.Open(orgA, "att_first")
 	if err != nil || size != int64(len(png)) {
 		t.Fatal(size, err)
 	}
@@ -76,29 +76,29 @@ func TestS3StoreVersionedIntegration(t *testing.T) {
 		t.Fatal("round trip changed the bytes")
 	}
 	// Org A's sealed bytes copied under org B's key never authenticate.
-	if _, err := client.Put(t.Context(), "orgs/"+orgB+"/att/att_copied", bytes.NewReader(raw), int64(len(raw))); err != nil {
+	if _, err := client.Put(t.Context(), "orgs/"+orgB+"/att/att_copied1", bytes.NewReader(raw), int64(len(raw))); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := st.Open(orgB, "att_copied"); !errors.Is(err, errObjectIntegrity) {
+	if _, _, err := st.Open(orgB, "att_copied1"); !errors.Is(err, errObjectIntegrity) {
 		t.Fatal("cross-org copy served", err)
 	}
 	// A member's delete keeps the data version; Erase removes it and the marker.
-	if err := st.Delete(orgA, "att_one"); err != nil {
+	if err := st.Delete(orgA, "att_first"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := st.Open(orgA, "att_one"); !errors.Is(err, os.ErrNotExist) {
+	if _, _, err := st.Open(orgA, "att_first"); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("deleted file served", err)
 	}
-	if v := versions(orgA, "att_one"); len(v) != 2 {
+	if v := versions(orgA, "att_first"); len(v) != 2 {
 		t.Fatalf("delete did not retain the version: %+v", v)
 	}
-	if err := st.Erase(orgA, "att_one"); err != nil {
+	if err := st.Erase(orgA, "att_first"); err != nil {
 		t.Fatal(err)
 	}
-	if v := versions(orgA, "att_one"); len(v) != 0 {
+	if v := versions(orgA, "att_first"); len(v) != 0 {
 		t.Fatalf("erase left versions: %+v", v)
 	}
-	if err := st.Delete(orgA, "att_two"); err != nil {
+	if err := st.Delete(orgA, "att_second"); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.DeletePrefix(orgA); err != nil {
@@ -107,7 +107,7 @@ func TestS3StoreVersionedIntegration(t *testing.T) {
 	if v := versions(orgA, ""); len(v) != 0 {
 		t.Fatalf("purge left versions: %+v", v)
 	}
-	if f, _, err := st.Open(orgB, "att_one"); err != nil {
+	if f, _, err := st.Open(orgB, "att_first"); err != nil {
 		t.Fatal("purge reached another org", err)
 	} else {
 		f.Close()
