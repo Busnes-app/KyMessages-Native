@@ -1643,6 +1643,7 @@ export const Chat: React.FC<ChatProps> = ({
       if (callSnap && callSnap.roomId !== roomId) {
         await handleLeaveCall();
       }
+      const revision = callRevisionsRef.current[roomId] ?? 0;
       const joinResp = await joinRoomCall(roomId, { audio: true, video: withVideo });
       callCtrlRef.current?.dispose();
       const ctrl = new HybridCallController({
@@ -1656,7 +1657,8 @@ export const Chat: React.FC<ChatProps> = ({
       });
       callCtrlRef.current = ctrl;
       await ctrl.start(joinResp, { audio: true, video: withVideo, protectIp: false });
-      updateCallState(roomId, {
+      // A call.state received during startup is newer than this join response.
+      if ((callRevisionsRef.current[roomId] ?? 0) === revision) updateCallState(roomId, {
         call_id: joinResp.call_id, room_id: roomId, mode: joinResp.mode,
         epoch: joinResp.epoch, sfu_sticky: joinResp.sfu_sticky,
         peers: joinResp.peers, ended: false,
