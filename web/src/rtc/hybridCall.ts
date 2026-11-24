@@ -347,6 +347,7 @@ export class HybridCallController {
     }
 
     if (mig.target_mode === 'p2p_mesh') {
+      this.epoch = mig.epoch ?? this.epoch;
       if (this.mode === 'p2p_mesh') return;
       this.clearProtectIpTimer();
       const wasProtectingIp = this.protectIp || this.protectIpPending;

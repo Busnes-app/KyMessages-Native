@@ -246,7 +246,7 @@ describe('HybridCallController SFU/P2P handoff', () => {
 
     ctrl.dispose();
   });
-  it('keeps room signaling separate and rebinds media after owner recovery', async () => {
+  it.each([false, true])('keeps room signaling separate and rebinds media after owner recovery (P2P step-down: %s)', async (stepDown) => {
     vi.useFakeTimers();
     class WireSocket {
       static OPEN = 1;
@@ -297,13 +297,25 @@ describe('HybridCallController SFU/P2P handoff', () => {
     await controller.handleMigrate({ call_id: response.call_id, room_id: response.room_id, epoch: 1,
       target_mode: 'sfu_livekit', livekit_url: response.livekit_url, livekit_token: 'stale' });
     expect(mockConnect).toHaveBeenCalledTimes(calls);
-    rejoin.mockResolvedValue({ ...response, epoch: 3, peer_id: 'peer_recovered', livekit_token: 'recovered' });
+    if (stepDown) {
+      await controller.handleMigrate({ call_id: response.call_id, room_id: response.room_id,
+        epoch: 3, target_mode: 'p2p_mesh' });
+      // A newer P2P epoch remains authoritative even when no media transition is needed.
+      await controller.handleMigrate({ call_id: response.call_id, room_id: response.room_id,
+        epoch: 4, target_mode: 'p2p_mesh' });
+      for (const epoch of [2, 3]) {
+        await controller.handleMigrate({ call_id: response.call_id, room_id: response.room_id, epoch,
+          target_mode: 'sfu_livekit', livekit_url: response.livekit_url, livekit_token: 'retired' });
+        expect(mockConnect).toHaveBeenCalledTimes(calls);
+      }
+    }
+    rejoin.mockResolvedValue({ ...response, epoch: 5, peer_id: 'peer_recovered', livekit_token: 'recovered' });
     wire.close();
     await vi.advanceTimersByTimeAsync(1400);
     const recovered = WireSocket.instances[1];
     recovered.open(); recovered.emit({ t: 'hello' });
     await vi.advanceTimersByTimeAsync(0);
-    expect(rejoin).toHaveBeenLastCalledWith({ audio: false, video: false, screenShare: false, protectIp: true });
+    expect(rejoin).toHaveBeenLastCalledWith({ audio: false, video: false, screenShare: false, protectIp: !stepDown });
     expect(mockConnect).toHaveBeenLastCalledWith(response.livekit_url, 'recovered');
     expect(audio.readyState).toBe('live');
     recovered.emit({ t: 'room.closed', room: 'room_owned', d: {} });
