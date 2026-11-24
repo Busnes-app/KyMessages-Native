@@ -27,6 +27,8 @@ type listedOrg struct {
 	Revision int64  `json:"revision"`
 	Enabled  bool   `json:"enabled"`
 	Quotas   any    `json:"quotas"`
+	// HomeRegion is the org's cell; empty is left out, like an install without cells.
+	HomeRegion string `json:"home_region,omitempty"`
 }
 
 type erasedSubject struct {

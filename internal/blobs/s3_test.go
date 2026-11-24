@@ -141,7 +141,24 @@ func (b *versionedBucket) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (b *versionedBucket) versions(key string) []fakeVersion {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return append([]fakeVersion(nil), b.keys["orgs/"+key]...)
+	return append([]fakeVersion(nil), b.keys[cellPath(key)]...)
+}
+
+// Org A lives in cell us-east-2, org B in us-east-3; any other org has no known cell.
+func fixtureCell(tenantID string) (string, error) {
+	switch tenantID {
+	case objectOrgA:
+		return "us-east-2", nil
+	case objectOrgB:
+		return "us-east-3", nil
+	}
+	return "", os.ErrNotExist
+}
+
+// cellPath is the bucket key of "<org>/att/<key>".
+func cellPath(orgKey string) string {
+	cell, _ := fixtureCell(orgKey[:36])
+	return "cells/" + cell + "/orgs/" + orgKey
 }
 
 func s3Fixture(t *testing.T) (*S3Store, *versionedBucket, string) {
@@ -154,7 +171,7 @@ func s3Fixture(t *testing.T) (*S3Store, *versionedBucket, string) {
 		t.Fatal(err)
 	}
 	scratch := t.TempDir()
-	st, err := NewS3Store(client, bytes.Repeat([]byte{1}, 32), scratch, 1024)
+	st, err := NewS3Store(client, bytes.Repeat([]byte{1}, 32), fixtureCell, scratch, 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +231,7 @@ func TestS3StoreRefusesCrossOrgAndTamperedObjects(t *testing.T) {
 	}
 	// org B's path serving org A's sealed bytes: the org-bound tag refuses it.
 	bucket.mu.Lock()
-	bucket.substitute["orgs/"+objectOrgB+"/att/att_example"] = "orgs/" + objectOrgA + "/att/att_example"
+	bucket.substitute[cellPath(objectOrgB+"/att/att_example")] = cellPath(objectOrgA + "/att/att_example")
 	bucket.mu.Unlock()
 	if f, _, err := st.Open(objectOrgB, "att_example", int64(len("org A's file"))); !errors.Is(err, errObjectIntegrity) || f != nil {
 		t.Fatalf("cross-org substitution: %v", err)
@@ -225,8 +242,8 @@ func TestS3StoreRefusesCrossOrgAndTamperedObjects(t *testing.T) {
 	if f, _, err := st.Open(objectOrgA, "att_example", int64(len("org A's file"))); !errors.Is(err, errObjectIntegrity) || f != nil {
 		t.Fatalf("tampered object: %v", err)
 	}
-	for _, org := range []string{"default", "../escape", ""} {
-		if _, err := st.Put(org, "att_example", strings.NewReader("x"), 1<<20); !errors.Is(err, ErrInvalidKey) {
+	for _, org := range []string{"default", "../escape", "", "00000000-0000-4000-8000-0000000000c1"} {
+		if _, err := st.Put(org, "att_example", strings.NewReader("x"), 1<<20); err == nil {
 			t.Fatalf("org %q: %v", org, err)
 		}
 	}

@@ -38,7 +38,7 @@ SELECT t.id,
 	COALESCE((SELECT SUM(v.size_bytes) FROM retained_attachment_versions v WHERE v.tenant_id = t.id), 0) +
 	COALESCE((SELECT SUM(r.reserved_bytes) FROM attachment_upload_reservations r WHERE r.tenant_id = t.id AND r.expires_at > ?), 0),
 	t.pool_reported_bytes, t.pool_ceiling_bytes, t.pool_expires_at
-FROM tenants t WHERE t.status = 'active' AND (? = '' OR t.id = ?) ORDER BY t.id`), nowMs, tenantID, tenantID)
+FROM tenants t WHERE t.status = 'active' AND `+directoryReady("t")+` AND (? = '' OR t.id = ?) ORDER BY t.id`), nowMs, tenantID, tenantID)
 	if err != nil {
 		return nil, err
 	}

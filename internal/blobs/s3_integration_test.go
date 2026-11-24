@@ -33,15 +33,18 @@ func TestS3StoreVersionedIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, err := NewS3Store(client, bytes.Repeat([]byte{7}, 32), t.TempDir(), 1<<20)
+	orgA, orgB := uuid.NewString(), uuid.NewString()
+	cells := map[string]string{orgA: "us-east-2", orgB: "us-east-3"}
+	cellOf := func(id string) (string, error) { return cells[id], nil }
+	path := func(org, key string) string { return "cells/" + cells[org] + "/orgs/" + org + "/att/" + key }
+	st, err := NewS3Store(client, bytes.Repeat([]byte{7}, 32), cellOf, t.TempDir(), 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
-	orgA, orgB := uuid.NewString(), uuid.NewString()
 	t.Cleanup(func() { _ = st.DeletePrefix(orgA); _ = st.DeletePrefix(orgB) })
 	versions := func(org, key string) []s3.Object {
 		t.Helper()
-		page, err := client.ListObjectVersions(t.Context(), "orgs/"+org+"/att/"+key, s3.VersionCursor{})
+		page, err := client.ListObjectVersions(t.Context(), path(org, key), s3.VersionCursor{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -57,7 +60,7 @@ func TestS3StoreVersionedIntegration(t *testing.T) {
 	if _, err := st.Put(orgA, "att_first", bytes.NewReader(png), 1<<20); !errors.Is(err, s3.ErrAlreadyExists) {
 		t.Fatal("a key was written twice", err)
 	}
-	body, _, err := client.Get(t.Context(), "orgs/"+orgA+"/att/att_first", "")
+	body, _, err := client.Get(t.Context(), path(orgA, "att_first"), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +79,7 @@ func TestS3StoreVersionedIntegration(t *testing.T) {
 		t.Fatal("round trip changed the bytes")
 	}
 	// Org A's sealed bytes copied under org B's key never authenticate.
-	if _, err := client.Put(t.Context(), "orgs/"+orgB+"/att/att_copied1", bytes.NewReader(raw), int64(len(raw))); err != nil {
+	if _, err := client.Put(t.Context(), path(orgB, "att_copied1"), bytes.NewReader(raw), int64(len(raw))); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := st.Open(orgB, "att_copied1", int64(len(png))); !errors.Is(err, errObjectIntegrity) {

@@ -33,7 +33,7 @@ func TestInvalidateGrantsFromMultiEnvironment(t *testing.T) {
 	if err := st.Sessions().CreateSession(ctx, &store.Session{UserID: "offline-user", TokenHash: "old-session", CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)}, ""); err != nil {
 		t.Fatal(err)
 	}
-	for key, value := range map[string]string{"KY_TENANCY_MODE": "multi", "KY_DATA_DIR": t.TempDir(), "KY_DB_DRIVER": "postgres", "KY_DB_DSN": dbCfg.DSN, "KY_STAFF_ORG_ID": "00000000-0000-4000-8000-000000000001", "KY_SESSION_SECRET": "maintenance-session-secret-0123456789", "KY_ENCRYPTION_KEY": strings.Repeat("ab", 32), "KY_PUSH_ENABLED": "false", "PUSH_RELAY_URL": "", "APNS_RELAY_URL": ""} {
+	for key, value := range map[string]string{"KY_TENANCY_MODE": "multi", "KY_DATA_DIR": t.TempDir(), "KY_DB_DRIVER": "postgres", "KY_DB_DSN": dbCfg.DSN, "KY_STAFF_ORG_ID": "00000000-0000-4000-8000-000000000001", "KY_SESSION_SECRET": "maintenance-session-secret-0123456789", "KY_ENCRYPTION_KEY": strings.Repeat("ab", 32), "KY_PUSH_ENABLED": "false", "KY_CELLS": "us-east-2", "PUSH_RELAY_URL": "", "APNS_RELAY_URL": ""} {
 		t.Setenv(key, value)
 	}
 	if _, err := config.LoadFromEnv(); err == nil {

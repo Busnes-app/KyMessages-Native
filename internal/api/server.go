@@ -231,8 +231,16 @@ func NewServer(cfg *config.Config, st store.Store) *Server {
 	if obj := cfg.Attachments.ObjectStore; obj != nil && cfg.Tenancy.IsMultiTenant() {
 		// The bucket holds every org; the local directory is only private scratch.
 		client, err := s3.New(obj.S3)
+		cellOf := func(tenantID string) (string, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			return st.Chat().TenantHomeRegion(ctx, tenantID)
+		}
+		if err == nil && st == nil {
+			err = errors.New("object storage needs the database")
+		}
 		if err == nil {
-			blobStore, err = blobs.NewS3Store(client, obj.SealKey, filepath.Join(attDir, ".s3-scratch"), cfg.Attachments.MaxUploadBytes)
+			blobStore, err = blobs.NewS3Store(client, obj.SealKey, cellOf, filepath.Join(attDir, ".s3-scratch"), cfg.Attachments.MaxUploadBytes)
 		}
 		if err != nil {
 			blobsErr = err

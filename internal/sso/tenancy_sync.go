@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -133,6 +134,20 @@ func (k *KyIdentityClient) applyListedOrg(ctx context.Context, o suitedir.Org) e
 		status = store.TenantStatusSuspended
 	}
 	chat := k.store.Chat()
+	home := o.HomeRegion
+	if o.ID == k.tenancy.StaffOrgID && len(k.tenancy.Cells) > 0 {
+		home = k.tenancy.Cells[0] // staff administer every cell
+	}
+	if len(k.tenancy.Cells) > 0 && !slices.Contains(k.tenancy.Cells, home) {
+		// Another cell's org (C5): never create it here. One already here is recorded with
+		// its cell below, which suspends it and revokes its grants.
+		if _, err := chat.GetTenant(ctx, o.ID); errors.Is(err, store.ErrNotFound) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		status = store.TenantStatusSuspended
+	}
 	if _, err := chat.EnsureTenant(ctx, o.ID); err != nil {
 		return err
 	}
@@ -141,7 +156,7 @@ func (k *KyIdentityClient) applyListedOrg(ctx context.Context, o suitedir.Org) e
 		return err
 	}
 	quotas, qerr := parseTenantQuotas(o.Quotas)
-	if err := chat.ApplyTenantDirectory(ctx, store.TenantDirectoryEntry{TenantID: o.ID, Revision: o.Revision, Status: listedStatus(o.Status), Enabled: o.Enabled, Valid: qerr == nil, Quotas: quotas}); err != nil {
+	if err := chat.ApplyTenantDirectory(ctx, store.TenantDirectoryEntry{TenantID: o.ID, Revision: o.Revision, Status: listedStatus(o.Status), Enabled: o.Enabled, Valid: qerr == nil, Quotas: quotas, HomeRegion: home}); err != nil {
 		return err
 	}
 	if qerr != nil {

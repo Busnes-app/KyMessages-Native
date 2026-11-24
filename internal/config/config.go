@@ -69,6 +69,35 @@ type TenancyConfig struct {
 	// StaffOrgID is KyIdentity's staff org (KY_STAFF_ORG_ID). In multi-tenant mode only its
 	// accounts may be administrators; customer orgs have none.
 	StaffOrgID string `json:"staff_org_id"`
+	// Cells are the KyIdentity home regions this deployment serves (KY_CELLS, multi mode).
+	// Every org whose home_region is another cell is refused on every way in.
+	Cells []string `json:"cells,omitempty"`
+}
+
+// MaxCells is KyIdentity's region-map cap per app.
+const MaxCells = 32
+
+var validCell = regexp.MustCompile(`^[a-z][a-z0-9-]{1,31}$`)
+
+// ValidCell reports whether s is a KyIdentity home-region slug.
+func ValidCell(s string) bool { return validCell.MatchString(s) }
+
+// parseCells reads KY_CELLS: comma-separated home-region slugs, at most MaxCells, no repeats.
+func parseCells(raw string) ([]string, error) {
+	var cells []string
+	seen := map[string]bool{}
+	for _, c := range strings.Split(raw, ",") {
+		c = strings.TrimSpace(c)
+		if !ValidCell(c) || seen[c] {
+			return nil, errors.New("KY_CELLS: comma-separated home-region slugs (^[a-z][a-z0-9-]{1,31}$), each once")
+		}
+		seen[c] = true
+		cells = append(cells, c)
+	}
+	if len(cells) > MaxCells {
+		return nil, fmt.Errorf("KY_CELLS: at most %d cells", MaxCells)
+	}
+	return cells, nil
 }
 
 // MayAdminister reports whether an account bound to orgID may hold the install-wide admin role.
@@ -353,6 +382,10 @@ func loadFromEnv(tenancyMode string) (*Config, error) {
 	}
 
 	staffOrgID := strings.TrimSpace(os.Getenv("KY_STAFF_ORG_ID"))
+	var cells []string
+	if tenancyMode != TenancyMulti && strings.TrimSpace(os.Getenv("KY_CELLS")) != "" {
+		return nil, errors.New("KY_CELLS is for KY_TENANCY_MODE=multi only")
+	}
 	scimEnabled := getEnvBool("KY_SCIM_ENABLED", true)
 	if tenancyMode == TenancyMulti {
 		if driver != "postgres" {
@@ -360,6 +393,9 @@ func loadFromEnv(tenancyMode string) (*Config, error) {
 		}
 		if !IsCanonicalUUID(staffOrgID) {
 			return nil, errors.New("KY_STAFF_ORG_ID is required and must be a canonical lowercase UUID when KY_TENANCY_MODE=multi")
+		}
+		if cells, err = parseCells(os.Getenv("KY_CELLS")); err != nil {
+			return nil, fmt.Errorf("%w (required when KY_TENANCY_MODE=multi)", err)
 		}
 		scimEnabled = false
 		if getEnvBool("KY_PUSH_ENABLED", true) && strings.TrimSpace(os.Getenv("KY_VAPID_PRIVATE_KEY")) == "" {
@@ -383,6 +419,7 @@ func loadFromEnv(tenancyMode string) (*Config, error) {
 		Tenancy: TenancyConfig{
 			Mode:       tenancyMode,
 			StaffOrgID: staffOrgID,
+			Cells:      cells,
 		},
 		Server: ServerConfig{
 			Host:         host,
@@ -573,6 +610,9 @@ func rejectLegacyEnvironment() error {
 		name, value, _ := strings.Cut(entry, "=")
 		if rest, ok := strings.CutPrefix(name, "KY_KYSIGNON_"); ok && strings.TrimSpace(value) != "" {
 			return fmt.Errorf("legacy environment variable %s is set; use KY_KYIDENTITY_%s instead", name, rest)
+		}
+		if name == "KY_REGION" && strings.TrimSpace(value) != "" {
+			return errors.New("KY_REGION is replaced by KY_CELLS, the list of cells this deployment serves")
 		}
 	}
 	return nil
