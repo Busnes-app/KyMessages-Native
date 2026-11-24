@@ -552,12 +552,12 @@ func (s *Server) lookupGuestToken(r *http.Request) (*store.MeetingGuest, *store.
 
 func (s *Server) authenticateGuestRequest(w http.ResponseWriter, r *http.Request, requireAdmitted bool) (*chat.GuestSession, *store.Meeting, bool) {
 	guestRow, meeting, windows, err := s.lookupGuestToken(r)
-	if errors.Is(err, store.ErrNotFound) || guestRow.RevokedAt != nil || meeting.ClosedAt != nil {
-		s.writeError(w, http.StatusNotFound, "Meeting link is invalid or has ended")
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		s.writeError(w, http.StatusInternalServerError, "Failed to verify meeting link")
 		return nil, nil, false
 	}
-	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "Failed to verify meeting link")
+	if errors.Is(err, store.ErrNotFound) || guestRow.RevokedAt != nil || meeting.ClosedAt != nil {
+		s.writeError(w, http.StatusNotFound, "Meeting link is invalid or has ended")
 		return nil, nil, false
 	}
 	if !chat.IsWithinMeetingWindows(time.Now().UTC(), windows) {
@@ -595,12 +595,12 @@ func (s *Server) handleGuestMeetInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	guestRow, meeting, windows, err := s.lookupGuestToken(r)
-	if errors.Is(err, store.ErrNotFound) || guestRow.RevokedAt != nil {
-		s.writeError(w, http.StatusNotFound, "Meeting link is invalid or revoked")
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		s.writeError(w, http.StatusInternalServerError, "Failed to look up meeting")
 		return
 	}
-	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "Failed to look up meeting")
+	if errors.Is(err, store.ErrNotFound) || guestRow.RevokedAt != nil {
+		s.writeError(w, http.StatusNotFound, "Meeting link is invalid or revoked")
 		return
 	}
 
@@ -642,12 +642,12 @@ func (s *Server) handleGuestMeetKnock(w http.ResponseWriter, r *http.Request) {
 	}
 
 	guestRow, meeting, windows, err := s.lookupGuestToken(r)
-	if errors.Is(err, store.ErrNotFound) || guestRow.RevokedAt != nil {
-		s.writeError(w, http.StatusNotFound, "Meeting link is invalid or revoked")
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		s.writeError(w, http.StatusInternalServerError, "Failed to look up meeting")
 		return
 	}
-	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "Failed to look up meeting")
+	if errors.Is(err, store.ErrNotFound) || guestRow.RevokedAt != nil {
+		s.writeError(w, http.StatusNotFound, "Meeting link is invalid or revoked")
 		return
 	}
 

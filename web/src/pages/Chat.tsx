@@ -189,6 +189,7 @@ export const Chat: React.FC<ChatProps> = ({
   const [pushState, setPushState] = useState<PushState>({ kind: 'unavailable' });
   const [pushBusy, setPushBusy] = useState(false);
 
+  const activeCallsRef = useRef(activeCalls);
   const socketRef = useRef<ChatSocket | null>(null);
   const callCtrlRef = useRef<HybridCallController | null>(null);
   const callStageRef = useRef<HTMLElement | null>(null);
@@ -215,6 +216,7 @@ export const Chat: React.FC<ChatProps> = ({
 
   activeRoomIdRef.current = activeRoomId;
   currentUserRef.current = currentUser;
+  activeCallsRef.current = activeCalls;
 
   // Search runs on this device: index every message as it is read, edited or deleted. Only
   // messages whose text or state changed since they were last indexed are written again.
@@ -961,7 +963,7 @@ export const Chat: React.FC<ChatProps> = ({
         if (cancelled) return;
         void (async () => {
           try {
-            const boot = await fetchBootstrap();
+            const boot = await fetchBootstrap(() => activeCallsRef.current);
             if (cancelled) return;
             // Mail may have arrived while offline, or the device may not have started.
             void startE2EE(boot.user.id).then(receiveRoomKeys, () => undefined);

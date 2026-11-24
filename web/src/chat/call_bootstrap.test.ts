@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fetchBootstrap } from './client';
+import type { CallState } from './types';
 
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), {
   status, headers: { 'Content-Type': 'application/json' },
 });
-const state = (room: string) => ({ call_id: `call_${room}`, room_id: room, mode: 'p2p_mesh', epoch: 2, peers: [] });
+const state = (room: string): CallState => ({ call_id: `call_${room}`, room_id: room, mode: 'p2p_mesh', epoch: 2, sfu_sticky: false, peers: [] });
 const bootstrap = (tenant: string) => ({
   user: { id: 'alice', username: 'alice', role: 'user' },
   tenant: { id: tenant, slug: tenant, display_name: 'Team' },
@@ -40,6 +41,21 @@ describe('room-routed call bootstrap', () => {
     expect(Object.keys(result.active_calls).sort()).toEqual(['three', 'two']);
   });
 
+  it('retains the caller roster on owner failure, removes authoritative nulls and drops inaccessible rooms', async () => {
+    const previous = { one: state('one'), two: state('two'), removed: state('removed') };
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/api/v1/bootstrap') return json({ ...bootstrap('hosted-org'), active_calls: {} });
+      if (url === '/api/v1/rooms/one/calls/state') return json({ error: 'owner unavailable' }, 503);
+      if (url === '/api/v1/rooms/two/calls/state') return json({ call: null });
+      return json({ call: state('three') });
+    }));
+    const result = await fetchBootstrap(() => previous);
+    expect(Object.keys(result.active_calls).sort()).toEqual(['one', 'three']);
+    expect(result.active_calls.one).toEqual(previous.one);
+    expect(Object.keys(previous).sort()).toEqual(['one', 'removed', 'two']);
+  });
+
   it('keeps single-mode bootstrap at its existing one request', async () => {
     const request = vi.fn(async () => json(bootstrap('default')));
     vi.stubGlobal('fetch', request);
@@ -50,12 +66,16 @@ describe('room-routed call bootstrap', () => {
   it('bounds a stalled owner with controlled time', async () => {
     vi.useFakeTimers();
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      if (String(input) === '/api/v1/bootstrap') return json(bootstrap('hosted-org'));
+      if (String(input) === '/api/v1/bootstrap') return json({ ...bootstrap('hosted-org'), active_calls: {} });
       return new Promise<Response>((_, reject) => init?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
     }));
-    const pending = fetchBootstrap();
-    await vi.advanceTimersByTimeAsync(2_000);
+    let previous: Record<string, ReturnType<typeof state>> = { two: state('two'), three: state('three') };
+    const pending = fetchBootstrap(() => previous);
+    await vi.advanceTimersByTimeAsync(1_000);
+    // A call ended locally while the other owner's request was still stalled.
+    previous = { two: state('two') };
+    await vi.advanceTimersByTimeAsync(1_000);
     const result = await pending;
-    expect(Object.keys(result.active_calls).sort()).toEqual(['three', 'two']);
+    expect(Object.keys(result.active_calls)).toEqual(['two']);
   });
 });

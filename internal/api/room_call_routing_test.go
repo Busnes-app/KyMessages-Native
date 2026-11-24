@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Busnes-app/ky-primitives/syncauth"
+	"github.com/Busnes-app/ky_server_base/internal/api"
 	"github.com/Busnes-app/ky_server_base/internal/chat"
 	"github.com/Busnes-app/ky_server_base/internal/config"
 	"github.com/Busnes-app/ky_server_base/internal/store"
@@ -235,5 +236,38 @@ func TestHostedMeetingCloseRetainsMediaCleanupAndRevokesAdmissions(t *testing.T)
 		if target != old.LiveKitRoom {
 			t.Fatalf("close retired another media target:%v", deleted)
 		}
+	}
+}
+
+type failedGuestLookup struct{ store.ChatStore }
+
+func (s failedGuestLookup) GetMeetingGuestByTokenHash(context.Context, string) (*store.MeetingGuest, *store.Meeting, []store.MeetingWindow, error) {
+	return nil, nil, nil, errors.New("private database lookup failure")
+}
+
+type failedGuestLookupStore struct{ store.Store }
+
+func (s failedGuestLookupStore) Chat() store.ChatStore {
+	return failedGuestLookup{ChatStore: s.Store.Chat()}
+}
+
+func TestGuestLookupFailureReturnsErrorWithoutPanic(t *testing.T) {
+	_, st, cfg := setupTestServer(t)
+	srv := api.NewServer(cfg, failedGuestLookupStore{Store: st})
+	for _, entry := range []struct{ method, suffix, body string }{{http.MethodGet, "", ""}, {http.MethodPost, "/knock", `{"display_name":"Visitor"}`}, {http.MethodGet, "/messages", ""}} {
+		t.Run(entry.method+entry.suffix, func(t *testing.T) {
+			defer func() {
+				if value := recover(); value != nil {
+					t.Errorf("lookup error panicked: %v", value)
+				}
+			}()
+			req := httptest.NewRequest(entry.method, "/api/meet/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"+entry.suffix, strings.NewReader(entry.body))
+			req.Header.Set("Content-Type", "application/json")
+			out := httptest.NewRecorder()
+			srv.ServeHTTP(out, req)
+			if out.Code != http.StatusInternalServerError || strings.Contains(out.Body.String(), "private database") {
+				t.Fatalf("unsafe lookup error: %d %s", out.Code, out.Body.String())
+			}
+		})
 	}
 }
