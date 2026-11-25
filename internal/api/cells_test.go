@@ -178,7 +178,7 @@ func TestCellsRefuseAnotherCellsOrgOnEveryWayIn(t *testing.T) {
 func TestCellsSyncAdmitsOnlyServedCells(t *testing.T) {
 	ctx := context.Background()
 	e := newSyncEnv(t)
-	e.cfg.Tenancy.Cells = []string{"us-east-2"}
+	e.cfg.Tenancy.Cells = []string{"us-east-2", "us-east-4"}
 	e.kyid.SetTenancy(e.cfg.Tenancy)
 	if err := api.EnsureTenancyMode(ctx, e.st, e.cfg.Tenancy); err != nil {
 		t.Fatal(err)
@@ -217,6 +217,22 @@ func TestCellsSyncAdmitsOnlyServedCells(t *testing.T) {
 	}
 	if cell, err := e.st.Chat().TenantHomeRegion(ctx, served); err != nil || cell != "us-east-2" {
 		t.Fatalf("recorded cell: %q %v", cell, err)
+	}
+	// The staff org keeps its own region whatever KY_CELLS lists, so a restart with the same
+	// cells in another order re-applies the unchanged listing and keeps its object keys.
+	if cell, err := e.st.Chat().TenantHomeRegion(ctx, testStaffOrg); err != nil || cell != "local" {
+		t.Fatalf("staff region: %q %v", cell, err)
+	}
+	e.cfg.Tenancy.Cells = []string{"us-east-4", "us-east-2"}
+	e.kyid.SetTenancy(e.cfg.Tenancy)
+	if err := api.EnsureTenancyMode(ctx, e.st, e.cfg.Tenancy); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.kyid.SyncTenancy(ctx, true, true); err != nil {
+		t.Fatalf("reordered KY_CELLS refused an unchanged listing: %v", err)
+	}
+	if cell, _ := e.st.Chat().TenantHomeRegion(ctx, testStaffOrg); cell != "local" || e.status(t, testStaffOrg) != store.TenantStatusActive {
+		t.Fatalf("staff after reorder: %q %s", cell, e.status(t, testStaffOrg))
 	}
 	// A pool report covers only admitted orgs: never another cell's, nor an unlisted one.
 	usages, err := e.st.Chat().PoolUsages(ctx, time.Now().UnixMilli(), "")

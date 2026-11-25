@@ -135,10 +135,8 @@ func (k *KyIdentityClient) applyListedOrg(ctx context.Context, o suitedir.Org) e
 	}
 	chat := k.store.Chat()
 	home := o.HomeRegion
-	if o.ID == k.tenancy.StaffOrgID && len(k.tenancy.Cells) > 0 {
-		home = k.tenancy.Cells[0] // staff administer every cell
-	}
-	if len(k.tenancy.Cells) > 0 && !slices.Contains(k.tenancy.Cells, home) {
+	// Every cell serves the staff org (store: cellServedSQL), under its own listed region.
+	if len(k.tenancy.Cells) > 0 && !slices.Contains(k.tenancy.Cells, home) && o.ID != k.tenancy.StaffOrgID {
 		// Another cell's org (C5): never create it here. One already here is recorded with
 		// its cell below, which suspends it and revokes its grants.
 		if _, err := chat.GetTenant(ctx, o.ID); errors.Is(err, store.ErrNotFound) {

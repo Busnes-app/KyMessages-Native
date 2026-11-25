@@ -60,7 +60,12 @@ func (c *chatStore) ApplyTenantDirectory(ctx context.Context, e TenantDirectoryE
 		if e.Revision < old.Revision {
 			return tx.Commit()
 		}
-		if e.Revision == old.Revision && (e.Status != old.Status || e.Enabled != old.Enabled || e.Valid != old.Valid || e.Quotas != old.Quotas || e.HomeRegion != old.HomeRegion) {
+		// home_region never changes (KyIdentity H2); a snapshot from before migration 67 has
+		// none yet, and the next listing fills it in, even at the same revision.
+		if old.HomeRegion != "" && e.HomeRegion != old.HomeRegion {
+			return ErrInvalidInput
+		}
+		if e.Revision == old.Revision && (e.Status != old.Status || e.Enabled != old.Enabled || e.Valid != old.Valid || e.Quotas != old.Quotas) {
 			return ErrInvalidInput
 		}
 	}
@@ -90,9 +95,10 @@ func (c *chatStore) ApplyTenantDirectory(ctx context.Context, e TenantDirectoryE
 	return tx.Commit()
 }
 
-// cellServedSQL holds when snapshot d's home region is a cell this deployment serves (C5).
-// served_cells is empty only where no cells are configured (single mode, tests).
-const cellServedSQL = `(d.home_region IN (SELECT cell FROM served_cells) OR NOT EXISTS (SELECT 1 FROM served_cells))`
+// cellServedSQL holds when snapshot d's home region is a cell this deployment serves (C5),
+// or d is the staff org, which every cell serves under its own fixed region. served_cells is
+// empty only where no cells are configured (single mode, tests).
+const cellServedSQL = `(d.home_region IN (SELECT cell FROM served_cells) OR NOT EXISTS (SELECT 1 FROM served_cells) OR d.tenant_id IN (SELECT value FROM server_settings WHERE key = '` + TenancyStaffOrgSettingKey + `'))`
 
 // Directory readiness is consulted on the primary alongside lifecycle status, including by
 // grant issuance. An org created from a token or a user webhook has no ready snapshot, and an

@@ -478,8 +478,10 @@ region hint in sessions or guest tokens, and no cross-region forwarding.
    only for a paired peer), so the start cannot yet check the list against the map; that is an
    open question for KyIdentity.
 2. **Where the cell comes from.** `/api/suite/orgs` (`home_region`), stored on the org's
-   directory snapshot (`tenant_directory.home_region`). Never a token claim. The staff org is
-   served by every cell.
+   directory snapshot (`tenant_directory.home_region`). Never a token claim. It never changes
+   once stored; a snapshot from before migration 67 gets it from the next listing, even at an
+   unchanged revision. The staff org keeps its listed region (so its object keys do not depend
+   on `KY_CELLS` order) and is served by every cell.
 3. **Refusal (C5).** Directory readiness, which every way in already requires (session cookie
    and bearer, `/api/v1/ws`, bot tokens, sign-in, guest meeting links, KyPost and KyCalendar
    peer calls, upload admission), also requires the snapshot's cell to be served. The listing
