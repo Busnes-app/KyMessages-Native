@@ -373,7 +373,7 @@ func TestS3StoreLowerUploadLimitKeepsExistingFiles(t *testing.T) {
 	if _, err := st.Put(objectOrgA, "att_bigger", bytes.NewReader(body), 1<<20); err != nil {
 		t.Fatal(err)
 	}
-	lowered, err := NewS3Store(st.client, bytes.Repeat([]byte{1}, 32), t.TempDir(), 16)
+	lowered, err := NewS3Store(st.client, bytes.Repeat([]byte{1}, 32), fixtureCell, t.TempDir(), 16)
 	if err != nil {
 		t.Fatal(err)
 	}

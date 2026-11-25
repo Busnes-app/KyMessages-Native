@@ -138,6 +138,13 @@ func (c *chatStore) SetServedCells(ctx context.Context, cells []string) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	// Replicas start together: one replacement at a time, or two inserts of an emptied table
+	// collide on the key. SQLite has one writer already.
+	if c.store.driver == "postgres" {
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext('kymessages:served-cells:' || current_schema()))`); err != nil {
+			return err
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM served_cells`); err != nil {
 		return err
 	}

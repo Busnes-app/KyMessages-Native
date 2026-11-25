@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/Busnes-app/ky_server_base/internal/testdb"
@@ -52,5 +53,52 @@ func TestHomeRegionBackfillsOnceThenStaysFixed(t *testing.T) {
 	}
 	if cell, _ := chat.TenantHomeRegion(ctx, org); cell != "us-east-2" {
 		t.Fatalf("region rewritten to %q", cell)
+	}
+}
+
+// Replicas starting together with the same KY_CELLS all succeed, from an empty table each
+// round, on separate database handles.
+func TestServedCellsConcurrentStarts(t *testing.T) {
+	ctx := context.Background()
+	cfg := testdb.Config(t)
+	var replicas []Store
+	for range 4 {
+		st, err := Open(ctx, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { st.Close() })
+		replicas = append(replicas, st)
+	}
+	db := replicas[0].(*SQLStore).db
+	for round := range 25 {
+		if _, err := db.ExecContext(ctx, `DELETE FROM served_cells`); err != nil {
+			t.Fatal(err)
+		}
+		start := make(chan struct{})
+		errs := make(chan error, 2*len(replicas))
+		var wg sync.WaitGroup
+		for _, st := range replicas {
+			for range 2 {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					<-start
+					errs <- st.Chat().SetServedCells(ctx, []string{"us-east-2", "us-east-3"})
+				}()
+			}
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatalf("round %d: concurrent start failed: %v", round, err)
+			}
+		}
+		var n int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM served_cells`).Scan(&n); err != nil || n != 2 {
+			t.Fatalf("round %d: served cells %d %v", round, n, err)
+		}
 	}
 }
