@@ -141,6 +141,8 @@ When the user requests a durable behavior change, record it here or in the relev
 
 ## Tenancy
 
+- Permanent retained-version removal (owner, 2026-11-24) is an original-uploader operation requiring fresh KyIdentity sign-in. Existing attachment-delete permissions do not suffice. The selected contract is in [the tenancy plan §9.4](docs/superpowers/specs/2026-11-23-tenancy-design.md#94-backup-copy-and-deletion); keep its member-facing action inactive until enforced and verified. Required erasure/org purge still removes every affected version and replica copy.
+- Multi mode stores attachments in S3 when `KY_ATTACHMENTS_S3_*` is set (`blobs.S3Store`, sealed per org/key; single mode refuses the variables). A member's message delete keeps the bucket's version, charged to the org (migration 66, `retained_attachment_versions`); erasure, org purge, upload rollback and unsent-upload cleanup call `Erase`/`DeletePrefix`, which remove every version. Multi startup stays refused; lifting it must also refuse multi without S3. Not built: the verified download cache, the admin reachability answer and provider-replica erasure.
 - Hosted multi mode requires S3-compatible object storage only; there is no disk-volume fallback.
   Org-layout disk constructors are internal migration/isolation fixtures while startup is gated.
 - Only `KY_TENANCY_MODE=single` (default) can start until the final tenancy build phase.
@@ -205,7 +207,7 @@ When the user requests a durable behavior change, record it here or in the relev
 ## Verification
 
 CI (`.github/workflows/ci.yml`) runs on every push and pull request:
-- `make lint` equivalent: gofmt, `go vet`, `go mod tidy`/`verify`, and `scripts/check-compose-proxy.sh`
+- `make lint` equivalent: gofmt, `go vet`, `go mod tidy`/`verify`, and `scripts/check-compose-proxy.sh`, and `scripts/check-release-required.sh` (every CI job is in the release workflow's `REQUIRED` list)
 - `go test -race` with coverage on SQLite, and the same suite against PostgreSQL 17
 - Bounded fuzzing (`go test -fuzz=… -fuzztime=Nx`, one step per target) of `FuzzClientIP`,
   `FuzzParseTrustedProxies`, `FuzzValidateName` and `FuzzNormalizePNG`; a crasher kept under

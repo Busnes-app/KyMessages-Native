@@ -2,8 +2,6 @@ package backup
 
 import (
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
@@ -31,12 +29,6 @@ const AttachmentMirrorPrunedDirName = ".pruned"
 // DefaultMirrorPruneRetention is how long unreferenced encrypted blobs stay in .pruned
 // before being permanently deleted.
 const DefaultMirrorPruneRetention = 7 * 24 * time.Hour
-
-const (
-	attachmentMirrorAADPrefix = "kymessages-attachments/v1\x00"
-	attachmentNonceSize       = 12
-	attachmentTagSize         = 16
-)
 
 // AttachmentMirrorResult summarizes a MirrorAttachments sync run.
 type AttachmentMirrorResult struct {
@@ -225,7 +217,7 @@ func MirrorAttachmentsAt(ctx context.Context, cfg *config.Config, now time.Time,
 	if err != nil {
 		return res, err
 	}
-	gcm, err := newAttachmentGCM(key)
+	sealer, err := newAttachmentSealer(key)
 	if err != nil {
 		return res, err
 	}
@@ -244,7 +236,7 @@ func MirrorAttachmentsAt(ctx context.Context, cfg *config.Config, now time.Time,
 		// remove the stale duplicate from .pruned/.
 		_ = mirrorRoot.Remove(filepath.Join(AttachmentMirrorPrunedDirName, encName))
 
-		expectedSize := srcSize + attachmentNonceSize + attachmentTagSize
+		expectedSize := srcSize + blobs.SealedOverhead
 		if info, err := mirrorRoot.Stat(encName); err == nil && info.Mode().IsRegular() && info.Size() == expectedSize {
 			res.Skipped++
 			continue
@@ -261,7 +253,7 @@ func MirrorAttachmentsAt(ctx context.Context, cfg *config.Config, now time.Time,
 		if len(plain) == 0 {
 			continue
 		}
-		sealed, err := sealAttachmentBlob(gcm, name, plain)
+		sealed, err := sealer.Seal(name, plain)
 		if err != nil {
 			return res, fmt.Errorf("backup: encrypt attachment %s: %w", name, err)
 		}
@@ -420,7 +412,7 @@ func RestoreAttachments(mirrorDir, targetDir string, key []byte) (int, error) {
 // overwriting active blobs or pre-existing live files. When referencedKeys is nil, all active
 // top-level blobs are restored and .pruned is skipped.
 func RestoreAttachmentsForKeys(mirrorDir, targetDir string, key []byte, referencedKeys map[string]struct{}) (int, error) {
-	gcm, err := newAttachmentGCM(key)
+	sealer, err := newAttachmentSealer(key)
 	if err != nil {
 		return 0, err
 	}
@@ -440,7 +432,7 @@ func RestoreAttachmentsForKeys(mirrorDir, targetDir string, key []byte, referenc
 	defer targetRoot.Close()
 
 	restoredKeys := make(map[string]struct{})
-	restored, err := restoreAttachmentDir(mirrorRoot, targetRoot, gcm, referencedKeys, restoredKeys, false)
+	restored, err := restoreAttachmentDir(mirrorRoot, targetRoot, sealer, referencedKeys, restoredKeys, false)
 	if err != nil {
 		return restored, err
 	}
@@ -472,11 +464,11 @@ func RestoreAttachmentsForKeys(mirrorDir, targetDir string, key []byte, referenc
 	}
 	defer prunedRoot.Close()
 
-	prunedRestored, err := restoreAttachmentDir(prunedRoot, targetRoot, gcm, referencedKeys, restoredKeys, true)
+	prunedRestored, err := restoreAttachmentDir(prunedRoot, targetRoot, sealer, referencedKeys, restoredKeys, true)
 	return restored + prunedRestored, err
 }
 
-func restoreAttachmentDir(srcRoot, targetRoot *os.Root, gcm cipher.AEAD, referencedKeys, restoredKeys map[string]struct{}, skipExisting bool) (int, error) {
+func restoreAttachmentDir(srcRoot, targetRoot *os.Root, sealer *blobs.Sealer, referencedKeys, restoredKeys map[string]struct{}, skipExisting bool) (int, error) {
 	dir, err := srcRoot.Open(".")
 	if err != nil {
 		return 0, fmt.Errorf("backup: read attachment mirror: %w", err)
@@ -516,7 +508,7 @@ func restoreAttachmentDir(srcRoot, targetRoot *os.Root, gcm cipher.AEAD, referen
 		if err != nil {
 			return restored, fmt.Errorf("backup: read mirrored blob %s: %w", blobKey, err)
 		}
-		plain, err := openAttachmentBlob(gcm, blobKey, sealed)
+		plain, err := sealer.Open(blobKey, sealed)
 		if err != nil {
 			return restored, fmt.Errorf("backup: decrypt mirrored blob %s: %w", blobKey, err)
 		}
@@ -529,36 +521,11 @@ func restoreAttachmentDir(srcRoot, targetRoot *os.Root, gcm cipher.AEAD, referen
 	return restored, nil
 }
 
-func newAttachmentGCM(key []byte) (cipher.AEAD, error) {
+func newAttachmentSealer(key []byte) (*blobs.Sealer, error) {
 	if len(key) != 32 {
 		return nil, fmt.Errorf("backup: attachment mirror key is %d bytes, want 32", len(key))
 	}
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	return cipher.NewGCM(block)
-}
-
-func sealAttachmentBlob(gcm cipher.AEAD, blobKey string, plain []byte) ([]byte, error) {
-	nonce := make([]byte, attachmentNonceSize)
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return nil, err
-	}
-	aad := []byte(attachmentMirrorAADPrefix + blobKey)
-	out := make([]byte, attachmentNonceSize, attachmentNonceSize+len(plain)+attachmentTagSize)
-	copy(out, nonce)
-	return gcm.Seal(out, nonce, plain, aad), nil
-}
-
-func openAttachmentBlob(gcm cipher.AEAD, blobKey string, sealed []byte) ([]byte, error) {
-	if len(sealed) <= attachmentNonceSize+attachmentTagSize {
-		return nil, errors.New("ciphertext too short")
-	}
-	nonce := sealed[:attachmentNonceSize]
-	ciphertext := sealed[attachmentNonceSize:]
-	aad := []byte(attachmentMirrorAADPrefix + blobKey)
-	return gcm.Open(nil, nonce, ciphertext, aad)
+	return blobs.NewSealer(key)
 }
 
 func writeFileAtomicRoot(root *os.Root, targetName string, data []byte) error {

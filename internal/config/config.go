@@ -17,6 +17,7 @@ import (
 
 	"github.com/Busnes-app/ky-primitives/applysetup"
 	"github.com/Busnes-app/ky-primitives/keyfile"
+	"github.com/Busnes-app/ky-primitives/s3"
 	"github.com/google/uuid"
 )
 
@@ -110,7 +111,19 @@ type AttachmentsConfig struct {
 	MaxTotalBytes       int64         `json:"max_total_bytes"`
 	MaxPendingUserBytes int64         `json:"max_pending_user_bytes"`
 	PendingTTL          time.Duration `json:"pending_ttl"`
+	// ObjectStore is the multi-mode S3 backend (KY_ATTACHMENTS_S3_*); nil keeps disk.
+	ObjectStore *ObjectStoreConfig `json:"-"`
 }
+
+// ObjectStoreConfig is the attachment bucket and the key that seals every object in it.
+// Neither secret is printable: s3.Config hides its keys and SealKey is never logged.
+type ObjectStoreConfig struct {
+	S3      s3.Config
+	SealKey []byte
+}
+
+func (ObjectStoreConfig) String() string   { return "config.ObjectStoreConfig" }
+func (ObjectStoreConfig) GoString() string { return "config.ObjectStoreConfig" }
 
 // PushConfig configures RFC 8291/8292 Web Push notifications (VAPID).
 type PushConfig struct {
@@ -233,6 +246,8 @@ func LoadFromEnv() (*Config, error) {
 	case TenancySingle:
 		return loadFromEnv(mode)
 	case TenancyMulti:
+		// Lifting this gate also means refusing multi startup without KY_ATTACHMENTS_S3_*
+		// (spec §9.1: no disk volume in hosted multi mode).
 		return nil, errors.New("KY_TENANCY_MODE=multi: multi-tenant mode is unavailable in this release")
 	default:
 		return nil, fmt.Errorf("KY_TENANCY_MODE: only single is available in this release, got %q", mode)
@@ -462,6 +477,9 @@ func loadFromEnv(tenancyMode string) (*Config, error) {
 			return nil, errors.New("KY_ATTACHMENTS_PENDING_TTL: must be a duration between 1m and 720h")
 		}
 		cfg.Attachments.PendingTTL = d
+	}
+	if cfg.Attachments.ObjectStore, err = objectStoreFromEnv(multi); err != nil {
+		return nil, err
 	}
 	// Every upload is staged before it can be attached to a message, so a single-file limit
 	// above the pending or total quota would advertise an unreachable maximum to clients.
@@ -693,4 +711,66 @@ func PeerOrigin(raw string) (string, error) {
 		return "", errors.New("must not be a loopback address")
 	}
 	return "https://" + u.Host, nil
+}
+
+// objectStoreFromEnv reads KY_ATTACHMENTS_S3_*: all of them or none, and only in multi mode,
+// so a single-mode server can never move off its disk store by accident. Errors name the
+// variable, never its value.
+func objectStoreFromEnv(multi bool) (*ObjectStoreConfig, error) {
+	names := []string{"ENDPOINT", "REGION", "BUCKET", "ACCESS_KEY", "ACCESS_KEY_FILE", "SECRET", "SECRET_FILE", "SEAL_KEY_FILE"}
+	set := false
+	for _, n := range names {
+		set = set || strings.TrimSpace(os.Getenv("KY_ATTACHMENTS_S3_"+n)) != ""
+	}
+	if !set {
+		return nil, nil
+	}
+	if !multi {
+		return nil, errors.New("KY_ATTACHMENTS_S3_*: object storage is for KY_TENANCY_MODE=multi only")
+	}
+	secret := func(name string) (string, error) {
+		v, file := strings.TrimSpace(os.Getenv(name)), strings.TrimSpace(os.Getenv(name+"_FILE"))
+		if (v == "") == (file == "") {
+			return "", fmt.Errorf("%s or %s_FILE is required (not both)", name, name)
+		}
+		if file != "" {
+			b, err := os.ReadFile(file)
+			if err != nil {
+				return "", fmt.Errorf("%s_FILE: unreadable", name)
+			}
+			v = strings.TrimSpace(string(b))
+		}
+		return v, nil
+	}
+	access, err := secret("KY_ATTACHMENTS_S3_ACCESS_KEY")
+	if err != nil {
+		return nil, err
+	}
+	secretKey, err := secret("KY_ATTACHMENTS_S3_SECRET")
+	if err != nil {
+		return nil, err
+	}
+	sealFile := strings.TrimSpace(os.Getenv("KY_ATTACHMENTS_S3_SEAL_KEY_FILE"))
+	if sealFile == "" {
+		return nil, errors.New("KY_ATTACHMENTS_S3_SEAL_KEY_FILE is required with object storage")
+	}
+	sealKey, err := keyfile.Load(sealFile, 32)
+	if err != nil {
+		return nil, errors.New("KY_ATTACHMENTS_S3_SEAL_KEY_FILE: must hold a 32-byte hex key")
+	}
+	cfg := s3.Config{
+		Endpoint:  strings.TrimSpace(os.Getenv("KY_ATTACHMENTS_S3_ENDPOINT")),
+		Region:    strings.TrimSpace(os.Getenv("KY_ATTACHMENTS_S3_REGION")),
+		Bucket:    strings.TrimSpace(os.Getenv("KY_ATTACHMENTS_S3_BUCKET")),
+		AccessKey: access,
+		SecretKey: secretKey,
+	}
+	if cfg.Region == "" {
+		return nil, errors.New("KY_ATTACHMENTS_S3_REGION is required with object storage")
+	}
+	// s3.New refuses non-HTTPS endpoints, credentials or a query in the URL, and bad names.
+	if _, err := s3.New(cfg); err != nil {
+		return nil, errors.New("KY_ATTACHMENTS_S3_ENDPOINT/BUCKET/ACCESS_KEY: invalid (HTTPS endpoint without credentials, plain bucket name)")
+	}
+	return &ObjectStoreConfig{S3: cfg, SealKey: sealKey}, nil
 }

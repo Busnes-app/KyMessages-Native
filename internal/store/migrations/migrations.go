@@ -299,6 +299,7 @@ ALTER TABLE mfa_challenges ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';`,
 	{Version: 63, Name: "erased_subjects", SQLite: erasedSubjectsSQLite, Postgres: erasedSubjectsPostgres},
 	{Version: 64, Name: "call_routing", SQLite: callRoutingSQLite, Postgres: callRoutingPostgres},
 	{Version: 65, Name: "guest_invite_binding", SQLite: guestInviteBindingSchema, Postgres: guestInviteBindingSchema},
+	{Version: 66, Name: "retained_attachment_versions", SQLite: retainedAttachmentVersionsSchema, Postgres: retainedAttachmentVersionsSchema},
 }
 
 const tenantDirectorySchema = `

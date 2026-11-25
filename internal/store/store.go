@@ -401,6 +401,7 @@ type ChatStore interface {
 	RemoveReaction(ctx context.Context, tenantID, roomID, messageID, userID, emoji string) error
 
 	// Attachments
+	RetainedAttachmentVersions(ctx context.Context, tenantID, uploaderID string) ([]RetainedAttachmentVersion, error)
 	CreateAttachment(ctx context.Context, a *Attachment) error
 	ReserveAttachmentQuota(ctx context.Context, tenantID, uploaderID string, requestedBytes int64, limits AttachmentQuotaLimits, ttl time.Duration) (*AttachmentQuotaReservation, error)
 	ReleaseAttachmentQuota(ctx context.Context, tenantID, reservationID string) error

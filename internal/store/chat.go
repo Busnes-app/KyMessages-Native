@@ -1012,6 +1012,9 @@ func (c *chatStore) DeleteMessage(ctx context.Context, tenantID, roomID, message
 		); err != nil {
 			return nil, err
 		}
+		if err := c.retainVersionsTx(ctx, tx, `a.tenant_id = ? AND a.room_id = ? AND a.message_id = ?`, tenantID, roomID, messageID); err != nil {
+			return nil, err
+		}
 		if _, err := tx.ExecContext(ctx,
 			c.store.rebind(`DELETE FROM attachments WHERE tenant_id = ? AND room_id = ? AND message_id = ?`),
 			tenantID, roomID, messageID,
@@ -1175,11 +1178,11 @@ func (c *chatStore) CreateAttachment(ctx context.Context, a *Attachment) error {
 		a.CreatedAt = nowMilli()
 	}
 	q := c.store.rebind(`
-		INSERT INTO attachments (id, tenant_id, room_id, message_id, uploader_id, blob_key, filename, mime_type, size_bytes, sha256_hex, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		INSERT INTO attachments (id, tenant_id, room_id, message_id, uploader_id, blob_key, filename, mime_type, size_bytes, sha256_hex, created_at, version_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	_, err := c.store.db.ExecContext(ctx, q,
 		a.ID, a.TenantID, a.RoomID, nullString(a.MessageID), a.UploaderID,
-		a.BlobKey, a.Filename, a.MimeType, a.SizeBytes, a.SHA256Hex, a.CreatedAt,
+		a.BlobKey, a.Filename, a.MimeType, a.SizeBytes, a.SHA256Hex, a.CreatedAt, a.VersionID,
 	)
 	return uniqueError(err)
 }
@@ -1293,7 +1296,10 @@ func (c *chatStore) attachmentQuotaUsageTx(ctx context.Context, tx *sql.Tx, tena
 		return 0, 0, err
 	}
 
-	var tenantAtts, tenantRes, pendingAtts, pendingRes int64
+	var tenantAtts, tenantRetained, tenantRes, pendingAtts, pendingRes int64
+	if err := tx.QueryRowContext(ctx, c.store.rebind(`SELECT COALESCE(SUM(size_bytes), 0) FROM retained_attachment_versions WHERE tenant_id = ?`), tenantID).Scan(&tenantRetained); err != nil {
+		return 0, 0, err
+	}
 	if err := tx.QueryRowContext(ctx,
 		c.store.rebind(`SELECT COALESCE(SUM(size_bytes), 0) FROM attachments WHERE tenant_id = ?`),
 		tenantID,
@@ -1318,7 +1324,7 @@ func (c *chatStore) attachmentQuotaUsageTx(ctx context.Context, tx *sql.Tx, tena
 	).Scan(&pendingRes); err != nil {
 		return 0, 0, err
 	}
-	return tenantAtts + tenantRes, pendingAtts + pendingRes, nil
+	return tenantAtts + tenantRetained + tenantRes, pendingAtts + pendingRes, nil
 }
 
 func (c *chatStore) ReserveAttachmentQuota(ctx context.Context, tenantID, uploaderID string, requestedBytes int64, limits AttachmentQuotaLimits, ttl time.Duration) (*AttachmentQuotaReservation, error) {
@@ -1483,11 +1489,11 @@ func (c *chatStore) CommitAttachmentWithQuota(ctx context.Context, reservationID
 	}
 
 	insQ := c.store.rebind(`
-		INSERT INTO attachments (id, tenant_id, room_id, message_id, uploader_id, blob_key, filename, mime_type, size_bytes, sha256_hex, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		INSERT INTO attachments (id, tenant_id, room_id, message_id, uploader_id, blob_key, filename, mime_type, size_bytes, sha256_hex, created_at, version_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if _, err := tx.ExecContext(ctx, insQ,
 		a.ID, a.TenantID, a.RoomID, nullString(a.MessageID), a.UploaderID,
-		a.BlobKey, a.Filename, a.MimeType, a.SizeBytes, a.SHA256Hex, a.CreatedAt,
+		a.BlobKey, a.Filename, a.MimeType, a.SizeBytes, a.SHA256Hex, a.CreatedAt, a.VersionID,
 	); err != nil {
 		return uniqueError(err)
 	}

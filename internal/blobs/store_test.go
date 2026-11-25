@@ -75,7 +75,7 @@ func TestStorePutOpenDeleteAndSHA256(t *testing.T) {
 		t.Error("image/png should be inline safe")
 	}
 
-	f, size, err := st.Open("default", res.Key)
+	f, size, err := st.Open("default", res.Key, res.SizeBytes)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestStorePutOpenDeleteAndSHA256(t *testing.T) {
 	if err := st.Delete("default", res.Key); err != nil {
 		t.Fatalf("idempotent Delete: %v", err)
 	}
-	if _, _, err := st.Open("default", res.Key); !errors.Is(err, os.ErrNotExist) {
+	if _, _, err := st.Open("default", res.Key, res.SizeBytes); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("Open after Delete = %v, want os.ErrNotExist", err)
 	}
 }
@@ -120,7 +120,7 @@ func TestStoreEnforcesSizeAndKeyBounds(t *testing.T) {
 		if _, err := st.Put("default", k, strings.NewReader("hi"), 64); !errors.Is(err, blobs.ErrInvalidKey) {
 			t.Errorf("Put(%q) = %v, want ErrInvalidKey", k, err)
 		}
-		if _, _, err := st.Open("default", k); !errors.Is(err, blobs.ErrInvalidKey) {
+		if _, _, err := st.Open("default", k, 1); !errors.Is(err, blobs.ErrInvalidKey) {
 			t.Errorf("Open(%q) = %v, want ErrInvalidKey", k, err)
 		}
 		if err := st.Delete("default", k); !errors.Is(err, blobs.ErrInvalidKey) {

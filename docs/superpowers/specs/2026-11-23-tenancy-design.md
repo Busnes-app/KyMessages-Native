@@ -137,6 +137,7 @@ through an org-bound user or row.
 | `message_reactions`, `meeting_windows`, `meeting_guests` | U | Reached through a T row. |
 | `meetings` | T | Global key on `id` (§8.3). |
 | `push_subscriptions`, `attachment_upload_reservations` | T | `migrations.go:297`, `:315` |
+| `retained_attachment_versions` | T | Migration 66 preparation: independent uploader/version provenance and retained-byte charge; erasure/purge completion refuses uncleared inventory (§9.4). |
 | Postgres full-text index on `messages` | T | Over `plain_v1` rows only (`chat.go:154`). Under E it never indexes ciphertext. |
 
 State outside the database:
@@ -173,7 +174,7 @@ Multi mode, `origin/main` plus PR #27. Every row has a cross-org test in
 | Admin agents | Owner's tenant (`internal/api/agent_handlers.go:107-113`) | Built |
 | Admin SCIM users | Empty list in multi mode (`internal/api/scim_admin.go:22-28`) | Built |
 | Admin audit | Install-wide, staff only | By design (open question 6) |
-| Attachments in S3 | Object key under `orgs/<tenant_id>/` (§9) | Not built |
+| Attachments in S3 | Object key under `orgs/<tenant_id>/`, sealed to that org and key (§9) | Built (PR 6), tested on a fake and a real versioned bucket; startup gated |
 | Pool usage report | Per org, signed (§10) | Not built |
 
 ## 7. Lifecycle gaps
@@ -380,9 +381,35 @@ org pool until a person explicitly removes it. PR 6 must extend the usage ledger
 those retained bytes and provide explicit removal; attachment-row totals alone are insufficient
 once versions survive a row deletion. Provider lifecycle rules must not silently delete versions.
 
+**Owner-selected permission (2026-11-24):** member-initiated permanent removal of a retained
+file version is allowed only to the original uploader, after a fresh KyIdentity sign-in.
+Existing attachment-delete rights alone do not authorize it; room ownership or an
+administrator role cannot substitute for the uploader check. Persist exact uploader
+provenance across ordinary attachment/account deletion and verify freshness from the
+KyIdentity authentication, not a new local or derived session. Keep the member-facing action
+inactive until these checks and the normal tests/review/startup gates are implemented.
+
 A person's erasure and an org purge delete every version of each affected object immediately,
 and the same objects on a provider replica. Neither waits for retention. The local attachment
 mirror remains off in multi mode.
+
+**Built (PR 6, startup still gated).** `blobs.S3Store` is the multi-mode backend when
+`KY_ATTACHMENTS_S3_*` is set (§9.2; single mode refuses the variables). It seals every object
+under the org/object key, writes each key once (`If-None-Match: *`) and serves a download only
+after the whole object authenticates. Migration 66 adds `retained_attachment_versions` and
+`attachments.version_id`. A member's message delete moves each posted file's version into the
+retained table in the same transaction, snapshotting the uploader, and adds a delete marker:
+the bytes stay in the bucket and in the org's pool. Erasure and org purge call `Erase` and
+`DeletePrefix`, which remove every version and marker, and only then drop the retained rows.
+An unsent upload (staged delete, expiry) and a failed upload commit are erased, not retained:
+they were never posted (decided in PR 6; open to the owner). A PUT that may have landed without
+a version receipt is erased at once, so no unaccounted object remains.
+
+Not built yet: the verified per-replica cache and its bus eviction (§9.3: every download fetches
+the object), the admin "reachable" answer, the member's fresh-sign-in removal action, and erasure
+on a provider replica outside the bucket. A crash between a PUT and its row commit leaves an
+orphan object that only the org purge's prefix delete removes. Multi startup stays refused;
+lifting it must also refuse multi mode without `KY_ATTACHMENTS_S3_*` (§9.1).
 
 ### 9.5 What KyMessages needs from ky-primitives
 

@@ -39,6 +39,9 @@ jobs:
       - name: Proxy compose overlay
         run: bash scripts/check-compose-proxy.sh
 
+      - name: Release gate names every CI job
+        run: bash scripts/check-release-required.sh
+
       - name: go.mod is tidy
         run: |
           go mod tidy
@@ -104,6 +107,37 @@ jobs:
         env:
           KY_TEST_POSTGRES_DSN: postgres://ci:ci@127.0.0.1:5432/ci_test?sslmode=disable
         run: go test -race -count=1 ./...
+
+  s3:
+    # The S3 attachment backend against a real signature-checking, versioned server.
+    name: Go tests (versioned S3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      KY_TEST_S3_ENDPOINT: http://127.0.0.1:8333
+      KY_TEST_S3_BUCKET: kymessages-ci
+      KY_TEST_S3_ACCESS_KEY: kymessages-ci
+      KY_TEST_S3_SECRET_KEY: kymessages-ci-fixture-secret
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: stable
+          check-latest: true
+          cache: true
+      - name: Start disposable versioned S3 server
+        run: |
+          docker run -d --name s3 --memory=512m --memory-swap=512m --cpus=1 --pids-limit=256 \
+            -p 127.0.0.1:8333:8333 -v "$PWD/.github/ci/s3.json:/etc/s3.json:ro" \
+            chrislusf/seaweedfs:4.52@sha256:57877e32bb90073b37dc109b438ba66e84fd5ed9ced5f5c04f56444ef243ce59 \
+            server -dir=/data -s3 -s3.port=8333 -s3.config=/etc/s3.json
+          for _ in $(seq 60); do curl -s -o /dev/null http://127.0.0.1:8333 && break; sleep 1; done
+          export AWS_ACCESS_KEY_ID="$KY_TEST_S3_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$KY_TEST_S3_SECRET_KEY" AWS_DEFAULT_REGION=us-east-1
+          aws --endpoint-url "$KY_TEST_S3_ENDPOINT" s3api create-bucket --bucket "$KY_TEST_S3_BUCKET"
+          aws --endpoint-url "$KY_TEST_S3_ENDPOINT" s3api put-bucket-versioning --bucket "$KY_TEST_S3_BUCKET" --versioning-configuration Status=Enabled
+      - run: go test -race -count=1 -run 'S3' ./internal/blobs/
+      - if: failure()
+        run: docker logs s3
 
   web:
     name: Frontend typecheck & build

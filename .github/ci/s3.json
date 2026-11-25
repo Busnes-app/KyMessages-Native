@@ -1,0 +1,1 @@
+{"identities":[{"name":"kymessages-ci","credentials":[{"accessKey":"kymessages-ci","secretKey":"kymessages-ci-fixture-secret"}],"actions":["Admin","Read","Write","List","Tagging"]}]}

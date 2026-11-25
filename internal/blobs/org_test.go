@@ -20,7 +20,7 @@ const (
 
 func read(t *testing.T, st *blobs.Store, tenant, k string) (string, error) {
 	t.Helper()
-	f, _, err := st.Open(tenant, k)
+	f, _, err := st.Open(tenant, k, 0)
 	if err != nil {
 		return "", err
 	}
@@ -197,7 +197,7 @@ func TestReadDuringRelocationFindsTheBlob(t *testing.T) {
 		}
 		done := make(chan error, 1)
 		go func() { done <- st.Relocate(orgA, k) }()
-		f, _, err := st.Open(orgA, k)
+		f, _, err := st.Open(orgA, k, 0)
 		if err != nil {
 			t.Fatalf("read %d during relocation: %v", i, err)
 		}

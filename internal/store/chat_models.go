@@ -130,6 +130,7 @@ type Attachment struct {
 	SizeBytes  int64  `json:"size_bytes"`
 	SHA256Hex  string `json:"sha256_hex"`
 	CreatedAt  int64  `json:"created_at"` // Unix milliseconds
+	VersionID  string `json:"-"`          // object-store version (multi mode); empty on disk
 }
 
 // AttachmentQuotaLimits bounds workspace total and per-uploader pending attachment bytes.

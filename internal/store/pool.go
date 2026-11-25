@@ -24,7 +24,7 @@ func (c *chatStore) poolCeilingTx(ctx context.Context, tx *sql.Tx, tenantID stri
 // PoolUsage is one org's storage figure for a pool report.
 type PoolUsage struct {
 	TenantID      string
-	UsedBytes     int64  // posted and staged attachments plus live upload reservations
+	UsedBytes     int64  // posted/staged attachments, retained versions and live upload reservations
 	ReportedBytes *int64 // last reported usage
 	CeilingBytes  *int64
 	ExpiresAt     *int64 // Unix ms
@@ -35,6 +35,7 @@ func (c *chatStore) PoolUsages(ctx context.Context, nowMs int64, tenantID string
 	rows, err := c.store.db.QueryContext(ctx, c.store.rebind(`
 SELECT t.id,
 	COALESCE((SELECT SUM(a.size_bytes) FROM attachments a WHERE a.tenant_id = t.id), 0) +
+	COALESCE((SELECT SUM(v.size_bytes) FROM retained_attachment_versions v WHERE v.tenant_id = t.id), 0) +
 	COALESCE((SELECT SUM(r.reserved_bytes) FROM attachment_upload_reservations r WHERE r.tenant_id = t.id AND r.expires_at > ?), 0),
 	t.pool_reported_bytes, t.pool_ceiling_bytes, t.pool_expires_at
 FROM tenants t WHERE t.status = 'active' AND (? = '' OR t.id = ?) ORDER BY t.id`), nowMs, tenantID, tenantID)
@@ -87,8 +88,9 @@ func (c *chatStore) NextPoolReport(ctx context.Context, tenantID string) (seq, u
 	}
 	if err := tx.QueryRowContext(ctx, c.store.rebind(`SELECT
 	COALESCE((SELECT SUM(size_bytes) FROM attachments WHERE tenant_id = ?), 0) +
+	COALESCE((SELECT SUM(size_bytes) FROM retained_attachment_versions WHERE tenant_id = ?), 0) +
 	COALESCE((SELECT SUM(reserved_bytes) FROM attachment_upload_reservations WHERE tenant_id = ? AND expires_at > ?), 0)`),
-		tenantID, tenantID, nowMilli()).Scan(&used); err != nil {
+		tenantID, tenantID, tenantID, nowMilli()).Scan(&used); err != nil {
 		return 0, 0, err
 	}
 	return seq, used, tx.Commit()

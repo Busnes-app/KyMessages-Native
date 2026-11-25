@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -188,16 +190,16 @@ func TestUserErasedIsIgnoredInSingleMode(t *testing.T) {
 	}
 }
 
-// spyBlobs runs check on the first delete, while the erasure is cleaning up blobs.
+// spyBlobs runs check on the first erase, while the erasure is cleaning up blobs.
 type spyBlobs struct {
 	blobs.Backend
 	once  sync.Once
 	check func()
 }
 
-func (b *spyBlobs) Delete(tenantID, key string) error {
+func (b *spyBlobs) Erase(tenantID, key string) error {
 	b.once.Do(b.check)
-	return b.Backend.Delete(tenantID, key)
+	return b.Backend.Erase(tenantID, key)
 }
 
 // The person loses access before anything is disconnected or deleted: by the time blobs are
@@ -377,17 +379,17 @@ func TestUserErasedCoversARecreatedAccount(t *testing.T) {
 	}
 }
 
-// failKey fails every delete of one key.
+// failKey fails every erase of one key.
 type failKey struct {
 	blobs.Backend
 	key string
 }
 
-func (f *failKey) Delete(tenantID, key string) error {
+func (f *failKey) Erase(tenantID, key string) error {
 	if key == f.key {
 		return errors.New("injected")
 	}
-	return f.Backend.Delete(tenantID, key)
+	return f.Backend.Erase(tenantID, key)
 }
 
 // One blob that keeps failing to delete does not hold back the rest of the queue.
@@ -423,12 +425,12 @@ type failSecondBlobDelete struct {
 	calls int
 }
 
-func (b *failSecondBlobDelete) Delete(tenant, key string) error {
+func (b *failSecondBlobDelete) Erase(tenant, key string) error {
 	b.calls++
 	if b.calls == 2 {
 		return errors.New("injected post-commit blob failure")
 	}
-	return b.Backend.Delete(tenant, key)
+	return b.Backend.Erase(tenant, key)
 }
 
 func TestErasureCompletionAuditSurvivesReplayAndCleanupRetry(t *testing.T) {
@@ -638,5 +640,70 @@ func TestWrongOrgErasureDoesNotRecordASubjectFence(t *testing.T) {
 	}
 	if r := doBearerJSON(t, srv, http.MethodGet, "/api/v1/rooms", tok, nil, nil); r.Code != http.StatusOK {
 		t.Fatalf("wrong-org delivery changed access: %d %s", r.Code, r.Body.String())
+	}
+}
+
+// versioningBlobs stands in for a versioned bucket over the disk store: every Put gets a
+// version, Delete keeps the bytes (the retained copy) and only Erase removes them.
+type versioningBlobs struct {
+	blobs.Backend
+	mu     sync.Mutex
+	erased []string
+}
+
+func (b *versioningBlobs) Put(tenantID, key string, r io.Reader, maxBytes int64) (blobs.PutResult, error) {
+	res, err := b.Backend.Put(tenantID, key, r, maxBytes)
+	res.VersionID = "v1/" + key
+	return res, err
+}
+
+func (b *versioningBlobs) Delete(string, string) error { return nil }
+
+func (b *versioningBlobs) Erase(tenantID, key string) error {
+	b.mu.Lock()
+	b.erased = append(b.erased, key)
+	b.mu.Unlock()
+	return b.Backend.Erase(tenantID, key)
+}
+
+// A posted file the member deletes stays charged to the org as a retained version, and the
+// member's erasure later erases every version of it and ends the charge.
+func TestDeletedFileVersionIsRetainedThenErased(t *testing.T) {
+	ctx := context.Background()
+	srv, _, st, _ := newReplicas(t, withPool(t, &fakePool{headroom: 1 << 20}))
+	alice, tok := createOrgUser(t, st, "usr_rv_alice", "rvalice", "user", replicaOrgA)
+	vb := &versioningBlobs{Backend: api.BlobsForTest(srv)}
+	api.SetBlobsForTest(srv, vb)
+	room := roomOf(t, doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", tok, map[string]any{"kind": store.RoomKindChannel, "name": "rv"}, nil))
+	rec := doMultipartUpload(t, srv, "/api/v1/rooms/"+room+"/attachments", tok, "file", "a.txt", []byte("retain me"))
+	var up struct {
+		Attachment store.Attachment `json:"attachment"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &up)
+	sent := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room+"/messages", tok, sealed("file", map[string]any{"attachment_ids": []string{up.Attachment.ID}}), nil)
+	var msg struct {
+		Message store.Message `json:"message"`
+	}
+	if err := json.Unmarshal(sent.Body.Bytes(), &msg); err != nil || sent.Code != http.StatusCreated || msg.Message.ID == "" {
+		t.Fatalf("send: %d %s", sent.Code, sent.Body.String())
+	}
+	if rec := doBearerJSON(t, srv, http.MethodDelete, "/api/v1/rooms/"+room+"/messages/"+msg.Message.ID, tok, nil, nil); rec.Code/100 != 2 {
+		t.Fatalf("delete: %d %s", rec.Code, rec.Body.String())
+	}
+	v, err := st.Chat().RetainedAttachmentVersions(ctx, replicaOrgA, alice.ID)
+	if err != nil || len(v) != 1 || v[0].VersionID != "v1/"+up.Attachment.ID || v[0].SizeBytes != int64(len("retain me")) {
+		t.Fatalf("deleted file not retained with its version: %+v %v", v, err)
+	}
+	if len(vb.erased) != 0 {
+		t.Fatalf("a member's own delete erased versions: %v", vb.erased)
+	}
+	if rec := postErased(t, srv, alice.SSOSubject, replicaOrgA); rec.Code != http.StatusOK {
+		t.Fatalf("user.erased = %d: %s", rec.Code, rec.Body.String())
+	}
+	if !slices.Contains(vb.erased, up.Attachment.ID) {
+		t.Fatalf("erasure did not erase the retained file: %v", vb.erased)
+	}
+	if v, err := st.Chat().RetainedAttachmentVersions(ctx, replicaOrgA, alice.ID); err != nil || len(v) != 0 {
+		t.Fatalf("erased file still charged: %+v %v", v, err)
 	}
 }
