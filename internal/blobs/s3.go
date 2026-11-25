@@ -24,21 +24,24 @@ var (
 const s3OpTimeout = 2 * time.Minute
 
 // S3Store is the multi-mode Backend: each blob is one AES-256-GCM sealed object at
-// orgs/<tenant_id>/att/<key> in a versioned bucket. Delete leaves the bucket's retained
-// version; Erase and DeletePrefix remove every version.
+// cells/<cell>/orgs/<tenant_id>/att/<key> in a versioned bucket, where cell is the org's
+// fixed KyIdentity home region (C1, C4), so cells can share a bucket and a deployment can
+// split later without moving objects. Delete leaves the bucket's retained version; Erase and
+// DeletePrefix remove every version.
 type S3Store struct {
 	client   *s3.Client
 	sealer   *Sealer
+	cellOf   func(tenantID string) (string, error)
 	scratch  string
 	maxBytes int64
 }
 
 var _ Backend = (*S3Store)(nil)
 
-// NewS3Store needs a 32-byte seal key that never goes in the bucket, and a private local
-// scratch directory for staging uploads and verified downloads.
-func NewS3Store(client *s3.Client, sealKey []byte, scratch string, maxBytes int64) (*S3Store, error) {
-	if client == nil || maxBytes <= 0 || maxBytes > config.MaxAllowedUploadBytes {
+// NewS3Store needs a 32-byte seal key that never goes in the bucket, the org's cell
+// (cellOf), and a private local scratch directory for staging uploads and verified downloads.
+func NewS3Store(client *s3.Client, sealKey []byte, cellOf func(string) (string, error), scratch string, maxBytes int64) (*S3Store, error) {
+	if client == nil || cellOf == nil || maxBytes <= 0 || maxBytes > config.MaxAllowedUploadBytes {
 		return nil, errors.New("blobs: invalid object store configuration")
 	}
 	sealer, err := NewSealer(sealKey)
@@ -48,23 +51,40 @@ func NewS3Store(client *s3.Client, sealKey []byte, scratch string, maxBytes int6
 	if _, err := NewStore(scratch); err != nil {
 		return nil, err
 	}
-	return &S3Store{client: client, sealer: sealer, scratch: scratch, maxBytes: maxBytes}, nil
+	return &S3Store{client: client, sealer: sealer, cellOf: cellOf, scratch: scratch, maxBytes: maxBytes}, nil
 }
 
-func objectPath(tenantID, key string) (string, error) {
-	if !config.IsCanonicalUUID(tenantID) || !ValidKey(key) {
+func (o *S3Store) objectPath(tenantID, key string) (string, error) {
+	if !ValidKey(key) {
 		return "", ErrInvalidKey
 	}
-	return orgPrefix(tenantID) + "att/" + key, nil
+	prefix, err := o.orgPrefix(tenantID)
+	if err != nil {
+		return "", err
+	}
+	return prefix + "att/" + key, nil
 }
 
-func orgPrefix(tenantID string) string { return "orgs/" + tenantID + "/" }
+// orgPrefix is the org's whole namespace. An org without a known cell has none.
+func (o *S3Store) orgPrefix(tenantID string) (string, error) {
+	if !config.IsCanonicalUUID(tenantID) {
+		return "", ErrInvalidKey
+	}
+	cell, err := o.cellOf(tenantID)
+	if err != nil {
+		return "", err
+	}
+	if !config.ValidCell(cell) {
+		return "", ErrInvalidKey
+	}
+	return "cells/" + cell + "/orgs/" + tenantID + "/", nil
+}
 
 // Put stages and sniffs the upload exactly as the disk store does, seals it and writes it
 // once with If-None-Match (keys are never reused). When the write may have landed but gave
 // no usable receipt, every version of the key is erased, so no unaccounted object remains.
 func (o *S3Store) Put(tenantID, key string, r io.Reader, maxBytes int64) (PutResult, error) {
-	object, err := objectPath(tenantID, key)
+	object, err := o.objectPath(tenantID, key)
 	if err != nil {
 		return PutResult{}, err
 	}
@@ -117,7 +137,7 @@ func (o *S3Store) Put(tenantID, key string, r io.Reader, maxBytes int64) (PutRes
 // size, at most the fixed hard maximum) plus the seal: a lowered upload limit restricts new
 // writes, never existing files. It serves ranges from a private local copy that Close removes.
 func (o *S3Store) Open(tenantID, key string, sizeBytes int64) (io.ReadSeekCloser, int64, error) {
-	object, err := objectPath(tenantID, key)
+	object, err := o.objectPath(tenantID, key)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -173,7 +193,7 @@ func (f *verifiedObject) Close() error {
 // Delete is a user's own delete: it hides the current version and the bucket keeps the
 // previous one as its backup copy, which the store keeps charged to the org (§9.4).
 func (o *S3Store) Delete(tenantID, key string) error {
-	object, err := objectPath(tenantID, key)
+	object, err := o.objectPath(tenantID, key)
 	if err != nil {
 		return err
 	}
@@ -188,7 +208,7 @@ func (o *S3Store) Delete(tenantID, key string) error {
 
 // Erase removes every version and delete marker of one object (erasure, purge, rollback).
 func (o *S3Store) Erase(tenantID, key string) error {
-	object, err := objectPath(tenantID, key)
+	object, err := o.objectPath(tenantID, key)
 	if err != nil {
 		return err
 	}
@@ -199,12 +219,13 @@ func (o *S3Store) Erase(tenantID, key string) error {
 
 // DeletePrefix removes every version of every object of one org, orphans included.
 func (o *S3Store) DeletePrefix(tenantID string) error {
-	if !config.IsCanonicalUUID(tenantID) {
-		return ErrInvalidKey
+	prefix, err := o.orgPrefix(tenantID)
+	if err != nil {
+		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
-	return o.client.DeletePrefix(ctx, orgPrefix(tenantID))
+	return o.client.DeletePrefix(ctx, prefix)
 }
 
 // SweepStaleTemps removes staging directories and verified copies a crash left behind.

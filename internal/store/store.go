@@ -349,6 +349,8 @@ type ChatStore interface {
 	ClearCallEviction(ctx context.Context, e CallEviction) error
 	EndOwnedCallSession(ctx context.Context, cs *CallSession, endedAt int64) error
 	ApplyTenantDirectory(ctx context.Context, entry TenantDirectoryEntry) error
+	SetServedCells(ctx context.Context, cells []string) error
+	TenantHomeRegion(ctx context.Context, tenantID string) (string, error)
 	// Tenants
 	CreateTenant(ctx context.Context, t *Tenant) error
 	EnsureTenant(ctx context.Context, tenantID string) (*Tenant, error)

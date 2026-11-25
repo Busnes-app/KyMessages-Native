@@ -3,7 +3,7 @@
 Date: 2026-11-23. Status: proposed design, docs only. Nothing here is built unless it says
 "built". It extends `2026-11-22-tenancy-design.md` (called **K22** here) for the owner decisions
 of 2026-11-22 and 2026-11-23. Where the two disagree, this spec wins. K22 §4 (the suite-peer
-`org_id` wire contract) and §6.2 (multi-region cells) stay authoritative and are not repeated.
+`org_id` wire contract) and §6.2 (cells, amended 2026-11-24) stay authoritative and are not repeated.
 
 Sources:
 - KyIdentity `docs/superpowers/specs/2026-11-19-tenancy-design.md` on `origin/master` (**T**).
@@ -174,7 +174,7 @@ Multi mode, `origin/main` plus PR #27. Every row has a cross-org test in
 | Admin agents | Owner's tenant (`internal/api/agent_handlers.go:107-113`) | Built |
 | Admin SCIM users | Empty list in multi mode (`internal/api/scim_admin.go:22-28`) | Built |
 | Admin audit | Install-wide, staff only | By design (open question 6) |
-| Attachments in S3 | Object key under `orgs/<tenant_id>/`, sealed to that org and key (§9) | Built (PR 6), tested on a fake and a real versioned bucket; startup gated |
+| Attachments in S3 | Object key under `cells/<home_region>/orgs/<tenant_id>/`, sealed to that path (§9) | Built (PR 6), tested on a fake and a real versioned bucket; startup gated |
 | Pool usage report | Per org, signed (§10) | Not built |
 
 ## 7. Lifecycle gaps
@@ -323,7 +323,8 @@ KyIdentity's erased and org lists before serving (§7.4).
 (an `io.ReadSeekCloser` and size, preserving range responses), `Delete`, `DeletePrefix` and
 `SweepStaleTemps`. PR 6 adds `Erase` for every version of one object; `DeletePrefix` removes
 every version under the org prefix. Keys stay random bare identifiers validated by `ValidKey`;
-the backend builds `orgs/<tenant_id>/att/<blob_key>`.
+the `disk` backend builds `orgs/<tenant_id>/att/<blob_key>` and `s3` builds
+`cells/<home_region>/orgs/<tenant_id>/att/<blob_key>` (K22 §6.2).
 
 - Single mode uses `disk`, with its existing flat layout and wire behavior unchanged.
 - Hosted multi mode requires `s3`. A disk backend or incomplete S3 configuration refuses startup.
@@ -345,7 +346,7 @@ single mode cannot change by accident.
 
 ### 9.3 Keys and content
 
-- Object key: `orgs/<tenant_id>/att/<blob_key>`. `blob_key` stays the random attachment ID
+- Object key: `cells/<home_region>/orgs/<tenant_id>/att/<blob_key>`, the org's fixed cell first. `blob_key` stays the random attachment ID
   (`att_<uuidv7>`, `internal/store/chat.go:1437-1444`), never a content hash, so no two orgs
   share an object and nobody can probe for a file's existence. The org prefix makes the purge one
   prefix delete.
@@ -597,7 +598,7 @@ replay or stale revision where it applies, oversize input), and runs CI on SQLit
 | 5 | The blob interface and internal org-layout disk migration/isolation checks (§9.1); hosted startup stays gated | Yes (interface prerequisite) | 2 |
 | 6 | The `s3` backend, sealing, the purge by prefix, and versioned deletes for erasure and purge (§9.2-§9.5). The interface gains `Erase(key)`, which removes every version (on `disk` it is `Delete`). Erasure and purge call it, and PR 1a's per-key deletes switch to it here. A user's own delete keeps `Delete` (current version only, §9.4). | Yes | 5, the ky-primitives S3 type |
 | 7 | The org pool: columns, check, `org_storage_full`, reporter (§10) | Yes | 2 (leases), KyIdentity's pool API |
-| 8 | Multi-region cells (K22 §6.2, its PR D) | No | 3, 4 |
+| 8 | Cells (K22 §6.2): `KY_CELLS`, the C5 refusal on every way in, cell-scoped object keys. Built, startup gated | Yes (owner, 2026-11-24) | 6 |
 
 Tests each PR must add, beyond its own:
 - **Cross-org:** the §6 matrix keeps passing. New: an org-B attachment key is never readable from

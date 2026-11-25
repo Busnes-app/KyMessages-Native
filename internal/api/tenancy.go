@@ -16,6 +16,17 @@ import (
 // before the lock that holds rooms or org-less directory accounts is single-tenant: those
 // accounts have no org, so locking it to multi would shut every one of them out for good.
 func EnsureTenancyMode(ctx context.Context, st store.Store, cfg config.TenancyConfig) error {
+	if err := ensureTenancyMode(ctx, st, cfg); err != nil || st == nil {
+		return err
+	}
+	// Before serving: an org of a cell no longer listed in KY_CELLS stops being ready here.
+	if cfg.IsMultiTenant() && len(cfg.Cells) > 0 {
+		return st.Chat().SetServedCells(ctx, cfg.Cells)
+	}
+	return nil
+}
+
+func ensureTenancyMode(ctx context.Context, st store.Store, cfg config.TenancyConfig) error {
 	if st == nil {
 		return nil
 	}

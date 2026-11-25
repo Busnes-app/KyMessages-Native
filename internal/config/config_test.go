@@ -384,7 +384,39 @@ func TestTenancyModeFromEnv(t *testing.T) {
 		t.Setenv("KY_SESSION_SECRET", "multi-session-secret-0123456789abcdef")
 		t.Setenv("KY_ENCRYPTION_KEY", strings.Repeat("ab", 32))
 		t.Setenv("KY_VAPID_PRIVATE_KEY", "unchecked-here")
+		t.Setenv("KY_CELLS", "us-east-2")
 	}
+
+	// KY_CELLS: required in multi mode, slugs only, each once, at most 32; KY_REGION is gone.
+	t.Run("cells", func(t *testing.T) {
+		multiEnv(t)
+		t.Setenv("KY_CELLS", " us-east-2 , us-east-3 ")
+		cfg, err := config.LoadForTenancy(config.TenancyMulti)
+		if err != nil || strings.Join(cfg.Tenancy.Cells, ",") != "us-east-2,us-east-3" {
+			t.Fatalf("cells: %v %v", cfg, err)
+		}
+		many := make([]string, 33)
+		for i := range many {
+			many[i] = fmt.Sprintf("us-east-%d", i)
+		}
+		for _, bad := range []string{"", "us-east-2,us-east-2", "US-EAST-2", "us_east", "a", "us-east-2,", strings.Join(many, ",")} {
+			multiEnv(t)
+			t.Setenv("KY_CELLS", bad)
+			if _, err := config.LoadForTenancy(config.TenancyMulti); err == nil || !strings.Contains(err.Error(), "KY_CELLS") {
+				t.Errorf("KY_CELLS=%q: %v", bad, err)
+			}
+		}
+		multiEnv(t)
+		t.Setenv("KY_REGION", "us-east")
+		if _, err := config.LoadForTenancy(config.TenancyMulti); err == nil || !strings.Contains(err.Error(), "KY_CELLS") {
+			t.Errorf("KY_REGION accepted: %v", err)
+		}
+		t.Setenv("KY_REGION", "")
+		t.Setenv("KY_DB_DRIVER", "sqlite")
+		if _, err := config.LoadForTenancy(config.TenancySingle); err == nil {
+			t.Error("single mode accepted KY_CELLS")
+		}
+	})
 
 	// Replicas must share every secret: none may be minted per process or per data directory.
 	t.Run("multi_requires_shared_secrets", func(t *testing.T) {
@@ -486,7 +518,8 @@ func TestTenancyModeFromEnv(t *testing.T) {
 		// Single mode never takes object storage, even fully configured.
 		s3Env(t)
 		t.Setenv("KY_DB_DRIVER", "sqlite")
-		if _, err := config.LoadForTenancy(config.TenancySingle); err == nil || !strings.Contains(err.Error(), "multi only") {
+		t.Setenv("KY_CELLS", "")
+		if _, err := config.LoadForTenancy(config.TenancySingle); err == nil || !strings.Contains(err.Error(), "KY_ATTACHMENTS_S3_") {
 			t.Fatalf("single mode accepted object storage: %v", err)
 		}
 		t.Setenv("KY_ATTACHMENTS_S3_SEAL_KEY_FILE", "")
@@ -580,6 +613,7 @@ func TestMaintenanceLoaderKeepsServerGate(t *testing.T) {
 	t.Setenv("KY_SESSION_SECRET", "maintenance-session-secret-0123456789")
 	t.Setenv("KY_ENCRYPTION_KEY", strings.Repeat("ab", 32))
 	t.Setenv("KY_PUSH_ENABLED", "false")
+	t.Setenv("KY_CELLS", "us-east-2")
 	if cfg, err := config.LoadForMaintenance(); err != nil || !cfg.Tenancy.IsMultiTenant() {
 		t.Fatalf("offline multi config: %+v %v", cfg, err)
 	}

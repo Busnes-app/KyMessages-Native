@@ -461,82 +461,43 @@ for hosted SaaS requires moving the remaining process-local state out of pod mem
 | Call & lobby state (`CallManager`, `LobbyManager`) | In-memory maps + `PostgresBus` eviction hooks. | Persist active call seats & waiting-room knocks in PostgreSQL (or route room WebSockets/calls with consistent hashing + DB reconciliation) so host and guest on different pods share one lobby and call state. |
 | Rate limiters (`attemptLimiter`, suite hourly budgets) | In-memory maps per pod. | Shared PostgreSQL sliding-window counters (or bounded shared store) for suite-peer and auth-abuse limits across pods. |
 
-### 6.2 Multi-Region Architecture (Home-Region Cells)
+### 6.2 Cells (amended 2026-11-24)
 
-Because **no chat room, DM, presence record, search query, bot, webhook, or meeting ever
-crosses an org boundary** (§3), KyMessages-Native scales across regions using **home-region
-org cells** rather than synchronous cross-region multi-master SQL writes:
+Owner decision, 2026-11-24 (KyIdentity tenancy design, "Cells", C1–C5): the hosted install
+scales by **cells**, never by a database or schema per org. A cell is a KyIdentity
+`home_region` slug, `<geography>-<n>` (`us-east-2`). Each org has exactly one, fixed at
+provisioning and never moved (C4). One KyMessages deployment (its replicas, its PostgreSQL and
+its LiveKit) serves one or more cells and holds their orgs in the shared `org_id` tables. This
+replaces the earlier home-region design here: there is no `KY_REGION`, no edge router, no
+region hint in sessions or guest tokens, and no cross-region forwarding.
 
-```mermaid
-flowchart TB
-  Edge["Global Edge Router / GeoDNS"]
-  Dir[("Global Org -> Region Directory\n(replicated read-only cache + KyIdentity source)")]
-
-  subgraph US["Region: us-east (KY_REGION=us-east)"]
-    US_Pods["KyMessages Replicas (N pods)"]
-    US_PG[("Regional Postgres Primary + Read Replicas\n+ LISTEN/NOTIFY")]
-    US_LK["Regional LiveKit SFU + Built-in TURN"]
-    US_S3[("Regional Object Store (Attachments)")]
-    US_Pods <--> US_PG
-    US_Pods <--> US_LK
-    US_Pods <--> US_S3
-  end
-
-  subgraph EU["Region: eu-central (KY_REGION=eu-central)"]
-    EU_Pods["KyMessages Replicas (N pods)"]
-    EU_PG[("Regional Postgres Primary + Read Replicas\n+ LISTEN/NOTIFY")]
-    EU_LK["Regional LiveKit SFU + Built-in TURN"]
-    EU_S3[("Regional Object Store (Attachments)")]
-    EU_Pods <--> EU_PG
-    EU_Pods <--> EU_LK
-    EU_Pods <--> EU_S3
-  end
-
-  Edge --> Dir
-  Edge --> US_Pods
-  Edge --> EU_Pods
-  US_Pods -. "Signed suite-peer forward\n(raw body + syncauth headers verbatim)" .-> EU_Pods
-```
-
-1. **Org home region (`tenants.home_region`):**
-   - Each hosted org has one immutable `home_region` (e.g., `us-east`, `eu-central`), assigned
-     at org provisioning from KyIdentity's org metadata.
-   - All authoritative data for that org — PostgreSQL primary rows, `LISTEN/NOTIFY` room bus,
-     `suite_replay_events`, attachments object bucket, and LiveKit SFU media — lives in its
-     home region.
-   - Voice and video stay local to the org's regional LiveKit SFU (avoiding trans-oceanic media
-     hairpinning). External guests connecting from another region negotiate direct P2P
-     DTLS-SRTP where permitted or escalate to the meeting org's regional LiveKit SFU/TURN.
-2. **Client & guest request routing:**
-   - Authenticated sessions carry a signed region hint (`ky_region` cookie / session prefix)
-     so the edge routes REST and `/api/v1/ws` directly to the org's home region.
-   - Guest meeting tokens (`/meet/{token}`) embed a non-secret region tag prefix (e.g.,
-     `<region>.<256-bit-random-token>`) so anonymous guest browsers route straight to the
-     meeting's home region without cross-region DB lookups.
-   - Incoming room webhooks (`/api/v1/webhooks/in/{id}`) similarly embed or map to their home
-     region at the edge.
-3. **Cross-region suite-peer calls (`/api/suite/*`, `/api/meetings/*`):**
-   - A peer (KyPost or KyCalendar) may run in a different region or post to a single global
-     KyMessages URL.
-   - When a KyMessages pod in region `R1` receives a signed suite-peer request whose `org_id`
-     homes in `R2 != R1`:
-     - `R1` does **not** mutate state or record the event ID locally.
-     - `R1` forwards the HTTP request to `R2`'s internal peer endpoint over mTLS/HTTPS,
-       preserving the **raw body and original `syncauth` headers verbatim**.
-     - `R2` independently verifies the `syncauth` signature, enforces `R2`'s
-       `suite_replay_events`, validates `(sub, org_id)` against `R2`'s primary DB, and returns
-       the response. No trust is placed in the forwarding hop.
-     - Forwarding is strictly single-hop (`X-Ky-Region-Hop: 1` refuses loops with `502`).
-4. **Org lifecycle across regions (`org.suspended`, `org.resumed`, `org.deleted`):**
-   - Delivered to the org's home region (directly by KyIdentity or forwarded by the receiving
-     region with raw `syncauth` headers intact).
-   - The home region updates `tenants` on its primary DB, revokes sessions/push/WS/calls/guests
-     across every pod in that region, and propagates the updated org status to the global
-     org-region directory so the edge can also fail closed for suspended/deleted orgs.
-5. **Single-region and self-hosted fallback:**
-   - When `KY_REGION` is unset (all single-tenant installs and single-region SaaS),
-     `home_region` defaults to `'local'`. No cross-region directory, region-tagged tokens, or
-     inter-region forwarding is enabled.
+1. **Configuration.** Multi mode requires `KY_CELLS`, the comma-separated cells this deployment
+   serves (at most 32, each a valid slug, each once). `KY_REGION` is refused. Single mode
+   refuses `KY_CELLS` and is unchanged. Every start writes the list to `served_cells` before
+   serving. KyIdentity offers an app no read of its own region map (`/api/suite/peer` answers
+   only for a paired peer), so the start cannot yet check the list against the map; that is an
+   open question for KyIdentity.
+2. **Where the cell comes from.** `/api/suite/orgs` (`home_region`), stored on the org's
+   directory snapshot (`tenant_directory.home_region`). Never a token claim. It never changes
+   once stored; a snapshot from before migration 67 gets it from the next listing, even at an
+   unchanged revision. The staff org keeps its listed region (so its object keys do not depend
+   on `KY_CELLS` order) and is served by every cell.
+3. **Refusal (C5).** Directory readiness, which every way in already requires (session cookie
+   and bearer, `/api/v1/ws`, bot tokens, sign-in, guest meeting links, KyPost and KyCalendar
+   peer calls, upload admission), also requires the snapshot's cell to be served. The listing
+   never creates another cell's org, and suspends one already present (staged by a user webhook,
+   or of a cell removed from `KY_CELLS`), revoking its grants. Pool reports cover only admitted
+   orgs, so a cell never reports for an org it does not hold. Tested per credential type
+   (`internal/api/cells_test.go`).
+4. **Routing.** Each cell has its own hostname in the app's KyIdentity region map. Users and
+   guests reach their org's cell through KyIdentity's launcher; KyPost and KyCalendar call
+   `suitedir.Peer.URLFor(home_region)`. A request that reaches another cell is refused like an
+   org this deployment does not serve.
+5. **Object storage.** Each object lives at `cells/<home_region>/orgs/<org>/att/<key>`, sealed to
+   that full path, so cells can share a bucket and a deployment that splits later moves nothing.
+6. **Signed webhooks.** KyIdentity still sends `user.*` webhooks to one endpoint. A cell that
+   receives one for another cell's org stages nothing it would serve; the org's own cell applies
+   erasures from `/api/suite/erased` on its next sync.
 
 ---
 
