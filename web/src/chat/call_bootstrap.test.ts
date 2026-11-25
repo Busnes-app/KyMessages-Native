@@ -50,7 +50,7 @@ describe('room-routed call bootstrap', () => {
       if (url === '/api/v1/rooms/two/calls/state') return json({ call: null });
       return json({ call: state('three') });
     }));
-    const result = await fetchBootstrap(() => previous);
+    const result = await fetchBootstrap(() => ({ calls: previous, revisions: {} }));
     expect(Object.keys(result.active_calls).sort()).toEqual(['one', 'three']);
     expect(result.active_calls.one).toEqual(previous.one);
     expect(Object.keys(previous).sort()).toEqual(['one', 'removed', 'two']);
@@ -70,7 +70,7 @@ describe('room-routed call bootstrap', () => {
       return new Promise<Response>((_, reject) => init?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
     }));
     let previous: Record<string, ReturnType<typeof state>> = { two: state('two'), three: state('three') };
-    const pending = fetchBootstrap(() => previous);
+    const pending = fetchBootstrap(() => ({ calls: previous, revisions: {} }));
     await vi.advanceTimersByTimeAsync(1_000);
     // A call ended locally while the other owner's request was still stalled.
     previous = { two: state('two') };
@@ -78,4 +78,43 @@ describe('room-routed call bootstrap', () => {
     const result = await pending;
     expect(Object.keys(result.active_calls)).toEqual(['two']);
   });
+  it('does not restore a successful but outdated owner response after a live call ends', async () => {
+    vi.useFakeTimers();
+    let current: Record<string, CallState> = { one: state('one') };
+    const revisions = { one: 0 };
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/v1/bootstrap') return json(bootstrap('hosted-org'));
+      if (url === '/api/v1/rooms/one/calls/state') return json({ call: state('one') });
+      return new Promise<Response>((_, reject) => init?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
+    }));
+    const pending = fetchBootstrap(() => ({ calls: current, revisions }));
+    await vi.advanceTimersByTimeAsync(1_000);
+    current = {};
+    revisions.one++;
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect((await pending).active_calls.one).toBeUndefined();
+  });
+
+  it.each([false, true])('preserves a live update after an earlier owner read (ended=%s)', async (ended) => {
+    vi.useFakeTimers();
+    let current: Record<string, CallState> = {};
+    const revisions = { one: 0 };
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/v1/bootstrap') return json(bootstrap('hosted-org'));
+      if (url === '/api/v1/rooms/one/calls/state') return json({ call: ended ? state('one') : null });
+      return new Promise<Response>((_, reject) => init?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
+    }));
+    const pending = fetchBootstrap(() => ({ calls: current, revisions }));
+    await vi.advanceTimersByTimeAsync(1_000);
+    current = { one: { ...state('one'), epoch: 9 } };
+    revisions.one++;
+    if (ended) { current = {}; revisions.one++; }
+    await vi.advanceTimersByTimeAsync(1_000);
+    const calls = (await pending).active_calls;
+    if (ended) expect(calls.one).toBeUndefined();
+    else expect(calls.one.epoch).toBe(9);
+  });
+
 });

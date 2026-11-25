@@ -197,6 +197,7 @@ export interface CallMigratePayload {
   room_id: string;
   epoch?: number;
   target_mode: CallMode;
+  peers?: CallPeer[];
   reason?: string;
   livekit_url?: string;
   livekit_token?: string;
@@ -529,6 +530,7 @@ export function parseCallMigrate(v: unknown): CallMigratePayload {
     room_id: str(o.room_id, 128),
     epoch: opt(o.epoch, num),
     target_mode: oneOf(o.target_mode, CALL_MODES),
+    peers: o.peers !== undefined ? arr(o.peers).map(parseCallPeer) : undefined,
     reason: opt(o.reason, (s) => str(s, 128)),
     livekit_url: opt(o.livekit_url, (s) => str(s, 512)),
     livekit_token: opt(o.livekit_token, (s) => str(s, 4096)),

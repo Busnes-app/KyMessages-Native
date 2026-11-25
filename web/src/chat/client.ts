@@ -48,7 +48,11 @@ async function apiJSON(input: string, init: RequestInit = {}, fallback = 'Reques
   return res.json();
 }
 
-export async function fetchBootstrap(previousCalls?: () => Readonly<Record<string, CallState>>): Promise<ChatBootstrap> {
+export async function fetchBootstrap(currentCalls?: () => {
+  calls: Readonly<Record<string, CallState>>;
+  revisions: Readonly<Record<string, number>>;
+}): Promise<ChatBootstrap> {
+  const startedRevisions = { ...currentCalls?.().revisions };
   const boot = parseBootstrap(await apiJSON('/api/v1/bootstrap', {}, 'Could not load chat'));
   if (boot.tenant.id === 'default') return boot;
   // The global chat socket/HTTP may reach any pod. Only the room route can supply its
@@ -79,11 +83,13 @@ export async function fetchBootstrap(previousCalls?: () => Readonly<Record<strin
   };
   try {
     await Promise.all(Array.from({ length: 4 }, readRooms));
-    const previous = previousCalls?.() ?? boot.active_calls;
+    const latest = currentCalls?.();
+    const previous = latest?.calls ?? boot.active_calls;
     const calls: Record<string, CallState> = {};
     for (const room of boot.rooms) {
       const result = results.get(room.id);
-      const state = result === undefined ? previous[room.id] : result;
+      const changed = (latest?.revisions[room.id] ?? 0) !== (startedRevisions[room.id] ?? 0);
+      const state = changed || result === undefined ? previous[room.id] : result;
       if (state) calls[room.id] = state;
     }
     return { ...boot, active_calls: calls };

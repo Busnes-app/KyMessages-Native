@@ -72,6 +72,20 @@ func (c *chatStore) callLeaseTx(ctx context.Context, tx *sql.Tx, cs *CallSession
 // PutCallSeat binds SFU credentials to a durable opaque account/peer link before they leave
 // the server. User/guest locks serialize it with revocation; the owner generation fences it.
 func (c *chatStore) PutCallSeat(ctx context.Context, cs *CallSession, seat CallSeat) error {
+	return c.putCallSeat(ctx, cs, seat, false)
+}
+
+// CreateOwnedCallSession commits a new call and its first authorized seat together.
+// Failed admission cannot leave an orphan for a later join to recover as already started.
+func (c *chatStore) CreateOwnedCallSession(ctx context.Context, cs *CallSession, seat CallSeat) error {
+	if cs.OwnerID == "" {
+		return ErrInvalidInput
+	}
+	prepareCallSession(cs)
+	return c.putCallSeat(ctx, cs, seat, true)
+}
+
+func (c *chatStore) putCallSeat(ctx context.Context, cs *CallSession, seat CallSeat, create bool) error {
 	userID, peerID, guest := seat.UserID, seat.PeerID, seat.Guest
 	if !guest && seat.SessionHash == "" {
 		return ErrInvalidInput
@@ -118,6 +132,11 @@ func (c *chatStore) PutCallSeat(ctx context.Context, cs *CallSession, seat CallS
 		}
 		if pending != 0 {
 			return ErrCallCleanupPending
+		}
+	}
+	if create {
+		if err := c.insertCallSession(ctx, tx, cs); err != nil {
+			return err
 		}
 	}
 	membership := `AND EXISTS(SELECT 1 FROM room_members m WHERE m.tenant_id=call_sessions.tenant_id AND m.room_id=call_sessions.room_id AND m.user_id=?)`

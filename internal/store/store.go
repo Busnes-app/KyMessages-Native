@@ -447,6 +447,9 @@ type ChatStore interface {
 
 	// Call Sessions
 	CreateCallSession(ctx context.Context, cs *CallSession) error
+
+	// CreateOwnedCallSession atomically creates the call and admits its first seat.
+	CreateOwnedCallSession(ctx context.Context, cs *CallSession, seat CallSeat) error
 	GetActiveCallSession(ctx context.Context, tenantID, roomID string) (*CallSession, error)
 	UpdateCallSession(ctx context.Context, cs *CallSession) error
 	EndCallSession(ctx context.Context, tenantID, callID string, endedAt int64) error

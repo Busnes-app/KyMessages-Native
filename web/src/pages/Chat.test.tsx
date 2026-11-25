@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { Chat } from './Chat';
+import { HybridCallController } from '../rtc/hybridCall';
 import { deliverKey, fakeEnvelope, heldOpenCount, holdFakeOpens, resetFakeE2EE, setFakeUnavailable, storeKeySilently } from '../chat/e2eeFake';
 
 // Pages run without the WebAssembly core; crypto/engine.test.ts covers the real one.
@@ -689,5 +690,66 @@ describe('Native Chat page', () => {
     await screen.findByRole('heading', { name: 'Welcome to #general' });
     // The hash is written by an effect after the room renders.
     await waitFor(() => expect(window.location.hash).toBe('#room=rm_gen'));
+  });
+
+  it('keeps a call roster received while joining instead of the older join response', async () => {
+    let finishStart = () => {};
+    const start = vi.spyOn(HybridCallController.prototype, 'start').mockImplementation(
+      () => new Promise<void>((resolve) => { finishStart = resolve; }),
+    );
+    const alice = { user_id: 'u_alice', display_name: 'Alice' };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === '/api/v1/bootstrap') {
+          return Promise.resolve(
+            json({
+              user: { id: 'u_alice', username: 'alice', display_name: 'Alice', role: 'user' },
+              tenant: { id: 'default', slug: 'default', display_name: 'Busnes HQ', plan: 'self_hosted' },
+              rooms: [
+                {
+                  id: 'rm_gen', tenant_id: 'default', kind: 'channel', name: 'general', topic: '',
+                  is_private: false, last_seq: 0, created_by: 'u_alice', created_at: Date.now(),
+                  role: 'owner', last_read_seq: 0, unread_count: 0, notify_mode: 'all',
+                },
+              ],
+            }),
+          );
+        }
+        if (url.startsWith('/api/v1/rooms/rm_gen/messages')) {
+          return Promise.resolve(json({ messages: [], has_more: false }));
+        }
+        if (url === '/api/v1/rooms/rm_gen/calls/join') {
+          return Promise.resolve(json({ call_id: 'c1', room_id: 'rm_gen', mode: 'p2p_mesh', epoch: 1, peers: [alice] }));
+        }
+        return Promise.resolve(json({ error: 'not found' }, 404));
+      }),
+    );
+
+    try {
+      render(<Chat />);
+      await screen.findByRole('heading', { name: 'Welcome to #general' });
+      fireEvent.click(screen.getByRole('button', { name: 'Audio call' }));
+      await waitFor(() => expect(start).toHaveBeenCalled());
+
+      act(() => {
+        FakeWebSocket.instances[0].emit({
+          t: 'call.state',
+          room: 'rm_gen',
+          d: {
+            call_id: 'c1', room_id: 'rm_gen', active: true, mode: 'p2p_mesh', epoch: 2,
+            peers: [alice, { user_id: 'u_bob', display_name: 'Bob' }, { user_id: 'u_carol', display_name: 'Carol' }],
+          },
+        });
+      });
+      await screen.findByTitle('3 in active call');
+
+      await act(async () => finishStart());
+      expect(screen.getByTitle('3 in active call')).toBeTruthy();
+      expect(screen.queryByTitle('1 in active call')).toBeNull();
+    } finally {
+      start.mockRestore();
+    }
   });
 });

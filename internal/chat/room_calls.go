@@ -18,12 +18,13 @@ const roomOwnerTTL = 90 * time.Second
 // Room affinity keeps each room's latency-sensitive seats and SDP on one process. The
 // database holds a fenced recovery record, not a second distributed signaling engine.
 type roomRouting struct {
-	holder string
-	locks  [64]sync.Mutex // bounded stripes; colliding rooms only serialize control operations
+	holder    string
+	afterFunc func(time.Duration, func()) *time.Timer
+	locks     [64]sync.Mutex // bounded stripes; colliding rooms only serialize control operations
 }
 
 func (m *CallManager) EnableRoomRouting() {
-	m.routing = &roomRouting{holder: uuid.NewString()}
+	m.routing = &roomRouting{holder: uuid.NewString(), afterFunc: time.AfterFunc}
 }
 
 func (m *CallManager) lockRoom(room string) func() {
@@ -76,6 +77,9 @@ func (m *CallManager) ownedRoom(ctx context.Context, tenant, room string) (*acti
 			m.hub.CloseRoomCalls(room)
 		}
 	}
+	if cached.ending {
+		return nil, m.endOwnedRoom(ctx, cached)
+	}
 	fresh, err := m.chatStore.GetActiveCallSession(ctx, tenant, room)
 	if err != nil {
 		return nil, err
@@ -114,19 +118,18 @@ func (m *CallManager) ownedRoom(ctx context.Context, tenant, room string) (*acti
 	if !empty && len(cached.peers) > 0 {
 		m.maybeScheduleStepDownLocked(room, cached)
 	}
+	var roster CallStatePayload
+	if len(removed) > 0 && !empty {
+		roster = m.buildStateLocked(cached, true)
+	}
 	m.mu.Unlock()
 	if empty {
-		// Keep the invalid cached peers until the durable end commits, so a failure retries.
 		// A newly recovered owner has no cached peers and still permits a fresh rejoin.
-		if err := m.chatStore.EndOwnedCallSession(ctx, &cached.session, 0); err != nil {
-			return nil, err
-		}
-		m.mu.Lock()
-		m.forgetRoomLocked(room)
-		state := m.buildStateLocked(cached, false)
-		m.mu.Unlock()
-		m.broadcastState(ctx, room, state)
-		return nil, m.DrainCleanup(ctx, tenant, "")
+		return nil, m.endOwnedRoom(ctx, cached)
+	}
+	if len(removed) > 0 {
+		// Roster revocation must not wait for media cleanup or an epoch change.
+		m.broadcastState(ctx, room, roster)
 	}
 	if err := m.DrainCleanup(ctx, tenant, ""); err != nil {
 		return nil, err
@@ -137,6 +140,24 @@ func (m *CallManager) ownedRoom(ctx context.Context, tenant, room string) (*acti
 		}
 	}
 	return cached, nil
+}
+
+// endOwnedRoom retains explicit end intent across a failed durable write. Empty recovery
+// caches remain distinct: only a failed start or a previously populated call enters here.
+func (m *CallManager) endOwnedRoom(ctx context.Context, c *activeCall) error {
+	m.mu.Lock()
+	c.ending = true
+	state := m.buildStateLocked(c, false)
+	state.Peers = []CallPeerState{}
+	m.mu.Unlock()
+	m.broadcastState(ctx, c.session.RoomID, state)
+	if err := m.chatStore.EndOwnedCallSession(ctx, &c.session, 0); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.forgetRoomLocked(c.session.RoomID)
+	m.mu.Unlock()
+	return m.DrainCleanup(ctx, c.session.TenantID, "")
 }
 
 func (m *CallManager) forgetRoomLocked(room string) {
@@ -151,6 +172,9 @@ func (m *CallManager) forgetRoomLocked(room string) {
 
 func (m *CallManager) removePeerLocked(room string, c *activeCall, id string) {
 	p := c.peers[id]
+	if p.disconnectTimer != nil {
+		p.disconnectTimer.Stop()
+	}
 	delete(c.peers, id)
 	if calls := m.userCalls[p.UserID]; calls != nil {
 		delete(calls, room)
@@ -160,7 +184,7 @@ func (m *CallManager) removePeerLocked(room string, c *activeCall, id string) {
 	}
 }
 
-func (m *CallManager) joinOwned(ctx context.Context, req JoinCallRequest) (*JoinCallResponse, error) {
+func (m *CallManager) joinOwned(ctx context.Context, req JoinCallRequest) (response *JoinCallResponse, err error) {
 	defer m.lockRoom(req.RoomID)()
 	c, err := m.ownedRoom(ctx, req.TenantID, req.RoomID)
 	if err != nil {
@@ -214,6 +238,11 @@ func (m *CallManager) joinOwned(ctx context.Context, req JoinCallRequest) (*Join
 	mode, reason, strict := evaluateCallMode(*tenant, c.session.SFUSticky, candidate)
 	session := c.session
 	m.mu.Unlock()
+	if !created && session.Mode == store.CallModeSFULiveKit && mode == store.CallModeP2PMesh {
+		// Only stepDownOwned may lower privacy after its delay and durable retirement.
+		mode = store.CallModeSFULiveKit
+		strict = true
+	}
 	if mode == store.CallModeSFULiveKit && m.livekit == nil {
 		if strict {
 			return nil, ErrSFUUnavailable
@@ -228,15 +257,16 @@ func (m *CallManager) joinOwned(ctx context.Context, req JoinCallRequest) (*Join
 	if mode == store.CallModeSFULiveKit && (session.LiveKitRoom == "" || changed) {
 		session.LiveKitRoom = mediaRoom(session)
 	}
+	seat := store.CallSeat{UserID: req.UserID, PeerID: peerID, SessionHash: req.SessionHash, Guest: req.IsGuest}
 	if created {
-		err = m.chatStore.CreateCallSession(ctx, &session)
+		err = m.chatStore.CreateOwnedCallSession(ctx, &session, seat)
 	} else {
 		err = m.chatStore.UpdateCallSession(ctx, &session)
+		if err == nil {
+			err = m.chatStore.PutCallSeat(ctx, &session, seat)
+		}
 	}
 	if err != nil {
-		return nil, err
-	}
-	if err := m.chatStore.PutCallSeat(ctx, &session, store.CallSeat{UserID: req.UserID, PeerID: peerID, SessionHash: req.SessionHash, Guest: req.IsGuest}); err != nil {
 		return nil, err
 	}
 	completed := false
@@ -244,7 +274,16 @@ func (m *CallManager) joinOwned(ctx context.Context, req JoinCallRequest) (*Join
 		if !completed {
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer cancel()
-			_ = m.chatStore.QueueOwnedCallSeatRemoval(cleanupCtx, &session, store.CallSeat{UserID: req.UserID, PeerID: peerID, SessionHash: req.SessionHash, Guest: req.IsGuest})
+			if created {
+				// Cache end intent even when external setup failed before the normal cache install.
+				m.mu.Lock()
+				c.session = session
+				m.calls[req.RoomID] = c
+				m.mu.Unlock()
+				err = errors.Join(err, m.endOwnedRoom(cleanupCtx, c))
+			} else {
+				err = errors.Join(err, m.chatStore.QueueOwnedCallSeatRemoval(cleanupCtx, &session, seat))
+			}
 		}
 	}()
 	if mode == store.CallModeSFULiveKit {
@@ -256,12 +295,16 @@ func (m *CallManager) joinOwned(ctx context.Context, req JoinCallRequest) (*Join
 	c.session = session
 	c.tenant = *tenant
 	peer.issuedEpoch = session.Epoch
+	if previous != nil && previous.disconnectTimer != nil {
+		previous.disconnectTimer.Stop()
+	}
 	c.peers[peerID] = peer
 	m.calls[req.RoomID] = c
 	if m.userCalls[req.UserID] == nil {
 		m.userCalls[req.UserID] = make(map[string]string)
 	}
 	m.userCalls[req.UserID][req.RoomID] = peerID
+	m.maybeScheduleStepDownLocked(req.RoomID, c)
 	state := m.buildStateLocked(c, true)
 	m.mu.Unlock()
 	if changed {
@@ -273,14 +316,44 @@ func (m *CallManager) joinOwned(ctx context.Context, req JoinCallRequest) (*Join
 	if err := m.chatStore.PutCallSeat(ctx, &session, store.CallSeat{UserID: req.UserID, PeerID: peerID, SessionHash: req.SessionHash, Guest: req.IsGuest}); err != nil {
 		return nil, err
 	}
-	response := &JoinCallResponse{CallID: session.ID, RoomID: req.RoomID, PeerID: peerID, Mode: mode, Epoch: session.Epoch, SFUSticky: session.SFUSticky, SFUAvailable: m.SFUAvailable(), ICEServers: m.ICEServers(), Peers: state.Peers, Started: created}
+	response = &JoinCallResponse{CallID: session.ID, RoomID: req.RoomID, PeerID: peerID, Mode: mode, Epoch: session.Epoch, SFUSticky: session.SFUSticky, SFUAvailable: m.SFUAvailable(), ICEServers: m.ICEServers(), Peers: state.Peers, Started: created}
 	if mode == store.CallModeSFULiveKit {
 		response.LiveKitURL = m.LiveKitURL()
 		response.LiveKitToken = m.livekit.JoinToken(session.LiveKitRoom, peerID, req.DisplayName, "", rtc.DefaultTokenTTL)
 	}
 	m.broadcastState(ctx, req.RoomID, state)
+	if mode == store.CallModeP2PMesh && m.hub != nil && m.hub.HasRoomCallSocket(req.UserID, req.RoomID, req.SessionHash) {
+		if err := m.notifyP2PPeerReady(ctx, c, peerID); err != nil {
+			return nil, err
+		}
+	}
 	completed = true
 	return response, nil
+}
+
+// notifyP2PPeerReady asks only existing authenticated seats to resend an unanswered
+// offer after the newcomer's socket exists. It changes no epoch, mode or bearer.
+func (m *CallManager) notifyP2PPeerReady(ctx context.Context, c *activeCall, peerID string) error {
+	m.mu.Lock()
+	session := c.session
+	ready := c.peers[peerID].CallPeerState
+	var peers []callPeer
+	for id, p := range c.peers {
+		if id != peerID {
+			peers = append(peers, *p)
+		}
+	}
+	m.mu.Unlock()
+	for _, p := range peers {
+		if err := m.chatStore.PutCallSeat(ctx, &session, store.CallSeat{UserID: p.UserID, PeerID: p.PeerID, SessionHash: p.sessionHash, Guest: p.IsGuest}); err != nil {
+			return err
+		}
+		notice := CallMigratePayload{CallID: session.ID, RoomID: session.RoomID, Epoch: session.Epoch, TargetMode: store.CallModeP2PMesh, Reason: "peer_signaling_ready", Peers: []CallPeerState{ready}}
+		if err := m.hub.PublishUser(ctx, p.UserID, Event{Type: EventCallMigrate, RoomID: session.RoomID, UserID: p.UserID, SessionHash: p.sessionHash, Data: MustMarshalData(notice)}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func mediaRoom(cs store.CallSession) string { return "ky_" + cs.ID + "_e" + strconv.Itoa(cs.Epoch) }
@@ -331,16 +404,64 @@ func (m *CallManager) migrateOwnedPeers(ctx context.Context, c *activeCall, reas
 	return nil
 }
 
-// HandleRoomDisconnect removes only the seat belonging to the disconnected session.
-// Another session or a replacement generation cannot be evicted by a late callback.
+// HandleRoomDisconnect allows the existing 20s guest/reconnect window for transport
+// loss only. Explicit leave and primary revocation still remove seats immediately.
 func (m *CallManager) HandleRoomDisconnect(user, room, hash string) {
+	defer m.lockRoom(room)()
+	if m.hub != nil && m.hub.HasRoomCallSocket(user, room, hash) {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c := m.calls[room]
+	if c == nil || c.ending {
+		return
+	}
+	for _, peer := range c.peers {
+		if peer.UserID != user || peer.sessionHash != hash {
+			continue
+		}
+		m.scheduleRoomDisconnectLocked(user, room, hash, peer)
+		return
+	}
+}
+
+func (m *CallManager) scheduleRoomDisconnectLocked(user, room, hash string, peer *callPeer) {
+	if peer.disconnectTimer != nil {
+		peer.disconnectTimer.Stop()
+	}
+	peer.disconnectTimer = m.routing.afterFunc(DefaultGuestLeaveGrace, func() { m.expireRoomDisconnect(user, room, hash, peer) })
+}
+
+func (m *CallManager) expireRoomDisconnect(user, room, hash string, expected *callPeer) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = m.leaveOwned(ctx, room, user, hash, true)
+	defer m.lockRoom(room)()
+	m.mu.Lock()
+	c := m.calls[room]
+	current := c != nil && c.peers[expected.PeerID] == expected
+	if current {
+		expected.disconnectTimer = nil
+	}
+	m.mu.Unlock()
+	if !current {
+		return
+	} // Rejoin replaced the peer, even if its socket is still opening.
+	if err := m.leaveOwnedLocked(ctx, room, user, hash, true); err != nil {
+		m.mu.Lock()
+		if c := m.calls[room]; c != nil && c.peers[expected.PeerID] == expected {
+			m.scheduleRoomDisconnectLocked(user, room, hash, expected)
+		}
+		m.mu.Unlock()
+	}
 }
 
 func (m *CallManager) leaveOwned(ctx context.Context, room, user, hash string, disconnected bool) error {
 	defer m.lockRoom(room)()
+	return m.leaveOwnedLocked(ctx, room, user, hash, disconnected)
+}
+
+func (m *CallManager) leaveOwnedLocked(ctx context.Context, room, user, hash string, disconnected bool) error {
 	if disconnected && m.hub != nil && m.hub.HasRoomCallSocket(user, room, hash) {
 		return nil
 	}

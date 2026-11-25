@@ -84,13 +84,15 @@ type activeCall struct {
 	tenant        store.Tenant
 	peers         map[string]*callPeer // peerID -> peer
 	stepDownTimer *time.Timer
+	ending        bool // routed owner must retry durable end before admitting another join
 }
 
 type callPeer struct {
 	CallPeerState
-	sessionHash   string
-	issuedEpoch   int
-	migratedEpoch int
+	sessionHash     string
+	issuedEpoch     int
+	migratedEpoch   int
+	disconnectTimer *time.Timer
 }
 
 // CallManager coordinates hybrid P2P-first / LiveKit SFU voice and video calls.
@@ -162,8 +164,11 @@ func (m *CallManager) Stats() CallStats {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var s CallStats
-	s.ActiveCalls = len(m.calls)
 	for _, c := range m.calls {
+		if c.ending {
+			continue
+		}
+		s.ActiveCalls++
 		if c.session.Mode == store.CallModeSFULiveKit {
 			s.SFUCalls++
 		} else {
@@ -179,7 +184,7 @@ func (m *CallManager) GetState(roomID string) *CallStatePayload {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	c := m.calls[roomID]
-	if c == nil {
+	if c == nil || c.ending {
 		return nil
 	}
 	st := m.buildStateLocked(c, true)
