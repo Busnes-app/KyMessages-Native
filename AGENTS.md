@@ -209,7 +209,7 @@ When the user requests a durable behavior change, record it here or in the relev
 
 CI (`.github/workflows/ci.yml`) runs on every push and pull request:
 - `make lint` equivalent: gofmt, `go vet`, `go mod tidy`/`verify`, and `scripts/check-compose-proxy.sh`, and `scripts/check-release-required.sh` (every CI job is in the release workflow's `REQUIRED` list), and `scripts/check-build-tags.sh` (the `kye2e` tag only in `internal/config/gate_*.go`; no build tags in release build inputs)
-- `go test -race` with coverage on SQLite, and the same suite against PostgreSQL 17
+- `go test -race` with coverage on SQLite, and the same suite against PostgreSQL 18
 - Bounded fuzzing (`go test -fuzz=… -fuzztime=Nx`, one step per target) of `FuzzClientIP`,
   `FuzzParseTrustedProxies`, `FuzzValidateName` and `FuzzNormalizePNG`; a crasher kept under
   `testdata/fuzz/<Target>/` replays in the normal test run
