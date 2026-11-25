@@ -160,12 +160,13 @@ func TestCellsRefuseAnotherCellsOrgOnEveryWayIn(t *testing.T) {
 		}
 	}
 	// New sessions are refused too, on a sign-in through KyIdentity.
+	cfg.SSO.AutoProvision = true
 	idp := newFakeIdP(t, cfg)
 	fresh := api.NewServer(cfg, st)
 	t.Cleanup(fresh.CloseChat)
 	for org, want := range map[string]int{replicaOrgB: http.StatusForbidden, replicaOrgA: http.StatusFound} {
 		r := idp.signIn(fresh, map[string]any{"sub": "sub-new-" + org[len(org)-2:], "preferred_username": "new" + org[len(org)-2:], "org_id": org})
-		if (want == http.StatusForbidden) != (sessionCookie(r) == nil) {
+		if got := sessionCookie(r) != nil; got != (want != http.StatusForbidden) || (!got && r.Code != http.StatusForbidden) {
 			t.Errorf("sign-in for %s: %d %s", org, r.Code, r.Body.String())
 		}
 	}
