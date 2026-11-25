@@ -48,7 +48,7 @@ type PutResult struct {
 // (erasure and purge).
 type Backend interface {
 	Put(tenantID, key string, r io.Reader, maxBytes int64) (PutResult, error)
-	Open(tenantID, key string) (io.ReadSeekCloser, int64, error)
+	Open(tenantID, key string, sizeBytes int64) (io.ReadSeekCloser, int64, error) // sizeBytes: as recorded at upload
 	Delete(tenantID, key string) error
 	Erase(tenantID, key string) error
 	DeletePrefix(tenantID string) error
@@ -231,8 +231,9 @@ func (s *Store) commitOrg(tmpName, rel string) error {
 	return nil
 }
 
-// Open opens an existing blob strictly confined to the store root directory.
-func (s *Store) Open(tenantID, key string) (io.ReadSeekCloser, int64, error) {
+// Open opens an existing blob strictly confined to the store root directory. The disk store
+// returns the file's own size; it ignores the recorded one, as it always has.
+func (s *Store) Open(tenantID, key string, _ int64) (io.ReadSeekCloser, int64, error) {
 	rel, err := s.rel(tenantID, key)
 	if err != nil {
 		return nil, 0, err

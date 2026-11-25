@@ -183,7 +183,7 @@ func TestS3StoreSealsAndServesVerifiedRanges(t *testing.T) {
 	if len(vs) != 1 || bytes.Contains(vs[0].body, plain) || len(vs[0].body) != len(plain)+SealedOverhead {
 		t.Fatal("the provider holds plaintext or an unexpected object")
 	}
-	f, size, err := st.Open(objectOrgA, "att_example")
+	f, size, err := st.Open(objectOrgA, "att_example", int64(len(plain)))
 	if err != nil || size != int64(len(plain)) {
 		t.Fatal(size, err)
 	}
@@ -216,13 +216,13 @@ func TestS3StoreRefusesCrossOrgAndTamperedObjects(t *testing.T) {
 	bucket.mu.Lock()
 	bucket.substitute["orgs/"+objectOrgB+"/att/att_example"] = "orgs/" + objectOrgA + "/att/att_example"
 	bucket.mu.Unlock()
-	if f, _, err := st.Open(objectOrgB, "att_example"); !errors.Is(err, errObjectIntegrity) || f != nil {
+	if f, _, err := st.Open(objectOrgB, "att_example", int64(len("org A's file"))); !errors.Is(err, errObjectIntegrity) || f != nil {
 		t.Fatalf("cross-org substitution: %v", err)
 	}
 	bucket.mu.Lock()
 	bucket.corrupt = true
 	bucket.mu.Unlock()
-	if f, _, err := st.Open(objectOrgA, "att_example"); !errors.Is(err, errObjectIntegrity) || f != nil {
+	if f, _, err := st.Open(objectOrgA, "att_example", int64(len("org A's file"))); !errors.Is(err, errObjectIntegrity) || f != nil {
 		t.Fatalf("tampered object: %v", err)
 	}
 	for _, org := range []string{"default", "../escape", ""} {
@@ -250,7 +250,7 @@ func TestS3StoreDeleteRetainsEraseAndPrefixRemoveEveryVersion(t *testing.T) {
 	if err := st.Delete(objectOrgA, "att_gone"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := st.Open(objectOrgA, "att_gone"); !errors.Is(err, os.ErrNotExist) {
+	if _, _, err := st.Open(objectOrgA, "att_gone", int64(len("bytes of att_gone"))); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("deleted file still served: %v", err)
 	}
 	if vs := bucket.versions(objectOrgA + "/att/att_gone"); len(vs) != 2 || vs[0].marker || !vs[1].marker {
@@ -277,7 +277,7 @@ func TestS3StoreDeleteRetainsEraseAndPrefixRemoveEveryVersion(t *testing.T) {
 			t.Fatalf("purge left %s: %+v", k, vs)
 		}
 	}
-	if f, _, err := st.Open(objectOrgB, "att_other"); err != nil {
+	if f, _, err := st.Open(objectOrgB, "att_other", int64(len("bytes of att_other"))); err != nil {
 		t.Fatal("purge reached another org", err)
 	} else {
 		f.Close()
@@ -342,8 +342,35 @@ func TestS3StoreOpenFailsWhenScratchWriteFails(t *testing.T) {
 		return os.Open(f.Name()) // read-only: every Write fails
 	}
 	t.Cleanup(func() { createVerified = os.CreateTemp })
-	if f, _, err := st.Open(objectOrgA, "att_scratchfull"); err == nil || f != nil {
+	if f, _, err := st.Open(objectOrgA, "att_scratchfull", int64(len("verified bytes"))); err == nil || f != nil {
 		t.Fatalf("download succeeded without its local copy: %v", err)
 	}
 	assertNoScratch(t, scratch)
+}
+
+// Lowering KY_MAX_UPLOAD_BYTES restricts new uploads only: an existing file stays readable,
+// bounded by its recorded size, and a size that does not match the object is refused.
+func TestS3StoreLowerUploadLimitKeepsExistingFiles(t *testing.T) {
+	st, _, _ := s3Fixture(t)
+	body := bytes.Repeat([]byte("k"), 1000)
+	if _, err := st.Put(objectOrgA, "att_bigger", bytes.NewReader(body), 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	lowered, err := NewS3Store(st.client, bytes.Repeat([]byte{1}, 32), t.TempDir(), 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, size, err := lowered.Open(objectOrgA, "att_bigger", int64(len(body)))
+	if err != nil || size != int64(len(body)) {
+		t.Fatalf("existing file unreadable after a lower limit: %d %v", size, err)
+	}
+	f.Close()
+	if _, err := lowered.Put(objectOrgA, "att_new_big", bytes.NewReader(body), 1<<20); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("lowered limit not applied to a new upload: %v", err)
+	}
+	for _, wrong := range []int64{999, 1001, 0, 200 << 20} {
+		if f, _, err := lowered.Open(objectOrgA, "att_bigger", wrong); !errors.Is(err, errObjectIntegrity) || f != nil {
+			t.Fatalf("recorded size %d: %v", wrong, err)
+		}
+	}
 }

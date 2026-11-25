@@ -92,6 +92,7 @@ jobs:
           REQUIRED: |
             Go build, vet & tests (SQLite)
             Go tests (PostgreSQL)
+            Go tests (versioned S3)
             Frontend typecheck & build
             Browser regressions (production server)
             Vulnerability scan

@@ -337,7 +337,7 @@ func (s *Server) handleChatDownloadAttachment(w http.ResponseWriter, r *http.Req
 		}
 	}
 
-	f, _, err := s.blobs.Open(att.TenantID, att.BlobKey)
+	f, _, err := s.blobs.Open(att.TenantID, att.BlobKey, att.SizeBytes)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) || errors.Is(err, blobs.ErrInvalidKey) {
 			s.writeError(w, http.StatusNotFound, "Attachment not found")

@@ -39,6 +39,9 @@ jobs:
       - name: Proxy compose overlay
         run: bash scripts/check-compose-proxy.sh
 
+      - name: Release gate names every CI job
+        run: bash scripts/check-release-required.sh
+
       - name: go.mod is tidy
         run: |
           go mod tidy

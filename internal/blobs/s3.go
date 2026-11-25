@@ -112,13 +112,17 @@ func (o *S3Store) Put(tenantID, key string, r io.Reader, maxBytes int64) (PutRes
 	return meta, nil
 }
 
-// Open fetches the whole current version (at most maxBytes plus the seal) and verifies its
-// GCM tag, bound to this org and key, before any byte is readable. It serves ranges from a
-// private local copy that Close removes.
-func (o *S3Store) Open(tenantID, key string) (io.ReadSeekCloser, int64, error) {
+// Open fetches the whole current version and verifies its GCM tag, bound to this org and key,
+// before any byte is readable. The object must be exactly sizeBytes (the attachment's recorded
+// size, at most the fixed hard maximum) plus the seal: a lowered upload limit restricts new
+// writes, never existing files. It serves ranges from a private local copy that Close removes.
+func (o *S3Store) Open(tenantID, key string, sizeBytes int64) (io.ReadSeekCloser, int64, error) {
 	object, err := objectPath(tenantID, key)
 	if err != nil {
 		return nil, 0, err
+	}
+	if sizeBytes <= 0 || sizeBytes > config.MaxAllowedUploadBytes {
+		return nil, 0, errObjectIntegrity
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), s3OpTimeout)
 	defer cancel()
@@ -127,11 +131,11 @@ func (o *S3Store) Open(tenantID, key string) (io.ReadSeekCloser, int64, error) {
 		return nil, 0, err // s3.ErrNotFound is os.ErrNotExist
 	}
 	defer body.Close()
-	limit := o.maxBytes + SealedOverhead
-	if meta.Size <= SealedOverhead || meta.Size > limit {
+	want := sizeBytes + SealedOverhead
+	if meta.Size != want {
 		return nil, 0, errObjectIntegrity
 	}
-	sealed, err := io.ReadAll(io.LimitReader(body, limit+1))
+	sealed, err := io.ReadAll(io.LimitReader(body, want+1))
 	if err != nil {
 		return nil, 0, err
 	}
