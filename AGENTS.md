@@ -208,7 +208,7 @@ When the user requests a durable behavior change, record it here or in the relev
 ## Verification
 
 CI (`.github/workflows/ci.yml`) runs on every push and pull request:
-- `make lint` equivalent: gofmt, `go vet`, `go mod tidy`/`verify`, and `scripts/check-compose-proxy.sh`, and `scripts/check-release-required.sh` (every CI job is in the release workflow's `REQUIRED` list)
+- `make lint` equivalent: gofmt, `go vet`, `go mod tidy`/`verify`, and `scripts/check-compose-proxy.sh`, and `scripts/check-release-required.sh` (every CI job is in the release workflow's `REQUIRED` list), and `scripts/check-build-tags.sh` (the `kye2e` tag only in `internal/config/gate_*.go`; no build tags in release build inputs)
 - `go test -race` with coverage on SQLite, and the same suite against PostgreSQL 17
 - Bounded fuzzing (`go test -fuzz=… -fuzztime=Nx`, one step per target) of `FuzzClientIP`,
   `FuzzParseTrustedProxies`, `FuzzValidateName` and `FuzzNormalizePNG`; a crasher kept under
@@ -221,7 +221,7 @@ CI (`.github/workflows/ci.yml`) runs on every push and pull request:
   shutdown. Time injection changes only its scratch database's last-attempt row.
   No live identity or recovery destination is contacted. CI's smoke job runs it.
 - `scripts/smoke-test.sh`: runs the built binary and asserts CLI, auth, session, and SPA behavior
-- Docker image build and container HTTP check
+- Docker image build and container HTTP check; `scripts/check-release-build.sh` proves the image's binary has no `kye2e` tag and refuses a complete multi config (the release workflow runs it before pushing)
 - Chromium and Firefox regressions against the built server: production CSP/worker, themes, responsive layout, sign-in landing in chat with Settings reached from its rail, the Create channel modal, the chat modals and their teammate and search pickers by keyboard, proof-of-work sign-in on a second server, and the Health, Audit (with Directory & SCIM reached from it by keyboard), Overview, Backup and Settings branding (rename by keyboard, logo upload and resets) pages; these checks remain release gates.
 - Container builds use `npm ci`. CI builds/runs `kymessages:ci` and publishes nothing.
   `.github/workflows/release-image.yml` is the only publisher: on a published release `vX.Y.Z`

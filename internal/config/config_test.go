@@ -3,6 +3,7 @@ package config_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -368,9 +369,9 @@ func TestTenancyModeFromEnv(t *testing.T) {
 
 	for _, mode := range []string{"multi", " MuLtI "} {
 		t.Run("unavailable/"+mode, func(t *testing.T) {
-			t.Setenv("KY_DATA_DIR", t.TempDir())
+			completeMultiEnv(t)
 			t.Setenv("KY_TENANCY_MODE", mode)
-			if _, err := config.LoadFromEnv(); err == nil || !strings.Contains(err.Error(), "KY_TENANCY_MODE=multi: multi-tenant mode is unavailable in this release") {
+			if _, err := config.LoadFromEnv(); wantMultiTenantBuild || !errors.Is(err, config.ErrMultiTenantRelease) {
 				t.Fatalf("want multi-tenant release refusal, got %v", err)
 			}
 		})
@@ -617,8 +618,8 @@ func TestMaintenanceLoaderKeepsServerGate(t *testing.T) {
 	if cfg, err := config.LoadForMaintenance(); err != nil || !cfg.Tenancy.IsMultiTenant() {
 		t.Fatalf("offline multi config: %+v %v", cfg, err)
 	}
-	if _, err := config.LoadFromEnv(); err == nil || !strings.Contains(err.Error(), "unavailable in this release") {
-		t.Fatalf("server gate lost: %v", err)
+	if _, err := config.LoadFromEnv(); err == nil {
+		t.Fatal("server gate lost")
 	}
 	t.Setenv("KY_TENANCY_MODE", "invalid")
 	if _, err := config.LoadForMaintenance(); err == nil {

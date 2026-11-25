@@ -409,8 +409,10 @@ a version receipt is erased at once, so no unaccounted object remains.
 Not built yet: the verified per-replica cache and its bus eviction (§9.3: every download fetches
 the object), the admin "reachable" answer, the member's fresh-sign-in removal action, and erasure
 on a provider replica outside the bucket. A crash between a PUT and its row commit leaves an
-orphan object that only the org purge's prefix delete removes. Multi startup stays refused;
-lifting it must also refuse multi mode without `KY_ATTACHMENTS_S3_*` (§9.1).
+orphan object that only the org purge's prefix delete removes. Multi startup stays refused in
+release builds; every build refuses multi mode without `KY_ATTACHMENTS_S3_*` (§9.1). Only a
+`-tags kye2e` test build, with a `.test` issuer, starts in multi mode (KyCalendar's cross-app
+e2e design, 2026-11-24).
 
 ### 9.5 What KyMessages needs from ky-primitives
 
