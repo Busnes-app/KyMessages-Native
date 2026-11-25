@@ -483,7 +483,7 @@ for its existing token/capsules; changing the default does not change KyRecovery
 ## Verification
 
 `make ci` runs formatting, module checks, race tests, frontend tests and the running
-server smoke checks. `make test-postgres` needs a disposable PostgreSQL 17 instance.
+server smoke checks. `make test-postgres` needs a disposable PostgreSQL 18 instance.
 See [web/AGENTS.md](web/AGENTS.md) for production-CSP, keyboard and responsive browser
 checks.
 The smoke CI job also runs `python3 scripts/backup-acceptance.py`, a three-minute
