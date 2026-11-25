@@ -42,6 +42,15 @@ jobs:
       - name: Release gate names every CI job
         run: bash scripts/check-release-required.sh
 
+      # Only a -tags kye2e build may start in multi mode (internal/config/gate_kye2e.go).
+      - name: kye2e tag stays out of release builds
+        run: bash scripts/check-build-tags.sh
+
+      - name: kye2e build opens the gate only for a .test issuer
+        run: |
+          go vet -tags kye2e ./internal/config/
+          go test -tags kye2e -run '^TestBuildGate|^TestTenancyModeFromEnv/unavailable/' ./internal/config/
+
       - name: go.mod is tidy
         run: |
           go mod tidy
@@ -272,6 +281,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build image
         run: docker build -t kymessages:ci .
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Image is a release build (no kye2e tag, refuses multi mode)
+        run: bash scripts/check-release-build.sh kymessages:ci
 
       - name: Container serves the app
         run: |

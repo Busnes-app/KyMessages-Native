@@ -131,6 +131,23 @@ jobs:
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
 
+      # Built and checked before anything is pushed; the publish step below reuses this
+      # builder's cache. A binary built with the e2e build tag could start in multi mode.
+      - name: Build the release image locally
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          tags: kymessages:release-check
+
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Require a release build (no e2e build tag, refuses multi mode)
+        run: bash scripts/check-release-build.sh kymessages:release-check
+
       # Only the immutable tag here. :stable moves after the attestation verifies,
       # so a failed attest never leaves :stable on an unattested image.
       - name: Build and publish the immutable version tag

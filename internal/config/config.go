@@ -268,19 +268,40 @@ const DefaultAppName = "KyMessages"
 // AppVersion is shared by the CLI and every capsule-producing path.
 const AppVersion = "0.4.2"
 
+// ErrMultiTenantRelease is the refusal every release build gives a complete multi-tenant config.
+var ErrMultiTenantRelease = errors.New("KY_TENANCY_MODE=multi: multi-tenant mode is unavailable in this release")
+
 // LoadFromEnv initializes a Config struct populated from environment variables with sensible defaults.
 func LoadFromEnv() (*Config, error) {
 	mode := strings.ToLower(getEnv("KY_TENANCY_MODE", TenancySingle))
-	switch mode {
-	case TenancySingle:
-		return loadFromEnv(mode)
-	case TenancyMulti:
-		// Lifting this gate also means refusing multi startup without KY_ATTACHMENTS_S3_*
-		// (spec §9.1: no disk volume in hosted multi mode).
-		return nil, errors.New("KY_TENANCY_MODE=multi: multi-tenant mode is unavailable in this release")
-	default:
+	if mode != TenancySingle && mode != TenancyMulti {
 		return nil, fmt.Errorf("KY_TENANCY_MODE: only single is available in this release, got %q", mode)
 	}
+	// A test build must never take tokens from a real issuer (RFC 2606 reserves .test).
+	if multiTenantBuild && !testIssuer(getEnv("KY_KYIDENTITY_ISSUER", "")) {
+		return nil, errors.New("KY_KYIDENTITY_ISSUER: this test build accepts only an https issuer under .test")
+	}
+	if mode == TenancySingle {
+		return loadFromEnv(mode)
+	}
+	// Every multi requirement is checked in both builds; only then does a release build refuse.
+	cfg, err := loadFromEnv(mode)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Attachments.ObjectStore == nil {
+		// Spec §9.1: no attachment disk volume in hosted multi mode.
+		return nil, errors.New("KY_TENANCY_MODE=multi requires object storage (KY_ATTACHMENTS_S3_*)")
+	}
+	if !multiTenantBuild {
+		return nil, ErrMultiTenantRelease
+	}
+	return cfg, nil
+}
+
+func testIssuer(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && u.Scheme == "https" && strings.HasSuffix(strings.ToLower(u.Hostname()), ".test")
 }
 
 // LoadForMaintenance reads deployment configuration for offline grant invalidation only.
