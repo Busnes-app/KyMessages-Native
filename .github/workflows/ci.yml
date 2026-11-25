@@ -49,7 +49,7 @@ jobs:
       - name: kye2e build opens the gate only for a .test issuer
         run: |
           go vet -tags kye2e ./internal/config/
-          go test -tags kye2e -run '^TestBuildGate' ./internal/config/
+          go test -tags kye2e -run '^TestBuildGate|^TestTenancyModeFromEnv/unavailable/' ./internal/config/
 
       - name: go.mod is tidy
         run: |

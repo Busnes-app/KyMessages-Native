@@ -371,7 +371,12 @@ func TestTenancyModeFromEnv(t *testing.T) {
 		t.Run("unavailable/"+mode, func(t *testing.T) {
 			completeMultiEnv(t)
 			t.Setenv("KY_TENANCY_MODE", mode)
-			if _, err := config.LoadFromEnv(); wantMultiTenantBuild || !errors.Is(err, config.ErrMultiTenantRelease) {
+			cfg, err := config.LoadFromEnv()
+			if wantMultiTenantBuild {
+				if err != nil || !cfg.Tenancy.IsMultiTenant() {
+					t.Fatalf("test build refused a complete multi config: %v", err)
+				}
+			} else if !errors.Is(err, config.ErrMultiTenantRelease) {
 				t.Fatalf("want multi-tenant release refusal, got %v", err)
 			}
 		})
