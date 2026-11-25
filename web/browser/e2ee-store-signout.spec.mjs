@@ -32,6 +32,23 @@ async function signOut(page) {
   await expect(page.locator('#login-username')).toBeVisible();
 }
 
+test('a started device asks the browser to keep the storage that holds its keys', async ({ page, context }) => {
+  // Counts the requests; the browser still answers them itself.
+  await page.addInitScript(() => {
+    const storage = navigator.storage;
+    const persist = storage.persist.bind(storage);
+    window.persistAsked = 0;
+    storage.persist = () => {
+      window.persistAsked += 1;
+      return persist();
+    };
+  });
+  await signInAndOpenChat(page, context);
+  // Asked once the device's store is open, unless the browser already keeps this site's storage.
+  await expect.poll(() => page.evaluate(async () => window.persistAsked > 0 || (await navigator.storage.persisted()))).toBe(true);
+  await signOut(page);
+});
+
 test('sign-out deletes the encryption store while another tab holds it open', async ({ page, context }) => {
   await signInAndOpenChat(page, context);
   // Tab B hears neither the WebSocket nor the other tab: only the store's own versionchange

@@ -3,6 +3,7 @@
 // opened as they arrive, so the rest of the app only ever sees decrypted text in `body`.
 import { errorMessage, secureFetch } from '../api';
 import { arr, bool, obj, str } from '../dto';
+import { keepStorage } from '../persist';
 import { CryptoEngine, DeviceChanged, type ClaimedKey, type DeviceKeys, type KeyServer, type Mail, type RoomInner } from '../crypto/engine';
 import { loadCrypto } from '../crypto/index';
 import { type CryptoStore, deleteCryptoStores, openCryptoStore, storedDevices } from '../crypto/store';
@@ -168,6 +169,7 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
       live();
     }
     entry.store = s;
+    void keepStorage();
     // Another tab deleted the store on sign-out: drop this engine, so the next use
     // starts afresh instead of writing to a closed or deleted store.
     s.onClosed(() => {
