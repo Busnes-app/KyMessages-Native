@@ -96,7 +96,8 @@ func (o *S3Store) Put(tenantID, key string, r io.Reader, maxBytes int64) (PutRes
 	ctx, cancel := context.WithTimeout(context.Background(), s3OpTimeout)
 	defer cancel()
 	remote, err := o.client.PutIfAbsent(ctx, object, bytes.NewReader(sealed), int64(len(sealed)))
-	if err == nil && remote.VersionID == "" {
+	// "null" is what a bucket with versioning suspended answers: no version to retain.
+	if err == nil && (remote.VersionID == "" || remote.VersionID == "null") {
 		err = errObjectReceipt
 	}
 	if err != nil {
@@ -141,11 +142,11 @@ func (o *S3Store) Open(tenantID, key string) (io.ReadSeekCloser, int64, error) {
 	if err != nil {
 		return nil, 0, errObjectIntegrity
 	}
-	f, err := os.CreateTemp(o.scratch, ".verified-")
+	f, err := createVerified(o.scratch, ".verified-")
 	if err != nil {
 		return nil, 0, err
 	}
-	if _, err := f.Write(plain); err == nil {
+	if _, err = f.Write(plain); err == nil {
 		_, err = f.Seek(0, io.SeekStart)
 	}
 	if err != nil {
@@ -155,6 +156,9 @@ func (o *S3Store) Open(tenantID, key string) (io.ReadSeekCloser, int64, error) {
 	}
 	return &verifiedObject{File: f}, int64(len(plain)), nil
 }
+
+// createVerified makes the private copy a download is served from (a test seam).
+var createVerified = os.CreateTemp
 
 type verifiedObject struct{ *os.File }
 

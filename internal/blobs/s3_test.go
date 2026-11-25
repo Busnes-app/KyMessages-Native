@@ -33,6 +33,7 @@ type versionedBucket struct {
 	keys        map[string][]fakeVersion // oldest first
 	seq, puts   int
 	omitVersion bool
+	nullVersion bool // versioning suspended: every write answers version "null"
 	corrupt     bool
 	substitute  map[string]string // GET of key serves another key
 }
@@ -44,6 +45,9 @@ func (b *versionedBucket) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	b.seq++
 	id := "v" + strconv.Itoa(b.seq) + "/+opaque"
+	if b.nullVersion {
+		id = "null"
+	}
 	switch {
 	case r.Method == http.MethodGet && key == "" && q.Has("versions"):
 		type entry struct {
@@ -305,6 +309,41 @@ func TestS3StoreSweepsStaleScratch(t *testing.T) {
 	}
 	if n := st.SweepStaleTemps(-1); n != 2 {
 		t.Fatal(fmt.Sprint("swept ", n))
+	}
+	assertNoScratch(t, scratch)
+}
+
+// A suspended-versioning bucket answers "null": the write is refused and erased, since no
+// retained version could ever be recorded for it.
+func TestS3StoreRefusesANullVersion(t *testing.T) {
+	st, bucket, scratch := s3Fixture(t)
+	bucket.nullVersion = true
+	if _, err := st.Put(objectOrgA, "att_nullversion", strings.NewReader("must not linger"), 1<<20); !errors.Is(err, errObjectReceipt) {
+		t.Fatal(err)
+	}
+	if vs := bucket.versions(objectOrgA + "/att/att_nullversion"); len(vs) != 0 {
+		t.Fatalf("unaccounted object remains: %+v", vs)
+	}
+	assertNoScratch(t, scratch)
+}
+
+// A local copy that cannot be written (scratch full) fails the download and leaves nothing.
+func TestS3StoreOpenFailsWhenScratchWriteFails(t *testing.T) {
+	st, _, scratch := s3Fixture(t)
+	if _, err := st.Put(objectOrgA, "att_scratchfull", strings.NewReader("verified bytes"), 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	createVerified = func(dir, pattern string) (*os.File, error) {
+		f, err := os.CreateTemp(dir, pattern)
+		if err != nil {
+			return nil, err
+		}
+		f.Close()
+		return os.Open(f.Name()) // read-only: every Write fails
+	}
+	t.Cleanup(func() { createVerified = os.CreateTemp })
+	if f, _, err := st.Open(objectOrgA, "att_scratchfull"); err == nil || f != nil {
+		t.Fatalf("download succeeded without its local copy: %v", err)
 	}
 	assertNoScratch(t, scratch)
 }
