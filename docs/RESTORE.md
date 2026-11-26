@@ -100,7 +100,7 @@ attachment downloads return 404.
     `tenancy.mode=multi`, preserve it for a release that supports multi-tenant startup.
   - Use the restored `data/encryption.key`; remove any stale `KY_ENCRYPTION_KEY` override that
     disagrees with it.
-  - If using LiveKit SFU (`KY_LIVEKIT_*`) or KyCalendar meeting sync (`KY_MEETING_SYNC_SECRET`),
+  - If using LiveKit SFU (`KY_LIVEKIT_*`) or an explicit KyCalendar pair (`KY_KYCALENDAR_URL`, `KY_KYCALENDAR_SECRET_FILE`),
     restore those environment variables before starting. Active calls are not restored across
     restarts; members can rejoin rooms immediately.
   - Keep restored key files private (`0600`) and data directories `0700`.

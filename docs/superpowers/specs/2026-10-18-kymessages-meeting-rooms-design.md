@@ -39,7 +39,8 @@ request is signed with `ky-primitives/syncauth` (scheme v1, the same verifier as
 stable per change, so the replay guard absorbs retries.
 
 - **`PUT /api/meetings/{id}`**, idempotent. `{id}` is KyCalendar's opaque meeting ID.
-  - **Body:** `{organizer_sub, title, member_subs[], guests[{key}], windows[{start, end}]}`.
+  - **Body:** `{id, sub, issuer, title, member_subs[], guests[{key}], windows[{start, end}]}`
+    (KyCalendar contract B wins over this spec's earlier `organizer_sub`; `id` repeats the path).
     - `guests[].key` is an opaque per-attendee key. KyMessages never receives guest names or
       addresses.
     - `windows` covers at most 90 days ahead. KyCalendar sends each occurrence as
@@ -49,11 +50,10 @@ stable per change, so the replay guard absorbs retries.
     - the title becomes the room name;
     - windows are replaced;
     - removed guest keys revoke their links.
-  - **Answers** `{member_url, guest_urls: {key: url}}`. A guest URL is returned only when its key
-    is new or was re-issued.
-  - **Refused (422):** an `organizer_sub` or `member_sub` that is not an active local MAS user
-    linked to KyIdentity, a title over 255 bytes or with control characters, or more than 100
-    members, 100 guests or 400 windows.
+  - **Answers** `{member_url, skipped_subs, guest_urls: {key: url}}`. A guest URL is returned only
+    when its key is new or was re-issued; `skipped_subs` lists members with no account here yet.
+  - **Refused:** an organizer that is not an active everyday account linked to that subject and
+    issuer (404 `no_user`), or more than 100 members, 100 guests or 400 windows.
 - **`DELETE /api/meetings/{id}`** closes the room the way the console's Close does today:
   blocked, members out, history kept. It revokes every guest link and ends every guest session.
 

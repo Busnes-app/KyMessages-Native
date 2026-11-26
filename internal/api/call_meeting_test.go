@@ -37,9 +37,10 @@ func setupCallTestServer(t *testing.T, withLiveKit bool) (*Server, store.Store) 
 			Provider: "none",
 		},
 		RTC: config.RTCConfig{
-			STUNURLs:          []string{"stun:stun.example.com:3478"},
-			MeetingSyncSecret: "meeting-sync-secret-key-32-bytes-minimum!!",
+			STUNURLs: []string{"stun:stun.example.com:3478"},
 		},
+		SSO:        config.SSOConfig{Enabled: true, KyIdentityIssuer: testCalIssuer},
+		KyCalendar: config.PairConfig{URL: "https://cal.example", Secret: []byte(testCalSecret)},
 	}
 	if withLiveKit {
 		lk := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -54,6 +55,21 @@ func setupCallTestServer(t *testing.T, withLiveKit bool) (*Server, store.Store) 
 
 	srv := NewServer(cfg, st)
 	return srv, st
+}
+
+const (
+	testCalIssuer = "https://id.example.com"
+	testCalSecret = "kycalendar-pair-secret-key-32-bytes-minimum!!"
+)
+
+// signCal signs body as KyCalendar does: the pair secret, the route's event type.
+func signCal(t *testing.T, req *http.Request, event, eventID string, body []byte) {
+	t.Helper()
+	h, err := syncauth.Sign([]byte(testCalSecret), time.Now(), event, eventID, body)
+	if err != nil {
+		t.Fatalf("syncauth.Sign: %v", err)
+	}
+	h.Apply(req)
 }
 
 func makeUserAndToken(t *testing.T, _ *Server, st store.Store, id, username, role string) string {
@@ -167,15 +183,22 @@ func TestHybridCallEndpointsAndAdminMediaPolicy(t *testing.T) {
 
 func TestMeetingSyncAndConfinedGuestWaitingRoom(t *testing.T) {
 	srv, st := setupCallTestServer(t, true)
-	hostTok := makeUserAndToken(t, srv, st, "u_host", "host", "admin")
+	hostTok := makeUserAndToken(t, srv, st, "u_host", "host", "user")
+	host, _ := st.Users().GetUserByID(context.Background(), "u_host")
+	host.SSOProvider, host.SSOSubject = "kyidentity", "sub-host"
+	if err := st.Users().UpdateUser(context.Background(), host); err != nil {
+		t.Fatal(err)
+	}
 
 	// 1. KyCalendar upserts a meeting via syncauth-signed PUT /api/meetings/{id}.
 	now := time.Now().UTC()
 	payload, _ := json.Marshal(map[string]any{
-		"organizer_sub": "u_host",
-		"title":         "Quarterly Review",
-		"member_subs":   []string{"u_host"},
-		"guests":        []map[string]string{{"key": "ext-client"}},
+		"id":          "cal-evt-42",
+		"sub":         "sub-host",
+		"issuer":      testCalIssuer,
+		"title":       "Quarterly Review",
+		"member_subs": []string{"sub-host"},
+		"guests":      []map[string]string{{"key": "ext-client"}},
 		"windows": []map[string]string{{
 			"start": now.Add(-5 * time.Minute).Format(time.RFC3339),
 			"end":   now.Add(45 * time.Minute).Format(time.RFC3339),
@@ -183,11 +206,7 @@ func TestMeetingSyncAndConfinedGuestWaitingRoom(t *testing.T) {
 	})
 	req := httptest.NewRequest(http.MethodPut, "/api/meetings/cal-evt-42", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
-	hdrs, err := syncauth.Sign([]byte(srv.config.RTC.MeetingSyncSecret), now, "meeting.upsert", "evt-1", payload)
-	if err != nil {
-		t.Fatalf("syncauth.Sign: %v", err)
-	}
-	hdrs.Apply(req)
+	signCal(t, req, "kycalendar.meeting.put", "evt-1", payload)
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -275,12 +294,9 @@ func TestMeetingSyncAndConfinedGuestWaitingRoom(t *testing.T) {
 	}
 
 	// 7. KyCalendar deletes/closes the meeting -> guest is evicted and link returns 404.
-	delReq := httptest.NewRequest(http.MethodDelete, "/api/meetings/cal-evt-42", nil)
-	delHdrs, err := syncauth.Sign([]byte(srv.config.RTC.MeetingSyncSecret), now, "meeting.delete", "evt-2", nil)
-	if err != nil {
-		t.Fatalf("syncauth.Sign delete: %v", err)
-	}
-	delHdrs.Apply(delReq)
+	delBody := []byte(`{"id":"cal-evt-42","sub":"sub-host","issuer":"` + testCalIssuer + `"}`)
+	delReq := httptest.NewRequest(http.MethodDelete, "/api/meetings/cal-evt-42", bytes.NewReader(delBody))
+	signCal(t, delReq, "kycalendar.meeting.close", "evt-2", delBody)
 	delRec := httptest.NewRecorder()
 	srv.ServeHTTP(delRec, delReq)
 	if delRec.Code != http.StatusOK {

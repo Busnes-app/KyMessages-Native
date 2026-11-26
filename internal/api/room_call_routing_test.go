@@ -96,7 +96,7 @@ func TestRoomCallHTTPAndSocketChooseOneAuthorizedReplica(t *testing.T) {
 func TestGuestRoomCallAliasRequiresExactMeetingAndAdmission(t *testing.T) {
 	lk := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{}`)) }))
 	defer lk.Close()
-	a, b, st, _ := newReplicas(t, func(c *config.Config) {
+	a, b, st, _ := newReplicas(t, withKyCalendar, func(c *config.Config) {
 		c.RTC.LiveKitURL = lk.URL
 		c.RTC.LiveKitAPIKey = "test"
 		c.RTC.LiveKitAPISecret = "test-secret"
@@ -157,7 +157,7 @@ func TestHostedMeetingCloseRetainsMediaCleanupAndRevokesAdmissions(t *testing.T)
 		_, _ = w.Write([]byte(`{}`))
 	}))
 	defer sfu.Close()
-	a, _, st, _ := newReplicas(t, func(c *config.Config) {
+	a, _, st, _ := newReplicas(t, withKyCalendar, func(c *config.Config) {
 		c.RTC.LiveKitURL = sfu.URL
 		c.RTC.LiveKitAPIKey = "test"
 		c.RTC.LiveKitAPISecret = "test-secret"
@@ -187,10 +187,10 @@ func TestHostedMeetingCloseRetainsMediaCleanupAndRevokesAdmissions(t *testing.T)
 	}
 	event := uuid.NewString()
 	closeMeeting := func() *httptest.ResponseRecorder {
-		raw := []byte(`{"org_id":"` + replicaOrgA + `"}`)
+		raw := []byte(`{"id":"closing","org_id":"` + replicaOrgA + `"}`)
 		request := httptest.NewRequest(http.MethodDelete, "/api/meetings/closing", bytes.NewReader(raw))
 		request.Header.Set("Content-Type", "application/json")
-		headers, err := syncauth.Sign([]byte(testMultiTenantHMAC), time.Now(), "meeting.close", event, raw)
+		headers, err := syncauth.Sign([]byte(testMultiTenantHMAC), time.Now(), "kycalendar.meeting.close", event, raw)
 		if err != nil {
 			t.Fatal(err)
 		}

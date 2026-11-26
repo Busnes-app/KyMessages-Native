@@ -143,19 +143,19 @@ sha256 098230e31a14b0105c570ee8e4de14f841da1aff1d84f3e92bbbd1a1660557de
 == meeting create
 status 200
 Content-Type: application/json
-{"guest_urls":{"ext-gold":"http://localhost:8080/meet/<token>"},"meeting_id":"gold-1","member_url":"http://localhost:8080/chat/rm_<uuid>","room_id":"rm_<uuid>"}
+{"guest_urls":{"ext-gold":"http://localhost:8080/meet/<token>"},"meeting_id":"gold-1","member_url":"http://localhost:8080/chat/rm_<uuid>","room_id":"rm_<uuid>","skipped_subs":[]}
 == meeting update
 status 200
 Content-Type: application/json
-{"guest_urls":{},"meeting_id":"gold-1","member_url":"http://localhost:8080/chat/rm_<uuid>","room_id":"rm_<uuid>"}
+{"guest_urls":{},"meeting_id":"gold-1","member_url":"http://localhost:8080/chat/rm_<uuid>","room_id":"rm_<uuid>","skipped_subs":[]}
 == meeting bad signature
 status 401
 Content-Type: application/json
-{"error":"Meeting sync signature invalid or not configured"}
+{"code":"bad_signature","error":"Bad signature"}
 == meeting with org_id in single
 status 400
 Content-Type: application/json
-{"error":"Invalid JSON payload or org_id"}
+{"code":"bad_body","error":"Invalid request"}
 == guest info
 status 200
 Content-Type: application/json

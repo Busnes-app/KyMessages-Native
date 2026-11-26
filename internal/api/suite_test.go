@@ -48,7 +48,6 @@ func newSuiteEnv(t *testing.T, mode string) *suiteEnv {
 		Database:   config.DatabaseConfig{DataDir: t.TempDir()},
 		Security:   config.SecurityConfig{SessionTTL: time.Hour},
 		SSO:        config.SSOConfig{Enabled: true, KyIdentityIssuer: suiteIssuer, KyIdentityHMACSecret: testMultiTenantHMAC},
-		RTC:        config.RTCConfig{MeetingSyncSecret: testMultiTenantHMAC},
 		Tenancy:    config.TenancyConfig{Mode: mode},
 		KyPost:     config.PairConfig{URL: "https://mail.example", Secret: []byte(suiteKyPostKey)},
 		KyCalendar: config.PairConfig{URL: "https://cal.example", Secret: []byte(suiteKyCalKey)},
@@ -302,7 +301,7 @@ func TestSuiteChatUnpaired(t *testing.T) {
 
 func TestMeetingSyncReplayAndOrgRules(t *testing.T) {
 	meeting := func(org string) []byte {
-		m := map[string]any{"title": "Standup", "organizer_sub": "sub-alice"}
+		m := map[string]any{"id": "ext-replay", "sub": "sub-alice", "issuer": suiteIssuer, "title": "Standup"}
 		if org != "" {
 			m["org_id"] = org
 		}
@@ -310,7 +309,7 @@ func TestMeetingSyncReplayAndOrgRules(t *testing.T) {
 		return b
 	}
 	put := func(raw []byte, id string) signed {
-		return signed{method: http.MethodPut, path: "/api/meetings/ext-replay", event: "kycalendar.meeting.put", key: testMultiTenantHMAC, raw: raw, id: id}
+		return signed{method: http.MethodPut, path: "/api/meetings/ext-replay", event: "kycalendar.meeting.put", key: suiteKyCalKey, raw: raw, id: id}
 	}
 
 	single := newSuiteEnv(t, config.TenancySingle)
@@ -321,7 +320,7 @@ func TestMeetingSyncReplayAndOrgRules(t *testing.T) {
 			t.Fatalf("single PUT with org_id %s = %d", raw, rec.Code)
 		}
 	}
-	if rec := single.do(single.srv, signed{method: http.MethodDelete, path: "/api/meetings/ext-replay", event: "kycalendar.meeting.close", key: testMultiTenantHMAC, raw: []byte(`{"org_id":""}`)}); rec.Code != http.StatusBadRequest {
+	if rec := single.do(single.srv, signed{method: http.MethodDelete, path: "/api/meetings/ext-replay", event: "kycalendar.meeting.close", key: suiteKyCalKey, raw: []byte(`{"id":"ext-replay","org_id":""}`)}); rec.Code != http.StatusBadRequest {
 		t.Fatalf("single DELETE with org_id = %d", rec.Code)
 	}
 	// #5 replay on the meeting routes.

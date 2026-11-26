@@ -2,6 +2,7 @@ package api_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -191,27 +192,30 @@ func TestSingleTenantGolden(t *testing.T) {
 
 	// Meetings and guests: create, update, the guest lobby, and close.
 	{
-		srv, st, cfg := setupTestServer(t)
-		cfg.RTC.MeetingSyncSecret = testMultiTenantHMAC
+		srv, st, _ := setupTestServer(t, withKyCalendar)
 		startChatBus(t, srv)
 		defer srv.CloseChat()
-		_, hostTok := createChatTestUser(t, st, "u_g_host", "ghost", "user")
+		host, hostTok := createChatTestUser(t, st, "u_g_host", "ghost", "user")
+		host.SSOProvider, host.SSOSubject = "kyidentity", "sub-g-host"
+		if err := st.Users().UpdateUser(context.Background(), host); err != nil {
+			t.Fatal(err)
+		}
 		now := time.Now().UTC()
 		meeting := func(title string) map[string]any {
-			return map[string]any{"organizer_sub": "u_g_host", "title": title, "member_subs": []string{"u_g_host"},
+			return map[string]any{"sub": "sub-g-host", "title": title, "member_subs": []string{"sub-g-host"},
 				"guests":  []map[string]string{{"key": "ext-gold"}},
 				"windows": []map[string]string{{"start": now.Add(-5 * time.Minute).Format(time.RFC3339), "end": now.Add(45 * time.Minute).Format(time.RFC3339)}}}
 		}
-		rec := goldenSigned(srv, testMultiTenantHMAC, http.MethodPut, "/api/meetings/gold-1", "meeting.upsert", meeting("Gold"))
+		rec := calSigned(srv, testMultiTenantHMAC, http.MethodPut, "/api/meetings/gold-1", meeting("Gold"))
 		g.add("meeting create", rec)
 		var m struct {
 			RoomID    string            `json:"room_id"`
 			GuestURLs map[string]string `json:"guest_urls"`
 		}
 		_ = json.Unmarshal(rec.Body.Bytes(), &m)
-		g.add("meeting update", goldenSigned(srv, testMultiTenantHMAC, http.MethodPut, "/api/meetings/gold-1", "meeting.upsert", meeting("Gold 2")))
-		g.add("meeting bad signature", goldenSigned(srv, "wrong-secret-wrong-secret-wrong-secret!!", http.MethodPut, "/api/meetings/gold-1", "meeting.upsert", meeting("Bad")))
-		g.add("meeting with org_id in single", goldenSigned(srv, testMultiTenantHMAC, http.MethodPut, "/api/meetings/gold-2", "meeting.upsert", map[string]any{"org_id": "00000000-0000-4000-8000-00000000000a", "organizer_sub": "u_g_host", "title": "x"}))
+		g.add("meeting update", calSigned(srv, testMultiTenantHMAC, http.MethodPut, "/api/meetings/gold-1", meeting("Gold 2")))
+		g.add("meeting bad signature", calSigned(srv, "wrong-secret-wrong-secret-wrong-secret!!", http.MethodPut, "/api/meetings/gold-1", meeting("Bad")))
+		g.add("meeting with org_id in single", calSigned(srv, testMultiTenantHMAC, http.MethodPut, "/api/meetings/gold-2", map[string]any{"org_id": "00000000-0000-4000-8000-00000000000a", "sub": "sub-g-host", "title": "x"}))
 		gu := m.GuestURLs["ext-gold"]
 		token := gu[strings.LastIndex(gu, "/meet/")+len("/meet/"):]
 		g.add("guest info", goldenWithCookie(srv, http.MethodGet, "/api/meet/"+token, nil, ""))
@@ -234,7 +238,7 @@ func TestSingleTenantGolden(t *testing.T) {
 		g.add("admit", doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+m.RoomID+"/lobby/"+k.GuestID+"/admit", hostTok, nil, nil))
 		g.add("guest post", goldenWithCookie(srv, http.MethodPost, "/api/meet/"+token+"/messages", gc, `{"body":"hello"}`))
 		g.add("guest messages", goldenWithCookie(srv, http.MethodGet, "/api/meet/"+token+"/messages", gc, ""))
-		g.add("meeting close", goldenSigned(srv, testMultiTenantHMAC, http.MethodDelete, "/api/meetings/gold-1", "meeting.delete", nil))
+		g.add("meeting close", calSigned(srv, testMultiTenantHMAC, http.MethodDelete, "/api/meetings/gold-1", map[string]any{"sub": "sub-g-host"}))
 		g.add("guest after close", goldenWithCookie(srv, http.MethodGet, "/api/meet/"+token+"/messages", gc, ""))
 	}
 
