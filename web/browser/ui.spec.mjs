@@ -1,5 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
+import { ensureEncryption } from './identity.mjs';
 
 async function fits(page) {
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
@@ -86,6 +87,8 @@ test('production CSP, worker, themes, keyboard, dialog and responsive shell', as
   const stagedTray = page.getByRole('list', { name: 'Pending attachments' });
   await expect(stagedTray.getByText(pngName)).toBeVisible();
   await expect(stagedTray.getByText(txtName)).toBeVisible();
+  // An encrypted send needs a verified device.
+  await ensureEncryption(page);
   const sendBtn = page.getByRole('button', { name: 'Send message' });
   await expect(sendBtn).toBeEnabled();
   // The message is sealed (and its room key shared) before it is posted: wait for the post.
