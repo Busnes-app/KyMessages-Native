@@ -1,6 +1,6 @@
 // The E3 identity steps the browser specs share, through the real screens. An encrypted send
 // needs a verified device (an unverified one shares a room key with no one, so it is refused).
-import { expect } from '@playwright/test';
+import { expect, test } from '@playwright/test';
 
 const banner = (page) => page.getByRole('status').filter({ hasText: /Set up encryption|Verify this device/ });
 
@@ -9,12 +9,27 @@ const banner = (page) => page.getByRole('status').filter({ hasText: /Set up encr
  * unknown here) and answers the recovery key read off the screen.
  */
 export async function newIdentity(page) {
-  await banner(page).getByRole('button').click();
-  const dialog = page.getByRole('dialog');
-  if (await dialog.getByRole('heading', { name: 'Verify this device' }).isVisible()) {
-    await dialog.getByRole('button', { name: 'I lost my recovery key and every other device' }).click();
+  // The specs share one account, whose key routes have a per-minute budget: a busy minute
+  // answers 429, which the screen shows. Wait and try again, as login does.
+  let key;
+  for (let attempt = 0; ; attempt++) {
+    await banner(page).getByRole('button').click();
+    const dialog = page.getByRole('dialog');
+    if (await dialog.getByRole('heading', { name: 'Verify this device' }).isVisible()) {
+      await dialog.getByRole('button', { name: 'I lost my recovery key and every other device' }).click();
+    }
+    const limited = dialog.getByRole('alert').filter({ hasText: /Too many/ });
+    const shown = page.getByTestId('recovery-key');
+    await expect(shown.or(limited).first()).toBeVisible({ timeout: 15_000 });
+    if (await shown.count()) {
+      key = (await shown.textContent()).trim();
+      break;
+    }
+    if (attempt >= 3) throw new Error('The key routes stayed rate limited');
+    await dialog.getByRole('button', { name: 'Not now' }).click();
+    test.info().setTimeout(test.info().timeout + 25_000); // the wait is not the test's fault
+    await page.waitForTimeout(20_000);
   }
-  const key = (await page.getByTestId('recovery-key').textContent()).trim();
   await page.getByRole('checkbox', { name: /I saved my recovery key/ }).check();
   await page.getByRole('button', { name: 'Continue' }).click();
   await expect(banner(page)).toHaveCount(0);
