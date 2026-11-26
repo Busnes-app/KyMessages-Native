@@ -34,8 +34,8 @@ interface AttachmentView {
   sealed: SealedFile[];
   /** Encrypted files the message names but the server did not attach. */
   missing: SealedFile[];
-  /** Uploads of a message whose file list cannot be read here, with why. */
-  unreadable: { count: number; reason: string };
+  /** Files this message has that cannot be read here (how many, when the message says), and why. */
+  unreadable?: { reason: string; expected?: number };
   /** Uploads the server attached that the message does not name: never offered. */
   unnamed: number;
   /** Uploads of a message from before E5 (or a bot): plaintext, labelled as such. */
@@ -48,7 +48,7 @@ interface AttachmentView {
  * names its files never shows an upload it does not name.
  */
 export function attachmentView(msg: ChatMessage): AttachmentView {
-  const view: AttachmentView = { sealed: [], missing: [], unreadable: { count: 0, reason: '' }, unnamed: 0, plain: [] };
+  const view: AttachmentView = { sealed: [], missing: [], unnamed: 0, plain: [] };
   if (msg.encoding === 'e2ee_room_v1' && msg.e2ee?.kind !== 'decrypted') return view;
   if (msg.files) {
     const named = new Set(sealedIds(msg.files));
@@ -56,7 +56,8 @@ export function attachmentView(msg: ChatMessage): AttachmentView {
     view.missing = msg.files.filter((f) => f.missing);
     view.unnamed = msg.attachments.filter((a) => !named.has(a.id)).length;
   } else if (msg.filesState) {
-    view.unreadable = { count: msg.attachments.length, reason: msg.filesState.reason };
+    // Shown even when the server lists no rows: their absence is no evidence there are none.
+    view.unreadable = { reason: msg.filesState.reason, expected: msg.filesState.expected };
   } else {
     view.plain = msg.attachments;
   }
@@ -186,7 +187,7 @@ export const MessageRow: React.FC<MessageRowProps> = ({
   const files = attachmentView(message);
   const sealedFiles = files.sealed;
   const plainFiles = files.plain;
-  const shownFiles = sealedFiles.length + files.missing.length + files.unreadable.count + plainFiles.length;
+  const shownFiles = sealedFiles.length + files.missing.length + (files.unreadable ? 1 : 0) + plainFiles.length;
   const canDelete = isSynced && !isDeleted && (isOwn || canModerate);
   const authorLabel = message.sender_name || 'Unknown';
 
@@ -370,9 +371,13 @@ export const MessageRow: React.FC<MessageRowProps> = ({
                 ))}
               </div>
             )}
-            {files.unreadable.count > 0 && (
+            {files.unreadable && (
               <p className="chat-msg-e2ee-note">
-                {files.unreadable.count === 1 ? 'Attachment unavailable.' : `${files.unreadable.count} attachments unavailable.`}{' '}
+                {files.unreadable.expected === 1
+                  ? 'Attachment unavailable.'
+                  : files.unreadable.expected
+                    ? `${files.unreadable.expected} attachments unavailable.`
+                    : 'Attachments unavailable.'}{' '}
                 {files.unreadable.reason}
               </p>
             )}

@@ -995,6 +995,11 @@ func TestChatAttachmentsRefusedUploadsReleaseEverything(t *testing.T) {
 	if n := blobsOnDisk(); n != 0 {
 		t.Fatalf("refused uploads left %d blobs on disk", n)
 	}
+	// The body is refused before the blob is put in place: not even a temporary file remains for a
+	// failed rollback to strand.
+	if entries, _ := os.ReadDir(filepath.Join(cfg.Database.DataDir, "attachments")); len(entries) != 0 {
+		t.Fatalf("refused uploads left files: %v", entries)
+	}
 	if rec := doMultipartUpload(t, srv, up, aliceTok, "file", "f", bytes.Repeat([]byte("k"), 1500)); rec.Code != http.StatusCreated {
 		t.Fatalf("upload after refusals = %d: %s (a reservation was not released)", rec.Code, rec.Body.String())
 	}
@@ -1012,5 +1017,39 @@ func TestChatAttachmentsRefusedUploadsReleaseEverything(t *testing.T) {
 	}
 	if rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room+"/messages", botTok, map[string]any{"body": "files", "encoding": "plain_v1", "attachment_ids": ids[:10]}, nil); rec.Code != http.StatusCreated {
 		t.Fatalf("plaintext message with 10 attachments = %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// A message from before E5 (plaintext, with plaintext files) keeps no "original" however often it
+// is edited, even once it is edited into an encrypted envelope: only a genuine first encrypted
+// envelope is ever kept.
+func TestChatLegacyAttachmentEditsKeepNoOriginal(t *testing.T) {
+	srv, st, _ := setupTestServer(t)
+	startChatBus(t, srv)
+	defer srv.CloseChat()
+	_, aliceTok := createChatTestUser(t, st, "u_leg_alice", "legalice", "user")
+	botTok := createChatTestBot(t, st, "u_leg_bot", "legbot", "u_leg_alice")
+	room := roomOf(t, doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", aliceTok, map[string]any{"kind": store.RoomKindChannel, "name": "legacy", "member_ids": []string{"u_leg_bot"}}, nil))
+	var up struct {
+		Attachment store.Attachment `json:"attachment"`
+	}
+	_ = json.Unmarshal(doPlainUpload(t, srv, "/api/v1/rooms/"+room+"/attachments", botTok, "file", "report.txt", []byte("plaintext report")).Body.Bytes(), &up)
+	var posted struct {
+		Message store.Message `json:"message"`
+	}
+	_ = json.Unmarshal(doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room+"/messages", botTok, map[string]any{"body": "report", "encoding": "plain_v1", "attachment_ids": []string{up.Attachment.ID}}, nil).Body.Bytes(), &posted)
+	for i, edit := range []map[string]any{
+		{"body": "report v2", "encoding": "plain_v1"},
+		{"body": testEnvelope("report v3"), "encoding": "e2ee_room_v1"},
+		{"body": testEnvelope("report v4"), "encoding": "e2ee_room_v1"},
+	} {
+		rec := doBearerJSON(t, srv, http.MethodPatch, "/api/v1/rooms/"+room+"/messages/"+posted.Message.ID, botTok, edit, nil)
+		var got struct {
+			Message store.Message `json:"message"`
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &got)
+		if rec.Code != http.StatusOK || got.Message.OriginalBody != "" || len(got.Message.Attachments) != 1 {
+			t.Fatalf("edit %d = %d, original_body %q, %d attachments", i+1, rec.Code, got.Message.OriginalBody, len(got.Message.Attachments))
+		}
 	}
 }

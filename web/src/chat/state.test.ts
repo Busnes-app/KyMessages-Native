@@ -43,7 +43,7 @@ describe('chat state helpers', () => {
       body: 'race condition',
       delivery: { kind: 'sending', idempotencyKey: 'k2' },
     });
-    const wsCopy = makeMsg({ id: 'msg_99', seq: 99, body: 'race condition' });
+    const wsCopy = makeMsg({ id: 'msg_99', seq: 99, body: 'race condition', ref: 'k2' });
 
     const afterWs = upsertMessage([pending], wsCopy);
     expect(afterWs).toHaveLength(1);
@@ -81,7 +81,7 @@ describe('chat state helpers', () => {
       attachments: [attB],
       delivery: { kind: 'sending', idempotencyKey: 'kb' },
     });
-    const wsB = makeMsg({ id: 'msg_101', seq: 101, body: '', attachments: [attB] });
+    const wsB = makeMsg({ id: 'msg_101', seq: 101, body: '', attachments: [attB], ref: 'kb' });
 
     const next = upsertMessage([pendingA, pendingB], wsB);
     expect(next).toHaveLength(2);
@@ -168,11 +168,29 @@ describe('encrypted files', () => {
     expect(searchSignature(opened)).not.toBe(searchSignature({ ...opened, files: [{ ...file, name: 'q4.xlsx' }] }));
   });
 
-  it('matches an optimistic encrypted send to the server copy by its sealed uploads', () => {
+  it('matches an unsent copy to the server copy by the idempotency key it seals, not by its rows', () => {
     const optimistic: ChatMessage = { ...base, id: 'pending_k', seq: Number.MAX_SAFE_INTEGER, body: 'hi', e2ee: { kind: 'decrypted' }, files: [file], delivery: { kind: 'sending', idempotencyKey: 'k' } };
     const att = (id: string) => ({ id, tenant_id: 't', room_id: 'r', uploader_id: 'u', filename: 'encrypted.bin', mime_type: 'application/octet-stream', size_bytes: 1, sha256_hex: '', created_at: 1 });
-    const confirmed: ChatMessage = { ...base, id: 'm_real', seq: 5, body: 'hi', e2ee: { kind: 'decrypted' }, attachments: [att('att_t'), att('att_f')] };
-    const out = upsertMessage([optimistic], confirmed);
-    expect(out.map((m) => m.id)).toEqual(['m_real']);
+    // The server dropped the thumbnail row: still the same message.
+    const confirmed: ChatMessage = { ...base, id: 'm_real', seq: 5, body: 'hi', e2ee: { kind: 'decrypted' }, attachments: [att('att_f')], ref: 'k' };
+    expect(upsertMessage([optimistic], confirmed).map((m) => m.id)).toEqual(['m_real']);
+    // A send that failed after the server took it is replaced too, not shown twice.
+    const failed: ChatMessage = { ...optimistic, delivery: { kind: 'failed', idempotencyKey: 'k', error: 'network' } };
+    expect(upsertMessage([failed], confirmed).map((m) => m.id)).toEqual(['m_real']);
+    // Another message with the same text and rows is not that send.
+    expect(upsertMessage([optimistic], { ...confirmed, ref: 'other' }).map((m) => m.id)).toEqual(['m_real', 'pending_k']);
+  });
+
+  it('keeps a deletion and the newest edit over late copies', () => {
+    const live: ChatMessage = { ...base, body: 'v2', edited_at: 20, e2ee: { kind: 'decrypted' } };
+    const tomb: ChatMessage = { ...base, body: '', deleted_at: 30 };
+    // A late edit response or history page never revives a deleted message.
+    expect(upsertMessage([tomb], live)[0].deleted_at).toBe(30);
+    expect(mergeMessageBatch([tomb], [live])[0].deleted_at).toBe(30);
+    // An older edit never replaces a newer one.
+    expect(upsertMessage([live], { ...live, body: 'v1', edited_at: 10 })[0].body).toBe('v2');
+    expect(mergeMessageBatch([live], [{ ...live, body: 'v1', edited_at: 10 }])[0].body).toBe('v2');
+    // A deletion always lands.
+    expect(upsertMessage([live], tomb)[0].deleted_at).toBe(30);
   });
 });

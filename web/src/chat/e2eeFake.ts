@@ -1,7 +1,7 @@
 // A stand-in for chat/e2ee.ts in page tests, which run without the WebAssembly core: "sealing"
 // base64-encodes the inner JSON under a session name, and a message opens once its session's key
 // has "arrived". Use with vi.mock('../chat/e2ee', () => import('../chat/e2eeFake')).
-import { messageFiles, type OpenedEnvelope } from '../crypto/attachments';
+import { expectOriginal, messageFiles, withTries, type OpenedEnvelope } from '../crypto/attachments';
 import type { RoomInner } from '../crypto/engine';
 import type { ChatMessage } from './types';
 
@@ -88,11 +88,13 @@ function openNow(m: ChatMessage): ChatMessage {
   let original: OpenedEnvelope | undefined;
   if (inner.type === 'edit' && m.original) {
     const o = JSON.parse(m.original) as { session_id: string; ciphertext: string };
-    original = keys.has(o.session_id) ? { state: 'decrypted', inner: JSON.parse(atob(o.ciphertext)) as RoomInner } : { state: 'waiting' };
+    const opened = keys.has(o.session_id) ? (JSON.parse(atob(o.ciphertext)) as RoomInner) : undefined;
+    const refused = opened && expectOriginal(inner)(opened);
+    original = !opened ? { state: 'waiting' } : refused ? { state: 'failed', reason: refused } : { state: 'decrypted', inner: opened };
   }
   const files = messageFiles(inner, original, m.attachments, keyGen);
   if (!files) return { ...m, body: '', e2ee: { kind: 'failed', reason: 'This message is damaged.' } };
-  return { ...m, body: inner.body, reply_to_id: inner.reply_to_id, e2ee: { kind: 'decrypted' }, ...files };
+  return { ...m, body: inner.body, reply_to_id: inner.reply_to_id, e2ee: { kind: 'decrypted' }, ...withTries(files, m.filesState?.tries) };
 }
 
 let held: Promise<void> | undefined;

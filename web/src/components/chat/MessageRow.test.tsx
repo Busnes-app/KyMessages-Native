@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MessageRow } from './MessageRow';
 import type { ChatAttachment, ChatMessage } from '../../chat/types';
 import { encryptBlob, type FileDescriptor } from '../../crypto/attachments';
@@ -314,10 +314,15 @@ describe('MessageRow', () => {
     });
 
     it('shows the uploads of a message whose files cannot be read here as unavailable, not plaintext', () => {
-      row({ ...sealed, body: 'new caption', filesState: { reason: 'This message was sent before this device could read the room.' }, attachments: [att('att_1')] });
-      expect(screen.getByText(/Attachment unavailable\. This message was sent before this device could read the room\./)).toBeTruthy();
+      // One file with its thumbnail is two rows, but one attachment: the count is the message's.
+      row({ ...sealed, body: 'new caption', filesState: { reason: 'This message was sent before this device could read the room.', expected: 1 }, attachments: [att('att_1'), att('att_1t')] });
+      expect(screen.getByText(/^Attachment unavailable\. This message was sent before this device could read the room\./)).toBeTruthy();
       expect(screen.queryByText('File not encrypted')).toBeNull();
       expect(screen.queryByRole('link')).toBeNull();
+      cleanup();
+      // The server withheld every row as well: the message still says it has files.
+      row({ ...sealed, body: 'new caption', filesState: { reason: "This message's files are not available.", expected: 2 }, attachments: [] });
+      expect(screen.getByText(/2 attachments unavailable\./)).toBeTruthy();
     });
 
     it('labels the uploads of a message from before E5 as not encrypted', () => {
@@ -334,10 +339,11 @@ describe('MessageRow', () => {
 
     // A PNG header (signature and IHDR) declaring width x height.
     const pngHeader = (width: number, height: number) => {
-      const b = new Uint8Array(33);
+      const b = new Uint8Array(45);
       b.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52]);
       new DataView(b.buffer).setUint32(16, width);
       new DataView(b.buffer).setUint32(20, height);
+      b.set([0, 0, 0, 0, 0x49, 0x44, 0x41, 0x54], 33); // an empty IDAT: a still image
       return b;
     };
 
@@ -353,6 +359,31 @@ describe('MessageRow', () => {
         expect(made).not.toHaveBeenCalled();
         cleanup();
       }
+    });
+
+    it('decrypts a thumbnail only near the viewport, and cancels it when scrolled away unfinished', async () => {
+      const { sealed: t } = await encryptBlob(new Blob([pngHeader(4, 3)]), 'thumb');
+      const thumb = { ...t, attachment_id: 'att_thumb', mime_type: 'image/png', width: 4, height: 3 };
+      let seen: (entries: { isIntersecting: boolean }[]) => void = () => undefined;
+      vi.stubGlobal('IntersectionObserver', class {
+        constructor(cb: typeof seen) {
+          seen = cb;
+        }
+        observe() {}
+        disconnect() {}
+      });
+      const signals: AbortSignal[] = [];
+      vi.stubGlobal('fetch', vi.fn((_url: string, init?: RequestInit) => {
+        signals.push(init!.signal!);
+        return new Promise<Response>(() => undefined);
+      }));
+      row({ ...sealed, body: '', files: [{ attachment_id: 'att_img', name: 'photo.png', mime_type: 'image/png', size: 9, thumb } as FileDescriptor], attachments: [att('att_img'), att('att_thumb')] });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(signals).toHaveLength(0);
+      act(() => seen([{ isIntersecting: true }]));
+      await waitFor(() => expect(signals).toHaveLength(1));
+      act(() => seen([{ isIntersecting: false }]));
+      expect(signals[0].aborted).toBe(true);
     });
 
     it('decrypts a thumbnail into a blob: URL and revokes it on unmount', async () => {

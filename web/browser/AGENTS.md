@@ -10,6 +10,7 @@ This directory owns test setup, disposable server launch and UI assertions. The 
 
 ## Local Contracts
 
+- `KY_BROWSER_PORT` (default 5391) moves both disposable servers (it and the next port), so two checkouts can run the suite at once; `server.mjs` passes `PUSH_RELAY_URL` and `APNS_RELAY_URL` empty.
 - Never reuse a development or production server. Launch the compiled `.browser/server` with a minimal environment and an owned temporary data directory; remove that directory on exit. `server.mjs [port] [captcha]` serves 5391 with captcha `none` for the main projects and 5392 with `pow` for the `captcha-pow` project (`captcha.spec.mjs`, Chromium), which `globalSetup` never touches.
 - `captcha.spec.mjs` signs in through the real proof-of-work: one challenge fetch while idle, exactly one more after a wrong password, then the bootstrap password reaches "Change your password".
 - Find sign-in fields by label (`getByLabel('Username')`, `getByLabel('Password')`), not placeholder. Sign-in lands in chat; `openSettings` waits for the Conversation region, opens the room list when a narrow screen hides the rail, then uses the rail's Settings gear. A reload returns to chat.
@@ -24,7 +25,7 @@ This directory owns test setup, disposable server launch and UI assertions. The 
 - Settings Branding at every project: reset to defaults first (a failed project must not break the next on the shared server), a 64-character name typed by keyboard (the header wraps it), a PNG upload previewed by digest with `/app-icon.png` served `no-cache`, then both resets.
 - `e2ee-device-reset.spec.mjs` exercises real shared devices in Chromium and Firefox: the server retires a device but refuses logout after its CSRF header is stripped. Another tab recovers without reload, including a stalled query aborted by the reset and a missed BroadcastChannel notification. A separate peer encrypts history and reads new messages; retained inbound keys, pins and replay records are checked, and a fresh engine decrypts the old ciphertext. Responses remain real server answers.
 - `e2ee-store-signout.spec.mjs`: a started device asks for persistent storage (counted around the browser's own `persist()`); sign-out deletes the encryption store even while another tab holds it, and reports one it cannot delete.
-- `ui.spec.mjs` attachments are end-to-end encrypted: uploads go to `?encrypted=1` as `encrypted.bin` (Firefox shows Playwright the multipart body, so the name, type and bytes are checked there; Chromium leaves a Blob-backed body empty), the stored rows and the HTTP download are opaque ciphertext, and the button's real download decrypts to the original file.
+- `ui.spec.mjs` attachments are end-to-end encrypted: uploads go to `?encrypted=1` as `encrypted.bin` (Firefox shows Playwright the multipart body, so the name, type and bytes are checked there; Chromium leaves a Blob-backed body empty), the stored rows and the HTTP download are opaque ciphertext, and the button's real download decrypts to the original file. Exactly three uploads (image, its thumbnail, text file). A caption edit seals only an envelope (the server returns the first one as `original_body`), and after a reload the caption, thumbnail, preview and real download still work.
 - Screenshots and failure traces live in ignored `test-results/` and CI artifacts, not production assets.
 
 ## Work Guidance

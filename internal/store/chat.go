@@ -957,19 +957,26 @@ func (c *chatStore) EditMessage(ctx context.Context, tenantID, roomID, messageID
 		return nil, ErrNotFound
 	}
 
-	if err := c.attachAttachments(ctx, tx, []*Message{m}); err != nil {
+	// One statement, so a concurrent delete or erase always wins: a tombstone is never written to.
+	// The first envelope of an encrypted message with files keeps their keys (an edit replaces only
+	// the text, so they are never sealed again for later room members). Only a genuine first
+	// envelope is kept: never one of a message edited before, whose body is already an edit.
+	editedAt := nowMilli()
+	err = tx.QueryRowContext(ctx, c.store.rebind(`UPDATE messages SET body = ?, encoding = ?, edited_at = ?,
+		original_body = CASE WHEN original_body = '' AND edited_at IS NULL AND encoding = ?
+			AND EXISTS (SELECT 1 FROM attachments a WHERE a.tenant_id = messages.tenant_id AND a.room_id = messages.room_id AND a.message_id = messages.id)
+			THEN body ELSE original_body END
+		WHERE tenant_id = ? AND room_id = ? AND id = ? AND deleted_at IS NULL
+		RETURNING original_body`),
+		newBody, encoding, editedAt, MessageEncodingE2EERoomV1, tenantID, roomID, messageID,
+	).Scan(&m.OriginalBody)
+	if errorsIs(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
 		return nil, err
 	}
-	// The first envelope of an encrypted message with files keeps their keys; an edit replaces
-	// only the text, so the keys are never sealed again for later room members.
-	if m.OriginalBody == "" && m.Encoding == MessageEncodingE2EERoomV1 && len(m.Attachments) > 0 {
-		m.OriginalBody = m.Body
-	}
-	editedAt := nowMilli()
-	if _, err := tx.ExecContext(ctx,
-		c.store.rebind(`UPDATE messages SET body = ?, original_body = ?, encoding = ?, edited_at = ? WHERE tenant_id = ? AND room_id = ? AND id = ?`),
-		newBody, m.OriginalBody, encoding, editedAt, tenantID, roomID, messageID,
-	); err != nil {
+	if err := c.attachAttachments(ctx, tx, []*Message{m}); err != nil {
 		return nil, err
 	}
 	if err := c.attachReactions(ctx, tx, []*Message{m}); err != nil {

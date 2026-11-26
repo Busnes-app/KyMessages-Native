@@ -1,12 +1,13 @@
-import { sealedIds } from '../crypto/attachments';
 import type { ChatMessage, ChatReactionSummary, ChatRoomSummary } from './types';
 
-// An optimistic encrypted send knows its uploads only from its sealed file list; the server's copy
-// lists them as attachments (and, once opened, as files too).
-const attachmentIds = (m: ChatMessage) => (m.files ? sealedIds(m.files) : m.attachments.map((a) => a.id)).sort().join('\n');
-
-function sameAttachmentIds(a: ChatMessage, b: ChatMessage): boolean {
-  return attachmentIds(a) === attachmentIds(b);
+/**
+ * Which of two copies of one message to keep: a deletion always wins, and a copy older than the
+ * one held (an earlier edit, a stale page or response) never replaces it.
+ */
+function keep(held: ChatMessage, incoming: ChatMessage): ChatMessage {
+  if (held.deleted_at && !incoming.deleted_at) return held;
+  if (!incoming.deleted_at && (held.edited_at ?? 0) > (incoming.edited_at ?? 0)) return held;
+  return incoming;
 }
 
 /** What the on-device search index holds of a message: a change means it is indexed again. */
@@ -28,19 +29,18 @@ export function upsertMessage(
   const idx = withoutOptimistic.findIndex((m) => m.id === incoming.id);
   let next: ChatMessage[];
   if (idx >= 0) {
+    const held = withoutOptimistic[idx];
     next = [...withoutOptimistic];
-    next[idx] = {
-      ...incoming,
-      reactions: incoming.reactions.length > 0 ? incoming.reactions : withoutOptimistic[idx].reactions,
-    };
+    next[idx] = keep(held, incoming) === held ? held : { ...incoming, reactions: incoming.reactions.length > 0 ? incoming.reactions : held.reactions };
   } else {
-    // Also drop any pending optimistic message from the same sender with identical body and attachments when WS races ahead of REST.
+    // The socket can confirm a send before (or instead of) its REST answer: the unsent copy with the
+    // idempotency key the message seals as its `ref` is that message, sending or already failed.
     const dupIdx = withoutOptimistic.findIndex(
       (m) =>
-        m.delivery.kind === 'sending' &&
+        m.delivery.kind !== 'synced' &&
         m.sender_id === incoming.sender_id &&
-        m.body === incoming.body &&
-        sameAttachmentIds(m, incoming),
+        incoming.ref !== undefined &&
+        m.delivery.idempotencyKey === incoming.ref,
     );
     if (dupIdx >= 0) {
       next = [...withoutOptimistic];
@@ -61,7 +61,8 @@ export function mergeMessageBatch(existing: ChatMessage[], incoming: ChatMessage
     byId.set(m.id, m);
   }
   for (const m of incoming) {
-    byId.set(m.id, m);
+    const held = byId.get(m.id);
+    byId.set(m.id, held ? keep(held, m) : m);
   }
   return sortMessages(Array.from(byId.values()));
 }

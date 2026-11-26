@@ -529,3 +529,54 @@ func TestAttachmentQuotaAtomicConcurrencyAndReservationRelease(t *testing.T) {
 		}
 	})
 }
+
+// An edit never writes into a deleted message: deleted before, or concurrently, the row stays a
+// tombstone with no body and no kept envelope.
+func TestChatStoreEditNeverRevivesATombstone(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	chat := st.Chat()
+	room := &store.Room{Kind: store.RoomKindChannel, Name: "tomb", CreatedBy: "u_alice"}
+	if err := chat.CreateRoom(ctx, room, nil); err != nil {
+		t.Fatal(err)
+	}
+	post := func(i int) *store.Message {
+		m, _, err := chat.CreateMessage(ctx, store.CreateMessageParams{RoomID: room.ID, SenderID: "u_alice", Encoding: store.MessageEncodingE2EERoomV1, Body: fmt.Sprintf("first %d", i)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	gone := post(0)
+	if _, err := chat.DeleteMessage(ctx, "", room.ID, gone.ID, "u_alice", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := chat.EditMessage(ctx, "", room.ID, gone.ID, "u_alice", "late edit", store.MessageEncodingE2EERoomV1); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("edit of a deleted message = %v, want ErrNotFound", err)
+	}
+	for i := 1; i <= 20; i++ {
+		m := post(i)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, _ = chat.DeleteMessage(ctx, "", room.ID, m.ID, "u_alice", false)
+		}()
+		go func() {
+			defer wg.Done()
+			if _, err := chat.EditMessage(ctx, "", room.ID, m.ID, "u_alice", "racing edit", store.MessageEncodingE2EERoomV1); err != nil && !errors.Is(err, store.ErrNotFound) {
+				t.Errorf("racing edit: %v", err)
+			}
+		}()
+		wg.Wait()
+	}
+	page, _, err := chat.ListMessages(ctx, store.MessagePageQuery{RoomID: room.ID, Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range page {
+		if m.DeletedAt == nil || m.Body != "" || m.OriginalBody != "" {
+			t.Fatalf("message %s after delete/edit race: deleted=%v body=%q original=%q", m.ID, m.DeletedAt != nil, m.Body, m.OriginalBody)
+		}
+	}
+}

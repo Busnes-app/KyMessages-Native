@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -251,13 +252,19 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 	}
 
 	attID := "att_" + uuid.Must(uuid.NewV7()).String()
+	var body io.Reader = filePart
 	if encrypted {
 		rawFilename = encryptedFilename
+		// Nothing may follow the ciphertext either: the whole body is checked before the blob is
+		// put in place, so a refused upload never leaves one behind.
+		body = &soleFile{part: filePart, rest: mr}
 	}
-	putRes, err := s.blobs.Put(tenantID, attID, filePart, res.ReservedBytes, blobs.PutOptions{Opaque: encrypted})
+	putRes, err := s.blobs.Put(tenantID, attID, body, res.ReservedBytes, blobs.PutOptions{Opaque: encrypted})
 	if err != nil {
 		var maxErr *http.MaxBytesError
 		switch {
+		case errors.Is(err, errTrailingPart):
+			s.writeError(w, http.StatusBadRequest, "An encrypted upload carries only its file")
 		case (errors.Is(err, blobs.ErrTooLarge) || errors.As(err, &maxErr)) && res.LimitingKind == store.AttachmentQuotaLimitPool:
 			s.writePoolError(w, store.ErrPoolFull)
 		case errors.Is(err, blobs.ErrTooLarge) || errors.As(err, &maxErr):
@@ -268,14 +275,6 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 			s.writeError(w, http.StatusInternalServerError, "Failed to store uploaded file")
 		}
 		return
-	}
-	// Nothing may follow the ciphertext either: an encrypted upload has no metadata.
-	if encrypted {
-		if _, err := mr.NextPart(); !errors.Is(err, io.EOF) {
-			s.eraseUncommitted(tenantID, putRes.Key)
-			s.writeError(w, http.StatusBadRequest, "An encrypted upload carries only its file")
-			return
-		}
 	}
 
 	att := &store.Attachment{
@@ -313,6 +312,25 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 
 	w.Header().Set("Cache-Control", "no-store")
 	s.writeJSON(w, http.StatusCreated, map[string]any{"attachment": att})
+}
+
+var errTrailingPart = errors.New("encrypted upload has more than its file")
+
+// soleFile reads an encrypted upload's file part and, where that part ends, fails unless the
+// multipart body ends there too, so Put refuses the blob before committing it.
+type soleFile struct {
+	part io.Reader
+	rest *multipart.Reader
+}
+
+func (f *soleFile) Read(p []byte) (int, error) {
+	n, err := f.part.Read(p)
+	if errors.Is(err, io.EOF) {
+		if _, next := f.rest.NextPart(); !errors.Is(next, io.EOF) {
+			return n, errTrailingPart
+		}
+	}
+	return n, err
 }
 
 // eraseUncommitted removes a blob whose upload was refused before its row was written. A failure

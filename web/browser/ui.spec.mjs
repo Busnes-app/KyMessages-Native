@@ -96,7 +96,8 @@ test('production CSP, worker, themes, keyboard, dialog and responsive shell', as
   await expect(sendBtn).toBeEnabled();
   page.off('request', onUpload);
   // Every upload is ciphertext: the flag, a generic name, never the file's name, type or bytes.
-  expect(uploads.length).toBeGreaterThanOrEqual(2);
+  // Exactly three: the image, its thumbnail and the text file (a text file has no thumbnail).
+  expect(uploads).toHaveLength(3);
   for (const req of uploads) {
     expect(new URL(req.url()).search).toBe('?encrypted=1');
     // Firefox shows Playwright the multipart body; Chromium leaves a Blob-backed body empty. The
@@ -113,7 +114,11 @@ test('production CSP, worker, themes, keyboard, dialog and responsive shell', as
   const postedResp = await posted;
   expect(postedResp.status()).toBe(201);
   const sent = (await postedResp.json()).message;
-  expect(JSON.stringify(postedResp.request().postDataJSON())).not.toContain(txtName);
+  const postedJSON = JSON.stringify(postedResp.request().postDataJSON());
+  expect(postedJSON).not.toContain(txtName);
+  expect(postedJSON).not.toContain(pngName);
+  expect(postedResp.request().postDataJSON()).toMatchObject({ encoding: 'e2ee_room_v1', attachment_ids: expect.any(Array) });
+  expect(sent.attachments).toHaveLength(3);
 
   const inlineImg = page.getByRole('img', { name: pngName }).last();
   await expect(inlineImg).toBeVisible();
@@ -137,8 +142,38 @@ test('production CSP, worker, themes, keyboard, dialog and responsive shell', as
   const cipherBody = await dlResp.body();
   expect(cipherBody.length).toBe(Buffer.byteLength(txtBody) + 16);
   expect(cipherBody.toString('latin1')).not.toContain(txtBody);
+
+  // Caption the files afterwards. The edit seals only text and what the files are, never their
+  // keys; the server keeps the envelope the files were sent in.
+  const caption = `caption-${suffix}`;
+  // By message ID: while editing, the row shows the edit form in place of its files.
+  const row = page.locator(`article[data-msg-id="${sent.id}"]`);
+  await row.hover();
+  await row.getByRole('button', { name: 'Edit message' }).click();
+  const editBox = row.getByRole('textbox', { name: 'Edit message' });
+  await editBox.fill(caption);
+  const patched = page.waitForResponse((r) => r.request().method() === 'PATCH' && r.url().includes(`/messages/${sent.id}`));
+  await editBox.press('Enter');
+  const patchedResp = await patched;
+  expect(patchedResp.status()).toBe(200);
+  const patchBody = patchedResp.request().postDataJSON();
+  expect(patchBody.encoding).toBe('e2ee_room_v1');
+  expect(JSON.stringify(patchBody)).not.toContain(caption);
+  expect((await patchedResp.json()).message.original_body).toBe(sent.body);
+  await expect(row.getByText(caption)).toBeVisible();
+
+  // After a reload the caption, the thumbnail (from the kept first envelope), the preview and the
+  // real file all still decrypt.
+  await page.reload();
+  const reloaded = page.locator(`article[data-msg-id="${sent.id}"]`);
+  await expect(reloaded.getByText(caption)).toBeVisible();
+  await expect(reloaded.getByRole('img', { name: pngName })).toBeVisible();
+  await expect.poll(() => reloaded.getByRole('img', { name: pngName }).evaluate((el) => el.complete && el.naturalWidth > 0)).toBe(true);
+  await reloaded.getByRole('button', { name: `Preview ${pngName}` }).click();
+  await expect(page.getByRole('dialog', { name: `Image preview: ${pngName}` }).getByRole('img', { name: pngName })).toBeVisible();
+  await page.keyboard.press('Escape');
   // The button decrypts and saves the real file under its real name.
-  const saveTxt = page.getByRole('button', { name: `Download ${txtName}` }).last();
+  const saveTxt = reloaded.getByRole('button', { name: `Download ${txtName}` });
   await expect(saveTxt).toBeVisible();
   const download = page.waitForEvent('download');
   await saveTxt.click();
@@ -146,10 +181,7 @@ test('production CSP, worker, themes, keyboard, dialog and responsive shell', as
   expect(saved.suggestedFilename()).toBe(txtName);
   expect(await readFile(await saved.path(), 'utf8')).toBe(txtBody);
   await expect(page.getByText('File not encrypted')).toHaveCount(0);
-
-  await page.reload();
-  await expect(page.getByRole('img', { name: pngName }).last()).toBeVisible();
-  await expect(page.getByRole('button', { name: `Download ${txtName}` }).last()).toBeVisible();
+  await expect(page.getByText(/unavailable|were replaced/)).toHaveCount(0);
 
   await openSettings(page);
   const nav = page.getByRole('navigation', { name: 'Settings and administration' });

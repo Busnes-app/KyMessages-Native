@@ -5,7 +5,7 @@ import { CryptoEngine, DeviceChanged, deviceSigned, oneTimeKeySigned, parseEnvel
 import { FakeKeyServer } from './fakeKeyServer';
 import { Account, GroupSession, loadCryptoSync } from './index';
 import { deleteCryptoStores, openCryptoStore } from './store';
-import { messageFiles, type OpenedEnvelope } from './attachments';
+import { FILES_REPLACED, expectOriginal, messageFiles, type OpenedEnvelope } from './attachments';
 import { editInner } from '../chat/client';
 
 beforeAll(() => {
@@ -194,38 +194,65 @@ describe('encrypted rooms between two client engines', () => {
     expect(await read(bob, bad)).toBe('failed: This message is damaged.');
   });
 
+  const descriptor = (id: string) => ({ attachment_id: id, v: 1, alg: 'A256GCM-STREAM', key: `${'S'.repeat(42)}Q`, nonce_prefix: `${'N'.repeat(9)}A`, chunk_size: 65536, sha256: 'a'.repeat(64), ciphertext_size: 26, size: 10, name: `${id}.pdf`, mime_type: 'application/pdf' });
+
+  // What a reader makes of an edited message whose kept original the server serves as `original`.
+  async function readEdited(reader: CryptoEngine, edited: SealedMessage, original: string, attached: string[]) {
+    const e = await reader.decrypt(edited);
+    if (e.state !== 'decrypted') throw new Error(`edit: ${e.state}`);
+    const o: OpenedEnvelope = await reader.decrypt({ ...edited, body: original }, expectOriginal(e.inner));
+    return { body: e.inner.body, inner: e.inner, files: messageFiles(e.inner, o, attached.map((id) => ({ id })), 0) };
+  }
+
   it('never hands a file key to a member who joined after the file was sent, even through a caption edit', async () => {
     const server = new FakeKeyServer();
     const alice = await device(server, 'u_alice');
     const bob = await device(server, 'u_bob');
     const carol = await device(server, 'u_carol');
     server.join('r1', 'u_alice', 'u_bob');
-    const descriptor = { attachment_id: 'att_1', v: 1, alg: 'A256GCM-STREAM', key: `${'S'.repeat(42)}Q`, nonce_prefix: `${'N'.repeat(9)}A`, chunk_size: 65536, sha256: 'a'.repeat(64), ciphertext_size: 26, size: 10, name: 'plan.pdf', mime_type: 'application/pdf' };
-    const original = post('r1', alice, await alice.encrypt('r1', { type: 'attachment', body: 'the plan', files: [descriptor] }));
+    const original = post('r1', alice, await alice.encrypt('r1', { type: 'attachment', body: 'the plan', ref: 'ref-plan-0001', files: [descriptor('att_1')] }));
     await bob.receive();
     server.join('r1', 'u_carol');
     // The edit goes to everyone in the room now, Carol included; the server keeps the original.
-    const editEnvelope = await alice.encrypt('r1', editInner(original.id, 'the plan, v2'));
-    const edited = { ...original, body: editEnvelope };
+    const edited = { ...original, body: await alice.encrypt('r1', editInner(original.id, 'the plan, v2', { kind: 'e5', ref: 'ref-plan-0001', files: 1 })) };
     await bob.receive();
     await carol.receive();
 
-    const filesFor = async (reader: CryptoEngine) => {
-      const e = await reader.decrypt(edited);
-      if (e.state !== 'decrypted') throw new Error(`edit: ${e.state}`);
-      const o: OpenedEnvelope = await reader.decrypt(original);
-      return { body: e.inner.body, editFiles: e.inner.files, files: messageFiles(e.inner, o, [{ id: 'att_1' }], 0) };
-    };
-    const forCarol = await filesFor(carol);
+    const forCarol = await readEdited(carol, edited, original.body, ['att_1']);
     expect(forCarol.body).toBe('the plan, v2');
-    expect(forCarol.editFiles).toEqual([]);
+    expect(forCarol.inner.files).toBeUndefined();
     expect(forCarol.files?.files).toBeUndefined();
-    expect(forCarol.files?.filesState?.reason).toMatch(/before this device could read the room/);
+    expect(forCarol.files?.filesState).toMatchObject({ expected: 1, reason: expect.stringMatching(/before this device could read the room/) });
     expect(JSON.stringify(forCarol)).not.toContain('S'.repeat(42));
     // Bob, who was there, still reads the file from the original.
-    const forBob = await filesFor(bob);
+    const forBob = await readEdited(bob, edited, original.body, ['att_1']);
     expect(forBob.body).toBe('the plan, v2');
     expect(forBob.files?.files?.[0]).toMatchObject({ attachment_id: 'att_1', key: `${'S'.repeat(42)}Q` });
+  });
+
+  it('refuses another message as an edited message\'s original on a fresh device, without taking its place', async () => {
+    const server = new FakeKeyServer();
+    const alice = await device(server, 'u_alice');
+    const dave = await device(server, 'u_dave');
+    server.join('r1', 'u_alice', 'u_dave');
+    const feb = post('r1', alice, await alice.encrypt('r1', { type: 'attachment', body: 'February', ref: 'ref-feb-00001', files: [descriptor('att_feb')] }));
+    const old = post('r1', alice, await alice.encrypt('r1', { type: 'text', body: 'sent before E5' }));
+    const mar = post('r1', alice, await alice.encrypt('r1', { type: 'attachment', body: 'March', ref: 'ref-mar-00001', files: [descriptor('att_mar')] }));
+    const edited = { ...mar, body: await alice.encrypt('r1', editInner(mar.id, 'signed March invoice', { kind: 'e5', ref: 'ref-mar-00001', files: 1 })) };
+    await dave.receive();
+
+    // The server pairs the authentic caption with February's envelope (and rows), then with a
+    // pre-E5 envelope (a downgrade to server-chosen plaintext): both are refused.
+    for (const [swap, rows] of [[feb, ['att_feb']], [old, ['att_plain']]] as const) {
+      const seen = await readEdited(dave, edited, swap.body, [...rows]);
+      expect(seen.body).toBe('signed March invoice');
+      expect(seen.files?.files).toBeUndefined();
+      expect(seen.files?.filesState).toEqual({ reason: FILES_REPLACED, expected: 1 });
+    }
+    // The substitutes claimed nothing: the real messages still open as themselves.
+    expect(await read(dave, feb)).toBe('February');
+    expect(await read(dave, old)).toBe('sent before E5');
+    expect((await readEdited(dave, edited, mar.body, ['att_mar'])).files?.files?.[0].attachment_id).toBe('att_mar');
   });
 
   it('binds an edit to the message it edits', async () => {

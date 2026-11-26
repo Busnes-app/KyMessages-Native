@@ -266,47 +266,112 @@ export function openFiles(raw: unknown, attached: readonly { id: string }[]): Se
   });
 }
 
-/** What a message's files are once opened: absent for a message from before E5 (plaintext uploads). */
+/**
+ * What an edit says the message it edits holds: E5 files (the sender's message ID and how many),
+ * or a message from before E5 whose uploads are plaintext. Read only from an envelope bound to
+ * the message (the message itself, or its latest edit), never from the server's kept original.
+ */
+export type Provenance = { kind: 'e5'; ref: string; files: number } | { kind: 'legacy' };
+const LEGACY: Provenance = { kind: 'legacy' };
+const REF_RE = /^[A-Za-z0-9_-]{8,128}$/;
+
+function parseProvenance(v: unknown): Provenance | undefined {
+  if (!isObj(v)) return undefined;
+  if (v.kind === 'legacy') return LEGACY;
+  if (v.kind !== 'e5' || typeof v.ref !== 'string' || !REF_RE.test(v.ref) || !isInt(v.files, 0, MAX_FILES)) return undefined;
+  return { kind: 'e5', ref: v.ref, files: v.files };
+}
+
+/** What a message's files are once opened. No `files` and no `filesState`: from before E5 (plaintext uploads). */
 export interface MessageFiles {
   files?: SealedFile[];
-  /** Files exist but cannot be read here; `gen` set when worth trying again as keys arrive. */
-  filesState?: { reason: string; gen?: number };
+  /** Files exist but cannot be read here. `gen` set while worth trying again as keys arrive. */
+  filesState?: { reason: string; gen?: number; tries?: number; expected?: number };
+  /** What an edit of this message must carry; absent when it cannot be edited safely. */
+  provenance?: Provenance;
+  /** The sender's ID for the message (its idempotency key). */
+  ref?: string;
 }
 
 /** An envelope opened as far as files care (crypto/engine.ts `Opened`). */
 export type OpenedEnvelope =
-  | { state: 'decrypted'; inner: { type: string; files?: unknown[] } }
+  | { state: 'decrypted'; inner: Inner }
   | { state: 'waiting' }
   | { state: 'failed'; reason: string };
+type Inner = { type: string; files?: unknown[]; ref?: string; original?: unknown };
 
 export const FILES_WAITING = "Waiting for the key to this message's files.";
 const FILES_GONE = "This message's files are not available.";
+export const FILES_REPLACED = "This message's files were replaced or damaged, so they are not shown.";
+const FILES_UNVERIFIED = "This message's files cannot be verified.";
 
 /**
- * A message's files, or undefined when they are damaged. Only the envelope a message was first sent
- * in describes them: the message itself, or once it was edited the server's kept `original` (edits
- * never repeat file keys, so a member who joined later gets none). An edit carries `files: []` to
- * say it was sealed by an E5 client. A message whose envelope has no `files` is from before E5.
+ * What the server's kept original of an edited message must be: for E5, the sender's first
+ * envelope of this very message (same ID, same number of files). Checked before the original's
+ * ratchet index is claimed, so a substitute never takes another message's place.
+ */
+export function expectOriginal(edit: Inner): (inner: Inner) => string | undefined {
+  const prov = parseProvenance(edit.original);
+  return (inner) => {
+    if (inner.type === 'edit') return FILES_REPLACED;
+    if (prov?.kind !== 'e5') return undefined;
+    return inner.ref === prov.ref && Array.isArray(inner.files) && inner.files.length === prov.files ? undefined : FILES_REPLACED;
+  };
+}
+
+/**
+ * A message's files, or undefined when the message is damaged. A message sent since E5 carries
+ * its files and its sender's ID (`ref`); an edit carries only text and `original`, which names
+ * that ID and how many files there are, never their keys. The server keeps the first envelope
+ * (`original`) and it must match. Anything missing, withheld or substituted reads as unavailable,
+ * never as fewer files; only a message from before E5 has plaintext uploads.
  */
 export function messageFiles(
-  inner: { type: string; files?: unknown[] },
+  inner: Inner,
   original: OpenedEnvelope | undefined,
   attached: readonly { id: string }[],
   gen: number,
 ): MessageFiles | undefined {
-  const named = (raw: unknown[] | undefined): MessageFiles | undefined => {
-    if (raw === undefined) return {};
-    const files = openFiles(raw, attached);
-    return files && { files };
-  };
-  if (inner.type !== 'edit') return named(inner.files);
-  if (!original) {
-    if (inner.files === undefined) return {};
-    return attached.length > 0 ? { filesState: { reason: FILES_GONE } } : { files: [] };
+  if (inner.type !== 'edit') {
+    if (inner.files === undefined) return { provenance: LEGACY };
+    if (typeof inner.ref !== 'string' || !REF_RE.test(inner.ref)) return undefined;
+    const files = openFiles(inner.files, attached);
+    return files && { files, ref: inner.ref, provenance: { kind: 'e5', ref: inner.ref, files: files.length } };
   }
-  if (original.state === 'waiting') return { filesState: { reason: FILES_WAITING, gen } };
-  if (original.state === 'failed') return { filesState: { reason: original.reason } };
-  return original.inner.type === 'edit' ? undefined : named(original.inner.files);
+  if (inner.original === undefined) {
+    // Sealed before this format. A pre-E5 edit keeps plaintext uploads, unless the kept original
+    // shows the message had E5 files, which such an edit cannot vouch for.
+    if (inner.files !== undefined) return { filesState: { reason: FILES_UNVERIFIED } };
+    if (!original) return { provenance: LEGACY };
+    return original.state === 'decrypted' && original.inner.type !== 'edit' && original.inner.files === undefined
+      ? { provenance: LEGACY }
+      : { filesState: { reason: FILES_UNVERIFIED } };
+  }
+  const prov = parseProvenance(inner.original);
+  if (!prov) return undefined;
+  if (prov.kind === 'legacy') return { provenance: prov };
+  const base = { provenance: prov, ref: prov.ref };
+  if (prov.files === 0) return { ...base, files: [] };
+  const expected = prov.files;
+  if (!original) return { ...base, filesState: { reason: FILES_GONE, expected } };
+  if (original.state === 'waiting') return { ...base, filesState: { reason: FILES_WAITING, gen, expected } };
+  if (original.state === 'failed') return { ...base, filesState: { reason: original.reason, expected } };
+  const files = expectOriginal(inner)(original.inner) ? undefined : openFiles(original.inner.files, attached);
+  return files ? { ...base, files } : { ...base, filesState: { reason: FILES_REPLACED, expected } };
+}
+
+const MAX_FILE_TRIES = 5;
+
+/**
+ * Counts how often a message's files waited for their key, after `tries` earlier waits. A key that
+ * never comes (a member who joined after the files were sent) stops being waited for, so retries
+ * stay bounded; a reload tries again.
+ */
+export function withTries(out: MessageFiles, tries = 0): MessageFiles {
+  const s = out.filesState;
+  if (s?.gen === undefined) return out;
+  if (tries + 1 >= MAX_FILE_TRIES) return { ...out, filesState: { reason: "The key to this message's files has not reached this device.", expected: s.expected } };
+  return { ...out, filesState: { ...s, tries: tries + 1 } };
 }
 
 /** Every server attachment ID a descriptor list names (files and their thumbnails). */
@@ -315,28 +380,43 @@ export const sealedIds = (files: readonly FileDescriptor[]) =>
 
 // --- Raster headers, read before any image is decoded (a small file can claim a huge canvas) ---
 
+/** Image types shown inline (thumbnails, previews); GIF and anything else are only ever saved. */
+export const PREVIEW_MIMES = THUMB_MIMES;
+
 const SOF = new Set([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf]);
 
-/** The pixel size a PNG, JPEG, GIF or WebP header declares, or undefined if it cannot be read. */
-export function rasterSize(b: Uint8Array): { width: number; height: number } | undefined {
+/**
+ * The pixel size a still PNG, JPEG or WebP header declares, only when its signature is the type
+ * `mime` names. Undefined for anything else: another or no signature, an animation (APNG `acTL`,
+ * animated WebP), a header cut short or not found in `b`.
+ */
+export function rasterSize(b: Uint8Array, mime: string): { width: number; height: number } | undefined {
   const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
-  const is = (off: number, ...bytes: number[]) => bytes.every((x, i) => b[off + i] === x);
+  const is = (off: number, ...bytes: number[]) => off + bytes.length <= b.length && bytes.every((x, i) => b[off + i] === x);
   const ascii = (off: number, s: string) => is(off, ...Array.from(s, (c) => c.charCodeAt(0)));
   const size = (width: number, height: number) => (width > 0 && height > 0 ? { width, height } : undefined);
-  if (b.length >= 24 && is(0, 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a) && ascii(12, 'IHDR')) {
-    return size(dv.getUint32(16), dv.getUint32(20));
+  const u24 = (off: number) => b[off] | (b[off + 1] << 8) | (b[off + 2] << 16);
+  if (mime === 'image/png') {
+    if (!is(0, 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a) || !ascii(12, 'IHDR') || b.length < 24) return undefined;
+    const declared = size(dv.getUint32(16), dv.getUint32(20));
+    // An APNG announces itself (acTL) before its first image data (IDAT).
+    for (let off = 8; off + 8 <= b.length; off += 12 + dv.getUint32(off)) {
+      if (ascii(off + 4, 'acTL')) return undefined;
+      if (ascii(off + 4, 'IDAT')) return declared;
+    }
+    return undefined;
   }
-  if (b.length >= 10 && (ascii(0, 'GIF87a') || ascii(0, 'GIF89a'))) return size(dv.getUint16(6, true), dv.getUint16(8, true));
-  if (b.length >= 30 && ascii(0, 'RIFF') && ascii(8, 'WEBP')) {
+  if (mime === 'image/webp') {
+    if (!ascii(0, 'RIFF') || !ascii(8, 'WEBP') || b.length < 30) return undefined;
     if (ascii(12, 'VP8 ') && is(23, 0x9d, 0x01, 0x2a)) return size(dv.getUint16(26, true) & 0x3fff, dv.getUint16(28, true) & 0x3fff);
     if (ascii(12, 'VP8L') && b[20] === 0x2f) {
       const bits = dv.getUint32(21, true);
       return size((bits & 0x3fff) + 1, ((bits >>> 14) & 0x3fff) + 1);
     }
-    if (ascii(12, 'VP8X')) return size((dv.getUint32(24, true) & 0xffffff) + 1, (dv.getUint32(27, true) & 0xffffff) + 1);
+    if (ascii(12, 'VP8X') && !(b[20] & 0x02)) return size(u24(24) + 1, u24(27) + 1);
     return undefined;
   }
-  if (b.length >= 4 && is(0, 0xff, 0xd8)) {
+  if (mime === 'image/jpeg' && is(0, 0xff, 0xd8, 0xff)) {
     for (let off = 2; off + 9 <= b.length; ) {
       if (b[off] !== 0xff) return undefined;
       const marker = b[off + 1];
@@ -349,7 +429,9 @@ export function rasterSize(b: Uint8Array): { width: number; height: number } | u
       } else if ((marker >= 0xd0 && marker <= 0xd7) || marker === 0x01) {
         off += 2;
       } else {
-        off += 2 + dv.getUint16(off + 2);
+        const len = dv.getUint16(off + 2);
+        if (len < 2) return undefined;
+        off += 2 + len;
       }
     }
   }

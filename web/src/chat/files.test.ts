@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { encryptBlob, type FileDescriptor } from '../crypto/attachments';
-import { openSealed, saveSealed, uploadEncryptedFile } from './files';
+import { limiter, openSealed, saveSealed, uploadEncryptedFile } from './files';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -116,10 +116,12 @@ describe('saving', () => {
 
 describe('uploading', () => {
   const png = (width: number, height: number) => {
+    // Signature, IHDR (13 bytes and its CRC), then an empty IDAT: a still PNG header.
     const b = new Uint8Array(64);
     b.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52]);
     new DataView(b.buffer).setUint32(16, width);
     new DataView(b.buffer).setUint32(20, height);
+    b.set([0, 0, 0, 0, 0x49, 0x44, 0x41, 0x54], 33);
     return new File([b], 'photo.png', { type: 'image/png' });
   };
   const uploaded = (id: string) =>
@@ -141,7 +143,13 @@ describe('uploading', () => {
       if (init?.method === 'DELETE') return new Response(null, { status: 204 });
       return calls.filter((c) => c.startsWith('POST')).length === 1 ? uploaded('att_file') : new Response('{"error":"full"}', { status: 507 });
     }));
-    const desc = await uploadEncryptedFile('r1', png(800, 600));
+    const picked = png(800, 600);
+    const previews: Blob[] = [];
+    const desc = await uploadEncryptedFile('r1', picked, undefined, (b) => previews.push(b));
+    // The composer is shown the bounded re-encoded thumbnail, never the picked file.
+    expect(previews).toHaveLength(1);
+    expect(previews[0]).not.toBe(picked);
+    expect(previews[0].type).toBe('image/webp');
     expect(desc.attachment_id).toBe('att_file');
     expect(desc).toMatchObject({ width: 800, height: 600 });
     expect(desc.thumb).toBeUndefined();
@@ -151,8 +159,10 @@ describe('uploading', () => {
   it('never decodes an image whose header declares more pixels than allowed', async () => {
     const bitmap = stubCanvas();
     vi.stubGlobal('fetch', vi.fn(async () => uploaded('att_file')));
-    const desc = await uploadEncryptedFile('r1', png(100_000, 100_000));
+    const onPreview = vi.fn();
+    const desc = await uploadEncryptedFile('r1', png(100_000, 100_000), undefined, onPreview);
     expect(bitmap).not.toHaveBeenCalled();
+    expect(onPreview).not.toHaveBeenCalled();
     expect(desc.thumb).toBeUndefined();
   });
 
@@ -179,5 +189,74 @@ describe('uploading', () => {
     }
     expect((await all).map((d) => d.attachment_id).sort()).toEqual(['att_1', 'att_2', 'att_3', 'att_4']);
     expect(most).toBe(2);
+  });
+});
+
+describe('limits', () => {
+  it('never runs more than its limit, and hands each freed slot to the next waiter', async () => {
+    const run = limiter(2);
+    let active = 0;
+    let most = 0;
+    const gates: (() => void)[] = [];
+    const task = () => new Promise<void>((resolve) => {
+      active++;
+      most = Math.max(most, active);
+      gates.push(() => {
+        active--;
+        resolve();
+      });
+    });
+    const all = Array.from({ length: 6 }, () => run(task));
+    for (let done = 0; done < 6; done++) {
+      await vi.waitFor(() => expect(gates.length).toBeGreaterThan(0));
+      gates.shift()!();
+      // A caller arriving just as a slot frees cannot take it from the waiter it was handed to.
+      void run(async () => undefined);
+    }
+    await Promise.all(all);
+    expect(most).toBe(2);
+  });
+
+  it('lets a waiter whose caller left go at once, without holding up the queue', async () => {
+    const run = limiter(1);
+    let release!: () => void;
+    const first = run(() => new Promise<void>((r) => (release = r)));
+    const ctrl = new AbortController();
+    const left = run(async () => 'never', ctrl.signal);
+    const next = run(async () => 'next');
+    ctrl.abort(new Error('left'));
+    await expect(left).rejects.toThrow('left');
+    release();
+    await first;
+    expect(await next).toBe('next');
+  });
+
+  it('gives up on a download that keeps trickling past its deadline', async () => {
+    const { ciphertext, file } = await sealedFile();
+    vi.useFakeTimers();
+    try {
+      let cancelled = false;
+      // One byte every 20 s: never a 30 s stall, but far past the 30 s + size deadline.
+      const trickle = new ReadableStream<Uint8Array>({
+        async pull(c) {
+          await new Promise((r) => setTimeout(r, 20_000));
+          c.enqueue(ciphertext.subarray(0, 1));
+        },
+        cancel() {
+          cancelled = true;
+        },
+      });
+      vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
+        init?.signal?.addEventListener('abort', () => void trickle.cancel().catch(() => undefined));
+        return new Response(trickle);
+      }));
+      const opening = openSealed(file, 'file', 'text/plain');
+      const failed = expect(opening).rejects.toThrow(/took too long|stalled|abort/i);
+      await vi.advanceTimersByTimeAsync(31_000);
+      await failed;
+      expect(cancelled).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

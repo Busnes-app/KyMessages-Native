@@ -6,6 +6,7 @@ import { obj } from '../dto';
 import {
   DAMAGED,
   MAX_THUMB_CIPHERTEXT,
+  PREVIEW_MIMES,
   THUMB_MAX_PX,
   THUMB_MIMES,
   checkBlob,
@@ -21,29 +22,54 @@ import {
   type SealedBlob,
 } from '../crypto/attachments';
 import { deleteAttachment } from './client';
-import { attachmentUrl, isInlineImageAttachment, parseAttachment, type ChatAttachment } from './types';
+import { attachmentUrl, parseAttachment, type ChatAttachment } from './types';
 
 // The most pixels this tab decodes for a thumbnail or a preview: a small file can declare a huge
 // canvas (a decompression bomb), so headers are read before anything is decoded.
 export const MAX_DECODE_PIXELS = 50_000_000;
 // Where a raster header sits: a JPEG's frame header can follow up to 64 KiB of EXIF.
 const HEADER_BYTES = 256 << 10;
-// A download that sends nothing for this long is given up.
+// A download that sends nothing for this long, or is not done by its deadline (30 s plus the
+// time to fetch it at 64 KiB/s), is given up.
 const STALL_MS = 30_000;
+const deadlineMs = (bytes: number) => 30_000 + Math.ceil(bytes / 64);
 
-/** Runs at most `n` tasks at once, in call order. */
-function limiter(n: number) {
+/**
+ * Runs at most `n` tasks at once, in call order. A finished task hands its slot straight to the
+ * next waiter, so nothing can slip in between; a waiter whose signal aborts leaves the queue at once.
+ */
+export function limiter(n: number) {
   let running = 0;
-  const queue: (() => void)[] = [];
+  const queue: { start: () => void }[] = [];
+  const release = () => {
+    const next = queue.shift();
+    if (next) next.start();
+    else running--;
+  };
   return async <T>(task: () => Promise<T>, signal?: AbortSignal): Promise<T> => {
-    if (running >= n) await new Promise<void>((resolve) => queue.push(resolve));
-    running++;
+    signal?.throwIfAborted();
+    if (running < n) {
+      running++;
+    } else {
+      await new Promise<void>((resolve, reject) => {
+        const waiter = {
+          start: () => {
+            signal?.removeEventListener('abort', leave);
+            resolve();
+          },
+        };
+        const leave = () => {
+          queue.splice(queue.indexOf(waiter), 1);
+          reject(signal?.reason);
+        };
+        queue.push(waiter);
+        signal?.addEventListener('abort', leave, { once: true });
+      });
+    }
     try {
-      signal?.throwIfAborted();
       return await task();
     } finally {
-      running--;
-      queue.shift()?.();
+      release();
     }
   };
 }
@@ -63,9 +89,9 @@ interface Thumbnail {
 // A bounded re-encode of a browser-decodable image; re-encoding also drops its metadata (EXIF,
 // location). Undefined when the browser cannot make one: the file is still sent, without a preview.
 async function makeThumbnail(file: Blob): Promise<Thumbnail | undefined> {
-  if (!isInlineImageAttachment({ mime_type: file.type }) || typeof createImageBitmap !== 'function') return undefined;
+  if (!PREVIEW_MIMES.has(file.type) || typeof createImageBitmap !== 'function') return undefined;
   try {
-    const declared = rasterSize(new Uint8Array(await file.slice(0, HEADER_BYTES).arrayBuffer()));
+    const declared = rasterSize(new Uint8Array(await file.slice(0, HEADER_BYTES).arrayBuffer()), file.type);
     if (!declared || declared.width * declared.height > MAX_DECODE_PIXELS) return undefined;
     const bmp = await createImageBitmap(file);
     const { width, height } = bmp;
@@ -101,13 +127,20 @@ async function uploadCiphertext(roomId: string, ciphertext: Uint8Array<ArrayBuff
 }
 
 /**
- * Encrypts and uploads a file, and its thumbnail when it is an image, each under its own new key.
- * There is no plaintext path. A failed file upload removes whatever was uploaded; a failed
- * thumbnail only loses the preview.
+ * Encrypts and uploads a file, and its thumbnail when it is a still image, each under its own new
+ * key. There is no plaintext path. `onPreview` gets the bounded re-encoded thumbnail, the only
+ * form of the image the composer shows. A failed file upload removes whatever was uploaded; a
+ * failed thumbnail only loses the preview.
  */
-export function uploadEncryptedFile(roomId: string, file: File, signal?: AbortSignal): Promise<FileDescriptor> {
+export function uploadEncryptedFile(
+  roomId: string,
+  file: File,
+  signal?: AbortSignal,
+  onPreview?: (thumb: Blob) => void,
+): Promise<FileDescriptor> {
   return uploads(async () => {
     const thumb = await makeThumbnail(file);
+    if (thumb && !signal?.aborted) onPreview?.(thumb.blob);
     const sealed = await encryptBlob(file, 'file');
     const desc: FileDescriptor = {
       ...sealed.sealed,
@@ -143,9 +176,9 @@ export function discardUploads(files: readonly FileDescriptor[]): void {
   for (const id of sealedIds(files)) if (id) void deleteAttachment(id).catch(() => undefined);
 }
 
-// Reads exactly `size` bytes: a declared length that differs, or any byte past `size`, ends the
-// download, so a reply is never buffered beyond what the descriptor allows.
-async function readExactly(res: Response, size: number, stalled: () => void): Promise<Uint8Array<ArrayBuffer>> {
+// Reads exactly `size` bytes into one buffer of that size: a declared length that differs, or any
+// byte past `size`, ends the download, so a reply is never buffered beyond what the descriptor allows.
+async function readExactly(res: Response, size: number, progress: () => void, signal: AbortSignal): Promise<Uint8Array<ArrayBuffer>> {
   const declared = res.headers.get('Content-Length');
   if (declared !== null && !res.headers.get('Content-Encoding') && Number(declared) !== size) {
     void res.body?.cancel();
@@ -153,39 +186,40 @@ async function readExactly(res: Response, size: number, stalled: () => void): Pr
   }
   const reader = res.body?.getReader();
   if (!reader) throw new Error(DAMAGED);
-  const parts: Uint8Array[] = [];
+  // Giving up (a stall, the deadline, the caller leaving) ends the read too, not just the request.
+  const stop = () => void reader.cancel(signal.reason).catch(() => undefined);
+  signal.addEventListener('abort', stop, { once: true });
+  const out = new Uint8Array(size);
   let got = 0;
   for (;;) {
-    stalled();
     const { done, value } = await reader.read();
     if (done) break;
-    got += value.length;
-    if (got > size) {
+    if (got + value.length > size) {
       void reader.cancel();
       throw new Error(DAMAGED);
     }
-    parts.push(value);
+    out.set(value, got);
+    got += value.length;
+    progress();
   }
+  signal.removeEventListener('abort', stop);
+  signal.throwIfAborted();
   if (got !== size) throw new Error(DAMAGED);
-  const out = new Uint8Array(size);
-  let off = 0;
-  for (const p of parts) {
-    out.set(p, off);
-    off += p.length;
-  }
   return out;
 }
 
-/** What an image must declare before it may be decoded: an exact size, or at most a pixel budget. */
+/** What an image must declare before it may be decoded: its type, and an exact size or a pixel budget. */
 export interface ImageCheck {
+  mime: string;
   width?: number;
   height?: number;
   maxPixels: number;
 }
 
 async function checkImage(plain: Blob, want: ImageCheck): Promise<void> {
-  const got = rasterSize(new Uint8Array(await plain.slice(0, HEADER_BYTES).arrayBuffer()));
-  if (!got || got.width * got.height > want.maxPixels) throw new Error('This image is too large to preview.');
+  const got = rasterSize(new Uint8Array(await plain.slice(0, HEADER_BYTES).arrayBuffer()), want.mime);
+  if (!got) throw new Error('This image cannot be previewed. Download it instead.');
+  if (got.width * got.height > want.maxPixels) throw new Error('This image is too large to preview.');
   if ((want.width !== undefined && got.width !== want.width) || (want.height !== undefined && got.height !== want.height)) {
     throw new Error('This image is not the size its message says.');
   }
@@ -193,7 +227,7 @@ async function checkImage(plain: Blob, want: ImageCheck): Promise<void> {
 
 /**
  * Downloads a blob and opens it; nothing is returned unless all of it is authentic, and an image
- * to be shown (`image`) is refused unless its header declares an acceptable size.
+ * to be shown (`image`) is refused unless its header declares an acceptable still image.
  */
 export async function openSealed(
   blob: SealedBlob,
@@ -204,27 +238,30 @@ export async function openSealed(
 ): Promise<Blob> {
   const { ciphertext_size } = checkBlob(blob, kind);
   const stall = new AbortController();
+  const late = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const stalled = () => {
+  const progress = () => {
     clearTimeout(timer);
     timer = setTimeout(() => stall.abort(new Error('The download stalled.')), STALL_MS);
   };
-  const done = signal ? AbortSignal.any([signal, stall.signal]) : stall.signal;
+  const deadline = setTimeout(() => late.abort(new Error('The download took too long.')), deadlineMs(ciphertext_size));
+  const done = AbortSignal.any(signal ? [signal, stall.signal, late.signal] : [stall.signal, late.signal]);
   try {
-    stalled();
+    progress();
     const res = await fetch(attachmentUrl(blob.attachment_id), { credentials: 'same-origin', cache: 'no-store', signal: done });
     if (!res.ok) throw new Error(res.status === 404 ? 'This file is no longer available.' : 'Could not download this file.');
-    const plain = new Blob(await decryptBlob(await readExactly(res, ciphertext_size, stalled), blob, kind), { type });
+    const plain = new Blob(await decryptBlob(await readExactly(res, ciphertext_size, progress, done), blob, kind), { type });
     if (image) await checkImage(plain, image);
     return plain;
   } finally {
     clearTimeout(timer);
+    clearTimeout(deadline);
   }
 }
 
 /** A thumbnail, decrypted a few at a time and only if it declares exactly its descriptor's size. */
 export function openThumb(thumb: NonNullable<FileDescriptor['thumb']>, signal?: AbortSignal): Promise<Blob> {
-  const check = { width: thumb.width, height: thumb.height, maxPixels: THUMB_MAX_PX * THUMB_MAX_PX };
+  const check = { mime: thumb.mime_type, width: thumb.width, height: thumb.height, maxPixels: THUMB_MAX_PX * THUMB_MAX_PX };
   return thumbs(() => openSealed(thumb, 'thumb', thumb.mime_type, signal, check), signal);
 }
 
@@ -236,24 +273,33 @@ const LEAVE_GRACE_MS = 1_000;
 
 /**
  * Saves decrypted bytes under a name. They are always saved untyped: a blob: URL belongs to this
- * origin, so a typed one (HTML, SVG) opened in a tab would run as this app. Aborting `signal`
- * (the caller left: another room, sign-out) releases the copy shortly after.
+ * origin, so a typed one (HTML, SVG) opened in a tab would run as this app. The copy is released
+ * after SAVE_URL_MS, or shortly after `signal` aborts (the caller left: another room, sign-out);
+ * `onRetired` runs then, with nothing of the save left behind.
  */
-export function saveBlob(plain: Blob, name: string, signal?: AbortSignal): void {
+export function saveBlob(plain: Blob, name: string, signal?: AbortSignal, onRetired?: () => void): void {
   signal?.throwIfAborted();
   const url = URL.createObjectURL(plain.slice(0, plain.size, 'application/octet-stream'));
-  const revoke = () => URL.revokeObjectURL(url);
-  signal?.addEventListener('abort', () => setTimeout(revoke, LEAVE_GRACE_MS), { once: true });
   const a = document.createElement('a');
   a.href = url;
   a.download = name;
   document.body.append(a);
   a.click();
   a.remove();
-  setTimeout(revoke, SAVE_URL_MS);
+  let timer = setTimeout(retire, SAVE_URL_MS);
+  function leave() {
+    clearTimeout(timer);
+    timer = setTimeout(retire, LEAVE_GRACE_MS);
+  }
+  function retire() {
+    signal?.removeEventListener('abort', leave);
+    URL.revokeObjectURL(url);
+    onRetired?.();
+  }
+  signal?.addEventListener('abort', leave, { once: true });
 }
 
 /** Decrypts a file and saves it under its name; aborting stops the download first. */
-export async function saveSealed(file: FileDescriptor, signal?: AbortSignal): Promise<void> {
-  saveBlob(await openSealed(file, 'file', 'application/octet-stream', signal), file.name, signal);
+export async function saveSealed(file: FileDescriptor, signal?: AbortSignal, onRetired?: () => void): Promise<void> {
+  saveBlob(await openSealed(file, 'file', 'application/octet-stream', signal), file.name, signal, onRetired);
 }

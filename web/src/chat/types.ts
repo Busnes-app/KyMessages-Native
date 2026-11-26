@@ -155,6 +155,10 @@ export interface ChatMessage {
   /** From the decrypted message only, never the server: its encrypted files (keys included). */
   files?: MessageFiles['files'];
   filesState?: MessageFiles['filesState'];
+  /** What an edit of this message must carry (from its own envelope or latest edit). */
+  provenance?: MessageFiles['provenance'];
+  /** The sender's ID for this message, its idempotency key, sealed in the message. */
+  ref?: string;
 }
 
 export type CallMode = 'p2p_mesh' | 'sfu_livekit';
@@ -296,7 +300,7 @@ export type WsServerEvent =
   | { kind: 'hello'; userId: string }
   | { kind: 'pong' }
   | { kind: 'message.new'; roomId: string; seq: number; message?: ChatMessage; refetch: boolean }
-  | { kind: 'message.edit'; roomId: string; seq: number; message?: ChatMessage; refetch: boolean }
+  | { kind: 'message.edit'; roomId: string; seq: number; message?: ChatMessage; refetch: boolean; messageId?: string }
   | { kind: 'message.delete'; roomId: string; seq: number; messageId: string; deletedAt: number }
   | { kind: 'reaction.set'; roomId: string; messageId: string; userId: string; emoji: string; added: boolean }
   | { kind: 'room.member'; roomId: string; action: 'added' | 'removed' | 'role'; userId: string; role?: RoomRole }
@@ -687,7 +691,9 @@ export function parseWsEvent(raw: unknown): WsServerEvent | null {
         if (data !== undefined && data !== null) {
           const d = obj(data);
           if (d.refetch === true) {
-            return { kind: t, roomId, seq, refetch: true };
+            // Too large for the bus: the row is named so it can be fetched again exactly.
+            const messageId = opt(d.id, (s) => str(s, 128));
+            return t === 'message.edit' ? { kind: t, roomId, seq, refetch: true, messageId } : { kind: t, roomId, seq, refetch: true };
           }
           return { kind: t, roomId, seq, message: parseMessage(d), refetch: false };
         }

@@ -661,8 +661,10 @@ describe('Native Chat page', () => {
     expect(outside).not.toContain('report.txt');
     expect(outside).not.toContain('"key"');
     const env = JSON.parse(String(posted[0].body)) as { ciphertext: string };
-    const inner = JSON.parse(atob(env.ciphertext)) as { type: string; files: { name: string; mime_type: string; key: string }[] };
+    const inner = JSON.parse(atob(env.ciphertext)) as { type: string; ref: string; files: { name: string; mime_type: string; key: string }[] };
     expect(inner.type).toBe('attachment');
+    // The message seals its idempotency key as the ID its edits name.
+    expect(inner.ref).toBe(posted[0].idempotency_key);
     expect(inner.files[0]).toMatchObject({ name: 'report.txt', mime_type: 'text/plain' });
     expect(inner.files[0].key).toMatch(/^[A-Za-z0-9+/]{43}$/);
     expect(screen.queryByText('File not encrypted')).toBeNull();
@@ -675,7 +677,7 @@ describe('Native Chat page', () => {
 
     // A message whose key arrives late still opens with its files. An edit afterwards seals only
     // its text (never the file keys) and the files still open, from the kept first envelope.
-    const lateInner = { room_id: 'rm_gen', type: 'attachment' as const, body: 'late note', files: inner.files };
+    const lateInner = { room_id: 'rm_gen', type: 'attachment' as const, body: 'late note', ref: 'late-ref-0001', files: inner.files };
     const lateMessage = () => ({
       id: 'm_late', room_id: 'rm_gen', seq: 2, sender_id: 'u_alice', sender_name: 'Alice', encoding: 'e2ee_room_v1',
       body: fakeEnvelope(lateInner, 's_late'), created_at: Date.now(), reactions: [],
@@ -693,9 +695,11 @@ describe('Native Chat page', () => {
     fireEvent.change(editBox, { target: { value: 'late note, edited' } });
     fireEvent.keyDown(editBox, { key: 'Enter' });
     await waitFor(() => expect(patched).toHaveLength(1));
-    const editInner = JSON.parse(atob((JSON.parse(String(patched[0].body)) as { ciphertext: string }).ciphertext)) as { type: string; files: unknown[] };
+    const editInner = JSON.parse(atob((JSON.parse(String(patched[0].body)) as { ciphertext: string }).ciphertext)) as { type: string; files?: unknown[]; original: unknown };
     expect(editInner.type).toBe('edit');
-    expect(editInner.files).toEqual([]);
+    expect(editInner.files).toBeUndefined();
+    expect(editInner.original).toEqual({ kind: 'e5', ref: 'late-ref-0001', files: 1 });
+    expect(String(patched[0].body)).not.toContain(inner.files[0].key);
     expect(await screen.findByText('late note, edited')).toBeTruthy();
     expect(screen.getAllByRole('button', { name: 'Download report.txt' })).toHaveLength(2);
 
@@ -705,6 +709,34 @@ describe('Native Chat page', () => {
     await screen.findByText('storage full');
     expect(uploads).toHaveLength(2);
     expect(uploads.every((u) => u.url.endsWith('?encrypted=1') && u.name === 'encrypted.bin')).toBe(true);
+  });
+
+  it('fetches again exactly the row an edit too large for the bus names, when it is already loaded', async () => {
+    const fetched: string[] = [];
+    const row = (body: string, edited?: number) => ({ id: 'm_old', room_id: 'rm_gen', seq: 3, sender_id: 'bot_1', sender_name: 'Bot', encoding: 'plain_v1', body, created_at: 1, reactions: [], attachments: [], ...(edited ? { edited_at: edited } : {}) });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === '/api/v1/bootstrap') {
+          return json({
+            user: { id: 'u_alice', username: 'alice', display_name: 'Alice', role: 'user' },
+            tenant: { id: 'default', slug: 'default', display_name: 'Busnes HQ', plan: 'self_hosted' },
+            rooms: [{ id: 'rm_gen', tenant_id: 'default', kind: 'channel', name: 'general', topic: '', is_private: false, last_seq: 9, created_by: 'u_alice', created_at: Date.now(), role: 'owner', last_read_seq: 9, unread_count: 0, notify_mode: 'all' }],
+          });
+        }
+        if (url.startsWith('/api/v1/rooms/rm_gen/messages')) {
+          fetched.push(url);
+          return json({ messages: [url.includes('before=4') ? row('caption, edited', 50) : row('first caption')], has_more: false });
+        }
+        return json({ error: 'not found' }, 404);
+      }),
+    );
+    render(<Chat />);
+    await screen.findByText('first caption');
+    act(() => FakeWebSocket.instances[0].emit({ t: 'message.edit', room: 'rm_gen', seq: 3, d: { refetch: true, id: 'm_old' } }));
+    expect(await screen.findByText('caption, edited')).toBeTruthy();
+    expect(fetched.at(-1)).toBe('/api/v1/rooms/rm_gen/messages?before=4&limit=1');
   });
 
   it('closes an image preview when its message is deleted', async () => {

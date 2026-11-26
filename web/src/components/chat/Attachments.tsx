@@ -1,33 +1,31 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Download, FileText, Loader2, X } from 'lucide-react';
-import type { FileDescriptor, SealedBlob } from '../../crypto/attachments';
+import { PREVIEW_MIMES, type FileDescriptor, type SealedBlob } from '../../crypto/attachments';
 import { MAX_DECODE_PIXELS, openSealed, openThumb, saveBlob, saveSealed } from '../../chat/files';
-import { formatBytes, isInlineImageAttachment } from '../../chat/types';
+import { formatBytes } from '../../chat/types';
 
-// Everything that identifies a blob's bytes; the descriptor object itself changes each render.
-const blobKey = (b: SealedBlob | undefined) =>
-  b && [b.attachment_id, b.key, b.nonce_prefix, b.sha256, b.ciphertext_size, b.chunk_size, b.size].join('\u0000');
+// Everything that decides what a blob opens to: its bytes' identity, and how it is checked.
+const identity = (b: SealedBlob, ...how: (string | number | undefined)[]) =>
+  [b.attachment_id, b.key, b.nonce_prefix, b.sha256, b.ciphertext_size, b.chunk_size, b.size, ...how].join('\u0000');
 
 /**
- * A decrypted blob and its blob: URL while the caller is mounted and `open` is set. Leaving
- * (another room, sign-out, a closed preview) aborts the download and revokes the URL, releasing
- * the plaintext.
+ * A decrypted blob and its blob: URL while the caller is mounted and `id` is set. Leaving
+ * (another room, sign-out, a closed preview, a thumbnail scrolled away unfinished) or a new `id`
+ * aborts the download and revokes the URL, releasing the plaintext.
  */
 export function useSealedUrl(
-  blob: SealedBlob | undefined,
-  open: ((signal: AbortSignal) => Promise<Blob>) | undefined,
+  id: string | undefined,
+  open: (signal: AbortSignal) => Promise<Blob>,
 ): { url?: string; plain?: Blob; error?: string } {
   const [state, setState] = useState<{ url?: string; plain?: Blob; error?: string }>({});
-  const id = open ? blobKey(blob) : undefined;
   const openRef = useRef(open);
   openRef.current = open;
   useEffect(() => {
-    const run = openRef.current;
-    if (!id || !run) return;
+    if (!id) return;
     const ctrl = new AbortController();
     let url: string | undefined;
     setState({});
-    run(ctrl.signal).then(
+    openRef.current(ctrl.signal).then(
       (plain) => {
         if (ctrl.signal.aborted) return;
         url = URL.createObjectURL(plain);
@@ -45,28 +43,36 @@ export function useSealedUrl(
   return state;
 }
 
-/** Whether an element has come near the viewport (always, where IntersectionObserver is missing). */
+/** Whether an element is near the viewport now (always, where IntersectionObserver is missing). */
 function useNearViewport(ref: React.RefObject<Element | null>): boolean {
   const [near, setNear] = useState(typeof IntersectionObserver === 'undefined');
   useEffect(() => {
     const el = ref.current;
-    if (near || !el) return;
-    const io = new IntersectionObserver((entries) => {
-      if (entries.some((e) => e.isIntersecting)) setNear(true);
-    }, { rootMargin: '200px' });
+    if (!el || typeof IntersectionObserver === 'undefined') return;
+    const io = new IntersectionObserver((entries) => setNear(entries.some((e) => e.isIntersecting)), { rootMargin: '200px' });
     io.observe(el);
     return () => io.disconnect();
-  }, [near, ref]);
+  }, [ref]);
   return near;
 }
 
-/** Only raster types render inline; anything else (SVG, HTML) is only ever saved. */
-export const previewable = (f: FileDescriptor) => isInlineImageAttachment(f);
+/** Only still PNG, JPEG and WebP render inline; anything else (GIF, SVG, HTML) is only ever saved. */
+export const previewable = (f: FileDescriptor) => PREVIEW_MIMES.has(f.mime_type);
 
-function SaveButton({ file, plain, className, children }: { file: FileDescriptor; plain?: Blob; className: string; children: React.ReactNode }) {
+interface SaveButtonProps {
+  file: FileDescriptor;
+  /** The preview's decrypted bytes, saved instead of a second download. */
+  plain?: Blob;
+  /** The preview is still decrypting: wait for its bytes rather than fetch them twice. */
+  pending?: boolean;
+  className: string;
+  children: React.ReactNode;
+}
+
+function SaveButton({ file, plain, pending, className, children }: SaveButtonProps) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  // Every save this button started belongs to it: leaving aborts them and releases their plaintext.
+  // The saves still holding a decrypted copy: leaving aborts them; each leaves the set once retired.
   const saves = useRef(new Set<AbortController>());
   useEffect(() => {
     const live = saves.current;
@@ -78,16 +84,18 @@ function SaveButton({ file, plain, className, children }: { file: FileDescriptor
     <button
       type="button"
       className={className}
-      disabled={busy}
+      disabled={busy || pending}
       title={error || `Download ${file.name}`}
       aria-label={`Download ${file.name}`}
       onClick={() => {
         const ctrl = new AbortController();
+        const retired = () => saves.current.delete(ctrl);
         saves.current.add(ctrl);
         setBusy(true);
         setError('');
-        (plain ? (async () => saveBlob(plain, file.name, ctrl.signal))() : saveSealed(file, ctrl.signal))
+        (plain ? (async () => saveBlob(plain, file.name, ctrl.signal, retired))() : saveSealed(file, ctrl.signal, retired))
           .catch((e: unknown) => {
+            retired();
             if (!ctrl.signal.aborted) setError(e instanceof Error ? e.message : 'Could not download this file.');
           })
           .finally(() => {
@@ -104,12 +112,18 @@ function SaveButton({ file, plain, className, children }: { file: FileDescriptor
 function SealedImage({ file, onPreview }: { file: FileDescriptor & { thumb: NonNullable<FileDescriptor['thumb']> }; onPreview?: (f: FileDescriptor) => void }) {
   const card = useRef<HTMLDivElement>(null);
   const near = useNearViewport(card);
-  const { url, error } = useSealedUrl(file.thumb, near ? (signal) => openThumb(file.thumb, signal) : undefined);
+  const [shown, setShown] = useState(false);
+  const { thumb } = file;
+  // Decrypts while near the viewport; leaving it before the thumbnail is ready cancels the work.
+  const { url, error } = useSealedUrl(near || shown ? identity(thumb, thumb.mime_type, thumb.width, thumb.height) : undefined, (signal) => openThumb(thumb, signal));
+  useEffect(() => {
+    if (url) setShown(true);
+  }, [url]);
   return (
     <div className="chat-att-image-card" ref={card}>
       <button type="button" className="chat-att-image-btn" aria-label={`Preview ${file.name}`} onClick={() => onPreview?.(file)}>
         {url ? (
-          <img src={url} alt={file.name} className="chat-att-image" width={file.thumb.width} height={file.thumb.height} />
+          <img src={url} alt={file.name} className="chat-att-image" width={thumb.width} height={thumb.height} />
         ) : (
           <span className="chat-att-image-pending">{error ?? <Loader2 size={16} className="ky-spin" aria-label="Decrypting" />}</span>
         )}
@@ -125,7 +139,7 @@ function SealedImage({ file, onPreview }: { file: FileDescriptor & { thumb: NonN
   );
 }
 
-/** A message's end-to-end encrypted files: thumbnails decrypt as they render, files on demand. */
+/** A message's end-to-end encrypted files: thumbnails decrypt near the viewport, files on demand. */
 export function SealedFiles({ files, onPreview }: { files: readonly FileDescriptor[]; onPreview?: (f: FileDescriptor) => void }) {
   return (
     <div className="chat-attachments" aria-label="Attachments">
@@ -188,7 +202,8 @@ export function Lightbox({ name, size, src, error, download, onClose }: Lightbox
 
 /** The full image of an encrypted file, decrypted while the preview is open. */
 export function SealedLightbox({ file, onClose }: { file: FileDescriptor; onClose: () => void }) {
-  const { url, plain, error } = useSealedUrl(file, (signal) => openSealed(file, 'file', file.mime_type, signal, { maxPixels: MAX_DECODE_PIXELS }));
+  const check = { mime: file.mime_type, maxPixels: MAX_DECODE_PIXELS };
+  const { url, plain, error } = useSealedUrl(identity(file, file.mime_type, check.maxPixels), (signal) => openSealed(file, 'file', file.mime_type, signal, check));
   return (
     <Lightbox
       name={file.name}
@@ -197,7 +212,7 @@ export function SealedLightbox({ file, onClose }: { file: FileDescriptor; onClos
       error={error}
       onClose={onClose}
       download={
-        <SaveButton file={file} plain={plain} className="btn-secondary chat-lightbox-dl">
+        <SaveButton file={file} plain={plain} pending={!plain && !error} className="btn-secondary chat-lightbox-dl">
           <Download size={14} aria-hidden="true" />
           <span>Download</span>
         </SaveButton>

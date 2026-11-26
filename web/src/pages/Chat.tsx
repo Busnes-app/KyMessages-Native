@@ -50,7 +50,7 @@ import {
 } from '../chat/client';
 import { discardUploads, uploadEncryptedFile } from '../chat/files';
 import { ciphertextSize, sealedIds, type FileDescriptor } from '../crypto/attachments';
-import { Lightbox, SealedLightbox } from '../components/chat/Attachments';
+import { Lightbox, SealedLightbox, previewable } from '../components/chat/Attachments';
 import {
   applyReactionDelta,
   formatDayDivider,
@@ -70,9 +70,7 @@ import {
   DEFAULT_ATTACHMENT_LIMITS,
   attachmentUrl,
   formatBytes,
-  isInlineImageAttachment,
   type CallState,
-  type ChatAttachment,
   type ChatAttachmentLimits,
   type ChatCurrentUser,
   type ChatDirectoryUser,
@@ -86,7 +84,7 @@ import {
   type WsStatus,
 } from '../chat/types';
 import { ChatSidebar } from '../components/chat/ChatSidebar';
-import { MessageRow, attachmentSummary } from '../components/chat/MessageRow';
+import { MessageRow, attachmentSummary, attachmentView } from '../components/chat/MessageRow';
 import { RoomDetailsDrawer, type DrawerTab } from '../components/chat/RoomDetailsDrawer';
 import { CreateChannelModal, SearchModal, StartDMModal } from '../components/chat/ChatModals';
 import { searchIndexFor } from '../chat/searchIndex';
@@ -135,11 +133,9 @@ type StagedAttachment =
   | { kind: 'ready'; localId: string; file: FileDescriptor; previewUrl?: string }
   | { kind: 'error'; localId: string; filename: string; error: string; attachmentId?: string };
 
-// The message a preview came from: it closes when that message, its room or the view of it goes.
-type LightboxTarget = { roomId: string; messageId: string } & (
-  | { kind: 'plain'; attachment: ChatAttachment }
-  | { kind: 'sealed'; file: FileDescriptor }
-);
+// A preview names its file by row, and shows only what that row offers now: it closes when the
+// message, its room, the view of it or the file's place in it goes.
+type LightboxTarget = { kind: 'plain' | 'sealed'; roomId: string; messageId: string; attachmentId: string };
 
 const isMac =
   typeof navigator !== 'undefined' && /mac|iphone|ipad|ipod/i.test(navigator.platform || navigator.userAgent);
@@ -294,7 +290,7 @@ export const Chat: React.FC<ChatProps> = ({
               const filesSig = (x: ChatMessage) => (x.files ? 'files' : `${x.filesState?.reason ?? ''}\u0000${x.filesState?.gen ?? ''}`);
               if (e2eeLabel(m) === e2eeLabel(o) && gen(m.e2ee) === gen(o.e2ee) && filesSig(m) === filesSig(o)) return m;
               changed = true;
-              return { ...m, body: o.body, reply_to_id: o.reply_to_id, e2ee: o.e2ee, files: o.files, filesState: o.filesState };
+              return { ...m, body: o.body, reply_to_id: o.reply_to_id, e2ee: o.e2ee, files: o.files, filesState: o.filesState, provenance: o.provenance, ref: o.ref };
             }),
           };
         }
@@ -385,14 +381,22 @@ export const Chat: React.FC<ChatProps> = ({
       });
   }, [activeRoomId]);
 
-  useEffect(() => {
-    if (!lightboxAttachment) return;
-    const { roomId, messageId } = lightboxAttachment;
+  const lightbox = useMemo(() => {
+    if (!lightboxAttachment) return null;
+    const { kind, roomId, messageId, attachmentId } = lightboxAttachment;
     const source = buckets[roomId]?.messages.find((m) => m.id === messageId);
-    if (activeRoomId !== roomId || !rooms.some((r) => r.id === roomId) || !source || source.deleted_at) {
-      setLightboxAttachment(null);
+    if (activeRoomId !== roomId || !rooms.some((r) => r.id === roomId) || !source || source.deleted_at) return null;
+    const view = attachmentView(source);
+    if (kind === 'sealed') {
+      const file = view.sealed.find((f) => f.attachment_id === attachmentId && previewable(f));
+      return file ? { kind, file } : null;
     }
+    const attachment = view.plain.find((a) => a.id === attachmentId);
+    return attachment ? { kind, attachment } : null;
   }, [lightboxAttachment, activeRoomId, rooms, buckets]);
+  useEffect(() => {
+    if (lightboxAttachment && !lightbox) setLightboxAttachment(null);
+  }, [lightboxAttachment, lightbox]);
 
   useEffect(() => {
     if (!lightboxAttachment) return;
@@ -651,6 +655,35 @@ export const Chat: React.FC<ChatProps> = ({
     [scrollToBottom, syncReadCursor],
   );
 
+  // An edit too large for the bus names its row: fetch exactly that row again and replace the
+  // copy held here (catching up by sequence would never see an older row change). A row not held
+  // here only loses its stale search entry.
+  const refetchRow = useCallback(
+    async (roomId: string, seq: number, id?: string) => {
+      if (!id) {
+        void catchUpRoom(roomId);
+        return;
+      }
+      if (!bucketsRef.current[roomId]?.messages.some((m) => m.id === id)) {
+        forgetIndexed(id);
+        return;
+      }
+      try {
+        const page = await fetchMessages(roomId, { before: seq + 1, limit: 1 });
+        const row = page.messages.find((m) => m.id === id);
+        if (!row) return;
+        setBuckets((prev) => {
+          const current = prev[roomId];
+          if (!current?.messages.some((m) => m.id === id)) return prev;
+          return { ...prev, [roomId]: { ...current, messages: upsertMessage(current.messages, row) } };
+        });
+      } catch {
+        // Transient: the next event or a room switch reloads it.
+      }
+    },
+    [catchUpRoom, forgetIndexed],
+  );
+
   const handleWsEvent = useCallback(
     (event: WsServerEvent) => {
       switch (event.kind) {
@@ -741,9 +774,9 @@ export const Chat: React.FC<ChatProps> = ({
         }
         case 'message.edit': {
           // Not loaded here: the indexed copy is out of date, so drop it (re-indexed when viewed).
-          if (!bucketsRef.current[event.roomId]) forgetIndexed(event.message?.id);
+          if (!bucketsRef.current[event.roomId]) forgetIndexed(event.message?.id ?? event.messageId);
           if (event.refetch || !event.message) {
-            void catchUpRoom(event.roomId);
+            void refetchRow(event.roomId, event.seq, event.messageId);
             return;
           }
           const edited = event.message;
@@ -918,7 +951,7 @@ export const Chat: React.FC<ChatProps> = ({
         }
       }
     },
-    [catchUpRoom, forgetIndexed, refreshRoomDetail, refreshRoomsList, scrollToBottom, syncReadCursor, updateCallState],
+    [catchUpRoom, forgetIndexed, refetchRow, refreshRoomDetail, refreshRoomsList, scrollToBottom, syncReadCursor, updateCallState],
   );
 
   // Initial bootstrap + WebSocket connection.
@@ -1283,11 +1316,19 @@ export const Chat: React.FC<ChatProps> = ({
           continue;
         }
 
+        // The composer never decodes the picked file itself: it shows the bounded, re-encoded
+        // thumbnail made (after its header is checked) for the upload, once there is one.
         let previewUrl: string | undefined;
-        if (isInlineImageAttachment({ mime_type: file.type })) {
-          previewUrl = URL.createObjectURL(file);
+        const showPreview = (thumb: Blob) => {
+          if (!(stagedByRoomRef.current[roomId] ?? []).some((item) => item.localId === localId)) return;
+          previewUrl = URL.createObjectURL(thumb);
           previewUrlsRef.current.add(previewUrl);
-        }
+          const url = previewUrl;
+          setStagedByRoom((prev) => ({
+            ...prev,
+            [roomId]: (prev[roomId] ?? []).map((item) => (item.localId === localId && item.kind !== 'error' ? { ...item, previewUrl: url } : item)),
+          }));
+        };
 
         setStagedByRoom((prev) => ({
           ...prev,
@@ -1306,7 +1347,7 @@ export const Chat: React.FC<ChatProps> = ({
         const controller = new AbortController();
         uploadControllersRef.current.set(localId, controller);
 
-        void uploadEncryptedFile(roomId, file, controller.signal)
+        void uploadEncryptedFile(roomId, file, controller.signal, showPreview)
           .then((sealed) => {
             uploadControllersRef.current.delete(localId);
             let cleanedOrphan = false;
@@ -1516,7 +1557,10 @@ export const Chat: React.FC<ChatProps> = ({
   const handleEditMessage = async (messageId: string, newBody: string) => {
     if (!activeRoomId) return;
     const original = bucketsRef.current[activeRoomId]?.messages.find((m) => m.id === messageId);
-    const updated = await editMessage(activeRoomId, messageId, newBody, original?.reply_to_id);
+    // What the message's files are comes from its own (or latest edit's) envelope, never from the
+    // server's kept original; a message sent before encryption is from before E5.
+    const provenance = original?.provenance ?? (original?.encoding === 'plain_v1' ? { kind: 'legacy' as const } : undefined);
+    const updated = await editMessage({ roomId: activeRoomId, messageId, body: newBody, replyToId: original?.reply_to_id, provenance });
     setBuckets((prev) => {
       const current = prev[activeRoomId];
       if (!current) return prev;
@@ -2310,8 +2354,8 @@ export const Chat: React.FC<ChatProps> = ({
                           onJumpToMessage={(seq) => {
                             void jumpToMessageSeq(activeRoom.id, seq);
                           }}
-                          onPreviewImage={(att) => setLightboxAttachment({ kind: 'plain', attachment: att, roomId: activeRoom.id, messageId: msg.id })}
-                          onPreviewFile={(file) => setLightboxAttachment({ kind: 'sealed', file, roomId: activeRoom.id, messageId: msg.id })}
+                          onPreviewImage={(att) => setLightboxAttachment({ kind: 'plain', attachmentId: att.id, roomId: activeRoom.id, messageId: msg.id })}
+                          onPreviewFile={(file) => setLightboxAttachment({ kind: 'sealed', attachmentId: file.attachment_id, roomId: activeRoom.id, messageId: msg.id })}
                           onToggleReaction={handleToggleReaction}
                           onEdit={handleEditMessage}
                           onDelete={handleDeleteMessage}
@@ -2666,19 +2710,19 @@ export const Chat: React.FC<ChatProps> = ({
         />
       )}
 
-      {lightboxAttachment?.kind === 'sealed' && (
-        <SealedLightbox file={lightboxAttachment.file} onClose={() => setLightboxAttachment(null)} />
+      {lightbox?.kind === 'sealed' && (
+        <SealedLightbox file={lightbox.file} onClose={() => setLightboxAttachment(null)} />
       )}
-      {lightboxAttachment?.kind === 'plain' && (
+      {lightbox?.kind === 'plain' && (
         <Lightbox
-          name={lightboxAttachment.attachment.filename}
-          size={lightboxAttachment.attachment.size_bytes}
-          src={attachmentUrl(lightboxAttachment.attachment.id, true)}
+          name={lightbox.attachment.filename}
+          size={lightbox.attachment.size_bytes}
+          src={attachmentUrl(lightbox.attachment.id, true)}
           onClose={() => setLightboxAttachment(null)}
           download={
             <a
-              href={attachmentUrl(lightboxAttachment.attachment.id)}
-              download={lightboxAttachment.attachment.filename}
+              href={attachmentUrl(lightbox.attachment.id)}
+              download={lightbox.attachment.filename}
               className="btn-secondary chat-lightbox-dl"
             >
               <Download size={14} aria-hidden="true" />

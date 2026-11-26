@@ -7,10 +7,14 @@ import {
   cleanName,
   decryptBlob,
   encryptBlob,
+  FILES_REPLACED,
   FILES_WAITING,
+  expectOriginal,
   messageFiles,
+  withTries,
   openFiles,
   parseFileDescriptor,
+  rasterSize,
   type BlobKind,
   type SealedBlob,
 } from './attachments';
@@ -277,30 +281,119 @@ describe('descriptors', () => {
   });
 
   describe('a message\'s files', () => {
-  const at = (...ids: string[]) => ids.map((id) => ({ id }));
-  const sent = (files?: unknown[]) => ({ state: 'decrypted' as const, inner: { type: 'attachment', ...(files ? { files } : {}) } });
+    const at = (...ids: string[]) => ids.map((id) => ({ id }));
+    const REF = 'ref-message-01';
+    const sent = (files: unknown[] | undefined, ref: string | undefined = REF) => ({
+      state: 'decrypted' as const,
+      inner: { type: 'attachment', ...(files ? { files } : {}), ...(ref ? { ref } : {}) },
+    });
+    const edit = (original: unknown) => ({ type: 'edit', original });
+    const e5 = (files: number) => edit({ kind: 'e5', ref: REF, files });
 
-  it('comes from the message itself, and is absent only for a message from before E5', () => {
-    expect(messageFiles({ type: 'attachment', files: [file('att_a')] }, undefined, at('att_a'), 0)?.files?.[0].attachment_id).toBe('att_a');
-    expect(messageFiles({ type: 'text', files: [] }, undefined, at(), 0)).toEqual({ files: [] });
-    expect(messageFiles({ type: 'text' }, undefined, at('att_old'), 0)).toEqual({});
-    expect(messageFiles({ type: 'text', files: [{ bogus: 1 }] }, undefined, at(), 0)).toBeUndefined();
+    it('come from the message itself, which carries its sender\'s ID; none means from before E5', () => {
+      const one = messageFiles({ type: 'attachment', ref: REF, files: [file('att_a')] }, undefined, at('att_a'), 0);
+      expect(one?.files?.[0].attachment_id).toBe('att_a');
+      expect(one?.provenance).toEqual({ kind: 'e5', ref: REF, files: 1 });
+      expect(messageFiles({ type: 'text', ref: REF, files: [] }, undefined, at(), 0)).toEqual({ files: [], ref: REF, provenance: { kind: 'e5', ref: REF, files: 0 } });
+      expect(messageFiles({ type: 'text' }, undefined, at('att_old'), 0)).toEqual({ provenance: { kind: 'legacy' } });
+      // An E5 message without its ID, or with bad descriptors, is damaged.
+      expect(messageFiles({ type: 'text', files: [] }, undefined, at(), 0)).toBeUndefined();
+      expect(messageFiles({ type: 'text', ref: REF, files: [{ bogus: 1 }] }, undefined, at(), 0)).toBeUndefined();
+    });
+
+    it('of an edit come only from the matching original, and a text-only edit needs none', () => {
+      expect(messageFiles(e5(1), sent([file('att_a')]), at('att_a'), 0)?.files?.map((f) => f.attachment_id)).toEqual(['att_a']);
+      expect(messageFiles(e5(0), undefined, at(), 0)?.files).toEqual([]);
+      // Rows the server adds to a text-only message are not its files.
+      expect(messageFiles(e5(0), undefined, at('att_x'), 0)?.files).toEqual([]);
+      expect(messageFiles(e5(1), { state: 'waiting' }, at('att_a'), 7)?.filesState).toEqual({ reason: FILES_WAITING, gen: 7, expected: 1 });
+      expect(messageFiles(e5(1), { state: 'failed', reason: 'sent before you joined' }, at('att_a'), 0)?.filesState).toEqual({ reason: 'sent before you joined', expected: 1 });
+    });
+
+    it('stay unavailable, not absent, when the server withholds the original or every row', () => {
+      expect(messageFiles(e5(2), undefined, at(), 0)?.filesState).toMatchObject({ expected: 2 });
+      expect(messageFiles(e5(1), undefined, at('att_a'), 0)?.files).toBeUndefined();
+      // The original's files withheld as rows: named, missing.
+      expect(messageFiles(e5(1), sent([file('att_a')]), at(), 0)?.files?.[0].missing).toBe(true);
+    });
+
+    it('are refused when the original is another message, an edit, a downgrade or a different count', () => {
+      for (const o of [sent([file('att_a')], 'ref-other-001'), { state: 'decrypted' as const, inner: { type: 'edit', original: { kind: 'legacy' } } }, sent(undefined), sent(undefined, undefined), sent([file('att_a'), file('att_b')])]) {
+        expect(messageFiles(e5(1), o, at('att_a', 'att_b'), 0)?.filesState).toEqual({ reason: FILES_REPLACED, expected: 1 });
+        if (o.state === 'decrypted') expect(expectOriginal(e5(1))(o.inner)).toBe(FILES_REPLACED);
+      }
+      expect(expectOriginal(e5(1))(sent([file('att_a')]).inner)).toBeUndefined();
+      expect(messageFiles(edit({ kind: 'e5', ref: 'x', files: 1 }), undefined, at(), 0)).toBeUndefined();
+    });
+
+    it('of a message from before E5 stay plaintext across any number of edits, whatever original the server keeps', () => {
+      const legacyEdit = edit({ kind: 'legacy' });
+      expect(messageFiles(legacyEdit, undefined, at('att_old'), 0)).toEqual({ provenance: { kind: 'legacy' } });
+      expect(messageFiles(legacyEdit, sent([file('att_a')]), at('att_old'), 0)).toEqual({ provenance: { kind: 'legacy' } });
+    });
+
+    it('of mixed versions: a pre-E5 edit keeps plaintext, unless the kept original had E5 files', () => {
+      const preE5Edit = { type: 'edit' };
+      expect(messageFiles(preE5Edit, undefined, at('att_old'), 0)).toEqual({ provenance: { kind: 'legacy' } });
+      expect(messageFiles(preE5Edit, sent(undefined, undefined), at('att_old'), 0)).toEqual({ provenance: { kind: 'legacy' } });
+      expect(messageFiles(preE5Edit, sent([file('att_a')]), at('att_a'), 0)?.filesState).toBeDefined();
+      // An edit sealed between formats (files: [] without `original`) cannot vouch for anything.
+      expect(messageFiles({ type: 'edit', files: [] }, sent([file('att_a')]), at('att_a'), 0)?.filesState).toBeDefined();
+    });
+
+    it('stop being waited for after a few tries', () => {
+      let out = messageFiles(e5(1), { state: 'waiting' }, at('att_a'), 1)!;
+      let tries: number | undefined;
+      for (let i = 0; i < 4; i++) {
+        out = withTries(out, tries);
+        tries = out.filesState?.tries;
+        expect(out.filesState?.gen).toBeDefined();
+        out = messageFiles(e5(1), { state: 'waiting' }, at('att_a'), 1)!;
+      }
+      const last = withTries(out, tries);
+      expect(last.filesState?.gen).toBeUndefined();
+      expect(last.filesState).toMatchObject({ expected: 1, reason: expect.stringMatching(/has not reached this device/) });
+    });
   });
 
-  it('comes from the original envelope once edited, never from the edit', () => {
-    const edit = { type: 'edit', files: [file('att_planted')] };
-    expect(messageFiles(edit, sent([file('att_a')]), at('att_a'), 0)?.files?.map((f) => f.attachment_id)).toEqual(['att_a']);
-    // An edit whose original is unreadable here (a member who joined later) has unavailable files.
-    expect(messageFiles(edit, { state: 'failed', reason: 'sent before you joined' }, at('att_a'), 0)).toEqual({ filesState: { reason: 'sent before you joined' } });
-    expect(messageFiles(edit, { state: 'waiting' }, at('att_a'), 7)).toEqual({ filesState: { reason: FILES_WAITING, gen: 7 } });
-    // The server dropped the original of an E5 edit: its uploads are not vouched for.
-    expect(messageFiles(edit, undefined, at('att_a'), 0)?.filesState).toBeDefined();
-    expect(messageFiles(edit, undefined, at(), 0)).toEqual({ files: [] });
-    // An edit sealed before E5 keeps its plaintext uploads, labelled as such.
-    expect(messageFiles({ type: 'edit' }, undefined, at('att_old'), 0)).toEqual({});
-    expect(messageFiles(edit, sent(), at('att_old'), 0)).toEqual({});
-    // An "original" that is itself an edit is a substitution.
-    expect(messageFiles(edit, { state: 'decrypted', inner: { type: 'edit', files: [] } }, at(), 0)).toBeUndefined();
-  });
 });
+
+describe('raster headers', () => {
+  const u32 = (n: number) => [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255];
+  const chunk = (type: string, len: number) => [...u32(len), ...Array.from(type, (c) => c.charCodeAt(0)), ...new Array(len + 4).fill(0)];
+  const png = (w: number, h: number, ...before: number[][]) => {
+    const ihdr = [...u32(13), 0x49, 0x48, 0x44, 0x52, ...u32(w), ...u32(h), 8, 6, 0, 0, 0, 0, 0, 0, 0];
+    return Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, ...ihdr, ...before.flat(), ...chunk('IDAT', 0)]);
+  };
+  const ascii = (t: string) => Array.from(t, (c) => c.charCodeAt(0));
+  const vp8x = (flags: number, w: number, h: number) => {
+    const b = Uint8Array.from([...ascii('RIFF'), 0, 0, 0, 0, ...ascii('WEBP'), ...ascii('VP8X'), 10, 0, 0, 0, flags, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    b.set([(w - 1) & 255, ((w - 1) >> 8) & 255, (w - 1) >> 16], 24);
+    b.set([(h - 1) & 255, ((h - 1) >> 8) & 255, (h - 1) >> 16], 27);
+    return b;
+  };
+  const jpeg = (...segments: number[][]) => Uint8Array.from([0xff, 0xd8, ...segments.flat(), 0xff, 0xd9]);
+  const sof = (w: number, h: number) => [0xff, 0xc0, 0, 11, 8, h >> 8, h & 255, w >> 8, w & 255, 1, 1, 0x11, 0];
+
+  it('reads still PNG, JPEG and WebP sizes', () => {
+    expect(rasterSize(png(400, 300), 'image/png')).toEqual({ width: 400, height: 300 });
+    expect(rasterSize(png(4, 3, chunk('tEXt', 5)), 'image/png')).toEqual({ width: 4, height: 3 });
+    expect(rasterSize(jpeg([0xff, 0xe0, 0, 4, 0, 0], sof(640, 480)), 'image/jpeg')).toEqual({ width: 640, height: 480 });
+    // Exactly 30 bytes: the canvas height ends at the last byte.
+    expect(rasterSize(vp8x(0x10, 400, 400), 'image/webp')).toEqual({ width: 400, height: 400 });
+  });
+
+  it('refuses animations, mislabelled types and headers cut short', () => {
+    expect(rasterSize(png(4, 3, chunk('acTL', 8)), 'image/png')).toBeUndefined();
+    expect(rasterSize(vp8x(0x02, 400, 400), 'image/webp')).toBeUndefined();
+    expect(rasterSize(png(4, 3), 'image/webp')).toBeUndefined();
+    expect(rasterSize(png(4, 3), 'image/jpeg')).toBeUndefined();
+    expect(rasterSize(vp8x(0, 4, 3), 'image/png')).toBeUndefined();
+    expect(rasterSize(png(4, 3), 'image/gif')).toBeUndefined();
+    expect(rasterSize(png(4, 3).subarray(0, 30), 'image/png')).toBeUndefined(); // no IDAT seen
+    expect(rasterSize(vp8x(0, 4, 3).subarray(0, 29), 'image/webp')).toBeUndefined();
+    expect(rasterSize(jpeg([0xff, 0xe0, 0, 1]), 'image/jpeg')).toBeUndefined(); // segment length below 2
+    expect(rasterSize(jpeg(sof(640, 480)).subarray(0, 8), 'image/jpeg')).toBeUndefined();
+    expect(rasterSize(Uint8Array.from([0xff, 0xd8, 0x00]), 'image/jpeg')).toBeUndefined();
+  });
 });

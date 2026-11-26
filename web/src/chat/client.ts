@@ -1,6 +1,6 @@
 import { errorMessage, secureFetch } from '../api';
 import { arr, bool, count, obj, opt, str } from '../dto';
-import { sealedIds, type FileDescriptor } from '../crypto/attachments';
+import { sealedIds, type FileDescriptor, type Provenance } from '../crypto/attachments';
 import { openMessage, openMessages, sealRoomMessage } from './e2ee';
 import type { MessageState } from './searchIndex';
 import {
@@ -229,12 +229,14 @@ export async function sendMessage(params: {
   const files = params.files ?? [];
   const attachmentIds = sealedIds(files);
   // Rooms are end-to-end encrypted: the text, its kind, its reply target and each file's key and
-  // name travel sealed. The server keeps reply_to_id and the attachment IDs as pointers.
+  // name travel sealed. The server keeps reply_to_id and the attachment IDs as pointers. `files`
+  // is always present, even empty: the message vouches for every file it has. `ref` (the
+  // idempotency key, the same on a retry) is the ID its edits name.
   const envelope = await sealRoomMessage(params.roomId, {
     type: params.replyToId ? 'reply' : files.length > 0 ? 'attachment' : 'text',
     body: params.body,
     ...(params.replyToId ? { reply_to_id: params.replyToId } : {}),
-    // Always present, even empty: it tells receivers this message vouches for every file it has.
+    ref: params.idempotencyKey,
     files,
   });
   const data = obj(
@@ -257,11 +259,19 @@ export async function sendMessage(params: {
   return openMessage(parseMessage(data.message));
 }
 
-export async function editMessage(roomId: string, messageId: string, body: string, replyToId?: string): Promise<ChatMessage> {
+export async function editMessage(params: {
+  roomId: string;
+  messageId: string;
+  body: string;
+  replyToId?: string;
+  provenance: Provenance | undefined;
+}): Promise<ChatMessage> {
+  const { roomId, messageId, body, replyToId, provenance } = params;
   // An edit is sealed too, names the message it replaces and keeps the reply it was. It never
   // carries file keys: it goes to whoever is in the room now, and the server keeps the envelope the
-  // files were sent in (original_body). `files: []` marks it as sealed by a client that knows that.
-  const envelope = await sealRoomMessage(roomId, editInner(messageId, body, replyToId));
+  // files were sent in (original_body). It names what that envelope must hold instead.
+  if (!provenance) throw new Error('This message cannot be edited here.');
+  const envelope = await sealRoomMessage(roomId, editInner(messageId, body, provenance, replyToId));
   const data = obj(
     await apiJSON(
       `/api/v1/rooms/${encodeURIComponent(roomId)}/messages/${encodeURIComponent(messageId)}`,
@@ -275,9 +285,12 @@ export async function editMessage(roomId: string, messageId: string, body: strin
   return openMessage(parseMessage(data.message));
 }
 
-/** The sealed content of an edit: new text only, never the message's file keys. */
-export function editInner(messageId: string, body: string, replyToId?: string) {
-  return { type: 'edit' as const, body, message_id: messageId, ...(replyToId ? { reply_to_id: replyToId } : {}), files: [] };
+/**
+ * The sealed content of an edit: new text, and what the message's files are (its sender's ID and
+ * how many, or that it is from before E5), never their keys.
+ */
+export function editInner(messageId: string, body: string, original: Provenance, replyToId?: string) {
+  return { type: 'edit' as const, body, message_id: messageId, ...(replyToId ? { reply_to_id: replyToId } : {}), original };
 }
 
 export async function deleteMessage(roomId: string, messageId: string): Promise<ChatMessage> {

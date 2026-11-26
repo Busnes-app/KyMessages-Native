@@ -97,6 +97,10 @@ export interface RoomInner {
   message_id?: string;
   /** Encrypted attachment descriptors, checked by crypto/attachments.ts openFiles. */
   files?: unknown[];
+  /** The sender's own ID for a message (its idempotency key), named again by its edits. */
+  ref?: string;
+  /** For an edit: what the edited message's files are, checked by crypto/attachments.ts. */
+  original?: unknown;
 }
 
 export interface RoomEnvelope {
@@ -215,6 +219,7 @@ function parseInner(s: string): RoomInner | undefined {
   if (i.reply_to_id !== undefined && !isStr(i.reply_to_id, 128)) return undefined;
   if (i.message_id !== undefined && !isStr(i.message_id, 128)) return undefined;
   if (i.files !== undefined && !Array.isArray(i.files)) return undefined;
+  if (i.ref !== undefined && !isStr(i.ref, 128)) return undefined;
   return {
     room_id: i.room_id,
     type: i.type as RoomMessageType,
@@ -222,6 +227,8 @@ function parseInner(s: string): RoomInner | undefined {
     ...(i.reply_to_id ? { reply_to_id: i.reply_to_id as string } : {}),
     ...(i.message_id ? { message_id: i.message_id as string } : {}),
     ...(i.files ? { files: i.files as unknown[] } : {}),
+    ...(i.ref ? { ref: i.ref as string } : {}),
+    ...(i.original !== undefined ? { original: i.original } : {}),
   };
 }
 
@@ -653,9 +660,10 @@ export class CryptoEngine {
   /**
    * Opens a stored e2ee_room_v1 message. The session must have come from the device that sent
    * it, for the room it is in; the plaintext must name that room; and its ratchet index may
-   * belong to no other message.
+   * belong to no other message. `expect` refuses an inner this message cannot be (its reason),
+   * checked before the index is claimed for this message, so a substitute never takes it.
    */
-  async decrypt(m: SealedMessage): Promise<Opened> {
+  async decrypt(m: SealedMessage, expect?: (inner: RoomInner) => string | undefined): Promise<Opened> {
     const env = parseEnvelope(m.body);
     if (!env) return { state: 'failed', reason: 'This message is damaged.' };
     const rec = await this.store.get<InboundRecord>(inboundKey(env.sender_key, env.session_id));
@@ -684,6 +692,8 @@ export class CryptoEngine {
     if (!inner) return { state: 'failed', reason: 'This message is damaged.' };
     if (inner.room_id !== m.room_id) return { state: 'failed', reason: 'This message was encrypted for another room.' };
     if (inner.type === 'edit' && inner.message_id !== m.id) return { state: 'failed', reason: 'This edit belongs to another message.' };
+    const refused = expect?.(inner);
+    if (refused) return { state: 'failed', reason: refused };
     const owner = await this.store.putIfAbsent(seenKey(env.sender_key, env.session_id, index), m.id);
     if (owner !== m.id) return { state: 'failed', reason: 'This message is a replay of another message.' };
     return { state: 'decrypted', inner };

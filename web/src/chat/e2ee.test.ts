@@ -485,27 +485,27 @@ describe('the signed-in device', () => {
       body: '{"alg":"megolm.v1","sender_key":"k","device_id":"DEVICE0001","session_id":"s","ciphertext":"AAAA"}',
     });
     const decrypt = vi.spyOn(e, 'decrypt');
-    decrypt.mockResolvedValue({ state: 'decrypted', inner: { room_id: 'r1', type: 'attachment', body: '', files: [desc('att_a'), desc('att_elsewhere')] } });
+    decrypt.mockResolvedValue({ state: 'decrypted', inner: { room_id: 'r1', type: 'attachment', body: '', ref: 'ref-m1-000001', files: [desc('att_a'), desc('att_elsewhere')] } });
     const opened = await openMessage(m);
     expect(opened.files?.map((f) => [f.attachment_id, f.missing ?? false])).toEqual([['att_a', false], ['att_elsewhere', true]]);
     expect(opened.files?.[0].name).toBe('att_a.txt');
     // An edit's files come from the envelope the message was first sent in, never from the edit.
     const edited = { ...m, original: '{"alg":"megolm.v1","sender_key":"k","device_id":"DEVICE0001","session_id":"s0","ciphertext":"BBBB"}' };
     decrypt.mockImplementation(async (sealed) => sealed.body === edited.original
-      ? { state: 'decrypted', inner: { room_id: 'r1', type: 'attachment', body: 'see file', files: [desc('att_a')] } }
-      : { state: 'decrypted', inner: { room_id: 'r1', type: 'edit', body: 'new caption', message_id: 'm1', files: [] } });
+      ? { state: 'decrypted', inner: { room_id: 'r1', type: 'attachment', body: 'see file', ref: 'ref-m1-000001', files: [desc('att_a')] } }
+      : { state: 'decrypted', inner: { room_id: 'r1', type: 'edit', body: 'new caption', message_id: 'm1', original: { kind: 'e5', ref: 'ref-m1-000001', files: 1 } } });
     const openedEdit = await openMessage(edited);
     expect(openedEdit.body).toBe('new caption');
     expect(openedEdit.files?.map((f) => f.attachment_id)).toEqual(['att_a']);
     decrypt.mockImplementation(async (sealed) => sealed.body === edited.original
       ? { state: 'failed', reason: 'This message was sent before this device could read the room.' }
-      : { state: 'decrypted', inner: { room_id: 'r1', type: 'edit', body: 'new caption', message_id: 'm1', files: [] } });
+      : { state: 'decrypted', inner: { room_id: 'r1', type: 'edit', body: 'new caption', message_id: 'm1', original: { kind: 'e5', ref: 'ref-m1-000001', files: 1 } } });
     const joiner = await openMessage(edited);
     expect(joiner.body).toBe('new caption');
     expect(joiner.files).toBeUndefined();
     expect(joiner.filesState?.reason).toMatch(/before this device/);
     decrypt.mockReset();
-    decrypt.mockResolvedValue({ state: 'decrypted', inner: { room_id: 'r1', type: 'attachment', body: '', files: [{ ...desc('att_a'), chunk_size: 1 }] } });
+    decrypt.mockResolvedValue({ state: 'decrypted', inner: { room_id: 'r1', type: 'attachment', body: '', ref: 'ref-m1-000001', files: [{ ...desc('att_a'), chunk_size: 1 }] } });
     expect((await openMessage(m)).e2ee).toEqual({ kind: 'failed', reason: 'This message is damaged.' });
   });
 
