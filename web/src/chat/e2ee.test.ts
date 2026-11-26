@@ -1222,4 +1222,28 @@ describe('Round 8: status and start-ups around a device reset', () => {
     otherTab.close();
     off();
   });
+
+  it('ignores duplicate peer device-reset notices while one is already held', async () => {
+    const server = new FakeKeyServer();
+    const s = serve(server);
+    const first = await startE2EE('u_alice');
+    await (await prepareIdentity()).commit();
+    await new Promise((r) => setTimeout(r, 100));
+    const otherTab = new BroadcastChannel('kymessages-room-keys');
+    otherTab.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId });
+    await vi.waitFor(() => expect(encryptionReadyFor('u_alice')).toBe(false));
+    const uploads = s.uploads;
+    // Start a status check waiting on the first hold, then send a duplicate device-reset.
+    const fresh = identityStatus();
+    otherTab.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId });
+    await tick();
+    expect(s.uploads).toBe(uploads);
+    const store = await openCryptoStore('u_alice');
+    await CryptoEngine.resetDevice('u_alice', first.deviceId, store);
+    store.close();
+    otherTab.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: first.deviceId });
+    expect(await fresh).toMatchObject({ state: 'verified' });
+    expect((await startE2EE('u_alice')).deviceId).not.toBe(first.deviceId);
+    otherTab.close();
+  });
 });

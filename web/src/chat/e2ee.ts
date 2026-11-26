@@ -273,11 +273,13 @@ if (keyChannel) keyChannel.onmessage = ({ data }: MessageEvent<unknown>) => {
     const key = `${data.user_id}\n${data.device_id}`;
     if (data.type === 'device-reset-done') return peerResets.get(key)?.();
     const entry = current;
-    if (entry?.userId !== data.user_id || entry.deviceId !== data.device_id) return;
+    if (entry?.userId !== data.user_id || entry.deviceId !== data.device_id || peerResets.has(key)) return;
     invalidateEntry(entry);
+    let timer: ReturnType<typeof setTimeout> | undefined;
     void holdStarts(entry, new Promise<void>((done) => {
-      peerResets.set(key, done);
-      setTimeout(done, PEER_RESET_MS);
+      const finish = () => { clearTimeout(timer); done(); };
+      peerResets.set(key, finish);
+      timer = setTimeout(finish, PEER_RESET_MS);
     })).then(() => {
       peerResets.delete(key);
       if (current === entry) announceIdentity();
@@ -295,9 +297,11 @@ function invalidateEntry(entry: Entry): void {
 
 /** Holds every start-up of entry's user until reset settles; cleared before anyone waiting resumes. */
 function holdStarts(entry: Entry, reset: Promise<unknown>): Promise<void> {
-  const clear = () => { entry.replacing = undefined; };
-  entry.replacing = reset.then(clear, clear);
-  return entry.replacing;
+  let held: Promise<void>;
+  const clear = () => { if (entry.replacing === held) entry.replacing = undefined; };
+  held = reset.then(clear, clear);
+  entry.replacing = held;
+  return held;
 }
 // Set when another tab deleted this tab's store (a sign-out). This tab may
 // have missed that sign-out, so it must not create a new device and new private keys on its own:
