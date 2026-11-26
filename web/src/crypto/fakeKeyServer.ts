@@ -1,8 +1,21 @@
 // An in-memory stand-in for the key server (internal/api/e2ee_handlers.go) and room membership,
 // for engine tests. It checks the same signatures the real server checks, and lets a test play a
 // hostile server by editing what it stores.
-import { deviceSigned, oneTimeKeySigned, type ClaimedKey, type DeviceKeys, type KeyServer, type Mail, type SignedKey } from './engine';
+import { Conflict, deviceSigned, oneTimeKeySigned, type ClaimedKey, type DeviceKeys, type KeyServer, type Mail, type SignedKey } from './engine';
+import type { BackupEntry, MasterKeyRecord, OwnMaster } from './identity';
 import { verifyEd25519 } from './index';
+import { pqc } from '../pqc/index';
+
+export const TENANT = '00000000-0000-4000-8000-00000000000a';
+
+interface Pairing {
+  user: string;
+  initiator: string;
+  newDevice: string;
+  ephemeral: string;
+  sealed: string;
+  expires: number;
+}
 
 const dk = (user: string, device: string) => `${user}\n${device}`;
 
@@ -13,6 +26,9 @@ export class FakeKeyServer {
   readonly mail = new Map<string, Mail[]>();
   readonly rooms = new Map<string, Set<string>>();
   readonly sent: { from: string; to: string; type: string }[] = [];
+  readonly masters = new Map<string, OwnMaster>();
+  readonly backups = new Map<string, Map<string, BackupEntry>>();
+  readonly pairings = new Map<string, Pairing>();
   private nextMail = 1;
 
   join(roomId: string, ...userIds: string[]): void {
@@ -23,6 +39,12 @@ export class FakeKeyServer {
 
   leave(roomId: string, userId: string): void {
     this.rooms.get(roomId)?.delete(userId);
+  }
+
+  private pairing(userId: string, id: string): Pairing {
+    const p = this.pairings.get(id);
+    if (!p || p.user !== userId || p.expires <= Date.now()) throw new Error('Unknown pairing');
+    return p;
   }
 
   oneTimeKeyCount(userId: string, deviceId: string): number {
@@ -61,9 +83,95 @@ export class FakeKeyServer {
         return { count: stored.length, fallback: this.fallbackKeys.has(id) };
       },
       query: async (userIds) => {
-        const out: Record<string, DeviceKeys[]> = {};
-        for (const u of userIds) out[u] = [...(this.devices.get(u)?.values() ?? [])].map((d) => ({ ...d }));
-        return out;
+        const devices: Record<string, DeviceKeys[]> = {};
+        const master_keys: Record<string, MasterKeyRecord> = {};
+        for (const u of userIds) {
+          devices[u] = [...(this.devices.get(u)?.values() ?? [])].map((d) => ({ ...d }));
+          const m = this.masters.get(u);
+          if (m) master_keys[u] = { version: m.version, master_key: m.master_key, self_signature: m.self_signature };
+        }
+        return { tenant_id: TENANT, devices, master_keys };
+      },
+      getMaster: async () => {
+        const m = this.masters.get(userId);
+        return { tenant_id: TENANT, master: m ? structuredClone(m) : null };
+      },
+      putMaster: async (req) => {
+        const cur = this.masters.get(userId);
+        if ((cur?.version ?? 0) !== req.expected_version) throw new Conflict('409');
+        const version = req.expected_version + 1;
+        if (!pqc.verifyMaster(req.master_key, TENANT, userId, req.self_signature) ||
+          !pqc.verifyBackupKey(req.master_key, TENANT, userId, version, req.backup_key.public_key, req.backup_key.signature)) {
+          throw new Error('The encryption identity is not validly signed');
+        }
+        this.masters.set(userId, { version, master_key: req.master_key, self_signature: req.self_signature, backup_key: req.backup_key, recovery: req.recovery, pins: { counter: 0, sealed: '' } });
+        this.backups.delete(userId);
+        for (const d of this.devices.get(userId)?.values() ?? []) delete d.master_signature;
+        return version;
+      },
+      putPins: async (version, expected, sealed) => {
+        const m = this.masters.get(userId);
+        if (!m || m.version !== version || m.pins.counter !== expected) throw new Conflict('409');
+        m.pins = { counter: expected + 1, sealed };
+      },
+      signDevice: async (deviceId, version, signature) => {
+        const m = this.masters.get(userId);
+        const d = this.devices.get(userId)?.get(deviceId);
+        if (!d) throw new Error('Unknown device');
+        if (!m || m.version !== version) throw new Conflict('409');
+        if (!pqc.verifyDevice(m.master_key, TENANT, userId, deviceId, d.curve25519, d.ed25519, signature)) throw new Error('The device signature does not verify');
+        d.master_signature = signature;
+      },
+      getBackup: async (version, afterRoom, afterSession) => {
+        if (this.masters.get(userId)?.version !== version) throw new Conflict('409');
+        const rows = [...(this.backups.get(userId)?.values() ?? [])]
+          .sort((a, b) => (a.room_id + '\n' + a.session_id < b.room_id + '\n' + b.session_id ? -1 : 1))
+          .filter((e) => e.room_id > afterRoom || (e.room_id === afterRoom && e.session_id > afterSession));
+        return { sessions: rows.slice(0, 2).map((e) => ({ ...e })), more: rows.length > 2 };
+      },
+      putBackup: async (version, sessions) => {
+        if (this.masters.get(userId)?.version !== version) throw new Conflict('409');
+        const box = this.backups.get(userId) ?? new Map<string, BackupEntry>();
+        for (const e of sessions) {
+          const k = `${e.room_id}\n${e.session_id}`;
+          const known = box.get(k);
+          if (!known || e.first_index < known.first_index) box.set(k, { ...e });
+        }
+        this.backups.set(userId, box);
+      },
+      pairingStart: async (deviceId) => {
+        const d = this.devices.get(userId)?.get(deviceId);
+        if (!d?.master_signature) throw new Error('Only a verified device can verify another');
+        for (const [k, p] of this.pairings) if (p.user === userId) this.pairings.delete(k);
+        // As the server makes them: 16 random bytes, unpadded base64url.
+        const id = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16)))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+        this.pairings.set(id, { user: userId, initiator: deviceId, newDevice: '', ephemeral: '', sealed: '', expires: Date.now() + 180_000 });
+        return { pairing_id: id, expires_at: Date.now() + 180_000 };
+      },
+      pairingGet: async (id) => {
+        const p = this.pairing(userId, id);
+        return { pairing_id: id, initiator_device: p.initiator, new_device: p.newDevice, ephemeral_key: p.ephemeral, sealed: p.sealed !== '' };
+      },
+      pairingJoin: async (id, deviceId, ephemeralKey) => {
+        const p = this.pairing(userId, id);
+        if (p.newDevice || deviceId === p.initiator) throw new Conflict('409');
+        p.newDevice = deviceId;
+        p.ephemeral = ephemeralKey;
+      },
+      pairingSeal: async (id, deviceId, sealed) => {
+        const p = this.pairing(userId, id);
+        if (p.initiator !== deviceId || !p.newDevice || p.sealed) throw new Conflict('409');
+        p.sealed = sealed;
+      },
+      pairingConsume: async (id, deviceId) => {
+        const p = this.pairing(userId, id);
+        if (p.newDevice !== deviceId || !p.sealed) throw new Conflict('409');
+        this.pairings.delete(id);
+        return { initiator_device: p.initiator, sealed: p.sealed };
+      },
+      pairingCancel: async (id) => {
+        this.pairing(userId, id);
+        this.pairings.delete(id);
       },
       claim: async (devices) => {
         const out: ClaimedKey[] = [];

@@ -6,13 +6,20 @@
 // Nothing the server says is trusted: device and one-time-key signatures are checked here, a
 // device's keys are pinned the first time they are seen, a room key is accepted only from the
 // device whose Olm identity sent it, and a decrypted message must name the room it arrived in
-// and may not reuse another message's ratchet index. Until E3 (master-key signing) keys go to
-// every device the server lists for a member; that gap is known and closed by E3.
+// and may not reuse another message's ratchet index. Room keys go only to devices that the
+// member's pinned post-quantum master key signed (E3, identity.ts): an unverified device can
+// send, but receives no keys until it is verified, and a changed identity stops keys to that
+// member until the viewer accepts it.
 //
 // State lives in a CryptoStore and is re-read inside a lock for every operation, so several tabs
 // of one user can share a device without overwriting each other's ratchets.
 import { Account, GroupSession, InboundGroupSession, Session, verifyEd25519 } from './index';
+import type { Hybrid } from '../pqc/index';
+import { Identity, type IdentityChange, type IdentityServer, type IdentityStatus, type MasterKeyRecord, type PairingJoin, type PairingOffer } from './identity';
+import { backupQueueKey, inboundKey, isObj, isStr, parseJSON, seenKey, Transient, type InboundRecord } from './records';
 import type { CryptoStore } from './store';
+
+export { Conflict } from './records';
 
 export const ROOM_KEY_TYPE = 'kymessages.room_key.v1';
 export const ROTATE_AFTER_MESSAGES = 100;
@@ -46,6 +53,15 @@ export interface DeviceKeys {
   curve25519: string;
   ed25519: string;
   signature: string;
+  /** The user's master key's cross-signature; absent until the device is verified. */
+  master_signature?: Hybrid;
+}
+
+/** A key query: the org the keys belong to, each user's devices and master key. */
+export interface QueryResult {
+  tenant_id: string;
+  devices: Record<string, DeviceKeys[]>;
+  master_keys: Record<string, MasterKeyRecord>;
 }
 
 export interface ClaimedKey extends SignedKey {
@@ -71,10 +87,10 @@ export interface Mail {
   content: string;
 }
 
-export interface KeyServer {
+export interface KeyServer extends IdentityServer {
   /** POST /api/v1/keys/upload; answers the stored one-time key count and whether a fallback key is live. */
   upload(req: UploadRequest): Promise<{ count: number; fallback: boolean }>;
-  query(userIds: string[]): Promise<Record<string, DeviceKeys[]>>;
+  query(userIds: string[]): Promise<QueryResult>;
   claim(devices: { user_id: string; device_id: string }[]): Promise<ClaimedKey[]>;
   sendToDevice(deviceId: string, messages: ToDeviceMessage[]): Promise<void>;
   mailbox(deviceId: string): Promise<Mail[]>;
@@ -142,15 +158,6 @@ interface OutboundRecord {
   shared: Record<string, string>;
 }
 
-interface InboundRecord {
-  pickle: string;
-  room_id: string;
-  sender_user: string;
-  sender_device: string;
-  sender_key: string;
-  first_index: number;
-}
-
 /** A member's device whose self-signature checked out and whose keys match the pin. */
 export interface Target {
   user_id: string;
@@ -171,30 +178,11 @@ interface RoomKeyPayload {
   content: { room_id: string; session_id: string; session_key: string; device_id: string };
 }
 
-/** A failure worth retrying later (the network, the server), as opposed to bad mail. */
-class Transient extends Error {}
-
 const devKey = (t: { user_id: string; device_id: string }) => `${t.user_id}\n${t.device_id}`;
 
 function randomDeviceId(): string {
   const b = crypto.getRandomValues(new Uint8Array(16));
   return btoa(String.fromCharCode(...b)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
-
-function isObj(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null && !Array.isArray(v);
-}
-
-function isStr(v: unknown, max = 65536): v is string {
-  return typeof v === 'string' && v.length > 0 && v.length <= max;
-}
-
-function parseJSON(s: string): unknown {
-  try {
-    return JSON.parse(s);
-  } catch {
-    return undefined;
-  }
 }
 
 export function parseEnvelope(body: string): RoomEnvelope | undefined {
@@ -238,6 +226,7 @@ export class DeviceChanged extends Error {
 
 export class CryptoEngine {
   private readonly listeners = new Set<(sessionIds: string[]) => void>();
+  private readonly identity: Identity;
 
   private constructor(
     readonly userId: string,
@@ -247,7 +236,9 @@ export class CryptoEngine {
     private readonly server: KeyServer,
     private readonly store: CryptoStore,
     private readonly key: Uint8Array,
-  ) {}
+  ) {
+    this.identity = new Identity({ userId, deviceId, curve25519, ed25519, server, store, pickleKey: key, locked: (fn) => this.locked(fn) });
+  }
 
   /** Restores this browser's device for userId, or creates one, and publishes its keys. */
   static async open(userId: string, server: KeyServer, store: CryptoStore, onIdentity?: (deviceId: string) => void): Promise<CryptoEngine> {
@@ -275,6 +266,8 @@ export class CryptoEngine {
     const engine = new CryptoEngine(userId, ids.deviceId, ids.curve, ids.ed, server, store, key);
     onIdentity?.(engine.deviceId);
     await engine.publishKeys();
+    // A device that holds the identity (one replaced by resetDevice too) makes sure it is signed.
+    void engine.identity.status().catch(() => undefined);
     return engine;
   }
 
@@ -394,23 +387,27 @@ export class CryptoEngine {
     const pins: [string, unknown][] = [];
     for (let i = 0; i < userIds.length; i += BATCH) {
       const batch = userIds.slice(i, i + BATCH);
-      let listed: Record<string, DeviceKeys[]>;
+      let listed: QueryResult;
       try {
         listed = await this.server.query(batch);
       } catch (e) {
         throw new Transient(e instanceof Error ? e.message : 'Could not list devices');
       }
       for (const userId of batch) {
-        for (const d of listed[userId] ?? []) {
+        // No pinned, validly self-bound master key: none of this member's devices gets keys.
+        const master = await this.identity.trustedMaster(userId, listed.master_keys?.[userId], listed.tenant_id, pins);
+        if (!master) continue;
+        for (const d of listed.devices?.[userId] ?? []) {
           if (userId === this.userId && isObj(d) && d.device_id === this.deviceId) continue;
           const checked = await this.checkDevice(userId, d);
-          if (!checked) continue;
+          if (!checked || !this.identity.deviceTrusted(master, listed.tenant_id, userId, d)) continue;
           if (checked.pin) pins.push(checked.pin);
           out.push(checked.target);
         }
       }
     }
     await this.store.write(pins);
+    this.identity.afterWrites();
     return out;
   }
 
@@ -446,6 +443,50 @@ export class CryptoEngine {
    */
   async memberLeft(roomId: string): Promise<void> {
     await this.locked(() => this.store.write([], [`out:${roomId}`]));
+  }
+
+  // --- Identity (identity.ts) ---
+
+  /** Seals queued room sessions to the key backup, after the current locked operation. */
+  private backupSoon(): void {
+    setTimeout(() => void this.locked(() => this.identity.flushBackup()).catch(() => undefined), 0);
+  }
+
+  /** Whether the user has an encryption identity and this device is verified by it. */
+  identityStatus(): Promise<IdentityStatus> {
+    return this.identity.status();
+  }
+
+  /** A new identity (the first device, or a reset); upload happens on commit. */
+  prepareIdentity(reset = false): { recoveryKey: string; commit(): Promise<void> } {
+    return this.identity.prepare(reset);
+  }
+
+  /** Verifies this device with the recovery key; answers the number of sessions restored. */
+  restoreIdentity(recoveryKey: string): Promise<number> {
+    return this.identity.restore(recoveryKey);
+  }
+
+  /** On a verified device: a QR pairing to verify a new one. */
+  offerVerification(): Promise<PairingOffer> {
+    return this.identity.offer();
+  }
+
+  /** On a new device: joins a pairing from the code a verified device shows. */
+  joinVerification(text: string): Promise<PairingJoin> {
+    return this.identity.join(text);
+  }
+
+  identityChanges(): Promise<IdentityChange[]> {
+    return this.identity.changes();
+  }
+
+  acceptIdentity(userId: string): Promise<void> {
+    return this.identity.acceptChange(userId);
+  }
+
+  onIdentityChange(fn: () => void): () => void {
+    return this.identity.onChange(fn);
   }
 
   // --- Olm ---
@@ -611,14 +652,16 @@ export class CryptoEngine {
           // This device reads its own messages through an inbound copy, like everyone else.
           const own = new InboundGroupSession(session.sessionKey());
           try {
-            await this.store.write([[inboundKey(this.curve25519, session.sessionId), {
+            const k = inboundKey(this.curve25519, session.sessionId);
+            await this.store.write([[k, {
               pickle: own.pickle(this.key),
               room_id: roomId,
               sender_user: this.userId,
               sender_device: this.deviceId,
               sender_key: this.curve25519,
               first_index: own.firstKnownIndex,
-            } satisfies InboundRecord]]);
+            } satisfies InboundRecord], [backupQueueKey(k), k]]);
+            this.backupSoon();
           } finally {
             own.free();
           }
@@ -760,7 +803,8 @@ export class CryptoEngine {
       if (e instanceof Transient || e instanceof DOMException) throw e;
       bad = e;
     }
-    await this.store.write(room ? [...pin, ...writes, [room.key, room.record]] : [...pin, ...writes]);
+    await this.store.write(room ? [...pin, ...writes, [room.key, room.record], [backupQueueKey(room.key), room.key]] : [...pin, ...writes]);
+    if (room) this.backupSoon();
     if (bad !== undefined) throw bad;
     return room ? { sessionId: room.sessionId, preKey } : undefined;
   }
@@ -809,12 +853,6 @@ export class CryptoEngine {
     }
   }
 }
-
-// Room sessions and their replay log are keyed by the sender's verified curve25519 key as well
-// as the session ID: a member who re-shares someone else's session as their own gets a separate
-// entry, and can neither displace the real sender's key nor claim its message indexes.
-const inboundKey = (senderKey: string, sessionId: string) => `in:${senderKey}:${sessionId}`;
-const seenKey = (senderKey: string, sessionId: string, index: number) => `seen:${senderKey}:${sessionId}:${index}`;
 
 function lockName(userId: string): string {
   return `kymessages-crypto-${userId}`;

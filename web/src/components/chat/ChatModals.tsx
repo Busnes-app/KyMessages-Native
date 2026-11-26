@@ -24,7 +24,7 @@ interface ChatDialogProps {
 // autoFocus field that already holds it keeps it, otherwise the first control), Tab stays
 // inside, Escape, Close and a press on the backdrop close it, focus returns to the opener
 // and the page behind does not scroll.
-function ChatDialog({ title, titleStyle, closeLabel = 'Close', onClose, busy = false, onSubmit, children }: ChatDialogProps) {
+export function ChatDialog({ title, titleStyle, closeLabel = 'Close', onClose, busy = false, onSubmit, children }: ChatDialogProps) {
   const popup = useRef<HTMLDivElement | null>(null);
   // The opener, read before an autoFocus field takes focus: Base UI notes the element focused
   // when its popup mounts, which by then is that field, gone once the dialog closes.

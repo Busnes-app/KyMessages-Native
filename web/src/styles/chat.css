@@ -3079,3 +3079,35 @@
 
 
 
+
+/* E3 identity screens (components/chat/EncryptionIdentity.tsx). */
+.e2ee-recovery-key {
+  display: block;
+  padding: 0.6rem 0.7rem;
+  border-radius: 8px;
+  background: var(--panel-hover);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.95rem;
+  line-height: 1.5;
+  word-break: break-all;
+  user-select: all;
+}
+
+.e2ee-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 1.8rem;
+  letter-spacing: 0.3em;
+  text-align: center;
+  margin: 0.25rem 0;
+}
+
+.btn-link {
+  align-self: flex-start;
+  background: none;
+  border: 0;
+  padding: 0;
+  color: inherit;
+  text-decoration: underline;
+  font-size: 0.82rem;
+  cursor: pointer;
+}

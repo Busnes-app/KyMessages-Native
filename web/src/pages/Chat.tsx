@@ -19,6 +19,7 @@ import {
   PhoneOff,
   Search,
   Send,
+  ShieldCheck,
   Video,
   X,
 } from 'lucide-react';
@@ -86,6 +87,7 @@ import { ChatSidebar } from '../components/chat/ChatSidebar';
 import { MessageRow } from '../components/chat/MessageRow';
 import { RoomDetailsDrawer, type DrawerTab } from '../components/chat/RoomDetailsDrawer';
 import { CreateChannelModal, SearchModal, StartDMModal } from '../components/chat/ChatModals';
+import { EncryptionIdentityGate, IdentityChangedBanner, VerifyAnotherDevice } from '../components/chat/EncryptionIdentity';
 import { searchIndexFor } from '../chat/searchIndex';
 import { keyGeneration, onRoomKeys, openMessages, receiveRoomKeys, retryable, roomMemberLeft, startE2EE } from '../chat/e2ee';
 import { CallAudioLayer, CallStage } from '../components/chat/CallStage';
@@ -111,7 +113,7 @@ interface ChatProps {
   onActiveCallChange?: (summary: ActiveCallSummary | null) => void;
 }
 
-type ActiveModal = 'none' | 'new-channel' | 'new-dm' | 'search';
+type ActiveModal = 'none' | 'new-channel' | 'new-dm' | 'search' | 'verify-device';
 
 // What a row says about its encryption state; a retry replaces the row only when this changes.
 const e2eeLabel = (m: ChatMessage) => (m.e2ee?.kind === 'failed' ? `failed:${m.e2ee.reason}` : m.e2ee?.kind ?? '');
@@ -144,6 +146,8 @@ export const Chat: React.FC<ChatProps> = ({
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
   const [bannerError, setBannerError] = useState('');
+  // This browser's encryption device started: the identity screens may ask the server.
+  const [e2eeReady, setE2eeReady] = useState(false);
   const [currentUser, setCurrentUser] = useState<ChatCurrentUser | null>(null);
   const [tenantName, setTenantName] = useState('KyMessages');
   const [rooms, setRooms] = useState<ChatRoomSummary[]>([]);
@@ -904,7 +908,9 @@ export const Chat: React.FC<ChatProps> = ({
         ]);
         if (cancelled) return;
         // Start this browser's encryption device before any room's messages are opened.
-        void startE2EE(boot.user.id).catch(() => {
+        void startE2EE(boot.user.id).then(() => {
+          if (!cancelled) setE2eeReady(true);
+        }, () => {
           if (!cancelled) setBannerError('Encryption could not start in this browser, so messages cannot be sent or read.');
         });
         setCurrentUser(boot.user);
@@ -2040,6 +2046,17 @@ export const Chat: React.FC<ChatProps> = ({
                 >
                   <Search size={17} />
                 </button>
+                {e2eeReady && (
+                  <button
+                    type="button"
+                    className="chat-icon-btn"
+                    title="Verify another of your devices"
+                    aria-label="Verify a device"
+                    onClick={() => setModal('verify-device')}
+                  >
+                    <ShieldCheck size={17} />
+                  </button>
+                )}
                 <button
                   type="button"
                   className={drawerOpen ? 'chat-header-panel-btn active' : 'chat-header-panel-btn'}
@@ -2065,6 +2082,13 @@ export const Chat: React.FC<ChatProps> = ({
               </div>
             </header>
 
+            <EncryptionIdentityGate ready={e2eeReady} />
+            {e2eeReady && roomDetail && roomDetail.room.id === activeRoom.id && (
+              <IdentityChangedBanner
+                memberIds={roomDetail.members.map((m) => m.user_id)}
+                nameOf={(id) => directory.find((u) => u.id === id)?.display_name || directory.find((u) => u.id === id)?.username || 'A member'}
+              />
+            )}
             {bannerError && (
               <div className="chat-banner chat-banner-error" role="alert">
                 <span>{bannerError}</span>
@@ -2623,6 +2647,7 @@ export const Chat: React.FC<ChatProps> = ({
         />
       )}
 
+      {modal === 'verify-device' && <VerifyAnotherDevice onClose={() => setModal('none')} />}
       {modal === 'new-channel' && (
         <CreateChannelModal
           directory={directory}

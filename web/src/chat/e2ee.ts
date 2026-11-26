@@ -4,8 +4,10 @@
 import { errorMessage, secureFetch } from '../api';
 import { arr, bool, obj, str } from '../dto';
 import { keepStorage } from '../persist';
-import { CryptoEngine, DeviceChanged, type ClaimedKey, type DeviceKeys, type KeyServer, type Mail, type RoomInner } from '../crypto/engine';
+import { Conflict, CryptoEngine, DeviceChanged, type ClaimedKey, type DeviceKeys, type KeyServer, type Mail, type RoomInner } from '../crypto/engine';
+import type { BackupEntry, IdentityChange, IdentityStatus, MasterKeyRecord, OwnMaster, PairingJoin, PairingOffer } from '../crypto/identity';
 import { loadCrypto } from '../crypto/index';
+import { loadPQC, type Hybrid } from '../pqc/index';
 import { type CryptoStore, deleteCryptoStores, openCryptoStore, storedDevices } from '../crypto/store';
 import { parseRoomDetail, type ChatMessage, type E2EEState } from './types';
 
@@ -23,14 +25,44 @@ async function call(path: string, method: string, body?: unknown, signal?: Abort
     headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
+  if (res.status === 409) throw new Conflict(await errorMessage(res, 'The encryption identity changed'));
   if (!res.ok) throw new KeyServerError(res.status, await errorMessage(res, 'Encryption request failed'));
   return res.status === 204 ? null : res.json();
 }
 
+const hybrid = (v: unknown): Hybrid => {
+  const o = obj(v);
+  if (o.alg !== 'mldsa65+ed25519') throw new Error('Unknown signature algorithm');
+  return { alg: o.alg, mldsa65: str(o.mldsa65, 8192), ed25519: str(o.ed25519, 128) };
+};
+
 const device = (v: unknown): DeviceKeys => {
   const o = obj(v);
-  return { device_id: str(o.device_id, 64), curve25519: str(o.curve25519, 64), ed25519: str(o.ed25519, 64), signature: str(o.signature, 128) };
+  const d: DeviceKeys = { device_id: str(o.device_id, 64), curve25519: str(o.curve25519, 64), ed25519: str(o.ed25519, 64), signature: str(o.signature, 128) };
+  if (o.master_signature !== undefined) d.master_signature = hybrid(o.master_signature);
+  return d;
 };
+
+const masterRecord = (v: unknown): MasterKeyRecord => {
+  const o = obj(v);
+  if (typeof o.version !== 'number') throw new Error('Invalid master key');
+  return { version: o.version, master_key: hybrid(o.master_key), self_signature: hybrid(o.self_signature) };
+};
+
+const ownMaster = (v: unknown): OwnMaster => {
+  const o = obj(v);
+  const bk = obj(o.backup_key);
+  const rc = obj(o.recovery);
+  const pins = obj(o.pins);
+  return {
+    ...masterRecord(o),
+    backup_key: { public_key: str(bk.public_key, 4096), signature: hybrid(bk.signature) },
+    recovery: { wrapped_master_key: str(rc.wrapped_master_key, 1024), wrapped_backup_key: str(rc.wrapped_backup_key, 1024) },
+    pins: { counter: typeof pins.counter === 'number' ? pins.counter : 0, sealed: typeof pins.sealed === 'string' ? pins.sealed : '' },
+  };
+};
+
+const pairingPath = (id: string) => `/api/v1/keys/pairings/${encodeURIComponent(id)}`;
 
 const keyServer = (signal: AbortSignal): KeyServer => ({
   async upload(req) {
@@ -39,16 +71,26 @@ const keyServer = (signal: AbortSignal): KeyServer => ({
     return { count: typeof o.one_time_key_count === 'number' ? o.one_time_key_count : 0, fallback: o.has_fallback_key !== false };
   },
   async query(userIds) {
-    const devices = obj(obj(await call('/api/v1/keys/query', 'POST', { user_ids: userIds }, signal)).devices);
+    const res = obj(await call('/api/v1/keys/query', 'POST', { user_ids: userIds }, signal));
+    const devices = obj(res.devices);
+    const masters = res.master_keys === undefined ? {} : obj(res.master_keys);
     const out: Record<string, DeviceKeys[]> = {};
-    for (const id of userIds) out[id] = arr(devices[id] ?? []).flatMap((d) => {
+    const master_keys: Record<string, MasterKeyRecord> = {};
+    for (const id of userIds) {
+      out[id] = arr(devices[id] ?? []).flatMap((d) => {
+        try {
+          return [device(d)];
+        } catch {
+          return [];
+        }
+      });
       try {
-        return [device(d)];
+        if (masters[id] !== undefined) master_keys[id] = masterRecord(masters[id]);
       } catch {
-        return [];
+        // A malformed master key is no master key: none of that user's devices gets room keys.
       }
-    });
-    return out;
+    }
+    return { tenant_id: str(res.tenant_id, 128), devices: out, master_keys };
   },
   async claim(devices) {
     return arr(obj(await call('/api/v1/keys/claim', 'POST', { devices }, signal)).keys).flatMap((v): ClaimedKey[] => {
@@ -87,6 +129,58 @@ const keyServer = (signal: AbortSignal): KeyServer => ({
   },
   async roomMembers(roomId) {
     return parseRoomDetail(await call(`/api/v1/rooms/${encodeURIComponent(roomId)}`, 'GET', undefined, signal)).members.map((m) => m.user_id);
+  },
+  async getMaster() {
+    const o = obj(await call('/api/v1/keys/master', 'GET', undefined, signal));
+    return { tenant_id: str(o.tenant_id, 128), master: o.master === null ? null : ownMaster(o.master) };
+  },
+  async putMaster(req) {
+    const o = obj(await call('/api/v1/keys/master', 'PUT', req, signal));
+    return typeof o.version === 'number' ? o.version : 0;
+  },
+  async putPins(version, expected, sealed) {
+    await call('/api/v1/keys/pins', 'PUT', { version, expected_counter: expected, sealed }, signal);
+  },
+  async signDevice(deviceId, version, signature) {
+    await call(`/api/v1/keys/devices/${encodeURIComponent(deviceId)}/signature`, 'POST', { version, signature }, signal);
+  },
+  async getBackup(version, afterRoom, afterSession) {
+    const q = new URLSearchParams({ version: String(version), after_room: afterRoom, after_session: afterSession });
+    const o = obj(await call(`/api/v1/keys/backup?${q}`, 'GET', undefined, signal));
+    const sessions = arr(o.sessions).flatMap((v): BackupEntry[] => {
+      try {
+        const e = obj(v);
+        return [{ room_id: str(e.room_id, 128), session_id: str(e.session_id, 128), first_index: typeof e.first_index === 'number' ? e.first_index : 0, sealed: str(e.sealed, 16384) }];
+      } catch {
+        return [];
+      }
+    });
+    return { sessions, more: o.more === true };
+  },
+  async putBackup(version, sessions) {
+    await call('/api/v1/keys/backup', 'PUT', { version, sessions }, signal);
+  },
+  async pairingStart(deviceId) {
+    const o = obj(await call('/api/v1/keys/pairings', 'POST', { device_id: deviceId }, signal));
+    return { pairing_id: str(o.pairing_id, 64), expires_at: typeof o.expires_at === 'number' ? o.expires_at : Date.now() };
+  },
+  async pairingGet(id) {
+    const o = obj(await call(pairingPath(id), 'GET', undefined, signal));
+    return { pairing_id: str(o.pairing_id, 64), initiator_device: str(o.initiator_device, 64),
+      new_device: typeof o.new_device === 'string' ? o.new_device : '', ephemeral_key: typeof o.ephemeral_key === 'string' ? o.ephemeral_key : '', sealed: o.sealed === true };
+  },
+  async pairingJoin(id, deviceId, ephemeralKey) {
+    await call(`${pairingPath(id)}/join`, 'POST', { device_id: deviceId, ephemeral_key: ephemeralKey }, signal);
+  },
+  async pairingSeal(id, deviceId, sealed) {
+    await call(`${pairingPath(id)}/sealed`, 'PUT', { device_id: deviceId, sealed }, signal);
+  },
+  async pairingConsume(id, deviceId) {
+    const o = obj(await call(`${pairingPath(id)}/consume`, 'POST', { device_id: deviceId }, signal));
+    return { initiator_device: str(o.initiator_device, 64), sealed: str(o.sealed, 16384) };
+  },
+  async pairingCancel(id) {
+    await call(pairingPath(id), 'DELETE', undefined, signal);
   },
 });
 
@@ -180,7 +274,7 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
     return s;
   };
   entry.engine = (async () => {
-    await loadCrypto();
+    await Promise.all([loadCrypto(), loadPQC()]);
     let e: CryptoEngine;
     const store = await openStore();
     try {
@@ -259,6 +353,59 @@ async function withEngine<T>(fn: (e: CryptoEngine) => Promise<T>): Promise<T> {
 export function onRoomKeys(fn: () => void): () => void {
   keyListeners.add(fn);
   return () => keyListeners.delete(fn);
+}
+
+// --- Identity and verification (crypto/identity.ts), for the UI ---
+
+const identityListeners = new Set<() => void>();
+let identityWired: CryptoEngine | undefined;
+
+/** Calls fn when this device's identity state or a member's pinned identity changes. */
+export function onIdentityChanged(fn: () => void): () => void {
+  identityListeners.add(fn);
+  return () => identityListeners.delete(fn);
+}
+
+function announceIdentity(): void {
+  for (const fn of identityListeners) fn();
+}
+
+async function identityEngine(): Promise<CryptoEngine> {
+  const e = await engine();
+  if (identityWired !== e) {
+    identityWired = e;
+    e.onIdentityChange(announceIdentity);
+  }
+  return e;
+}
+
+export const identityStatus = (): Promise<IdentityStatus> => identityEngine().then((e) => e.identityStatus());
+
+/** A new identity for this account: show recoveryKey, then commit once the user saved it. */
+export async function prepareIdentity(reset = false): Promise<{ recoveryKey: string; commit(): Promise<void> }> {
+  const p = (await identityEngine()).prepareIdentity(reset);
+  return { recoveryKey: p.recoveryKey, commit: async () => { await p.commit(); announceIdentity(); keysArrived(true); } };
+}
+
+export async function restoreIdentity(recoveryKey: string): Promise<number> {
+  const n = await (await identityEngine()).restoreIdentity(recoveryKey);
+  announceIdentity();
+  keysArrived(true);
+  return n;
+}
+
+export const offerVerification = (): Promise<PairingOffer> => identityEngine().then((e) => e.offerVerification());
+
+export async function joinVerification(text: string): Promise<PairingJoin> {
+  const j = await (await identityEngine()).joinVerification(text);
+  return { ...j, finish: async (signal) => { const n = await j.finish(signal); announceIdentity(); keysArrived(true); return n; } };
+}
+
+export const identityChanges = (): Promise<IdentityChange[]> => identityEngine().then((e) => e.identityChanges());
+
+export async function acceptIdentity(userId: string): Promise<void> {
+  await (await identityEngine()).acceptIdentity(userId);
+  announceIdentity();
 }
 
 /** Reads the device mailbox: on start, on a `to_device` wake and after a reconnect. */

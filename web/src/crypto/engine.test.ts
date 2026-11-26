@@ -4,10 +4,12 @@ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { CryptoEngine, DeviceChanged, deviceSigned, oneTimeKeySigned, parseEnvelope, ROTATE_AFTER_MESSAGES, ROTATE_AFTER_MS, type SealedMessage } from './engine';
 import { FakeKeyServer } from './fakeKeyServer';
 import { Account, GroupSession, loadCryptoSync } from './index';
+import { loadPQCFrom } from '../pqc/index';
 import { deleteCryptoStores, openCryptoStore } from './store';
 
-beforeAll(() => {
+beforeAll(async () => {
   loadCryptoSync(readFileSync('src/crypto/pkg/kycrypto_bg.wasm'));
+  await loadPQCFrom(readFileSync('src/pqc/pqc.wasm'));
 });
 
 const opened: CryptoEngine[] = [];
@@ -17,10 +19,28 @@ afterEach(async () => {
   await deleteCryptoStores();
 });
 
-async function device(server: FakeKeyServer, userId: string): Promise<CryptoEngine> {
-  const e = await CryptoEngine.open(userId, server.as(userId), await openCryptoStore(userId));
-  opened.push(e);
+// Each user's recovery key, so a test's later devices of that user verify as a person would.
+const recoveryKeys = new WeakMap<FakeKeyServer, Map<string, string>>();
+
+/** Gives e's user an identity (the first device) or verifies e with it (later devices). */
+async function verify(server: FakeKeyServer, e: CryptoEngine): Promise<CryptoEngine> {
+  const keys = recoveryKeys.get(server) ?? new Map<string, string>();
+  recoveryKeys.set(server, keys);
+  const status = await e.identityStatus();
+  if (status.state === 'none') {
+    const p = e.prepareIdentity();
+    keys.set(e.userId, p.recoveryKey);
+    await p.commit();
+  } else if (status.state === 'unverified') {
+    await e.restoreIdentity(keys.get(e.userId)!);
+  }
   return e;
+}
+
+async function device(server: FakeKeyServer, userId: string, storeName = userId): Promise<CryptoEngine> {
+  const e = await CryptoEngine.open(userId, server.as(userId), await openCryptoStore(storeName));
+  opened.push(e);
+  return verify(server, e);
 }
 
 let nextId = 1;
@@ -319,6 +339,7 @@ describe('encrypted rooms between two client engines', () => {
     const alice = await device(server, 'u_alice');
     const bobServer = server.as('u_bob');
     const bob = await CryptoEngine.open('u_bob', bobServer, await openCryptoStore('u_bob'));
+    await verify(server, bob);
     opened.push(bob);
     server.join('r1', 'u_alice', 'u_bob');
     const message = await send('r1', alice, 'read while upload stalls');
@@ -348,6 +369,7 @@ describe('encrypted rooms between two client engines', () => {
     const alice = await device(server, 'u_alice');
     const bobServer = server.as('u_bob');
     const bob = await CryptoEngine.open('u_bob', bobServer, await openCryptoStore('u_bob'));
+    await verify(server, bob);
     opened.push(bob);
     server.join('r1', 'u_alice', 'u_bob');
     const m1 = await send('r1', alice, 'acked later');
@@ -367,6 +389,7 @@ describe('encrypted rooms between two client engines', () => {
     await send('r1', alice, 'before');
     // Bob signs in on a second browser; no event tells alice.
     const laptop = await CryptoEngine.open('u_bob', server.as('u_bob'), await openCryptoStore('u_bob_laptop'));
+    await verify(server, laptop);
     opened.push(laptop);
     const m = await send('r1', alice, 'reaches the laptop');
     await laptop.receive();
@@ -424,6 +447,7 @@ describe('encrypted rooms between two client engines', () => {
     // A second browser for alice: a separate store, so a separate device.
     const aliceStore = await openCryptoStore('u_alice_laptop');
     const laptop = await CryptoEngine.open('u_alice', server.as('u_alice'), aliceStore);
+    await verify(server, laptop);
     opened.push(laptop);
     expect(laptop.deviceId).not.toBe(alice.deviceId);
     const m1 = await send('r1', alice, 'on every device');
@@ -529,6 +553,7 @@ describe('encrypted rooms between two client engines', () => {
     const alice = await device(server, 'u_alice');
     const bobServer = server.as('u_bob');
     const bob = await CryptoEngine.open('u_bob', bobServer, await openCryptoStore('u_bob'));
+    await verify(server, bob);
     opened.push(bob);
     server.join('r1', 'u_alice', 'u_bob');
     const m1 = await send('r1', alice, 'later');
@@ -554,6 +579,7 @@ describe('encrypted rooms between two client engines', () => {
       return write(puts, deletes);
     };
     const bob = await CryptoEngine.open('u_bob', server.as('u_bob'), store);
+    await verify(server, bob);
     opened.push(bob);
     server.join('r1', 'u_alice', 'u_bob');
     const m1 = await send('r1', alice, 'kept for later'); // a pre-key message: spends a one-time key
@@ -579,6 +605,7 @@ describe('encrypted rooms between two client engines', () => {
       return get(key);
     }) as typeof store.get;
     const bob = await CryptoEngine.open('u_bob', server.as('u_bob'), store);
+    await verify(server, bob);
     opened.push(bob);
     server.join('r1', 'u_alice', 'u_bob');
     const m1 = await send('r1', alice, 'read on retry'); // a pre-key message: spends a one-time key

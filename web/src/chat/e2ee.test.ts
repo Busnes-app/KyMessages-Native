@@ -12,10 +12,14 @@ vi.mock('../crypto/store', async (importOriginal) => {
   return { ...real, storedDevices: () => deviceRead.replace?.() ?? real.storedDevices() };
 });
 
-// jsdom cannot fetch the module by URL; load it from disk instead.
+// jsdom cannot fetch the modules by URL; load them from disk instead.
 vi.mock('../crypto/index', async (importOriginal) => {
   const real = await importOriginal<typeof import('../crypto/index')>();
   return { ...real, loadCrypto: async () => real.loadCryptoSync(readFileSync('src/crypto/pkg/kycrypto_bg.wasm')) };
+});
+vi.mock('../pqc/index', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../pqc/index')>();
+  return { ...real, loadPQC: () => real.loadPQCFrom(readFileSync('src/pqc/pqc.wasm')) };
 });
 
 const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { 'Content-Type': 'application/json' } });
@@ -43,7 +47,7 @@ describe('the signed-in device', () => {
         return json({ one_time_key_count: req.one_time_keys.length });
       }
       if (url === '/api/v1/rooms/r1') return json(ownRoom);
-      if (url === '/api/v1/keys/query') return json({ devices: {} });
+      if (url === '/api/v1/keys/query') return json({ tenant_id: 'default', devices: {}, master_keys: {} });
       if (url.startsWith('/api/v1/to-device')) return json({ messages: [] });
       return json({ error: `unexpected ${url}` }, 404);
     }));
@@ -89,7 +93,7 @@ describe('the signed-in device', () => {
         return json({ one_time_key_count: req.one_time_keys.length });
       }
       if (url === '/api/v1/rooms/r1') return json(ownRoom);
-      if (url === '/api/v1/keys/query') return json({ devices: {} });
+      if (url === '/api/v1/keys/query') return json({ tenant_id: 'default', devices: {}, master_keys: {} });
       return json({ messages: [] });
     }));
     await expect(startE2EE('u_alice')).rejects.toThrow('Try later');
