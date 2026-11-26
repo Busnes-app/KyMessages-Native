@@ -159,6 +159,15 @@ Owns HTTP routing, request parsing, session cookie validation, CORS headers, and
   publishes a `to_device` WebSocket event to the recipient. These routes spend their own `e2ee:`
   budget (600 a minute), not chat writes.
 
+- E3 identity routes (`e2ee_identity_handlers.go`, spec §9.1): `GET/PUT /api/v1/keys/master`,
+  `PUT /api/v1/keys/pins`, `POST /api/v1/keys/devices/{id}/signature`, `GET/PUT/DELETE
+  /api/v1/keys/backup` and `/api/v1/keys/pairings[/{id}[/join|/sealed|/consume]]`. Bodies are
+  decoded strictly (`decodeIdentity`) and carry no secret field; every hybrid signature is
+  verified for the caller's org and user before it is stored; versions are compare-and-swap
+  (`409`); a reset (`expected_version` > 0) needs a session younger than `stepUpWindow`; `/keys/query` adds `tenant_id`, `master_keys` and current-version
+  `master_signature`s. Pairings are one per user, 3 minutes (`E2EEPairingTTL`), started only by a
+  cross-signed device, joined and sealed once, consumed once; another user's or org's reads as
+  unknown. Same `e2ee:` budget.
 - In multi mode, whole-user bus revocations remove call seats on every replica even without a chat socket; session-only revocations leave calls alone. Guest invite replacement, denial and revocation use the same bus path.
 
 ## Verification

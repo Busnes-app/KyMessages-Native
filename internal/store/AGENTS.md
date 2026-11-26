@@ -97,6 +97,14 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   first locks the device row (`FOR UPDATE`) so concurrent uploads cannot both pass the cap. Mail has no
   cursor: `ToDevice` returns the oldest unacknowledged rows and `AckToDevice` deletes exactly the
   IDs named, because PostgreSQL IDs commit out of order. Migration 54 adds each mail row's sender device keys (`sender_curve25519`, `sender_ed25519`, `sender_signature`, copied at send time), so mail from a device deleted since stays verifiable; older rows carry empty keys, which clients refuse. Only public keys and ciphertext are stored.
+- Migration 68 (E3, `e2ee_identity.go`): `e2ee_master_keys` (one row per user: hybrid master
+  key, self-binding, X-Wing backup key and its signature, recovery-key wraps, sealed pin set and
+  counter, `version`), `e2ee_devices.master_signature`/`master_version`, `e2ee_key_backup`
+  (`(user, version, room, session)`, the lowest `first_index` wins, capped per call by `max`) and
+  `e2ee_pairings` (QR pairings). `PutMasterKey` is compare-and-swap on `version`; a replacement
+  deletes the backup, pairings and pins and clears every cross-signature in the same transaction.
+  Backup writes lock the master row on PostgreSQL. `ConsumePairing` is one `DELETE … RETURNING`.
+  All four cascade from `users`; restore deletes pairings and keeps the rest.
 - `store.Open(ctx, cfg)` initializes and auto-migrates the configured database backend. On
   PostgreSQL `migrations.Run` holds `pg_advisory_lock(hashtext('kymessages:migrate'))` on one
   connection for the whole run and reads `schema_migrations` under it, so replicas starting

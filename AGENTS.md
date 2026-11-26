@@ -163,8 +163,14 @@ When the user requests a durable behavior change, record it here or in the relev
   `api.E2EEOneTimeKeySigned` strings, which clients verify again. Encrypted rooms (E2): the web
   client (`web/src/crypto/engine.ts`, `web/src/chat/e2ee.ts`) sends only `e2ee_room_v1`; the
   server refuses `plain_v1` from everything but `kybot_` tokens (`api.CodeE2EERequired`), and the
-  CSP's one script exception is `'wasm-unsafe-eval'` for the crypto core. No release is published
-  while E2 is merged and E3-E5 are not (spec §10).
+  CSP's one script exception is `'wasm-unsafe-eval'` for the crypto cores. No release is published
+  while E2 is merged and E4-E5 are not (spec §10).
+- E3 identity and recovery is post-quantum (spec §3.1, §9.1; PQC Stack Plan ky-primitives#80):
+  `internal/pqc/{xwing,hybridsig}` and `internal/e2eeid` run natively on the server and, built by
+  `web/pqc-wasm/build.sh`, as the committed `web/src/pqc/pqc.wasm` in the browser (CI job
+  "PQC core (Go/WASM)" rebuilds and diffs it with go.mod's toolchain, go1.27.4). Clients share
+  room keys only with devices their member's pinned master key signed. Migration 68 holds master
+  keys, cross-signatures, the X-Wing key backup and QR pairings; no private key reaches the server.
 - Only the staff org (`KY_STAFF_ORG_ID`) holds administrators (`config.TenancyConfig.MayAdminister`,
   enforced in directory sync and the `admin` middleware). Org-less local operators keep the
   install-wide console; per-org admin pages need a staff-org account.
@@ -214,6 +220,8 @@ CI (`.github/workflows/ci.yml`) runs on every push and pull request:
   `FuzzParseTrustedProxies`, `FuzzValidateName` and `FuzzNormalizePNG`; a crasher kept under
   `testdata/fuzz/<Target>/` replays in the normal test run
 - Frontend vitest suite, then typecheck/build plus a check that committed `web/dist` matches source, untracked files included (it is embedded in the binary)
+- Crypto cores: `web/src/crypto/pkg` (Rust/vodozemac) and `web/src/pqc` (Go/WASM, with the
+  `internal/e2eeid` and `internal/pqc` tests run under `GOOS=js GOARCH=wasm`) rebuilt and diffed
 - `govulncheck` and `npm audit --audit-level=high`
 - `scripts/backup-acceptance.py` starts its own loopback process and disposable
   SQLite/local-copy directories. It exercises real scheduler ticks (~3 minutes),
@@ -239,6 +247,8 @@ the compose checks. Run the same checks locally with `make ci` (`tidy-check lint
 - [internal/config/AGENTS.md](internal/config/AGENTS.md): Configuration management and environment loader.
 - [internal/store/AGENTS.md](internal/store/AGENTS.md): Pluggable database abstraction layer (SQLite & PostgreSQL).
 - [internal/crypto/AGENTS.md](internal/crypto/AGENTS.md): Cryptographic primitives (AES-256-GCM, HMAC, SHA-256, randomness, PKCE).
+- [internal/pqc/AGENTS.md](internal/pqc/AGENTS.md): Vendored X-Wing and ML-DSA-65+Ed25519 hybrid signatures, until ky-primitives ships them.
+- [internal/e2eeid/AGENTS.md](internal/e2eeid/AGENTS.md): E3 identity formats (master key statements, recovery key, key backup, QR transfer) shared with the browser.
 - [internal/auth/AGENTS.md](internal/auth/AGENTS.md): Authentication, MFA (TOTP), recovery codes, sessions, and CAPTCHA.
 - [internal/sso/AGENTS.md](internal/sso/AGENTS.md): KyIdentity OIDC sign-in and signed directory webhooks.
 - [internal/scim/AGENTS.md](internal/scim/AGENTS.md): SCIM 2.0 user and group provisioning engine.

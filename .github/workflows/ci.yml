@@ -214,6 +214,33 @@ jobs:
           dirty="$(git status --porcelain -- ../src/crypto/pkg)"
           if [ -n "$dirty" ]; then printf '%s\n' "$dirty"; git diff --stat -- ../src/crypto/pkg; exit 1; fi
 
+  pqc:
+    name: PQC core (Go/WASM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The committed module is reproducible only for one Go: go.mod's toolchain line.
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # The same tests and shared vectors as the native build, compiled to js/wasm under Node.
+      - name: Tests (js/wasm under Node)
+        run: PATH="$(go env GOROOT)/lib/wasm:$PATH" GOOS=js GOARCH=wasm go test -count=1 ./internal/e2eeid/ ./internal/pqc/...
+
+      # The committed module is what web/dist bundles; it must be what this source builds.
+      - name: Committed web/src/pqc matches source
+        run: |
+          web/pqc-wasm/build.sh
+          dirty="$(git status --porcelain -- web/src/pqc)"
+          if [ -n "$dirty" ]; then printf '%s\n' "$dirty"; git diff --stat -- web/src/pqc; exit 1; fi
+
   browser:
     name: Browser regressions (production server)
     runs-on: ubuntu-latest
