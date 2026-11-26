@@ -20,10 +20,8 @@ var (
 	// ErrE2EETooManyKeys: an upload would leave a device holding more one-time keys than allowed.
 	ErrE2EETooManyKeys = errors.New("too many one-time keys for this device")
 	// ErrE2EEVersion: a write names a master key, pin set or backup version that is not current.
-	ErrE2EEVersion = errors.New("encryption identity version is not current")
-	// ErrE2EEBackupFull: a key backup write would pass the per-user session cap.
-	ErrE2EEBackupFull = errors.New("key backup is full")
-	ErrAlreadyExists  = errors.New("record already exists")
+	ErrE2EEVersion   = errors.New("encryption identity version is not current")
+	ErrAlreadyExists = errors.New("record already exists")
 	// ErrUsernameTaken: another account holds the username (exact case, as the column is unique).
 	ErrUsernameTaken                  = fmt.Errorf("username is taken: %w", ErrAlreadyExists)
 	ErrSessionExpired                 = errors.New("session expired")
@@ -128,20 +126,27 @@ type E2EEStore interface {
 	// PutPins stores the user's sealed pin set as counter expected+1 under master key version,
 	// once proof accepts the write against that version's master key (all in one transaction).
 	PutPins(ctx context.Context, tenantID, userID string, version, expected int64, pins string, proof Proof) error
+	// ReserveDeviceList reserves epoch expected+1 of the device list under version for the list
+	// whose digest is given, until now+ttl: ErrE2EEVersion unless the list is at epoch expected
+	// and no other unexpired reservation holds it. Reserving the same digest again renews it.
+	ReserveDeviceList(ctx context.Context, tenantID, userID string, version, expected int64, digest string, now time.Time, ttl time.Duration) error
 	// PutDeviceList stores the master-signed device list as epoch expected+1 under version, once
-	// proof accepts it against that version's master key (all in one transaction).
-	PutDeviceList(ctx context.Context, tenantID, userID string, version, expected int64, list, signature string, proof Proof) error
-	// PutBackupSessions adds sealed sessions to backup version once proof accepts the batch
-	// against that version's master key: a session already stored is replaced only by a copy
-	// with a lower first index; a new one is stored only within maxSessions and maxBytes of
-	// sealed text (the result says Full when one was not). ErrE2EEVersion when version is not
-	// current in tenantID.
-	PutBackupSessions(ctx context.Context, tenantID, userID string, version int64, sessions []E2EEBackupSession, maxSessions int, maxBytes int64, proof Proof) (E2EEBackupResult, error)
+	// proof accepts it against that version's master key and an unexpired reservation names its
+	// digest (all in one transaction); ErrE2EEVersion otherwise.
+	PutDeviceList(ctx context.Context, tenantID, userID string, version, expected int64, list, digest, signature string, now time.Time, proof Proof) error
+	// PutBackupSessions adds sealed sessions to backup version and generation once proof
+	// accepts the batch against that version's master key: a session already stored is replaced
+	// only by a copy with a lower first index; either is stored only within maxSessions and
+	// maxBytes of sealed text (the result lists the others as Refused). ErrE2EEVersion when
+	// version or generation is not current in tenantID.
+	PutBackupSessions(ctx context.Context, tenantID, userID string, version, generation int64, sessions []E2EEBackupSession, maxSessions int, maxBytes int64, proof Proof) (E2EEBackupResult, error)
 	// ListBackupSessions pages backup version in bytewise (room, sender key, session) order
 	// after the cursor.
 	ListBackupSessions(ctx context.Context, tenantID, userID string, version int64, after E2EEBackupCursor, limit int) ([]E2EEBackupSession, error)
-	// DeleteBackup removes every session of backup version; ErrE2EEVersion when not current.
-	DeleteBackup(ctx context.Context, tenantID, userID string, version int64) error
+	// DeleteBackup removes every session of backup version and bumps its generation, so no
+	// write signed before it lands after; it returns the new generation. ErrE2EEVersion when
+	// version is not current.
+	DeleteBackup(ctx context.Context, tenantID, userID string, version int64) (int64, error)
 
 	// CreatePairing opens a QR pairing, cancelling the user's other pairings, only while
 	// p.MasterVersion is the user's identity version and the initiator is cross-signed by it
@@ -174,7 +179,9 @@ type E2EEMasterKey struct {
 	// DeviceList is the JSON array of device IDs the master key signed at DeviceListEpoch.
 	DeviceList, DeviceListSignature string
 	DeviceListEpoch                 int64
-	UpdatedAt                       time.Time
+	// BackupGeneration is bumped by each backup deletion.
+	BackupGeneration int64
+	UpdatedAt        time.Time
 }
 
 // E2EEBackupSession is one Megolm session sealed to the user's X-Wing backup key.
@@ -185,10 +192,10 @@ type E2EEBackupSession struct {
 }
 
 // E2EEBackupResult says what a backup write did: Stored new rows and better copies, Kept rows
-// already as good, and Full when a new session did not fit the caps.
+// already as good, and Refused the indexes of entries that did not fit the caps.
 type E2EEBackupResult struct {
 	Stored, Kept int
-	Full         bool
+	Refused      []int
 }
 
 // E2EEBackupCursor is the last (room, sender key, session) a backup page ended on.

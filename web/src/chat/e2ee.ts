@@ -4,10 +4,11 @@
 import { adminFetch, errorMessage } from '../api';
 import { arr, bool, obj, str } from '../dto';
 import { keepStorage } from '../persist';
-import { Conflict, CryptoEngine, DeviceChanged, type ClaimedKey, type DeviceKeys, type KeyServer, type Mail, type RoomInner } from '../crypto/engine';
+import { Conflict, CryptoEngine, DeviceChanged, EARLY, type ClaimedKey, type DeviceKeys, type KeyServer, type Mail, type RoomInner } from '../crypto/engine';
 import type { BackupEntry, DeviceList, IdentityChange, IdentityStatus, MasterKeyRecord, OwnMaster, PairingJoin, PairingOffer } from '../crypto/identity';
 import { loadCrypto } from '../crypto/index';
-import { loadPQC, type Hybrid } from '../pqc/index';
+import { ensurePQC, loadPQC, type Hybrid } from '../pqc/index';
+import { isTransient } from '../crypto/records';
 import { type CryptoStore, deleteCryptoStores, openCryptoStore, storedDevices } from '../crypto/store';
 import { parseRoomDetail, type ChatMessage, type E2EEState } from './types';
 
@@ -64,12 +65,15 @@ const ownMaster = (v: unknown): OwnMaster => {
   return {
     ...masterRecord(o),
     backup_key: { public_key: str(bk.public_key, 4096), signature: hybrid(bk.signature) },
+    backup_generation: typeof o.backup_generation === 'number' ? o.backup_generation : 0,
     recovery: { wrapped_master_key: str(rc.wrapped_master_key, 1024), wrapped_backup_key: str(rc.wrapped_backup_key, 1024) },
     pins: { counter: typeof pins.counter === 'number' ? pins.counter : 0, sealed: typeof pins.sealed === 'string' ? pins.sealed : '' },
   };
 };
 
 const pairingPath = (id: string) => `/api/v1/keys/pairings/${encodeURIComponent(id)}`;
+/** The device's signal, and the asking screen's when it has one. */
+const both = (a: AbortSignal, b?: AbortSignal) => (b ? AbortSignal.any([a, b]) : a);
 
 const keyServer = (signal: AbortSignal): KeyServer => ({
   async upload(req) {
@@ -151,6 +155,9 @@ const keyServer = (signal: AbortSignal): KeyServer => ({
   async signDevice(deviceId, version, signature) {
     await call(`/api/v1/keys/devices/${encodeURIComponent(deviceId)}/signature`, 'POST', { version, signature }, signal);
   },
+  async reserveDeviceList(version, expectedEpoch, digest) {
+    await call('/api/v1/keys/devices/list/reserve', 'POST', { version, expected_epoch: expectedEpoch, digest }, signal);
+  },
   async putDeviceList(version, expectedEpoch, deviceIds, signature) {
     await call('/api/v1/keys/devices/list', 'PUT', { version, expected_epoch: expectedEpoch, device_ids: deviceIds, signature }, signal);
   },
@@ -167,26 +174,27 @@ const keyServer = (signal: AbortSignal): KeyServer => ({
     });
     return { sessions, more: o.more === true };
   },
-  async putBackup(version, sessions, signature) {
-    return { full: obj(await call('/api/v1/keys/backup', 'PUT', { version, sessions, signature }, signal)).full === true };
+  async putBackup(version, generation, sessions, signature) {
+    const o = obj(await call('/api/v1/keys/backup', 'PUT', { version, generation, sessions, signature }, signal));
+    return { refused: Array.isArray(o.refused) ? o.refused.filter((n): n is number => Number.isInteger(n)) : [] };
   },
   async pairingStart(deviceId) {
     const o = obj(await call('/api/v1/keys/pairings', 'POST', { device_id: deviceId }, signal));
     return { pairing_id: str(o.pairing_id, 64), expires_in_ms: typeof o.expires_in_ms === 'number' ? o.expires_in_ms : 0 };
   },
-  async pairingGet(id) {
-    const o = obj(await call(pairingPath(id), 'GET', undefined, signal));
+  async pairingGet(id, screen) {
+    const o = obj(await call(pairingPath(id), 'GET', undefined, both(signal, screen)));
     return { pairing_id: str(o.pairing_id, 64), initiator_device: str(o.initiator_device, 64),
       new_device: typeof o.new_device === 'string' ? o.new_device : '', ephemeral_key: typeof o.ephemeral_key === 'string' ? o.ephemeral_key : '', sealed: o.sealed === true };
   },
   async pairingJoin(id, deviceId, ephemeralKey) {
     await call(`${pairingPath(id)}/join`, 'POST', { device_id: deviceId, ephemeral_key: ephemeralKey }, signal);
   },
-  async pairingSeal(id, deviceId, sealed) {
-    await call(`${pairingPath(id)}/sealed`, 'PUT', { device_id: deviceId, sealed }, signal);
+  async pairingSeal(id, deviceId, sealed, screen) {
+    await call(`${pairingPath(id)}/sealed`, 'PUT', { device_id: deviceId, sealed }, both(signal, screen));
   },
-  async pairingConsume(id, deviceId) {
-    const o = obj(await call(`${pairingPath(id)}/consume`, 'POST', { device_id: deviceId }, signal));
+  async pairingConsume(id, deviceId, screen) {
+    const o = obj(await call(`${pairingPath(id)}/consume`, 'POST', { device_id: deviceId }, both(signal, screen)));
     return { initiator_device: str(o.initiator_device, 64), sealed: str(o.sealed, 16384) };
   },
   async pairingCancel(id) {
@@ -308,6 +316,7 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
     }
     void retireAbandoned(userId, entry.controller.signal, e).catch(() => undefined);
     e.onKeys(() => keysArrived(true));
+    e.onTransient(retryLater);
     return e;
   })();
   current = entry;
@@ -321,7 +330,7 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
   }, () => undefined);
   // Keep the user on a failed entry so the next send can retry without a socket reconnect.
   // Attach failure handling directly: it runs before a caller resumes from the rejected start.
-  void entry.engine.then((e) => void e.receive().catch(() => undefined), () => {
+  void entry.engine.then((e) => void e.receive().catch(failedLater), () => {
     entry.failed = true;
     entry.controller.abort();
     entry.store?.close();
@@ -333,6 +342,10 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
 function stopE2EE(): void {
   const old = current;
   current = undefined;
+  clearTimeout(retryTimer);
+  retryTimer = undefined;
+  retryAttempt = 0;
+  setPending(false);
   if (!old) return;
   old.cancelled = true;
   old.controller.abort();
@@ -394,13 +407,14 @@ export const identityStatus = (): Promise<IdentityStatus> => identityEngine().th
 /** A new identity for this account: show recoveryKey, then commit once the user saved it. */
 export async function prepareIdentity(reset = false): Promise<{ recoveryKey: string; commit(): Promise<void> }> {
   const p = await (await identityEngine()).prepareIdentity(reset);
-  return { recoveryKey: p.recoveryKey, commit: async () => { await p.commit(); announceIdentity(); keysArrived(true); } };
+  return { recoveryKey: p.recoveryKey, commit: async () => { await p.commit(); announceIdentity(); keysArrived(true); retireAfterVerify(); } };
 }
 
 export async function restoreIdentity(recoveryKey: string): Promise<number> {
   const n = await (await identityEngine()).restoreIdentity(recoveryKey);
   announceIdentity();
   keysArrived(true);
+  retireAfterVerify();
   return n;
 }
 
@@ -411,7 +425,7 @@ export const ownDeviceVerified = (deviceId: string): Promise<boolean> => identit
 
 export async function joinVerification(text: string): Promise<PairingJoin> {
   const j = await (await identityEngine()).joinVerification(text);
-  return { ...j, finish: async (signal) => { const n = await j.finish(signal); announceIdentity(); keysArrived(true); return n; } };
+  return { ...j, finish: async (signal) => { const n = await j.finish(signal); announceIdentity(); keysArrived(true); retireAfterVerify(); return n; } };
 }
 
 export const identityChanges = (): Promise<IdentityChange[]> => identityEngine().then((e) => e.identityChanges());
@@ -429,7 +443,66 @@ export function checkRoomIdentities(roomId: string): void {
 
 /** Reads the device mailbox: on start, on a `to_device` wake and after a reconnect. */
 export function receiveRoomKeys(): void {
-  void withEngine((e) => e.receive()).catch(() => undefined);
+  void withEngine((e) => e.receive()).catch(failedLater);
+}
+
+// Work that failed for availability (the post-quantum module restarting, the network, the
+// server) is retried on a bounded schedule: the mailbox, then the identity status, which resumes
+// a key backup restore and drains the backup queue. While some is waiting, encryptionPending
+// says so and the UI offers retryEncryptionNow.
+const RETRY_MS = [2_000, 5_000, 15_000, 30_000, 60_000];
+let retryAttempt = 0;
+let retryTimer: ReturnType<typeof setTimeout> | undefined;
+let pending = false;
+const pendingListeners = new Set<() => void>();
+
+/** Whether encryption work is waiting for a retry. */
+export const encryptionPending = () => pending;
+
+/** Calls fn when encryptionPending changes. */
+export function onEncryptionPending(fn: () => void): () => void {
+  pendingListeners.add(fn);
+  return () => pendingListeners.delete(fn);
+}
+
+function setPending(v: boolean): void {
+  if (pending === v) return;
+  pending = v;
+  for (const fn of pendingListeners) fn();
+}
+
+function failedLater(e: unknown): void {
+  if (isTransient(e) || e instanceof KeyServerError && e.status >= 500 || e instanceof TypeError) retryLater();
+}
+
+function retryLater(): void {
+  setPending(true);
+  if (retryTimer !== undefined || retryAttempt >= RETRY_MS.length) return;
+  retryTimer = setTimeout(() => void runRetry(), RETRY_MS[retryAttempt++]);
+}
+
+async function runRetry(): Promise<void> {
+  clearTimeout(retryTimer);
+  retryTimer = undefined;
+  try {
+    await ensurePQC();
+    await withEngine(async (e) => {
+      await e.receive();
+      // Resumes the restore and the backup; their own failures call retryLater again.
+      await e.identityStatus();
+    });
+    retryAttempt = 0;
+    setPending(false);
+    keysArrived(false);
+  } catch (e) {
+    failedLater(e);
+  }
+}
+
+/** Runs the waiting work now, and restarts the retry schedule. */
+export function retryEncryptionNow(): Promise<void> {
+  retryAttempt = 0;
+  return runRetry();
 }
 
 /** Starts a new room session when someone left or was removed, so they never get its key. */
@@ -441,8 +514,9 @@ export function roomMemberLeft(roomId: string): void {
 export const UNAVAILABLE = 'Encryption is not available in this browser yet.';
 /** An open that threw (local storage, a store closed under the device): tried again later. */
 export const NOT_YET = 'This message could not be opened yet.';
-/** Whether a failed message is worth opening again when keys arrive or the device restarts. */
-export const retryable = (reason: string) => reason === UNAVAILABLE || reason === NOT_YET;
+/** Whether a failed message is worth opening again when keys arrive or the device restarts: a
+ * message from before this device's copy of its session may be covered by a backup page later. */
+export const retryable = (reason: string) => reason === UNAVAILABLE || reason === NOT_YET || reason === EARLY;
 
 // The plaintext limit members had before encryption; the envelope may be larger.
 export const MAX_MESSAGE_BYTES = 16 << 10;
@@ -475,7 +549,7 @@ export async function openMessage(m: ChatMessage): Promise<ChatMessage> {
   try {
     const r = await e.decrypt({ id: m.id, room_id: m.room_id, sender_id: m.sender_id, body: m.envelope });
     if (r.state === 'waiting') return shut({ kind: 'waiting', gen });
-    if (r.state === 'failed') return shut({ kind: 'failed', reason: r.reason });
+    if (r.state === 'failed') return shut({ kind: 'failed', reason: r.reason, ...(retryable(r.reason) ? { gen } : {}) });
     // The encrypted reply target is the true one; the server's copy is only a hint.
     return { ...m, body: r.inner.body, reply_to_id: r.inner.reply_to_id, e2ee: r.authenticated ? { kind: 'decrypted' } : { kind: 'decrypted', trust: r.restored ? 'backup' : 'unverified' } };
   } catch {
@@ -497,95 +571,128 @@ const DELIST_MS = 2000;
  * and rotate their sessions. Call it while the session is still valid; it answers whether the
  * server no longer lists the device. When it does not, use abandonDevice so a later sign-in retires it.
  * `wait` gives up after RETIRE_MS, so sign-out never waits on a stuck start-up or request.
- * On a refused logout, `replaceIfRetired` follows the eventual result, including a late deletion.
+ * On a refused logout, `replaceIfRetired` follows the eventual result: once retirement touched
+ * the device (it marked itself retiring, so it no longer lists itself) it is replaced by a new
+ * one, which lists itself, and the old one stays pending until its removal and deletion are
+ * both confirmed, however late either lands.
  */
 export function retireDevice() {
   const entry = current;
+  let touched = false;
   const attempt = (async () => {
     const e = await entry?.engine.catch(() => undefined);
     if (!e) return false;
+    touched = true;
+    // Pending from the start, per device: a refused or interrupted sign-out leaves it to retire.
+    saveAbandoned({ user_id: e.userId, device_id: e.deviceId });
     // Off the signed device list first, so the server cannot bring the device back later;
     // bounded, so sign-out never waits long on it. A removal that did not become durable here
     // stays pending (it outlives this browser's store) until a verified device signs it.
-    const delisted = await Promise.race([
-      e.delistDevices([e.deviceId]).then(() => true, () => false),
-      new Promise<boolean>((r) => setTimeout(r, DELIST_MS, false)),
-    ]);
-    if (!delisted) saveAbandoned([...abandoned(), { user_id: e.userId, device_id: e.deviceId, delisted: false }]);
+    const me = { user_id: e.userId, device_id: e.deviceId };
+    const delisting = e.delistDevices([e.deviceId]);
+    void delisting.then(() => {
+      saveAbandoned({ ...me, delisted: true });
+      settleAbandoned(me);
+    }, () => undefined);
+    await Promise.race([delisting.catch(() => undefined), new Promise((r) => setTimeout(r, DELIST_MS))]);
     try {
       await call(`/api/v1/keys/devices/${encodeURIComponent(e.deviceId)}`, 'DELETE', undefined, entry?.controller.signal);
-      return true;
     } catch (err) {
-      return err instanceof KeyServerError && err.status === 404;
+      if (!(err instanceof KeyServerError && err.status === 404)) return false;
     }
+    saveAbandoned({ ...me, deleted: true });
+    settleAbandoned(me);
+    return true;
   })();
   return {
     wait: Promise.race([attempt, new Promise<boolean>((r) => setTimeout(r, RETIRE_MS, false))]),
     async replaceIfRetired(): Promise<void> {
+      await attempt;
       // Never reset a different device after another sign-out, sign-in or revocation.
-      if (await attempt && entry && current === entry) await replaceDevice();
+      if (touched && entry && current === entry) await replaceDevice();
     },
   };
 }
 
 // Devices to retire later: abandoned when a session was revoked (the server no longer accepts
-// that session), or signed out before their removal from the signed device list was durable.
-// Each is removed from the key server, and from the list by a verified device, the next time
-// its user's device starts here; an entry goes only once both are done (deleted, delisted).
-const RETIRE_KEY = 'kymessages-e2ee-retire';
+// that session), or signed out before their removal was confirmed. Each is removed from the key
+// server, and from the signed list by a verified device, the next time its user's device starts
+// here (or verifies); an entry goes only once both are done (deleted, delisted). Each device has
+// its own key, so tabs recording different devices never overwrite each other, and a flag once
+// set stays set.
+const RETIRE_PREFIX = 'kymessages-e2ee-retire:';
+/** The single list earlier builds kept; read once into per-device keys. */
+const LEGACY_RETIRE_KEY = 'kymessages-e2ee-retire';
 type Abandoned = { user_id: string; device_id: string; deleted?: boolean; delisted?: boolean };
+const retireKey = (d: { user_id: string; device_id: string }) => `${RETIRE_PREFIX}${d.user_id}:${d.device_id}`;
+const isAbandoned = (d: unknown): d is Abandoned =>
+  typeof d === 'object' && d !== null && typeof (d as Abandoned).user_id === 'string' && typeof (d as Abandoned).device_id === 'string';
 
 function abandoned(): Abandoned[] {
   try {
-    const v: unknown = JSON.parse(localStorage.getItem(RETIRE_KEY) ?? '[]');
-    return Array.isArray(v) ? v.filter((d): d is Abandoned => typeof d?.user_id === 'string' && typeof d?.device_id === 'string')
-      .map((d) => ({ user_id: d.user_id, device_id: d.device_id, deleted: d.deleted === true, delisted: d.delisted === true })) : [];
+    const legacy: unknown = JSON.parse(localStorage.getItem(LEGACY_RETIRE_KEY) ?? 'null');
+    if (Array.isArray(legacy)) for (const d of legacy) if (isAbandoned(d)) saveAbandoned(d);
+    localStorage.removeItem(LEGACY_RETIRE_KEY);
+    const out: Abandoned[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k?.startsWith(RETIRE_PREFIX)) continue;
+      const d: unknown = JSON.parse(localStorage.getItem(k) ?? 'null');
+      if (isAbandoned(d) && retireKey(d) === k) out.push({ user_id: d.user_id, device_id: d.device_id, deleted: d.deleted === true, delisted: d.delisted === true });
+    }
+    return out;
   } catch {
     return [];
   }
 }
 
-function saveAbandoned(list: Abandoned[]): void {
-  // One entry per device; a later record of the same device keeps what an earlier one did.
-  const byKey = new Map<string, Abandoned>();
-  for (const d of list) {
-    const k = `${d.user_id}\u0000${d.device_id}`;
-    const was = byKey.get(k);
-    byKey.set(k, { ...d, deleted: !!(d.deleted || was?.deleted), delisted: !!(d.delisted && (was?.delisted ?? true)) });
-  }
-  list = [...byKey.values()];
+/** Records d as pending, keeping whatever was already confirmed for it. */
+function saveAbandoned(d: Abandoned): void {
   try {
-    if (list.length === 0) localStorage.removeItem(RETIRE_KEY);
-    else localStorage.setItem(RETIRE_KEY, JSON.stringify(list.slice(-20)));
+    const was: unknown = JSON.parse(localStorage.getItem(retireKey(d)) ?? 'null');
+    const w = isAbandoned(was) ? was : undefined;
+    localStorage.setItem(retireKey(d), JSON.stringify({ user_id: d.user_id, device_id: d.device_id, deleted: !!(d.deleted || w?.deleted), delisted: !!(d.delisted || w?.delisted) }));
   } catch {
     // No storage: the device stays listed until it is removed by hand.
   }
 }
 
+/** Drops d once both its removal and its deletion are confirmed (by any tab). */
+function settleAbandoned(d: Abandoned): void {
+  try {
+    const cur: unknown = JSON.parse(localStorage.getItem(retireKey(d)) ?? 'null');
+    if (isAbandoned(cur) && cur.deleted && cur.delisted) localStorage.removeItem(retireKey(d));
+  } catch {
+    // Kept: retried at the next start.
+  }
+}
+
 async function retireAbandoned(userId: string, signal: AbortSignal, e?: CryptoEngine): Promise<void> {
-  const left: Abandoned[] = [];
-  const pending = abandoned();
-  const toDelist = pending.filter((d) => d.user_id === userId && !d.delisted).map((d) => d.device_id);
+  const pending = abandoned().filter((d) => d.user_id === userId);
+  const toDelist = pending.filter((d) => !d.delisted).map((d) => d.device_id);
   // A verified device takes them off the signed device list; an unverified one cannot sign, so
   // they stay pending. Deleting the server row alone does not complete a retirement.
   const delisted = toDelist.length > 0 && !!e && await e.delistDevices(toDelist).then(() => true, () => false);
   for (const d of pending) {
-    if (d.user_id !== userId) {
-      left.push(d);
-      continue;
-    }
-    const next = { ...d, delisted: d.delisted || delisted };
-    if (!next.deleted) {
+    let deleted = d.deleted;
+    if (!deleted) {
       try {
         await call(`/api/v1/keys/devices/${encodeURIComponent(d.device_id)}`, 'DELETE', undefined, signal);
-        next.deleted = true;
+        deleted = true;
       } catch (err) {
-        next.deleted = err instanceof KeyServerError && err.status === 404;
+        deleted = err instanceof KeyServerError && err.status === 404;
       }
     }
-    if (!(next.deleted && next.delisted)) left.push(next);
+    saveAbandoned({ ...d, deleted, delisted: d.delisted || delisted });
+    settleAbandoned(d);
   }
-  saveAbandoned(left);
+}
+
+/** Retires pending devices again once this device can sign (it was just verified). */
+function retireAfterVerify(): void {
+  const entry = current;
+  const e = entry?.ready;
+  if (entry && e) void retireAbandoned(entry.userId, entry.controller.signal, e).catch(() => undefined);
 }
 
 /**
@@ -611,7 +718,7 @@ export async function forgetCryptoStore(): Promise<void> {
   deletedElsewhere = false;
   // Best effort: a device read that fails or stalls must never stop the wipe.
   const devices = await Promise.race([storedDevices().catch(() => []), new Promise<[]>((r) => setTimeout(r, DEVICE_READ_MS, []))]);
-  saveAbandoned([...abandoned(), ...devices]);
+  for (const d of devices) saveAbandoned(d);
   await deleteCryptoStores();
 }
 

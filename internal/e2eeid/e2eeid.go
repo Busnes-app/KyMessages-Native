@@ -16,6 +16,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"slices"
 	"strconv"
@@ -135,6 +136,18 @@ func DeviceListMessage(tenantID, userID string, version, epoch int64, deviceIDs 
 	return Fields(fields...), nil
 }
 
+// DeviceListDigest names one proposed device list: lowercase hex SHA-256 of
+// Fields("kymessages.device-list", ids...), the browser's pqc.hash of the same. A device
+// reserves its digest before signing, so a proposal that loses the race is never signed.
+func DeviceListDigest(deviceIDs []string) string {
+	f := [][]byte{s("kymessages.device-list")}
+	for _, id := range deviceIDs {
+		f = append(f, s(id))
+	}
+	h := sha256.Sum256(Fields(f...))
+	return hex.EncodeToString(h[:])
+}
+
 // PinsWriteMessage is what the master key signs to replace the sealed pin set: it names the
 // org, user, identity version and new counter, and the SHA-256 of the sealed set, so the server
 // stores only what a verified device wrote, at exactly that place.
@@ -144,10 +157,11 @@ func PinsWriteMessage(tenantID, userID string, version, counter int64, sealed []
 }
 
 // BackupWriteMessage is what the master key signs over one key backup write: the org, user,
-// identity version and each entry's (room, sender key, session, first index) with the SHA-256
+// identity version, backup generation (bumped by each deletion, so an old write cannot refill
+// a deleted backup) and each entry's (room, sender key, session, first index) with the SHA-256
 // of its sealed bytes, in the order sent.
-func BackupWriteMessage(tenantID, userID string, version int64, entries []BackupEntry, sealed [][]byte) []byte {
-	f := [][]byte{s(hybridsig.Alg), s(tenantID), s(userID), s(strconv.FormatInt(version, 10)), s(strconv.Itoa(len(entries)))}
+func BackupWriteMessage(tenantID, userID string, version, generation int64, entries []BackupEntry, sealed [][]byte) []byte {
+	f := [][]byte{s(hybridsig.Alg), s(tenantID), s(userID), s(strconv.FormatInt(version, 10)), s(strconv.FormatInt(generation, 10)), s(strconv.Itoa(len(entries)))}
 	for i, e := range entries {
 		d := sha256.Sum256(sealed[i])
 		f = append(f, e.fields(), d[:])
@@ -453,14 +467,15 @@ func transferAAD(pairingID, verifiedDevice, newDevice string) []byte {
 }
 
 // ComparisonCode is the six digits both screens show before the verified device sends its
-// keys: an HMAC under the QR secret of the pairing and the new device's ephemeral key, so the
-// server, which never sees the secret, cannot grind a substitute key that shows the same code.
-func ComparisonCode(secret []byte, pairingID string, ephemeralPub []byte) (string, error) {
-	if len(secret) != SecretBytes {
+// keys: an HMAC under the QR secret of the pairing, the joining device's ID and its ephemeral
+// key, so the server, which never sees the secret, cannot grind a substitute key or swap in
+// another of the user's devices and show the same code.
+func ComparisonCode(secret []byte, pairingID, newDevice string, ephemeralPub []byte) (string, error) {
+	if len(secret) != SecretBytes || newDevice == "" {
 		return "", ErrQR
 	}
 	m := hmac.New(sha256.New, secret)
-	m.Write(Fields(s(labelQRCode), s(pairingID), ephemeralPub))
+	m.Write(Fields(s(labelQRCode), s(pairingID), s(newDevice), ephemeralPub))
 	v := binary.BigEndian.Uint32(m.Sum(nil)) % 1_000_000
 	code := strconv.FormatUint(uint64(v), 10)
 	for len(code) < 6 {

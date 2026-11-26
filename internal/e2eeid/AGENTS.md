@@ -10,7 +10,9 @@ and the two-layer QR transfer.
 - `e2eeid.go`: the formats, over `internal/pqc/xwing` and `internal/pqc/hybridsig`.
 - Statements signed by the master key: `kymessages.master.v1`, `.device.v2`, `.backup-key.v1`,
   `.device-list.v1`, `.pins-write.v1` and `.backup-write.v1` (`BackupWrite` builds the last from
-  API entries, so the server and the browser sign the same bytes).
+  API entries and the backup generation, so the server and the browser sign the same bytes).
+  `DeviceListDigest` names a proposed list for its reservation (the browser's `hash` of the same
+  fields). `ComparisonCode` binds the joining device's ID as well as its ephemeral key.
 - `call.go`: `Call(name, args)`, the string API (unpadded base64; base64url for pairing IDs and
   QR text) that `web/pqc-wasm` exposes to the browser as `kyPQCCall`.
 

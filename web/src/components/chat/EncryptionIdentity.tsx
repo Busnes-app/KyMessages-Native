@@ -6,7 +6,8 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import QRCode from 'qrcode';
 import { ShieldAlert, ShieldCheck } from 'lucide-react';
 import {
-  acceptIdentity, identityChanges, identityStatus, joinVerification, offerVerification, onIdentityChanged, ownDeviceVerified, prepareIdentity, restoreIdentity,
+  acceptIdentity, encryptionPending, identityChanges, identityStatus, joinVerification, offerVerification, onEncryptionPending, onIdentityChanged, ownDeviceVerified,
+  prepareIdentity, restoreIdentity, retryEncryptionNow,
 } from '../../chat/e2ee';
 
 const POLL_MS = 1500;
@@ -199,9 +200,15 @@ export function VerifyAnotherDevice({ onClose }: { onClose: () => void }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
   const offerRef = useRef<PairingOffer | undefined>(undefined);
+  // Aborted on close or unmount: in-flight requests are dropped and every wait below ends. Made
+  // per effect run, so a remount (StrictMode runs effects twice) does not start out aborted.
+  const stop = useRef(new AbortController());
   useEffect(() => {
     let live = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const controller = new AbortController();
+    stop.current = controller;
+    const signal = controller.signal;
     void (async () => {
       try {
         const o = await offerVerification();
@@ -218,7 +225,7 @@ export function VerifyAnotherDevice({ onClose }: { onClose: () => void }) {
           if (!live) return;
           if (Date.now() >= deadline) return setErr('The code expired. Close this and start again.');
           try {
-            const j = await o.poll();
+            const j = await o.poll(signal);
             failures = 0;
             if (j) return live && setJoined(j);
           } catch (e) {
@@ -236,40 +243,49 @@ export function VerifyAnotherDevice({ onClose }: { onClose: () => void }) {
     return () => {
       live = false;
       clearTimeout(timer);
+      controller.abort();
     };
   }, []);
+  // Keys already sent stay with the pairing: the new device may still be fetching them, so
+  // closing then only stops watching.
   const close = () => {
-    if (!done) void offerRef.current?.cancel().catch(() => undefined);
+    stop.current.abort();
+    if (!sent && !done) void offerRef.current?.cancel().catch(() => undefined);
     onClose();
   };
   const approve = async () => {
+    const signal = stop.current.signal;
     setBusy(true);
     try {
-      await offer!.approve();
+      await offer!.approve(signal);
       setSent(true);
     } catch (e) {
+      if (signal.aborted) return;
       setErr(errText(e, 'The keys could not be sent.'));
       setBusy(false);
       return;
     }
-    // Verified only once the new device has signed itself on and is listed, not on upload.
+    setBusy(false);
+    // Verified only once the new device has signed itself on and is listed, not on upload; the
+    // wait is bounded, and ends when this screen closes.
     let failures = 0;
     const until = Math.max(deadlineRef.current, Date.now()) + 60_000;
-    while (Date.now() < until) {
+    while (Date.now() < until && !signal.aborted) {
       try {
         if (await ownDeviceVerified(joined!.device)) {
-          setDone(true);
-          setBusy(false);
+          if (!signal.aborted) setDone(true);
           return;
         }
         failures = 0;
       } catch {
         if (++failures > POLL_RETRIES) break;
       }
-      await new Promise((r) => setTimeout(r, POLL_MS));
+      await new Promise<void>((r) => {
+        const timer = setTimeout(r, POLL_MS);
+        signal.addEventListener('abort', () => { clearTimeout(timer); r(); }, { once: true });
+      });
     }
-    setErr('The keys were sent, but the new device has not confirmed. Check it, or start again.');
-    setBusy(false);
+    if (!signal.aborted) setErr('The keys were sent, but the new device has not confirmed. Check it, or start again.');
   };
   return (
     <ChatDialog title="Verify a device" onClose={close} busy={busy}>
@@ -278,7 +294,7 @@ export function VerifyAnotherDevice({ onClose }: { onClose: () => void }) {
         {done ? (
           <p role="status"><ShieldCheck size={16} aria-hidden="true" /> The new device is verified.</p>
         ) : sent ? (
-          <p role="status">Keys sent. Waiting for the new device to confirm…</p>
+          <p role="status">Keys sent. Waiting for the new device to confirm… You can close this; the new device still gets them.</p>
         ) : joined ? (
           <div role="status">
             <p>Does the new device show this code?</p>
@@ -295,7 +311,7 @@ export function VerifyAnotherDevice({ onClose }: { onClose: () => void }) {
         ) : !err && <p>Starting…</p>}
       </div>
       <div className="chat-modal-foot">
-        <button type="button" className="btn-secondary" onClick={close} disabled={busy}>{done ? 'Close' : joined ? 'It does not match' : 'Cancel'}</button>
+        <button type="button" className="btn-secondary" onClick={close} disabled={busy}>{done || sent ? 'Close' : joined ? 'It does not match' : 'Cancel'}</button>
         {joined && !sent && <button type="button" onClick={() => void approve()} disabled={busy}>{busy ? 'Sending…' : 'The codes match'}</button>}
       </div>
     </ChatDialog>
@@ -326,14 +342,34 @@ export function useIdentityStatus(ready: boolean): [GateState, () => void] {
 export function EncryptionIdentityGate({ gate, refresh }: { gate: GateState; refresh: () => void }) {
   const [open, setOpen] = useState(false);
   const [reset, setReset] = useState(false);
+  const pending = useEncryptionPending();
   if (gate.state === 'loading') return null;
   if (gate.state === 'verified') {
-    return gate.backupFull ? (
-      <div className="chat-banner chat-banner-info" role="status">
-        <ShieldAlert size={16} aria-hidden="true" />
-        <span>Your key backup is full: messages from now on are readable on this device, but are not backed up for a new one.</span>
-      </div>
-    ) : null;
+    const done = () => { setOpen(false); refresh(); };
+    return (
+      <>
+        {gate.problem && (
+          <div className="chat-banner chat-banner-error" role="alert">
+            <ShieldAlert size={16} aria-hidden="true" />
+            <span>
+              {gate.problem === 'fork'
+                ? 'The server showed two different lists of your devices. '
+                : 'The server showed an older list of your devices, or older pinned identities, than this device has seen. '}
+              Nothing is shared or signed over it. Resetting your identity starts a new one: messages on this device stay readable, and everyone you share rooms with will see that your identity changed.
+            </span>
+            <button type="button" className="btn-secondary" onClick={() => setOpen(true)}>Reset identity</button>
+          </div>
+        )}
+        {gate.backupFull && (
+          <div className="chat-banner chat-banner-info" role="status">
+            <ShieldAlert size={16} aria-hidden="true" />
+            <span>Your key backup is full: some messages are readable on this device but not backed up for a new one. They stay queued here.</span>
+          </div>
+        )}
+        {pending && <PendingBanner />}
+        {open && <SetUpEncryption reset onClose={() => setOpen(false)} onDone={done} />}
+      </>
+    );
   }
   if (gate.state === 'error') {
     return (
@@ -364,6 +400,31 @@ export function EncryptionIdentityGate({ gate, refresh }: { gate: GateState; ref
         ? <SetUpEncryption reset={reset} onClose={close} onDone={done} />
         : <VerifyThisDevice fingerprint={gate.fingerprint} onClose={close} onReset={() => setReset(true)} onDone={done} />)}
     </>
+  );
+}
+
+function useEncryptionPending(): boolean {
+  const [pending, setPending] = useState(encryptionPending);
+  useEffect(() => {
+    setPending(encryptionPending());
+    return onEncryptionPending(() => setPending(encryptionPending()));
+  }, []);
+  return pending;
+}
+
+/** Encryption work (reading keys, the key backup, a restore) waits for a retry. */
+function PendingBanner() {
+  const [busy, setBusy] = useState(false);
+  const retry = () => {
+    setBusy(true);
+    void retryEncryptionNow().finally(() => setBusy(false));
+  };
+  return (
+    <div className="chat-banner chat-banner-info" role="status" data-testid="encryption-pending">
+      <ShieldAlert size={16} aria-hidden="true" />
+      <span>Some encryption work is waiting: messages or the key backup may be behind. It is retried by itself.</span>
+      <button type="button" className="btn-secondary" onClick={retry} disabled={busy}>{busy ? 'Retrying…' : 'Retry now'}</button>
+    </div>
   );
 }
 

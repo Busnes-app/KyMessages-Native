@@ -13,7 +13,7 @@
 import { InboundGroupSession } from './index';
 import { b64, pqc, unb64, type BackupRef, type Hybrid } from '../pqc/index';
 import type { CryptoStore } from './store';
-import { backupCoverKey, backupQueueKey, Conflict, inboundKey, isObj, isStr, isTransient, parseJSON, type InboundRecord } from './records';
+import { backupCoverKey, backupQueueKey, backupRefusedKey, Conflict, inboundKey, isObj, isStr, isTransient, parseJSON, type InboundRecord } from './records';
 
 // --- The key server, as the identity needs it (chat/e2ee.ts implements it over HTTP) ---
 
@@ -32,6 +32,8 @@ export interface MasterKeyRecord {
 
 export interface OwnMaster extends MasterKeyRecord {
   backup_key: { public_key: string; signature: Hybrid };
+  /** Bumped by each deletion of the key backup; backup writes are signed for one generation. */
+  backup_generation: number;
   recovery: { wrapped_master_key: string; wrapped_backup_key: string };
   pins: { counter: number; sealed: string };
 }
@@ -68,18 +70,21 @@ export interface IdentityServer {
   putMaster(req: MasterPut): Promise<number>;
   /** signature: the master key's kymessages.pins-write.v1 signature over this write. */
   putPins(version: number, expectedCounter: number, sealed: string, signature: Hybrid): Promise<void>;
+  /** Reserves epoch expectedEpoch+1 for the list with this digest; Conflict while another holds it. */
+  reserveDeviceList(version: number, expectedEpoch: number, digest: string): Promise<void>;
   putDeviceList(version: number, expectedEpoch: number, deviceIds: string[], signature: Hybrid): Promise<void>;
   signDevice(deviceId: string, version: number, signature: Hybrid): Promise<void>;
   getBackup(version: number, after: BackupCursor): Promise<{ sessions: BackupEntry[]; more: boolean }>;
-  /** signature: the master key's kymessages.backup-write.v1 signature over the batch. full:
-   * a new session did not fit the server's caps (improvements to stored ones still landed). */
-  putBackup(version: number, sessions: BackupEntry[], signature: Hybrid): Promise<{ full: boolean }>;
+  /** signature: the master key's kymessages.backup-write.v1 signature over the batch, for one
+   * backup generation. refused: indexes of entries that did not fit the server's caps. */
+  putBackup(version: number, generation: number, sessions: BackupEntry[], signature: Hybrid): Promise<{ refused: number[] }>;
   pairingStart(deviceId: string): Promise<{ pairing_id: string; expires_in_ms: number }>;
-  pairingGet(id: string): Promise<PairingState>;
+  // signal: the screen that asked closed, so the request is dropped.
+  pairingGet(id: string, signal?: AbortSignal): Promise<PairingState>;
   pairingJoin(id: string, deviceId: string, ephemeralKey: string): Promise<void>;
-  pairingSeal(id: string, deviceId: string, sealed: string): Promise<void>;
+  pairingSeal(id: string, deviceId: string, sealed: string, signal?: AbortSignal): Promise<void>;
   /** The sealed keys, once; Conflict while none are waiting yet. */
-  pairingConsume(id: string, deviceId: string): Promise<{ initiator_device: string; sealed: string }>;
+  pairingConsume(id: string, deviceId: string, signal?: AbortSignal): Promise<{ initiator_device: string; sealed: string }>;
   pairingCancel(id: string): Promise<void>;
 }
 
@@ -88,8 +93,10 @@ export type IdentityStatus =
   | { state: 'none'; quarantined: boolean }
   | { state: 'unverified'; fingerprint: string; quarantined: boolean }
   /** restoring: sessions from the key backup are still being read in. backupFull: the server's
-   * cap stopped new sessions going into the backup. */
-  | { state: 'verified'; fingerprint: string; restoring: boolean; backupFull: boolean };
+   * cap refused sessions, which stay queued here. problem: the server showed this identity's
+   * device list or pin set older than this device has seen (rollback) or two lists at one epoch
+   * (fork); nothing is trusted or signed over it, and resetting the identity is the way out. */
+  | { state: 'verified'; fingerprint: string; restoring: boolean; backupFull: boolean; problem?: 'rollback' | 'fork' };
 
 /** A colleague whose master key changed since it was pinned. */
 export interface IdentityChange {
@@ -104,9 +111,9 @@ export interface PairingOffer {
   /** Milliseconds the pairing stays open, by the server's clock. */
   expiresInMs: number;
   /** The comparison code once the new device has joined. */
-  poll(): Promise<{ code: string; device: string } | undefined>;
+  poll(signal?: AbortSignal): Promise<{ code: string; device: string } | undefined>;
   /** Sends the keys to the device that showed the code poll returned. */
-  approve(): Promise<void>;
+  approve(signal?: AbortSignal): Promise<void>;
   cancel(): Promise<void>;
 }
 
@@ -156,7 +163,6 @@ const IDENTITY = 'identity';
 const SIGNED = 'identity:signed';
 /** The newest pin set counter seen for one identity: scoped to org, fingerprint and version. */
 const pinsMark = (l: { tenant_id: string; fingerprint: string; version: number }) => `pins:hwm:${l.tenant_id}:${l.fingerprint}:${l.version}`;
-const BACKUP_FULL = 'backup:full';
 const RESTORE = 'backup:restore';
 const previousKey = (fp: string, version: number) => `identity:previous:${fp}:${version}`;
 const pinKey = (userId: string) => `mpin:${userId}`;
@@ -172,6 +178,16 @@ const PAIRING_POLL_MS = 1500;
 const PAIRING_WAIT_MS = 4 * 60_000;
 /** Consecutive failures (the network, the server) a pairing poll rides out before giving up. */
 const PAIRING_RETRIES = 5;
+/** Attempts at a device list edit; a reservation held by another device lapses in 30 seconds. */
+const LIST_ATTEMPTS = 4;
+const LIST_BACKOFF_MS = 500;
+
+/** The server showed an identity's device list or pin set older than seen (or a forked list). */
+export class Rollback extends Error {
+  constructor(readonly kind: 'rollback' | 'fork', message: string) {
+    super(message);
+  }
+}
 
 // Signature checks are pure, and every send lists every member's keys again: verify each
 // distinct (statement, signature) once. Keys are SHA-256 of the inputs, not the inputs; a
@@ -236,13 +252,15 @@ export interface IdentityContext {
   locked<T>(fn: () => Promise<T>): Promise<T>;
   /** Called with the session IDs a restored backup page stored, so waiting messages reopen. */
   onRestored?(sessionIds: string[]): void;
+  /** Called when background work (restore, backup) failed for availability and should be retried. */
+  onTransient?(): void;
 }
 
 export class Identity {
   private readonly listeners = new Set<() => void>();
-  private pinsDirty = false;
   private changed = false;
   private restoring?: Promise<number>;
+  private backupGen?: { version: number; generation: number };
 
   constructor(private readonly ctx: IdentityContext) {}
 
@@ -304,10 +322,11 @@ export class Identity {
   /**
    * userId's master key from a key query, with the devices on its newest signed device list, if
    * this device is verified and the key is validly self-bound in tenantId, has no pending change
-   * and matches the pin; undefined otherwise. A first sight is pinned (after the pin set is
-   * synced) and a mismatch is recorded as a change. Pin writes go into writes. Lock held.
+   * and matches the pin; undefined otherwise. A mismatch is recorded as a change (pin writes go
+   * into writes). A first sight is only proposed, into sights: the caller trusts it after
+   * commitFirstSights stored it in the synced pin set. Lock held.
    */
-  async trustedMaster(userId: string, rec: unknown, tenantId: string, writes: [string, unknown][]): Promise<TrustedMaster | undefined> {
+  async trustedMaster(userId: string, rec: unknown, tenantId: string, writes: [string, unknown][], sights: Map<string, string>): Promise<TrustedMaster | undefined> {
     const own = await this.local();
     // An unverified device cannot check anyone: it pins nobody and trusts nobody.
     if (!own || own.tenant_id !== tenantId) return undefined;
@@ -321,14 +340,21 @@ export class Identity {
       return own.fingerprint === fp && own.version === rec.version ? this.withList(userId, rec, tenantId) : undefined;
     }
     // A pending change blocks this member until it is accepted, even if the server goes back to
-    // serving the old key.
-    if (await this.ctx.store.get<IdentityChange>(changeKey(userId))) return undefined;
-    // beforeTrust synced the pin set first, so a first sight here is one no other of the user's
-    // devices has pinned either.
-    let pin = await this.ctx.store.get<PinRecord>(pinKey(userId));
+    // serving the old key. A newer verified key replaces the candidate shown, trusted no more.
+    const c = await this.ctx.store.get<IdentityChange>(changeKey(userId));
+    if (c) {
+      if (fp !== c.fingerprint && fp !== c.previous) {
+        writes.push([changeKey(userId), { ...c, fingerprint: fp } satisfies IdentityChange]);
+        this.changed = true;
+      }
+      return undefined;
+    }
+    const pin = await this.ctx.store.get<PinRecord>(pinKey(userId));
     if (!pin) {
-      pin = await this.ctx.store.putIfAbsent<PinRecord>(pinKey(userId), { fingerprint: fp, n: 1, accepted: false });
-      this.pinsDirty = true;
+      // Not trusted until the synced pin set holds it: another of the user's devices may be
+      // pinning a different key for this member right now.
+      sights.set(userId, fp);
+      return this.withList(userId, rec, tenantId);
     }
     if (pin.fingerprint !== fp) {
       writes.push([changeKey(userId), { user_id: userId, fingerprint: fp, previous: pin.fingerprint } satisfies IdentityChange]);
@@ -336,6 +362,22 @@ export class Identity {
       return undefined;
     }
     return this.withList(userId, rec, tenantId);
+  }
+
+  /**
+   * Commits first sights to the synced pin set in one compare-and-swap (a conflict refetches and
+   * evaluates the winner) and answers the members whose pin is now exactly the key proposed,
+   * with no pending change. A failure commits nothing and throws. Lock held.
+   */
+  async commitFirstSights(sights: Map<string, string>): Promise<Set<string>> {
+    const ok = new Set<string>();
+    if (sights.size === 0) return ok;
+    await this.syncPins(sights);
+    for (const [user, fp] of sights) {
+      const pin = await this.ctx.store.get<PinRecord>(pinKey(user));
+      if (pin?.fingerprint === fp && !(await this.ctx.store.get(changeKey(user)))) ok.add(user);
+    }
+    return ok;
   }
 
   /**
@@ -367,13 +409,16 @@ export class Identity {
    * Records dl as seen for one identity and says whether it is acceptable: 'ok' when it is the
    * newest seen (or exactly the newest), 'rollback' when older (or missing once one was seen),
    * 'fork' when another list was seen at the same epoch. The mark only rises, in one storage
-   * transaction, so a status check and an unlocked sign-out cannot lower it.
+   * transaction, so a status check and an unlocked sign-out cannot lower it; a list no newer
+   * than the mark is checked without a write.
    */
   private async observeList(tenantId: string, userId: string, fp: string, version: number, dl: DeviceList | undefined): Promise<'ok' | 'rollback' | 'fork'> {
     const key = listKey(tenantId, userId, fp, version);
-    if (!dl) return (await this.ctx.store.get(key)) ? 'rollback' : 'ok';
+    type Mark = { epoch: number; digest: string };
+    const seen = await this.ctx.store.get<Mark>(key);
+    if (!dl) return seen ? 'rollback' : 'ok';
     const digest = pqc.hash('kymessages.device-list', ...dl.device_ids);
-    const mark = await this.ctx.store.update<{ epoch: number; digest: string }>(key, (cur) => (!cur || dl.epoch > cur.epoch ? { epoch: dl.epoch, digest } : cur));
+    const mark = seen && seen.epoch >= dl.epoch ? seen : await this.ctx.store.update<Mark>(key, (cur) => (!cur || dl.epoch > cur.epoch ? { epoch: dl.epoch, digest } : cur));
     if (!mark || mark.epoch > dl.epoch) return 'rollback';
     return mark.digest === digest ? 'ok' : 'fork';
   }
@@ -395,16 +440,12 @@ export class Identity {
       () => pqc.verifyDevice(master.key, tenantId, userId, d.device_id, d.curve25519, d.ed25519, s));
   }
 
-  /** After trustedMaster's writes are stored: announce changes, and sync new pins to the
-   * user's other devices once the caller's lock is released. */
+  /** After trustedMaster's writes are stored: announce changes. */
   afterWrites(): void {
     if (this.changed) {
       this.changed = false;
       this.notify();
     }
-    if (!this.pinsDirty) return;
-    this.pinsDirty = false;
-    setTimeout(() => void this.ctx.locked(() => this.syncPins()).catch(() => undefined), 0);
   }
 
   changes(): Promise<IdentityChange[]> {
@@ -413,16 +454,17 @@ export class Identity {
 
   /**
    * The viewer accepts userId's change from previous to fingerprint, exactly as shown: if the
-   * pending change is anything else (another tab or the server changed it meanwhile) nothing is
-   * accepted. The new pin syncs to the user's other devices.
+   * pending change or the current pin is anything else (another tab, another of the user's
+   * devices or the server changed it meanwhile) nothing is accepted. The new pin syncs to the
+   * user's other devices.
    */
   acceptChange(userId: string, previous: string, fingerprint: string): Promise<void> {
     return this.ctx.locked(async () => {
       const c = await this.ctx.store.get<IdentityChange>(changeKey(userId));
-      if (!c || c.previous !== previous || c.fingerprint !== fingerprint) {
+      const pin = await this.ctx.store.get<PinRecord>(pinKey(userId));
+      if (!c || c.previous !== previous || c.fingerprint !== fingerprint || pin?.fingerprint !== previous) {
         throw new Error('This identity changed again. Check the new fingerprint before accepting.');
       }
-      const pin = await this.ctx.store.get<PinRecord>(pinKey(userId));
       await this.ctx.store.write([[pinKey(userId), { fingerprint, n: (pin?.n ?? 0) + 1, accepted: true, prev: previous } satisfies PinRecord]], [changeKey(userId)]);
       await this.syncPins().catch(() => undefined);
       this.notify();
@@ -461,12 +503,25 @@ export class Identity {
         }
       }
       if (l && current(l)) {
+        this.backupGen = { version: master.version, generation: master.backup_generation };
         await this.signOwnDevice(l);
-        await this.ensureListed(l);
-        // A failed resume keeps its cursor, shows as restoring, and runs again on the next status.
-        void this.resumeRestore().catch(() => undefined);
-        void this.ctx.locked(() => this.flushBackup()).catch(() => undefined);
-        return { state: 'verified', fingerprint: fp, restoring: (await this.ctx.store.get(RESTORE)) !== undefined, backupFull: (await this.ctx.store.get(BACKUP_FULL)) === true };
+        // A rolled-back or forked list or pin set is reported, never signed over: re-signing an
+        // old roster, or an empty pin set, to get past the mark would bring back what the newer
+        // state removed. Resetting the identity is the way out (the UI offers it).
+        let problem: Rollback['kind'] | undefined;
+        try {
+          if (master.pins.counter < ((await this.ctx.store.get<number>(pinsMark(l))) ?? 0)) throw new Rollback('rollback', 'pin set rolled back');
+          await this.ensureListed(l);
+        } catch (e) {
+          if (!(e instanceof Rollback)) throw e;
+          problem = e.kind;
+        }
+        // A failed resume keeps its cursor, shows as restoring, and is retried.
+        void this.resumeRestore().catch((e: unknown) => this.later(e));
+        void this.ctx.locked(() => this.flushBackup(true)).catch((e: unknown) => this.later(e));
+        const restoring = (await this.ctx.store.get(RESTORE)) !== undefined;
+        const backupFull = (await this.ctx.store.list('bqf:')).length > 0;
+        return { state: 'verified', fingerprint: fp, restoring, backupFull, ...(problem ? { problem } : {}) };
       }
       if (l) {
         await this.quarantine(l);
@@ -474,6 +529,11 @@ export class Identity {
       }
       return { state: 'unverified', fingerprint: fp, quarantined: await this.hasQuarantined() };
     });
+  }
+
+  /** Background work that failed for availability asks for a retry. */
+  private later(e: unknown): void {
+    if (isTransient(e)) this.ctx.onTransient?.();
   }
 
   private async signOwnDevice(l: LocalIdentity): Promise<void> {
@@ -486,18 +546,23 @@ export class Identity {
     await this.ctx.store.write([[SIGNED, { version: l.version, device_id: this.ctx.deviceId }]]);
   }
 
-  /** Rewrites the signed device list with change applied, until it holds. */
   /**
    * Rewrites the signed device list with change applied. The list it starts from must be signed
    * by this device's own master key for exactly this org, user and version, canonical, and not
-   * older than (nor a fork of) the newest this device has seen; a missing list is a start only
-   * when this device has seen none. Throws when the server's list fails any of that, when the
-   * identity moved on, or when compare-and-swap keeps losing.
+   * older than (nor a fork of) the newest this device has seen (Rollback otherwise); a missing
+   * list is a start only when this device has seen none. The next epoch is reserved for exactly
+   * the proposed list before it is signed, so a proposal that loses to another device's is never
+   * signed: on a conflict this refetches and applies change to the winner. guard, checked on
+   * every attempt before reserving, can call the edit off: an edit that started before the guard
+   * turned false either published first (and a later edit sees its result) or loses its
+   * reservation and stops. Throws when the identity moved on or the list keeps changing.
    */
-  private async editList(l: LocalIdentity, change: (ids: Set<string>) => void): Promise<void> {
+  private async editList(l: LocalIdentity, change: (ids: Set<string>) => void, guard?: () => Promise<boolean>): Promise<void> {
     const seeds = await this.seeds(l);
     const user = this.ctx.userId;
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < LIST_ATTEMPTS; attempt++) {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, LIST_BACKOFF_MS * 2 ** (attempt - 1)));
+      if (guard && !(await guard())) return;
       const { tenant_id, master } = await this.ctx.server.getMaster();
       if (!master || tenant_id !== l.tenant_id || master.version !== l.version || pqc.fingerprint(master.master_key) !== l.fingerprint) {
         throw new Error('The encryption identity changed; the device list was not edited.');
@@ -507,30 +572,33 @@ export class Identity {
         throw new Error('The server’s device list is not signed by this identity.');
       }
       const seen = await this.observeList(l.tenant_id, user, l.fingerprint, l.version, cur);
-      if (seen !== 'ok') throw new Error(seen === 'fork' ? 'The server showed two device lists at once.' : 'The server returned an older device list than this device has seen.');
+      if (seen !== 'ok') throw new Rollback(seen, seen === 'fork' ? 'The server showed two device lists at once.' : 'The server returned an older device list than this device has seen.');
       const ids = new Set(cur?.device_ids ?? []);
       const before = [...ids].join('\n');
       change(ids);
       const next = [...ids].sort();
       if (cur && next.join('\n') === before) return;
       const epoch = (cur?.epoch ?? 0) + 1;
-      const signature = pqc.signDeviceList(seeds.master, l.tenant_id, user, l.version, epoch, next);
       try {
+        await this.ctx.server.reserveDeviceList(l.version, epoch - 1, pqc.hash('kymessages.device-list', ...next));
+        // Signed only once reserved; a lost reservation discards this signature unsent.
+        const signature = pqc.signDeviceList(seeds.master, l.tenant_id, user, l.version, epoch, next);
         await this.ctx.server.putDeviceList(l.version, epoch - 1, next, signature);
       } catch (e) {
         if (e instanceof Conflict) continue;
         throw e;
       }
-      await this.observeList(l.tenant_id, user, l.fingerprint, l.version, { epoch, device_ids: next, signature });
+      // Finalized: only a list the server took is recorded as seen.
+      await this.observeList(l.tenant_id, user, l.fingerprint, l.version, { epoch, device_ids: next, signature: '' });
       return;
     }
     throw new Error('The device list kept changing; try again.');
   }
 
-  /** Adds this device to the list, unless it is retiring (a sign-out is taking it off). */
+  /** Adds this device to the list unless it is retiring (a sign-out is taking it off), checked
+   * on every attempt so an enrollment in flight cannot undo a sign-out. */
   private async ensureListed(l: LocalIdentity): Promise<void> {
-    if ((await this.ctx.store.get<string>(RETIRING)) === this.ctx.deviceId) return;
-    await this.editList(l, (ids) => ids.add(this.ctx.deviceId));
+    await this.editList(l, (ids) => ids.add(this.ctx.deviceId), async () => (await this.ctx.store.get<string>(RETIRING)) !== this.ctx.deviceId);
   }
 
   /**
@@ -571,6 +639,7 @@ export class Identity {
       master_key: master.public_key,
       self_signature: pqc.signMaster(master.seed, tenant_id, user),
       backup_key: { public_key: backup.public, signature: pqc.signBackupKey(master.seed, tenant_id, user, version, backup.public) },
+      backup_generation: 0,
       recovery: {
         wrapped_master_key: pqc.recoveryWrap(recovery.key, 'master-key', tenant_id, user, master.seed),
         wrapped_backup_key: pqc.recoveryWrap(recovery.key, 'backup-key', tenant_id, user, backup.seed),
@@ -640,16 +709,19 @@ export class Identity {
     const local = await this.sealLocal(tenantId, master, masterSeed, backupSeed);
     await this.ctx.locked(async () => {
       // Every verified room key this device already holds goes to the backup too.
+      // A new identity has a new, empty backup: what an old one refused is tried again.
       const queue = (await this.ctx.store.list<InboundRecord>('in:')).filter(([, r]) => r.verified && !r.from_backup).map(([k]): [string, unknown] => [backupQueueKey(k), k]);
+      const refused = (await this.ctx.store.list('bqf:')).map(([k]) => k);
       const restore: RestoreCursor = { version: local.version, after: { room_id: '', sender_key: '', session_id: '' }, count: 0 };
-      await this.ctx.store.write([[IDENTITY, local], [RESTORE, restore], ...queue], [SIGNED]);
+      this.backupGen = { version: master.version, generation: master.backup_generation };
+      await this.ctx.store.write([[IDENTITY, local], [RESTORE, restore], ...queue], [SIGNED, ...refused]);
       await this.signOwnDevice(local);
       await this.ensureListed(local);
       await this.syncPins().catch(() => undefined);
     });
     this.notify();
     const restored = await this.resumeRestore();
-    await this.ctx.locked(() => this.flushBackup()).catch(() => undefined);
+    await this.ctx.locked(() => this.flushBackup()).catch((e: unknown) => this.later(e));
     return restored;
   }
 
@@ -659,9 +731,11 @@ export class Identity {
    * Merges this device's pins with the sealed set on the server and writes the result back. A
    * pin never silently changes: a different fingerprint is adopted only as an accepted change
    * from exactly this device's pin, and any other disagreement is kept as a pending change. The
-   * counter's high-water mark refuses a rolled-back set. Lock held.
+   * counter's high-water mark refuses a rolled-back set (Rollback). sights are first sights to
+   * add: each is stored here only once the server took a set holding it, and one another device
+   * pinned first wins (this device's key for that member becomes a pending change). Lock held.
    */
-  async syncPins(): Promise<void> {
+  async syncPins(sights: ReadonlyMap<string, string> = new Map()): Promise<void> {
     const l = await this.local();
     if (!l) return;
     const seeds = await this.seeds(l);
@@ -672,7 +746,7 @@ export class Identity {
         throw new Error('The encryption identity changed; check this device again.');
       }
       const counter = master.pins.counter;
-      if (counter < ((await this.ctx.store.get<number>(mark)) ?? 0)) throw new Error('The server returned an older pin set than this device has seen.');
+      if (counter < ((await this.ctx.store.get<number>(mark)) ?? 0)) throw new Rollback('rollback', 'The server returned an older pin set than this device has seen.');
       const remote: Record<string, PinRecord> = {};
       if (counter > 0) {
         // A set that does not open is an error, never an empty set: local pins stay as they are.
@@ -685,6 +759,21 @@ export class Identity {
       const merged: Record<string, PinRecord> = {};
       const writes: [string, unknown][] = [];
       const deletes: string[] = [];
+      // First sights become pins only after the server took them (tentative until then).
+      const tentative: [string, unknown][] = [];
+      for (const [user, fp] of sights) {
+        if (user === this.ctx.userId || local.has(user)) continue;
+        const r = remote[user];
+        if (!r) {
+          const pin: PinRecord = { fingerprint: fp, n: 1, accepted: false };
+          merged[user] = pin;
+          tentative.push([pinKey(user), pin]);
+        } else if (r.fingerprint !== fp) {
+          // Another device pinned a different key first: that pin stands, this one is a change.
+          writes.push([changeKey(user), { user_id: user, fingerprint: fp, previous: r.fingerprint } satisfies IdentityChange]);
+          this.changed = true;
+        }
+      }
       for (const user of new Set([...local.keys(), ...Object.keys(remote)])) {
         if (user === this.ctx.userId) continue;
         const a = local.get(user);
@@ -704,11 +793,14 @@ export class Identity {
           continue;
         }
         if (r.accepted && r.n > a.n && r.prev === a.fingerprint) {
-          // Accepted on another of the user's devices, as a change from exactly this pin.
+          // Accepted on another of the user's devices, as a change from exactly this pin. A
+          // prompt here for that same key is settled; one for yet another key now changes from
+          // the new pin, so it is never accepted against the pin it replaced.
           merged[user] = r;
           writes.push([pinKey(user), r]);
           const c = await this.ctx.store.get<IdentityChange>(changeKey(user));
           if (c?.fingerprint === r.fingerprint) deletes.push(changeKey(user));
+          else if (c) writes.push([changeKey(user), { ...c, previous: r.fingerprint } satisfies IdentityChange]);
           this.changed = true;
           continue;
         }
@@ -736,26 +828,49 @@ export class Identity {
       const signature = pqc.signPinsWrite(seeds.master, l.tenant_id, this.ctx.userId, l.version, counter + 1, sealed);
       try {
         await this.ctx.server.putPins(l.version, counter, sealed, signature);
-        await this.ctx.store.update<number>(mark, (cur) => (cur === undefined || counter + 1 > cur ? counter + 1 : cur));
-        return;
       } catch (e) {
         if (!(e instanceof Conflict)) throw e;
+        continue; // refetch: the winner's set is merged on the next attempt
       }
+      // putIfAbsent: a pin another tab stored meanwhile is never overwritten.
+      for (const [k, v] of tentative) await this.ctx.store.putIfAbsent(k, v);
+      await this.ctx.store.update<number>(mark, (cur) => (cur === undefined || counter + 1 > cur ? counter + 1 : cur));
+      return;
     }
     throw new Error('The synced pin set kept changing; try again.');
   }
 
   // --- Key backup ---
 
-  /** Seals queued room sessions to the backup key; a bad entry is dropped alone. Lock held. */
-  async flushBackup(): Promise<void> {
+  /** The backup generation writes are signed for: cached from the identity, refetched after a
+   * conflict (a deletion elsewhere starts a new one, and what it refused is tried again). */
+  private async generation(l: LocalIdentity, refetch: boolean): Promise<number> {
+    if (!refetch && this.backupGen?.version === l.version) return this.backupGen.generation;
+    const { tenant_id, master } = await this.ctx.server.getMaster();
+    if (!master || tenant_id !== l.tenant_id || master.version !== l.version) throw new Conflict('The encryption identity changed');
+    const was = this.backupGen?.version === l.version ? this.backupGen.generation : undefined;
+    this.backupGen = { version: l.version, generation: master.backup_generation };
+    if (was !== undefined && master.backup_generation !== was) {
+      const refused = await this.ctx.store.list<string>('bqf:');
+      await this.ctx.store.write(refused.map(([, ik]): [string, unknown] => [backupQueueKey(ik), ik]), refused.map(([k]) => k));
+    }
+    return master.backup_generation;
+  }
+
+  /**
+   * Seals queued room sessions to the backup key; a bad entry is dropped alone. Entries the
+   * server refused for its caps stay queued apart (bqf:), retried with refused (on status) and
+   * shown as the backup being full until they fit. Lock held.
+   */
+  async flushBackup(refused = false): Promise<void> {
     const l = await this.local();
     if (!l) return;
-    const queue = await this.ctx.store.list<string>('bq:');
+    const queue = [...await this.ctx.store.list<string>('bq:'), ...(refused ? await this.ctx.store.list<string>('bqf:') : [])];
     if (queue.length === 0) return;
     const seeds = await this.seeds(l);
     for (let i = 0; i < queue.length; i += BACKUP_BATCH) {
       const entries: BackupEntry[] = [];
+      const keys: [string, string][] = [];
       const done: string[] = [];
       for (const [qk, ik] of queue.slice(i, i + BACKUP_BATCH)) {
         done.push(qk);
@@ -767,6 +882,7 @@ export class Identity {
           const ref: BackupRef = { room_id: rec.room_id, sender_key: rec.sender_key, session_id: s.sessionId, first_index: s.firstKnownIndex };
           const payload = { v: 1, ...ref, sender_user: rec.sender_user, sender_device: rec.sender_device, session_key: s.exportAtFirstKnownIndex() };
           entries.push({ ...ref, sealed: pqc.backupSeal(l.backup_key, seeds.master, ref, b64(JSON.stringify(payload))) });
+          keys.push([qk, ik]);
         } catch (e) {
           // An unavailable module stops the flush with the queue kept; only an unreadable
           // pickle is dropped from it.
@@ -775,12 +891,24 @@ export class Identity {
           s?.free();
         }
       }
+      const keep: [string, unknown][] = [];
       if (entries.length > 0) {
-        const { full } = await this.ctx.server.putBackup(l.version, entries, pqc.signBackupWrite(seeds.master, l.tenant_id, this.ctx.userId, l.version, entries));
-        // Kept for status: the backup holds no more sessions until the user frees room.
-        await this.ctx.store.write(full ? [[BACKUP_FULL, true]] : [], full ? [] : [BACKUP_FULL]);
+        const put = async (refetch: boolean) => {
+          const gen = await this.generation(l, refetch);
+          return this.ctx.server.putBackup(l.version, gen, entries, pqc.signBackupWrite(seeds.master, l.tenant_id, this.ctx.userId, l.version, gen, entries));
+        };
+        const res = await put(false).catch((e: unknown) => {
+          if (e instanceof Conflict) return put(true);
+          throw e;
+        });
+        for (const n of new Set(res.refused)) {
+          const k = keys[n];
+          if (k) keep.push([backupRefusedKey(k[1]), k[1]]);
+        }
       }
-      await this.ctx.store.write([], done);
+      // A refused entry moves to bqf: (or stays there); everything else in the batch is done.
+      const kept = new Set(keep.map(([k]) => k));
+      await this.ctx.store.write(keep, done.filter((k) => !kept.has(k)));
     }
   }
 
@@ -883,17 +1011,18 @@ export class Identity {
     return {
       text,
       expiresInMs: expires_in_ms,
-      poll: async () => {
-        const st = await this.ctx.server.pairingGet(id);
+      poll: async (signal) => {
+        const st = await this.ctx.server.pairingGet(id, signal);
         if (!st.new_device || !st.ephemeral_key) return undefined;
         joined = { key: st.ephemeral_key, device: st.new_device };
-        return { code: pqc.comparisonCode(secret, id, st.ephemeral_key), device: st.new_device };
+        return { code: pqc.comparisonCode(secret, id, st.new_device, st.ephemeral_key), device: st.new_device };
       },
-      approve: async () => {
-        // Sealed to the very key whose code the user compared, never one fetched afterwards.
+      approve: async (signal) => {
+        // Sealed to the very key and device whose code the user compared, never ones fetched
+        // afterwards.
         if (!joined) throw new Error('No device has joined yet.');
         const seeds = await this.seeds(l);
-        await this.ctx.server.pairingSeal(id, this.ctx.deviceId, pqc.transferSeal(joined.key, secret, id, this.ctx.deviceId, joined.device, seeds.master, seeds.backup));
+        await this.ctx.server.pairingSeal(id, this.ctx.deviceId, pqc.transferSeal(joined.key, secret, id, this.ctx.deviceId, joined.device, seeds.master, seeds.backup), signal);
       },
       cancel: () => this.ctx.server.pairingCancel(id),
     };
@@ -915,7 +1044,7 @@ export class Identity {
     const eph = pqc.xwingGenerate();
     await this.ctx.server.pairingJoin(q.pairing_id, this.ctx.deviceId, eph.public);
     return {
-      code: pqc.comparisonCode(q.secret, q.pairing_id, eph.public),
+      code: pqc.comparisonCode(q.secret, q.pairing_id, this.ctx.deviceId, eph.public),
       finish: async (signal) => {
         // Bounded: stops at the pairing's lifetime, and after a few failures in a row; a
         // pairing the server no longer has (404) ends it at once.
@@ -926,14 +1055,18 @@ export class Identity {
           signal?.throwIfAborted();
           if (Date.now() >= deadline) throw new Error('The other device did not approve in time. Start again.');
           try {
-            got = await this.ctx.server.pairingConsume(q.pairing_id, this.ctx.deviceId);
+            got = await this.ctx.server.pairingConsume(q.pairing_id, this.ctx.deviceId, signal);
             break;
           } catch (e) {
+            signal?.throwIfAborted();
             if ((e as { status?: number }).status === 404) throw new Error('This verification was cancelled or expired. Start again.');
             if (!(e instanceof Conflict) && ++failures > PAIRING_RETRIES) throw e;
             if (e instanceof Conflict) failures = 0;
           }
-          await new Promise((r) => setTimeout(r, PAIRING_POLL_MS));
+          await new Promise<void>((r) => {
+            const timer = setTimeout(r, PAIRING_POLL_MS);
+            signal?.addEventListener('abort', () => { clearTimeout(timer); r(); }, { once: true });
+          });
         }
         let keys: { master_seed: string; backup_seed: string };
         try {

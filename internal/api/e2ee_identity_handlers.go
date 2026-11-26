@@ -1,11 +1,10 @@
 package api
 
 import (
-	"bytes"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
-	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"io"
 	"math"
@@ -39,15 +38,19 @@ const (
 	e2eeBackupWrapBytes = 1 + 12 + xwing.SeedBytes + 16
 	e2eeMaxDeviceList   = 100
 	// E2EEPairingTTL is how long a QR pairing stays open.
-	E2EEPairingTTL   = 3 * time.Minute
-	e2eeIdentityBody = 64 << 10
-	e2eeMaxPins      = 512 << 10
-	e2eeMaxTransfer  = 4 << 10
+	E2EEPairingTTL = 3 * time.Minute
+	// E2EEDeviceListReservation is how long a device holds the next device list epoch between
+	// reserving it and publishing the list it signed.
+	E2EEDeviceListReservation = 30 * time.Second
+	e2eeIdentityBody          = 64 << 10
+	e2eeMaxPins               = 512 << 10
+	e2eeMaxTransfer           = 4 << 10
 )
 
 var (
 	e2eeRoomID    = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,128}$`)
 	e2eePairingID = regexp.MustCompile(`^[A-Za-z0-9_-]{22}$`)
+	e2eeDigest    = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
 // Master keys and their signatures travel as unpadded base64 of hybridsig's tagged encodings
@@ -78,19 +81,12 @@ func (s *Server) e2eeFresh(w http.ResponseWriter, r *http.Request, user *store.U
 	return false
 }
 
-// decodeIdentity is decodeStrict with a larger cap: master keys and their signatures are
-// several kilobytes, and a pin set or backup batch more.
-//
-// The body must also be valid JSON text with no repeated member name (encoding/json/jsontext),
-// so a signed field cannot be shadowed by a second copy that a different parser would read.
+// decodeIdentity decodes one JSON value with encoding/json/v2 under a size cap: member names
+// match case-sensitively, and a repeated or unknown name, invalid UTF-8 or trailing data fails.
+// So no signed field can be shadowed by a second spelling that another parser would read.
 func decodeIdentity(w http.ResponseWriter, r *http.Request, limit int64, v any) bool {
 	b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
-	if err != nil || !jsontext.Value(b).IsValid() {
-		return false
-	}
-	dec := json.NewDecoder(bytes.NewReader(b))
-	dec.DisallowUnknownFields()
-	return dec.Decode(v) == nil && dec.Decode(&struct{}{}) == io.EOF
+	return err == nil && jsonv2.Unmarshal(b, v, jsonv2.RejectUnknownMembers(true)) == nil
 }
 
 // errProof is a write whose master-key signature does not verify.
@@ -153,9 +149,16 @@ type (
 		DeviceIDs     []string `json:"device_ids"`
 		Signature     string   `json:"signature"`
 	}
+	e2eeDeviceListReserve struct {
+		Version       int64 `json:"version"`
+		ExpectedEpoch int64 `json:"expected_epoch"`
+		// e2eeid.DeviceListDigest of the proposed list.
+		Digest string `json:"digest"`
+	}
 	e2eeBackupPut struct {
-		Version  int64             `json:"version"`
-		Sessions []e2eeBackupEntry `json:"sessions"`
+		Version    int64             `json:"version"`
+		Generation int64             `json:"generation"`
+		Sessions   []e2eeBackupEntry `json:"sessions"`
 		// The master key's kymessages.backup-write.v1 signature over the batch.
 		Signature string `json:"signature"`
 	}
@@ -215,9 +218,10 @@ func (s *Server) handleE2EEGetMaster(w http.ResponseWriter, r *http.Request) {
 	mj := masterJSON(m)
 	s.writeJSON(w, http.StatusOK, map[string]any{"tenant_id": tenantID, "master": map[string]any{
 		"version": m.Version, "master_key": m.MasterKey, "self_signature": m.SelfSignature, "device_list": mj.DeviceList,
-		"backup_key": map[string]any{"public_key": m.BackupKey, "signature": m.BackupSignature},
-		"recovery":   map[string]string{"wrapped_master_key": m.RecoveryMaster, "wrapped_backup_key": m.RecoveryBackup},
-		"pins":       map[string]any{"counter": m.PinsCounter, "sealed": m.Pins},
+		"backup_key":        map[string]any{"public_key": m.BackupKey, "signature": m.BackupSignature},
+		"backup_generation": m.BackupGeneration,
+		"recovery":          map[string]string{"wrapped_master_key": m.RecoveryMaster, "wrapped_backup_key": m.RecoveryBackup},
+		"pins":              map[string]any{"counter": m.PinsCounter, "sealed": m.Pins},
 	}})
 }
 
@@ -349,9 +353,34 @@ func (s *Server) handleE2EESignDevice(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// POST /api/v1/keys/devices/list/reserve reserves the next device list epoch for one proposed
+// list, named by its digest, for E2EEDeviceListReservation. A device signs a list only after
+// reserving it, so of two devices editing the list at once only one ever signs; the other gets
+// 409 and reads the winner. Reserving the same digest again renews it (an honest retry).
+func (s *Server) handleE2EEReserveDeviceList(w http.ResponseWriter, r *http.Request) {
+	user, tenantID, ok := s.e2eeCaller(w, r)
+	if !ok {
+		return
+	}
+	var req e2eeDeviceListReserve
+	if !decodeIdentity(w, r, 4<<10, &req) || req.Version < 1 || req.ExpectedEpoch < 0 || !e2eeDigest.MatchString(req.Digest) {
+		s.writeError(w, http.StatusBadRequest, "Invalid device list reservation")
+		return
+	}
+	switch err := s.store.E2EE().ReserveDeviceList(r.Context(), tenantID, user.ID, req.Version, req.ExpectedEpoch, req.Digest, time.Now(), E2EEDeviceListReservation); {
+	case errors.Is(err, store.ErrE2EEVersion):
+		s.writeError(w, http.StatusConflict, "The device list changed or is being changed; reload it")
+	case err != nil:
+		s.writeError(w, http.StatusInternalServerError, "Failed to reserve the device list")
+	default:
+		s.writeJSON(w, http.StatusOK, map[string]any{"epoch": req.ExpectedEpoch + 1, "expires_in_ms": E2EEDeviceListReservation.Milliseconds()})
+	}
+}
+
 // PUT /api/v1/keys/devices/list stores the master-signed list of the caller's devices,
-// compare-and-swap on its epoch. Clients trust only listed devices and remember the newest
-// epoch, so a device removed from the list cannot be brought back by the server.
+// compare-and-swap on its epoch and only under a live reservation of its digest. Clients trust
+// only listed devices and remember the newest epoch, so a device removed from the list cannot
+// be brought back by the server.
 func (s *Server) handleE2EEPutDeviceList(w http.ResponseWriter, r *http.Request) {
 	user, tenantID, ok := s.e2eeCaller(w, r)
 	if !ok {
@@ -374,7 +403,8 @@ func (s *Server) handleE2EEPutDeviceList(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	list, _ := json.Marshal(req.DeviceIDs)
-	switch err := s.store.E2EE().PutDeviceList(r.Context(), tenantID, user.ID, req.Version, req.ExpectedEpoch, string(list), req.Signature, proofOf(e2eeid.DomainDeviceList, msg, req.Signature)); {
+	digest := e2eeid.DeviceListDigest(req.DeviceIDs)
+	switch err := s.store.E2EE().PutDeviceList(r.Context(), tenantID, user.ID, req.Version, req.ExpectedEpoch, string(list), digest, req.Signature, time.Now(), proofOf(e2eeid.DomainDeviceList, msg, req.Signature)); {
 	case errors.Is(err, errProof):
 		s.writeError(w, http.StatusBadRequest, "The device list is not validly signed")
 	case errors.Is(err, store.ErrE2EEVersion):
@@ -388,17 +418,17 @@ func (s *Server) handleE2EEPutDeviceList(w http.ResponseWriter, r *http.Request)
 
 // e2eeBackupVersion reads the caller's current identity version, writing 409 when version
 // is not it.
-func (s *Server) e2eeBackupVersion(w http.ResponseWriter, r *http.Request, userID, tenantID string, version int64) bool {
+func (s *Server) e2eeBackupVersion(w http.ResponseWriter, r *http.Request, userID, tenantID string, version int64) (*store.E2EEMasterKey, bool) {
 	m, err := s.store.E2EE().GetMasterKey(r.Context(), userID)
 	if errors.Is(err, store.ErrNotFound) || (err == nil && (m.TenantID != tenantID || m.Version != version)) {
 		s.writeError(w, http.StatusConflict, "The key backup version is not current")
-		return false
+		return nil, false
 	}
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to load the key backup")
-		return false
+		return nil, false
 	}
-	return true
+	return m, true
 }
 
 // GET /api/v1/keys/backup?version=&after_room=&after_session= pages the caller's sealed sessions.
@@ -413,7 +443,8 @@ func (s *Server) handleE2EEGetBackup(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "Invalid key backup query")
 		return
 	}
-	if !s.e2eeBackupVersion(w, r, user.ID, tenantID, version) {
+	m, ok := s.e2eeBackupVersion(w, r, user.ID, tenantID, version)
+	if !ok {
 		return
 	}
 	after := store.E2EEBackupCursor{RoomID: q.Get("after_room"), SenderKey: q.Get("after_sender"), SessionID: q.Get("after_session")}
@@ -427,7 +458,7 @@ func (s *Server) handleE2EEGetBackup(w http.ResponseWriter, r *http.Request) {
 		out[i] = e2eeBackupEntry{b.RoomID, b.SenderKey, b.SessionID, b.FirstIndex, b.Sealed}
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	s.writeJSON(w, http.StatusOK, map[string]any{"version": version, "sessions": out, "more": len(rows) == e2eeBackupPage})
+	s.writeJSON(w, http.StatusOK, map[string]any{"version": version, "generation": m.BackupGeneration, "sessions": out, "more": len(rows) == e2eeBackupPage})
 }
 
 // PUT /api/v1/keys/backup adds sealed sessions; a session already backed up is replaced only
@@ -438,7 +469,7 @@ func (s *Server) handleE2EEPutBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req e2eeBackupPut
-	if !decodeIdentity(w, r, 1<<20, &req) || req.Version < 1 || len(req.Sessions) == 0 || len(req.Sessions) > e2eeBackupBatch {
+	if !decodeIdentity(w, r, 1<<20, &req) || req.Version < 1 || req.Generation < 0 || len(req.Sessions) == 0 || len(req.Sessions) > e2eeBackupBatch {
 		s.writeError(w, http.StatusBadRequest, "Send 1 to 100 backed-up sessions")
 		return
 	}
@@ -455,14 +486,15 @@ func (s *Server) handleE2EEPutBackup(w http.ResponseWriter, r *http.Request) {
 		rows[i] = store.E2EEBackupSession{RoomID: b.RoomID, SenderKey: b.SenderKey, SessionID: b.SessionID, FirstIndex: b.FirstIndex, Sealed: b.Sealed}
 		signed[i] = e2eeid.BackupWriteEntry(b)
 	}
-	msg, err := e2eeid.BackupWrite(tenantID, user.ID, req.Version, signed)
+	msg, err := e2eeid.BackupWrite(tenantID, user.ID, req.Version, req.Generation, signed)
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, "Invalid backed-up session")
 		return
 	}
 	// Only a device holding the master key writes the backup: the batch is signed, and checked
-	// against the master key of the version it names inside the write's transaction.
-	res, err := s.store.E2EE().PutBackupSessions(r.Context(), tenantID, user.ID, req.Version, rows, E2EEBackupMaxSessions, E2EEBackupMaxBytes, proofOf(e2eeid.DomainBackupWrite, msg, req.Signature))
+	// against the master key of the version it names inside the write's transaction. The
+	// generation fences it from a deletion signed later.
+	res, err := s.store.E2EE().PutBackupSessions(r.Context(), tenantID, user.ID, req.Version, req.Generation, rows, E2EEBackupMaxSessions, E2EEBackupMaxBytes, proofOf(e2eeid.DomainBackupWrite, msg, req.Signature))
 	switch {
 	case errors.Is(err, errProof):
 		s.writeError(w, http.StatusBadRequest, "The backup write is not signed by the current master key")
@@ -471,12 +503,17 @@ func (s *Server) handleE2EEPutBackup(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		s.writeError(w, http.StatusInternalServerError, "Failed to store the key backup")
 	default:
-		// full: a new session did not fit the caps; improvements to stored ones still landed.
-		s.writeJSON(w, http.StatusOK, map[string]any{"stored": res.Stored, "kept": res.Kept, "full": res.Full})
+		// refused: the indexes of entries that did not fit the caps; the rest landed.
+		refused := res.Refused
+		if refused == nil {
+			refused = []int{}
+		}
+		s.writeJSON(w, http.StatusOK, map[string]any{"stored": res.Stored, "kept": res.Kept, "full": len(refused) > 0, "refused": refused})
 	}
 }
 
-// DELETE /api/v1/keys/backup?version= empties the caller's key backup.
+// DELETE /api/v1/keys/backup?version= empties the caller's key backup and starts a new
+// generation, which it answers.
 func (s *Server) handleE2EEDeleteBackup(w http.ResponseWriter, r *http.Request) {
 	user, tenantID, ok := s.e2eeCaller(w, r)
 	if !ok {
@@ -490,17 +527,17 @@ func (s *Server) handleE2EEDeleteBackup(w http.ResponseWriter, r *http.Request) 
 	if !s.e2eeFresh(w, r, user) {
 		return
 	}
-	if !s.e2eeBackupVersion(w, r, user.ID, tenantID, version) {
+	if _, ok := s.e2eeBackupVersion(w, r, user.ID, tenantID, version); !ok {
 		return
 	}
-	switch err := s.store.E2EE().DeleteBackup(r.Context(), tenantID, user.ID, version); {
+	switch gen, err := s.store.E2EE().DeleteBackup(r.Context(), tenantID, user.ID, version); {
 	case errors.Is(err, store.ErrE2EEVersion):
 		s.writeError(w, http.StatusConflict, "The key backup version is not current")
 	case err != nil:
 		s.writeError(w, http.StatusInternalServerError, "Failed to delete the key backup")
 	default:
 		s.audit(r.Context(), user.ID, r, "e2ee.backup_deleted", user.ID, "")
-		w.WriteHeader(http.StatusNoContent)
+		s.writeJSON(w, http.StatusOK, map[string]int64{"generation": gen})
 	}
 }
 

@@ -163,7 +163,7 @@ func TestSnapshotSeesUncheckpointedCommit(t *testing.T) {
 	if err := st.E2EE().PutMasterKey(ctx, &store.E2EEMasterKey{TenantID: store.DefaultTenantID, UserID: "u-e3", MasterKey: "mk", SelfSignature: "ss", BackupKey: "bk", BackupSignature: "bs", RecoveryMaster: "rm", RecoveryBackup: "rb"}, 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.E2EE().PutBackupSessions(ctx, store.DefaultTenantID, "u-e3", 1, []store.E2EEBackupSession{{RoomID: "r", SenderKey: "k", SessionID: "s", Sealed: "sealed"}}, 10, 1<<20, func(string) error { return nil }); err != nil {
+	if _, err := st.E2EE().PutBackupSessions(ctx, store.DefaultTenantID, "u-e3", 1, 0, []store.E2EEBackupSession{{RoomID: "r", SenderKey: "k", SessionID: "s", Sealed: "sealed"}}, 10, 1<<20, func(string) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	payload, err := backup.Collect(ctx, cfg, "1.0.0")

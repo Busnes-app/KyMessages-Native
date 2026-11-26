@@ -160,16 +160,20 @@ Owns HTTP routing, request parsing, session cookie validation, CORS headers, and
   budget (600 a minute), not chat writes.
 
 - E3 identity routes (`e2ee_identity_handlers.go`, spec §9.1): `GET/PUT /api/v1/keys/master`,
-  `PUT /api/v1/keys/pins`, `PUT /api/v1/keys/devices/list`, `POST /api/v1/keys/devices/{id}/signature`, `GET/PUT/DELETE
+  `PUT /api/v1/keys/pins`, `POST /api/v1/keys/devices/list/reserve`, `PUT /api/v1/keys/devices/list`, `POST /api/v1/keys/devices/{id}/signature`, `GET/PUT/DELETE
   /api/v1/keys/backup` and `/api/v1/keys/pairings[/{id}[/join|/sealed|/consume]]`. Every
   `PUT master` and `DELETE backup` needs a session younger than `stepUpWindow` (`e2eeFresh`);
-  each recovery wrap must be exactly its own length (93/61 bytes) with version 1; bodies with a
-  repeated member name are refused (`jsontext`). Pin, backup and device-list writes and device
+  each recovery wrap must be exactly its own length (93/61 bytes) with version 1; bodies are
+  decoded by `encoding/json/v2` (case-sensitive names; an unknown or repeated name or trailing
+  data is refused). A device list is published only under a live reservation of its digest
+  (`e2eeid.DeviceListDigest`, `E2EEDeviceListReservation` 30 s), so the losing one of two
+  concurrent proposals is refused before it is signed. Pin, backup and device-list writes and device
   cross-signatures carry master-key signatures that the store checks (`proofOf`, a
   `store.Proof`) against the master row it locks in the write's transaction. Backup rows carry
   `sender_key`, a uint32 `first_index`, and are capped by `E2EEBackupMaxSessions` and
-  `E2EEBackupMaxBytes` (2 MiB; the database is one 64 MiB capsule member); a write answers
-  `{stored, kept, full}`. Bodies are
+  `E2EEBackupMaxBytes` (2 MiB; the database is one 64 MiB capsule member), checked for inserts and
+  replacements alike; a write is signed for the backup generation (bumped by `DELETE`, which
+  answers it) and answers `{stored, kept, full, refused}`. Bodies are
   decoded strictly (`decodeIdentity`) and carry no secret field; every hybrid signature is
   verified for the caller's org and user before it is stored; versions are compare-and-swap
   (`409`); `/keys/query` adds `tenant_id`, `master_keys` and current-version

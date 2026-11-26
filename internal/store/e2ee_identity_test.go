@@ -82,13 +82,17 @@ func TestE2EEMasterKeyVersions(t *testing.T) {
 	if err := k.PutPins(ctx, "t2", "u-a", 1, 1, "pins-other-org", okProof); !errors.Is(err, store.ErrE2EEVersion) {
 		t.Fatalf("pins written from another org: %v", err)
 	}
-	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, `["D1"]`, "list-sig", okProof); err != nil {
+	now := time.Now()
+	if err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-1", now, time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, `["D1","D9"]`, "stale", okProof); !errors.Is(err, store.ErrE2EEVersion) {
+	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, `["D1"]`, "dg-1", "list-sig", now, okProof); err != nil {
+		t.Fatal(err)
+	}
+	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, `["D1","D9"]`, "dg-1", "stale", now, okProof); !errors.Is(err, store.ErrE2EEVersion) {
 		t.Fatalf("stale device list epoch: %v", err)
 	}
-	if _, err := k.PutBackupSessions(ctx, "t1", "u-a", 1, []store.E2EEBackupSession{{RoomID: "r", SenderKey: "k", SessionID: "s", FirstIndex: 0, Sealed: "x"}}, 10, 1<<20, okProof); err != nil {
+	if _, err := k.PutBackupSessions(ctx, "t1", "u-a", 1, 0, []store.E2EEBackupSession{{RoomID: "r", SenderKey: "k", SessionID: "s", FirstIndex: 0, Sealed: "x"}}, 10, 1<<20, okProof); err != nil {
 		t.Fatal(err)
 	}
 	if err := k.CreatePairing(ctx, &store.E2EEPairing{ID: "p0", TenantID: "t1", UserID: "u-a", InitiatorDevice: "D1", MasterVersion: 2, ExpiresAt: time.Now().Add(time.Minute)}); !errors.Is(err, store.ErrE2EEVersion) {
@@ -122,7 +126,7 @@ func TestE2EEMasterKeyVersions(t *testing.T) {
 	if _, err := k.GetPairing(ctx, "t1", "u-a", "p1", time.Now()); !errors.Is(err, store.ErrNotFound) {
 		t.Fatal("pairing survived the reset")
 	}
-	if _, err := k.PutBackupSessions(ctx, "t1", "u-a", 1, []store.E2EEBackupSession{{RoomID: "r", SenderKey: "k", SessionID: "s", Sealed: "x"}}, 10, 1<<20, okProof); !errors.Is(err, store.ErrE2EEVersion) {
+	if _, err := k.PutBackupSessions(ctx, "t1", "u-a", 1, 0, []store.E2EEBackupSession{{RoomID: "r", SenderKey: "k", SessionID: "s", Sealed: "x"}}, 10, 1<<20, okProof); !errors.Is(err, store.ErrE2EEVersion) {
 		t.Fatalf("write to the old backup version: %v", err)
 	}
 	if list, _ := k.ListMasterKeys(ctx, "t2", []string{"u-a"}); len(list) != 0 {
@@ -140,7 +144,7 @@ func TestE2EEKeyBackupKeepsTheBestCopy(t *testing.T) {
 	}
 	put := func(sender string, idx int64, sealed string) {
 		t.Helper()
-		if _, err := k.PutBackupSessions(ctx, "t1", "u-a", 1, []store.E2EEBackupSession{{RoomID: "r1", SenderKey: sender, SessionID: "s1", FirstIndex: idx, Sealed: sealed}}, 10, 1<<20, okProof); err != nil {
+		if _, err := k.PutBackupSessions(ctx, "t1", "u-a", 1, 0, []store.E2EEBackupSession{{RoomID: "r1", SenderKey: sender, SessionID: "s1", FirstIndex: idx, Sealed: sealed}}, 10, 1<<20, okProof); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -161,30 +165,42 @@ func TestE2EEKeyBackupKeepsTheBestCopy(t *testing.T) {
 	for i := range 8 {
 		batch = append(batch, store.E2EEBackupSession{RoomID: fmt.Sprintf("r%d", i%3+2), SenderKey: fmt.Sprintf("k%d", i%2), SessionID: fmt.Sprintf("s%d", i), Sealed: "x"})
 	}
-	if _, err := k.PutBackupSessions(ctx, "t1", "u-a", 1, batch, 10, 1<<20, okProof); err != nil {
+	if _, err := k.PutBackupSessions(ctx, "t1", "u-a", 1, 0, batch, 10, 1<<20, okProof); err != nil {
 		t.Fatal(err)
 	}
-	res, err := k.PutBackupSessions(ctx, "t1", "u-a", 1, []store.E2EEBackupSession{
+	res, err := k.PutBackupSessions(ctx, "t1", "u-a", 1, 0, []store.E2EEBackupSession{
 		{RoomID: "r9", SenderKey: "k", SessionID: "s", Sealed: "x"},                       // new: past the session cap
 		{RoomID: "r1", SenderKey: "kA", SessionID: "s1", FirstIndex: 1, Sealed: "from-1"}, // better copy of a stored one
 	}, 10, 1<<20, okProof)
-	if err != nil || !res.Full || res.Stored != 1 {
+	if err != nil || fmt.Sprint(res.Refused) != "[0]" || res.Stored != 1 {
 		t.Fatalf("past the session cap: %+v %v", res, err)
 	}
 	stored := int64(len("from-1") + len("impostor") + 8)
-	res, err = k.PutBackupSessions(ctx, "t1", "u-a", 1, []store.E2EEBackupSession{{RoomID: "r8", SenderKey: "k", SessionID: "s", Sealed: "y"}}, 100, stored, okProof)
-	if err != nil || !res.Full || res.Stored != 0 {
+	res, err = k.PutBackupSessions(ctx, "t1", "u-a", 1, 0, []store.E2EEBackupSession{{RoomID: "r8", SenderKey: "k", SessionID: "s", Sealed: "y"}}, 100, stored, okProof)
+	if err != nil || fmt.Sprint(res.Refused) != "[0]" || res.Stored != 0 {
 		t.Fatalf("past the byte cap: %+v %v", res, err)
 	}
 	if rows, _ := k.ListBackupSessions(ctx, "t1", "u-a", 1, store.E2EEBackupCursor{}, 1); rows[0].Sealed != "from-1" || rows[0].FirstIndex != 1 {
 		t.Fatalf("the improvement did not land: %+v", rows)
 	}
+	// An improvement that would grow the backup past the byte cap is refused too; one that
+	// fits in the same batch lands.
+	res, err = k.PutBackupSessions(ctx, "t1", "u-a", 1, 0, []store.E2EEBackupSession{
+		{RoomID: "r1", SenderKey: "kA", SessionID: "s1", FirstIndex: 0, Sealed: "from-0-but-much-longer"},
+		{RoomID: "r1", SenderKey: "kB", SessionID: "s1", FirstIndex: 0, Sealed: "imposter"},
+	}, 100, stored, okProof)
+	if err != nil || fmt.Sprint(res.Refused) != "[0]" || res.Stored != 0 || res.Kept != 1 {
+		t.Fatalf("an oversized improvement: %+v %v", res, err)
+	}
+	if rows, _ := k.ListBackupSessions(ctx, "t1", "u-a", 1, store.E2EEBackupCursor{}, 1); rows[0].Sealed != "from-1" {
+		t.Fatalf("an oversized improvement landed: %+v", rows)
+	}
 	// A write whose proof fails stores nothing, inside the same transaction.
 	refuse := errors.New("refused")
-	if _, err := k.PutBackupSessions(ctx, "t1", "u-a", 1, []store.E2EEBackupSession{{RoomID: "r1", SenderKey: "kA", SessionID: "s1", FirstIndex: 0, Sealed: "forged"}}, 10, 1<<20, func(string) error { return refuse }); !errors.Is(err, refuse) {
+	if _, err := k.PutBackupSessions(ctx, "t1", "u-a", 1, 0, []store.E2EEBackupSession{{RoomID: "r1", SenderKey: "kA", SessionID: "s1", FirstIndex: 0, Sealed: "forged"}}, 10, 1<<20, func(string) error { return refuse }); !errors.Is(err, refuse) {
 		t.Fatalf("refused proof: %v", err)
 	}
-	if _, err := k.PutBackupSessions(ctx, "t2", "u-a", 1, []store.E2EEBackupSession{{RoomID: "r1", SenderKey: "kA", SessionID: "s1", FirstIndex: 0, Sealed: "other-org"}}, 10, 1<<20, okProof); !errors.Is(err, store.ErrE2EEVersion) {
+	if _, err := k.PutBackupSessions(ctx, "t2", "u-a", 1, 0, []store.E2EEBackupSession{{RoomID: "r1", SenderKey: "kA", SessionID: "s1", FirstIndex: 0, Sealed: "other-org"}}, 10, 1<<20, okProof); !errors.Is(err, store.ErrE2EEVersion) {
 		t.Fatalf("write from another org: %v", err)
 	}
 	if rows, _ := k.ListBackupSessions(ctx, "t2", "u-a", 1, store.E2EEBackupCursor{}, 10); len(rows) != 0 {
@@ -212,14 +228,25 @@ func TestE2EEKeyBackupKeepsTheBestCopy(t *testing.T) {
 	if len(seen) != 10 || seen[0] != "r1/kA/s1" || seen[1] != "r1/kB/s1" || seen[9] != "r4/k1/s5" {
 		t.Fatalf("paged %v", seen)
 	}
-	if err := k.DeleteBackup(ctx, "t1", "u-a", 2); !errors.Is(err, store.ErrE2EEVersion) {
+	if _, err := k.DeleteBackup(ctx, "t1", "u-a", 2); !errors.Is(err, store.ErrE2EEVersion) {
 		t.Fatal(err)
 	}
-	if err := k.DeleteBackup(ctx, "t1", "u-a", 1); err != nil {
-		t.Fatal(err)
+	if gen, err := k.DeleteBackup(ctx, "t1", "u-a", 1); err != nil || gen != 1 {
+		t.Fatal(gen, err)
 	}
 	if rows, _ := k.ListBackupSessions(ctx, "t1", "u-a", 1, store.E2EEBackupCursor{}, 10); len(rows) != 0 {
 		t.Fatal("backup not deleted")
+	}
+	// A write signed before the deletion cannot refill it; one for the new generation can.
+	old := []store.E2EEBackupSession{{RoomID: "r1", SenderKey: "kA", SessionID: "s1", Sealed: "replayed"}}
+	if _, err := k.PutBackupSessions(ctx, "t1", "u-a", 1, 0, old, 10, 1<<20, okProof); !errors.Is(err, store.ErrE2EEVersion) {
+		t.Fatalf("replayed write after deletion: %v", err)
+	}
+	if res, err := k.PutBackupSessions(ctx, "t1", "u-a", 1, 1, old, 10, 1<<20, okProof); err != nil || res.Stored != 1 {
+		t.Fatalf("write to the new generation: %+v %v", res, err)
+	}
+	if m, _ := k.GetMasterKey(ctx, "u-a"); m.BackupGeneration != 1 {
+		t.Fatalf("generation %d", m.BackupGeneration)
 	}
 }
 
@@ -331,7 +358,7 @@ func TestE2EEIdentityGoesWithTheUser(t *testing.T) {
 	if err := k.PutMasterKey(ctx, master("u-a", "t1", "1"), 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := k.PutBackupSessions(ctx, "t1", "u-a", 1, []store.E2EEBackupSession{{RoomID: "r", SenderKey: "k", SessionID: "s", Sealed: "x"}}, 10, 1<<20, okProof); err != nil {
+	if _, err := k.PutBackupSessions(ctx, "t1", "u-a", 1, 0, []store.E2EEBackupSession{{RoomID: "r", SenderKey: "k", SessionID: "s", Sealed: "x"}}, 10, 1<<20, okProof); err != nil {
 		t.Fatal(err)
 	}
 	signedInitiator(t, st, "u-a", "t1", "D")
@@ -370,7 +397,7 @@ func TestE2EEKeyBackupPagesBytewise(t *testing.T) {
 			batch = append(batch, store.E2EEBackupSession{RoomID: room, SenderKey: sender, SessionID: "s", Sealed: "x"})
 		}
 	}
-	if _, err := k.PutBackupSessions(ctx, "t1", "u-a", 1, batch, 100, 1<<20, okProof); err != nil {
+	if _, err := k.PutBackupSessions(ctx, "t1", "u-a", 1, 0, batch, 100, 1<<20, okProof); err != nil {
 		t.Fatal(err)
 	}
 	var got []string
@@ -392,5 +419,70 @@ func TestE2EEKeyBackupPagesBytewise(t *testing.T) {
 	want := []string{"rm-b/kY", "rm-b/k_x", "rm.c/kY", "rm.c/k_x", "rmZ/kY", "rmZ/k_x", "rm_a/kY", "rm_a/k_x"}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("paged %v, want bytewise %v", got, want)
+	}
+}
+
+// Two devices proposing different successors of one device list: only the first to reserve
+// may publish, the other is refused before it signs, an honest retry renews its own
+// reservation, and an abandoned one lapses so the list cannot be held forever.
+func TestE2EEDeviceListReservation(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	e2eeUser(t, st, "u-a")
+	k := st.E2EE()
+	if err := k.PutMasterKey(ctx, master("u-a", "t1", "1"), 0); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-a", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	// The losing proposal: refused while A's reservation is live, and unpublishable.
+	if err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-b", now, time.Minute); !errors.Is(err, store.ErrE2EEVersion) {
+		t.Fatalf("second reservation: %v", err)
+	}
+	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, `["B"]`, "dg-b", "sig-b", now, okProof); !errors.Is(err, store.ErrE2EEVersion) {
+		t.Fatalf("unreserved publish: %v", err)
+	}
+	// Wrong version, epoch or org reserve nothing.
+	for _, c := range []struct {
+		tenant           string
+		version, expired int64
+	}{{"t1", 2, 0}, {"t1", 1, 1}, {"t2", 1, 0}} {
+		if err := k.ReserveDeviceList(ctx, c.tenant, "u-a", c.version, c.expired, "dg-a", now, time.Minute); !errors.Is(err, store.ErrE2EEVersion) {
+			t.Fatalf("reservation %+v: %v", c, err)
+		}
+	}
+	// A's honest retry renews it; past its lapse A cannot publish, and B may reserve.
+	if err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-a", now.Add(30*time.Second), time.Minute); err != nil {
+		t.Fatalf("renewal: %v", err)
+	}
+	later := now.Add(2 * time.Minute)
+	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, `["A"]`, "dg-a", "sig-a", later, okProof); !errors.Is(err, store.ErrE2EEVersion) {
+		t.Fatalf("publish after the reservation lapsed: %v", err)
+	}
+	if err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-b", later, time.Minute); err != nil {
+		t.Fatalf("reservation after a lapse: %v", err)
+	}
+	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, `["B"]`, "dg-b", "sig-b", later, okProof); err != nil {
+		t.Fatal(err)
+	}
+	// Publishing ends the reservation, and the next epoch starts free.
+	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 1, `["B"]`, "dg-b", "sig-b", later, okProof); !errors.Is(err, store.ErrE2EEVersion) {
+		t.Fatalf("publish without a reservation of epoch 2: %v", err)
+	}
+	if err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 1, "dg-c", later, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	m, _ := k.GetMasterKey(ctx, "u-a")
+	if m.DeviceListEpoch != 1 || m.DeviceList != `["B"]` || m.DeviceListSignature != "sig-b" {
+		t.Fatalf("published %+v", m)
+	}
+	// A reset clears a pending reservation with the list.
+	if err := k.PutMasterKey(ctx, master("u-a", "t1", "2"), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := k.ReserveDeviceList(ctx, "t1", "u-a", 2, 0, "dg-d", later, time.Minute); err != nil {
+		t.Fatalf("reservation after a reset: %v", err)
 	}
 }

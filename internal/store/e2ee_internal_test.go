@@ -104,3 +104,36 @@ func TestE2EEClaimWaitsOutLockedKeysInsteadOfFallingBack(t *testing.T) {
 		t.Fatalf("claim during a held lock = %+v %v, want the one-time key once the lock is gone", k, err)
 	}
 }
+
+// The key backup's key columns must compare bytewise on PostgreSQL whatever the database's
+// default collation: the browser checks the page cursor bytewise.
+func TestE2EEKeyBackupColumnsCollateC(t *testing.T) {
+	ctx := context.Background()
+	cfg := testdb.Config(t)
+	if cfg.Driver != "postgres" {
+		t.Skip("SQLite compares TEXT bytewise (BINARY) unless a column says otherwise")
+	}
+	opened, err := Open(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = opened.Close() })
+	st := opened.(*SQLStore)
+	rows, err := st.db.QueryContext(ctx, `SELECT column_name, COALESCE(collation_name, '') FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = 'e2ee_key_backup' AND column_name IN ('room_id', 'sender_key', 'session_id') ORDER BY column_name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	got := map[string]string{}
+	for rows.Next() {
+		var col, coll string
+		if err := rows.Scan(&col, &coll); err != nil {
+			t.Fatal(err)
+		}
+		got[col] = coll
+	}
+	if len(got) != 3 || got["room_id"] != "C" || got["sender_key"] != "C" || got["session_id"] != "C" {
+		t.Fatalf("key backup collations %v, want C", got)
+	}
+}

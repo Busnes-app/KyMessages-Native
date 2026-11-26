@@ -11,12 +11,12 @@ import (
 // E3 identity rows (migration 68). Every write that depends on the master key version checks
 // it in the same statement or transaction, so a reset cannot interleave with a stale write.
 
-const masterColumns = `user_id, tenant_id, version, master_key, self_signature, backup_key, backup_signature, recovery_master, recovery_backup, pins_counter, pins, device_list, device_list_epoch, device_list_signature, updated_at`
+const masterColumns = `user_id, tenant_id, version, master_key, self_signature, backup_key, backup_signature, recovery_master, recovery_backup, pins_counter, pins, device_list, device_list_epoch, device_list_signature, backup_generation, updated_at`
 
 func scanMaster(sc interface{ Scan(...any) error }) (*E2EEMasterKey, error) {
 	var m E2EEMasterKey
 	var updated int64
-	if err := sc.Scan(&m.UserID, &m.TenantID, &m.Version, &m.MasterKey, &m.SelfSignature, &m.BackupKey, &m.BackupSignature, &m.RecoveryMaster, &m.RecoveryBackup, &m.PinsCounter, &m.Pins, &m.DeviceList, &m.DeviceListEpoch, &m.DeviceListSignature, &updated); err != nil {
+	if err := sc.Scan(&m.UserID, &m.TenantID, &m.Version, &m.MasterKey, &m.SelfSignature, &m.BackupKey, &m.BackupSignature, &m.RecoveryMaster, &m.RecoveryBackup, &m.PinsCounter, &m.Pins, &m.DeviceList, &m.DeviceListEpoch, &m.DeviceListSignature, &m.BackupGeneration, &updated); err != nil {
 		return nil, err
 	}
 	m.UpdatedAt = time.Unix(updated, 0).UTC()
@@ -80,10 +80,10 @@ func (s *e2eeStore) PutMasterKey(ctx context.Context, m *E2EEMasterKey, expected
 				return err
 			}
 		}
-		res, err = tx.ExecContext(ctx, s.store.rebind(`INSERT INTO e2ee_master_keys (`+masterColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', '', 0, '', ?) ON CONFLICT (user_id) DO NOTHING`),
+		res, err = tx.ExecContext(ctx, s.store.rebind(`INSERT INTO e2ee_master_keys (`+masterColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', '', 0, '', 0, ?) ON CONFLICT (user_id) DO NOTHING`),
 			m.UserID, m.TenantID, version, m.MasterKey, m.SelfSignature, m.BackupKey, m.BackupSignature, m.RecoveryMaster, m.RecoveryBackup, now)
 	} else {
-		res, err = tx.ExecContext(ctx, s.store.rebind(`UPDATE e2ee_master_keys SET version = ?, master_key = ?, self_signature = ?, backup_key = ?, backup_signature = ?, recovery_master = ?, recovery_backup = ?, pins_counter = 0, pins = '', device_list = '', device_list_epoch = 0, device_list_signature = '', updated_at = ? WHERE user_id = ? AND tenant_id = ? AND version = ?`),
+		res, err = tx.ExecContext(ctx, s.store.rebind(`UPDATE e2ee_master_keys SET version = ?, master_key = ?, self_signature = ?, backup_key = ?, backup_signature = ?, recovery_master = ?, recovery_backup = ?, pins_counter = 0, pins = '', device_list = '', device_list_epoch = 0, device_list_signature = '', device_list_reserved = '', device_list_reserved_until = 0, backup_generation = 0, updated_at = ? WHERE user_id = ? AND tenant_id = ? AND version = ?`),
 			version, m.MasterKey, m.SelfSignature, m.BackupKey, m.BackupSignature, m.RecoveryMaster, m.RecoveryBackup, now, m.UserID, m.TenantID, expected)
 	}
 	if err != nil {
@@ -106,7 +106,7 @@ func (s *e2eeStore) PutMasterKey(ctx context.Context, m *E2EEMasterKey, expected
 		return err
 	}
 	m.Version, m.PinsCounter, m.Pins, m.UpdatedAt = version, 0, "", time.Unix(now, 0).UTC()
-	m.DeviceList, m.DeviceListEpoch, m.DeviceListSignature = "", 0, ""
+	m.DeviceList, m.DeviceListEpoch, m.DeviceListSignature, m.BackupGeneration = "", 0, "", 0
 	return nil
 }
 
@@ -194,11 +194,31 @@ func (s *e2eeStore) PutPins(ctx context.Context, tenantID, userID string, versio
 	})
 }
 
-func (s *e2eeStore) PutDeviceList(ctx context.Context, tenantID, userID string, version, expected int64, list, signature string, proof Proof) error {
+// ReserveDeviceList is the device list's tentative state: one proposed successor at a time,
+// which only its proposer signs. A proposal that loses the reservation is never signed, so it
+// cannot later be shown as a signed successor.
+func (s *e2eeStore) ReserveDeviceList(ctx context.Context, tenantID, userID string, version, expected int64, digest string, now time.Time, ttl time.Duration) error {
+	return oneRowVersion(s.store.db.ExecContext(ctx, s.store.rebind(`UPDATE e2ee_master_keys SET device_list_reserved = ?, device_list_reserved_until = ?
+		WHERE user_id = ? AND tenant_id = ? AND version = ? AND device_list_epoch = ? AND (device_list_reserved = ? OR device_list_reserved_until <= ?)`),
+		digest, now.Add(ttl).Unix(), userID, tenantID, version, expected, digest, now.Unix()))
+}
+
+func oneRowVersion(res sql.Result, err error) error {
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return ErrE2EEVersion
+	}
+	return nil
+}
+
+func (s *e2eeStore) PutDeviceList(ctx context.Context, tenantID, userID string, version, expected int64, list, digest, signature string, now time.Time, proof Proof) error {
 	return s.fenced(ctx, tenantID, userID, version, proof, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, s.store.rebind(`UPDATE e2ee_master_keys SET device_list = ?, device_list_signature = ?, device_list_epoch = ?
-			WHERE user_id = ? AND tenant_id = ? AND version = ? AND device_list_epoch = ?`),
-			list, signature, expected+1, userID, tenantID, version, expected)
+		// The finalized state: published only under its own live reservation, which it ends.
+		res, err := tx.ExecContext(ctx, s.store.rebind(`UPDATE e2ee_master_keys SET device_list = ?, device_list_signature = ?, device_list_epoch = ?, device_list_reserved = '', device_list_reserved_until = 0
+			WHERE user_id = ? AND tenant_id = ? AND version = ? AND device_list_epoch = ? AND device_list_reserved = ? AND device_list_reserved_until > ?`),
+			list, signature, expected+1, userID, tenantID, version, expected, digest, now.Unix())
 		if err != nil {
 			return err
 		}
@@ -209,9 +229,17 @@ func (s *e2eeStore) PutDeviceList(ctx context.Context, tenantID, userID string, 
 	})
 }
 
-func (s *e2eeStore) PutBackupSessions(ctx context.Context, tenantID, userID string, version int64, sessions []E2EEBackupSession, maxSessions int, maxBytes int64, proof Proof) (E2EEBackupResult, error) {
+func (s *e2eeStore) PutBackupSessions(ctx context.Context, tenantID, userID string, version, generation int64, sessions []E2EEBackupSession, maxSessions int, maxBytes int64, proof Proof) (E2EEBackupResult, error) {
 	var out E2EEBackupResult
 	err := s.fenced(ctx, tenantID, userID, version, proof, func(tx *sql.Tx) error {
+		// The master row is locked, so a deletion cannot bump the generation meanwhile.
+		var gen int64
+		if err := tx.QueryRowContext(ctx, s.store.rebind(`SELECT backup_generation FROM e2ee_master_keys WHERE user_id = ?`), userID).Scan(&gen); err != nil {
+			return err
+		}
+		if gen != generation {
+			return ErrE2EEVersion
+		}
 		var n int
 		var bytes int64
 		if err := tx.QueryRowContext(ctx, s.store.rebind(`SELECT COUNT(*), COALESCE(SUM(LENGTH(sealed)), 0) FROM e2ee_key_backup WHERE user_id = ? AND tenant_id = ? AND version = ?`),
@@ -219,15 +247,19 @@ func (s *e2eeStore) PutBackupSessions(ctx context.Context, tenantID, userID stri
 			return err
 		}
 		now := time.Now().Unix()
-		for _, b := range sessions {
-			// A copy reaching further back replaces the stored one, whatever the caps: an
-			// improvement never takes a new row.
+		for i, b := range sessions {
+			// A copy reaching further back replaces the stored one without taking a new row,
+			// as long as its bytes fit.
 			var cur int64
 			var curLen int64
 			err := tx.QueryRowContext(ctx, s.store.rebind(`SELECT first_index, LENGTH(sealed) FROM e2ee_key_backup WHERE user_id = ? AND tenant_id = ? AND version = ? AND room_id = ? AND sender_key = ? AND session_id = ?`),
 				userID, tenantID, version, b.RoomID, b.SenderKey, b.SessionID).Scan(&cur, &curLen)
 			switch {
 			case err == nil && b.FirstIndex < cur:
+				if bytes-curLen+int64(len(b.Sealed)) > maxBytes {
+					out.Refused = append(out.Refused, i)
+					continue
+				}
 				if _, err := tx.ExecContext(ctx, s.store.rebind(`UPDATE e2ee_key_backup SET first_index = ?, sealed = ?, updated_at = ? WHERE user_id = ? AND tenant_id = ? AND version = ? AND room_id = ? AND sender_key = ? AND session_id = ?`),
 					b.FirstIndex, b.Sealed, now, userID, tenantID, version, b.RoomID, b.SenderKey, b.SessionID); err != nil {
 					return err
@@ -238,7 +270,7 @@ func (s *e2eeStore) PutBackupSessions(ctx context.Context, tenantID, userID stri
 				out.Kept++
 			case errors.Is(err, sql.ErrNoRows):
 				if n+1 > maxSessions || bytes+int64(len(b.Sealed)) > maxBytes {
-					out.Full = true
+					out.Refused = append(out.Refused, i)
 					continue
 				}
 				if _, err := tx.ExecContext(ctx, s.store.rebind(`INSERT INTO e2ee_key_backup (user_id, tenant_id, version, room_id, sender_key, session_id, first_index, sealed, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`),
@@ -279,11 +311,18 @@ func (s *e2eeStore) ListBackupSessions(ctx context.Context, tenantID, userID str
 	return out, rows.Err()
 }
 
-func (s *e2eeStore) DeleteBackup(ctx context.Context, tenantID, userID string, version int64) error {
-	return s.fenced(ctx, tenantID, userID, version, func(string) error { return nil }, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, s.store.rebind(`DELETE FROM e2ee_key_backup WHERE user_id = ? AND tenant_id = ? AND version = ?`), userID, tenantID, version)
-		return err
+func (s *e2eeStore) DeleteBackup(ctx context.Context, tenantID, userID string, version int64) (int64, error) {
+	var gen int64
+	err := s.fenced(ctx, tenantID, userID, version, func(string) error { return nil }, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, s.store.rebind(`DELETE FROM e2ee_key_backup WHERE user_id = ? AND tenant_id = ? AND version = ?`), userID, tenantID, version); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, s.store.rebind(`UPDATE e2ee_master_keys SET backup_generation = backup_generation + 1 WHERE user_id = ?`), userID); err != nil {
+			return err
+		}
+		return tx.QueryRowContext(ctx, s.store.rebind(`SELECT backup_generation FROM e2ee_master_keys WHERE user_id = ?`), userID).Scan(&gen)
 	})
+	return gen, err
 }
 
 // --- QR pairings ---

@@ -102,14 +102,19 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   counter, `version`), `e2ee_devices.master_signature`/`master_version`, `e2ee_key_backup`
   (`(user, version, room, sender_key, session)`, the lowest `first_index` wins, capped per call
   by session count and sealed bytes, bytewise `COLLATE "C"` key columns on PostgreSQL), the
-  master-signed device list columns, and `e2ee_pairings`
+  master-signed device list columns with the reservation of its next epoch
+  (`device_list_reserved`, `_until`), `backup_generation`, and `e2ee_pairings`
   (QR pairings, unique per `(tenant_id, user_id)`, carrying the `master_version` they were opened
   under). `PutMasterKey` is compare-and-swap on `version`; a first setup drops a row the user left
   in another org; a replacement deletes the backup, pairings, pins and device list and clears
   every cross-signature in the same transaction. Pin, device-list and backup writes and
   `SignDevice` run `fenced`: they lock the master row at (tenant, user, version) and call the
-  caller's `Proof` with its key before writing, all in one transaction; a backup write stores
-  improvements to stored rows whatever the caps and new rows only within them (`Full`).
+  caller's `Proof` with its key before writing, all in one transaction. `ReserveDeviceList` holds
+  epoch `expected+1` for one digest until it lapses (the same digest renews it), and
+  `PutDeviceList` publishes only under a live reservation of its digest, ending it. A backup
+  write must name the current `backup_generation`, which `DeleteBackup` bumps; every insert and
+  replacement must fit the caps, and the others are returned as `Refused` indexes. A
+  PostgreSQL schema test asserts the backup key columns collate `C`.
   Backup reads and deletes name the tenant too. `CreatePairing` checks the version and the
   initiator's cross-signature in its transaction. `ListMasterKeys` reads public columns only;
   `PutPins` and `PutDeviceList` are compare-and-swap within the caller's org. Backup writes lock

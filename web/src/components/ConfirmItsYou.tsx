@@ -43,10 +43,10 @@ function SignInAgain({ username, onDone }: { username: string; onDone: () => voi
       }
     } finally {
       setBusy(false);
-      if (!mfa) {
-        setCaptcha('');
-        setRound((r) => r + 1);
-      }
+      // A captcha token is spent by the login that carried it, including one whose code step
+      // then failed: the password step always gets a fresh challenge.
+      setCaptcha('');
+      setRound((r) => r + 1);
     }
   };
   return (

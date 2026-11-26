@@ -226,8 +226,13 @@ export class DeviceChanged extends Error {
   constructor() { super('This browser device was replaced'); }
 }
 
+/** A message from before the session this device holds starts: a key backup page (restored
+ * later) or a re-shared session may still cover it, so it is worth opening again. */
+export const EARLY = 'This message was sent before this device could read the room.';
+
 export class CryptoEngine {
   private readonly listeners = new Set<(sessionIds: string[]) => void>();
+  private readonly transient = new Set<() => void>();
   private readonly identity: Identity;
 
   private constructor(
@@ -242,6 +247,7 @@ export class CryptoEngine {
     this.identity = new Identity({
       userId, deviceId, curve25519, ed25519, server, store, pickleKey: key, locked: (fn) => this.locked(fn),
       onRestored: (ids) => { for (const fn of this.listeners) fn(ids); },
+      onTransient: () => { for (const fn of this.transient) fn(); },
     });
   }
 
@@ -292,6 +298,13 @@ export class CryptoEngine {
 
   close(): void {
     this.store.close();
+  }
+
+  /** Calls fn when background work (key backup, restore) failed for availability and waits for
+   * a retry (identityStatus runs it again); returns an unsubscribe. */
+  onTransient(fn: () => void): () => void {
+    this.transient.add(fn);
+    return () => this.transient.delete(fn);
   }
 
   /** Calls fn with the IDs of room sessions whose keys just arrived; returns an unsubscribe. */
@@ -396,6 +409,9 @@ export class CryptoEngine {
     }
     const out: Target[] = [];
     const pins: [string, unknown][] = [];
+    // Members seen for the first time: their devices wait until the synced pin set holds them.
+    const sights = new Map<string, string>();
+    const proposed = new Map<string, { target: Target; pin?: [string, unknown] }[]>();
     for (let i = 0; i < userIds.length; i += BATCH) {
       const batch = userIds.slice(i, i + BATCH);
       let listed: QueryResult;
@@ -407,18 +423,40 @@ export class CryptoEngine {
       for (const userId of batch) {
         // No pinned, validly self-bound master key (or this device is unverified): none of this
         // member's devices gets keys.
-        const master = await this.identity.trustedMaster(userId, listed.master_keys?.[userId], listed.tenant_id, pins);
+        const master = await this.identity.trustedMaster(userId, listed.master_keys?.[userId], listed.tenant_id, pins, sights);
         if (!master) continue;
+        const ok: { target: Target; pin?: [string, unknown] }[] = [];
         for (const d of listed.devices?.[userId] ?? []) {
           if (userId === this.userId && isObj(d) && d.device_id === this.deviceId) continue;
           const checked = await this.checkDevice(userId, d);
           if (!checked || !this.identity.deviceTrusted(master, listed.tenant_id, userId, d)) continue;
-          if (checked.pin) pins.push(checked.pin);
-          out.push(checked.target);
+          ok.push(checked);
+        }
+        if (sights.has(userId)) proposed.set(userId, ok);
+        else for (const c of ok) {
+          if (c.pin) pins.push(c.pin);
+          out.push(c.target);
         }
       }
     }
     await this.store.write(pins);
+    // All first sights in one shared compare-and-swap, before any of them gets a key.
+    let committed: Set<string>;
+    try {
+      committed = await this.identity.commitFirstSights(sights);
+    } catch (e) {
+      this.identity.afterWrites();
+      throw new Transient(e instanceof Error ? e.message : 'Could not sync pinned identities');
+    }
+    const later: [string, unknown][] = [];
+    for (const [userId, ok] of proposed) {
+      if (!committed.has(userId)) continue;
+      for (const c of ok) {
+        if (c.pin) later.push(c.pin);
+        out.push(c.target);
+      }
+    }
+    await this.store.write(later);
     this.identity.afterWrites();
     return out;
   }
@@ -461,7 +499,9 @@ export class CryptoEngine {
 
   /** Seals queued room sessions to the key backup, after the current locked operation. */
   private backupSoon(): void {
-    setTimeout(() => void this.locked(() => this.identity.flushBackup()).catch(() => undefined), 0);
+    setTimeout(() => void this.locked(() => this.identity.flushBackup()).catch((e: unknown) => {
+      if (isTransient(e)) for (const fn of this.transient) fn();
+    }), 0);
   }
 
   /** Whether the user has an encryption identity and this device is verified by it. */
@@ -744,7 +784,7 @@ export class CryptoEngine {
       opened = this.openWith(usable, env.ciphertext);
       via = usable;
     }
-    if (!opened) return { state: 'failed', reason: 'This message was sent before this device could read the room.' };
+    if (!opened) return { state: 'failed', reason: EARLY };
     const { plaintext, index } = opened;
     const inner = parseInner(plaintext);
     if (!inner) return { state: 'failed', reason: 'This message is damaged.' };

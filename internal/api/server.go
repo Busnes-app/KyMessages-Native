@@ -574,6 +574,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("DELETE /api/v1/keys/devices/{id}", s.handleE2EEDeleteDevice)
 	s.mux.HandleFunc("POST /api/v1/keys/devices/{id}/signature", s.handleE2EESignDevice)
 	s.mux.HandleFunc("PUT /api/v1/keys/devices/list", s.handleE2EEPutDeviceList)
+	s.mux.HandleFunc("POST /api/v1/keys/devices/list/reserve", s.handleE2EEReserveDeviceList)
 	s.mux.HandleFunc("GET /api/v1/keys/master", s.handleE2EEGetMaster)
 	s.mux.HandleFunc("PUT /api/v1/keys/master", s.handleE2EEPutMaster)
 	s.mux.HandleFunc("PUT /api/v1/keys/pins", s.handleE2EEPutPins)

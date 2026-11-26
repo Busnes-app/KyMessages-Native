@@ -3,6 +3,17 @@ import { cleanup, fireEvent, render, screen, within } from '@testing-library/rea
 import { ConfirmItsYou } from './ConfirmItsYou';
 import { adminFetch } from '../api';
 
+// A captcha that hands out one token per round, as the real widget solves one challenge each.
+vi.mock('./CaptchaWidget', async () => {
+  const { useEffect } = await import('react');
+  return {
+    CaptchaWidget: ({ onToken, round }: { onToken: (t: string) => void; round: number }) => {
+      useEffect(() => onToken(`captcha-${round}`), [onToken, round]);
+      return null;
+    },
+  };
+});
+
 const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { 'Content-Type': 'application/json' } });
 const STEP_UP = { error: "Confirm it's you: this change needs a sign-in from the last 10 minutes", code: 'reauthentication_required', reauth_url: '/api/sso/kyidentity/login?fresh=1' };
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
@@ -133,4 +144,34 @@ it('goes back to the password when a refused code spent its challenge, and then 
   expect((await within(dialog).findByRole('alert')).textContent).toMatch(/Enter your password again/);
   await signIn();
   expect((await pending).status).toBe(200);
+});
+
+it('never sends a captcha token again that a login spent, also after a refused code', async () => {
+  const LOCAL = { error: STEP_UP.error, code: STEP_UP.code };
+  const tokens: unknown[] = [];
+  const replies: Record<string, Response[]> = {
+    '/x': [json(LOCAL, 403), json({ ok: true })],
+    '/api/auth/login': [json({ mfa_required: true, mfa_token: 'mfa-1' }), json({ mfa_required: true, mfa_token: 'mfa-2' })],
+    '/api/auth/mfa/totp': [json({ error: 'Invalid code' }, 401), json({ authenticated: true, user: { username: 'alice', role: 'user' } })],
+  };
+  vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === '/api/auth/login') tokens.push((JSON.parse(String(init?.body)) as { captcha_token?: string }).captcha_token);
+    const q = replies[url];
+    return (q.length > 1 ? q.shift() : q[0])!.clone();
+  }));
+  render(<ConfirmItsYou username="alice" />);
+  const pending = adminFetch('/x', { method: 'PUT' });
+  const dialog = await screen.findByRole('dialog', { name: "Confirm it's you" });
+  for (let i = 0; i < 2; i++) {
+    fireEvent.change(await within(dialog).findByLabelText('Password for @alice'), { target: { value: 'pw' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Sign in again' }));
+    fireEvent.change(await within(dialog).findByLabelText(/Authentication code/), { target: { value: '123456' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Verify' }));
+  }
+  expect((await pending).status).toBe(200);
+  expect(tokens).toHaveLength(2);
+  expect(tokens[0]).toBeTruthy();
+  expect(tokens[1]).toBeTruthy();
+  expect(tokens[1]).not.toBe(tokens[0]);
 });

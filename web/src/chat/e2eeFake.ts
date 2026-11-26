@@ -6,7 +6,8 @@ import type { ChatMessage } from './types';
 
 export const UNAVAILABLE = 'Encryption is not available in this browser yet.';
 export const NOT_YET = 'This message could not be opened yet.';
-export const retryable = (reason: string) => reason === UNAVAILABLE || reason === NOT_YET;
+export const EARLY = 'This message was sent before this device could read the room.';
+export const retryable = (reason: string) => reason === UNAVAILABLE || reason === NOT_YET || reason === EARLY;
 export const MAX_MESSAGE_BYTES = 16 << 10;
 export const MAX_INNER_BYTES = 32 << 10;
 
@@ -47,6 +48,7 @@ export function resetFakeE2EE(): void {
   unavailable = false;
   fakeIdentity = { state: 'verified', fingerprint: 'f'.repeat(64), restoring: false, backupFull: false };
   fakeChanges = [];
+  fakePending = false;
 }
 
 export const startE2EE = async () => ({});
@@ -110,7 +112,8 @@ export function openMessages(list: ChatMessage[]): Promise<ChatMessage[]> {
 }
 
 // Identity (E3): page tests see a verified device with no identity changes unless they say so.
-type FakeIdentity = { state: 'none'; quarantined: boolean } | { state: 'unverified'; fingerprint: string; quarantined: boolean } | { state: 'verified'; fingerprint: string; restoring: boolean; backupFull: boolean };
+type FakeIdentity = { state: 'none'; quarantined: boolean } | { state: 'unverified'; fingerprint: string; quarantined: boolean } |
+  { state: 'verified'; fingerprint: string; restoring: boolean; backupFull: boolean; problem?: 'rollback' | 'fork' };
 let fakeIdentity: FakeIdentity = { state: 'verified', fingerprint: 'f'.repeat(64), restoring: false, backupFull: false };
 let fakeChanges: { user_id: string; fingerprint: string; previous: string }[] = [];
 const identityListeners = new Set<() => void>();
@@ -133,6 +136,21 @@ export async function acceptIdentity(userId: string, previous: string, fingerpri
 export const prepareIdentity = async () => ({ recoveryKey: 'ABCD '.repeat(14).trim(), commit: async () => setFakeIdentity({ state: 'verified', fingerprint: 'f'.repeat(64), restoring: false, backupFull: false }) });
 export const restoreIdentity = async () => 0;
 export const checkRoomIdentities = () => undefined;
+let fakePending = false;
+const pendingListeners = new Set<() => void>();
+export const encryptionPending = () => fakePending;
+export const onEncryptionPending = (fn: () => void) => {
+  pendingListeners.add(fn);
+  return () => pendingListeners.delete(fn);
+};
+export async function retryEncryptionNow(): Promise<void> {
+  setFakePending(false);
+}
+/** Makes encryption work wait for a retry, as after the post-quantum module restarted. */
+export function setFakePending(v: boolean): void {
+  fakePending = v;
+  for (const fn of pendingListeners) fn();
+}
 export const offerVerification = async () => ({ text: 'x'.repeat(108), expiresInMs: 180_000, poll: async (): Promise<{ code: string; device: string } | undefined> => undefined, approve: async () => undefined, cancel: async () => undefined });
 export const ownDeviceVerified = async () => true;
 export const joinVerification = async () => ({ code: '123456', finish: async () => 0, cancel: async () => undefined });

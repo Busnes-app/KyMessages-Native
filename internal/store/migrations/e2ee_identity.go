@@ -32,6 +32,11 @@ CREATE TABLE IF NOT EXISTS e2ee_master_keys (
 	device_list TEXT NOT NULL DEFAULT '',
 	device_list_epoch BIGINT NOT NULL DEFAULT 0,
 	device_list_signature TEXT NOT NULL DEFAULT '',
+	-- The one proposed successor list (its digest) a device may sign and publish, until then.
+	device_list_reserved TEXT NOT NULL DEFAULT '',
+	device_list_reserved_until BIGINT NOT NULL DEFAULT 0,
+	-- Bumped by each backup deletion; backup writes are signed for one generation.
+	backup_generation BIGINT NOT NULL DEFAULT 0,
 	updated_at BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_e2ee_master_keys_tenant ON e2ee_master_keys(tenant_id, user_id);

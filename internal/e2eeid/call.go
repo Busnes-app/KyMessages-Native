@@ -168,7 +168,7 @@ type BackupWriteEntry struct {
 }
 
 // BackupWrite parses entries into what BackupWriteMessage signs.
-func BackupWrite(tenantID, userID string, version int64, entries []BackupWriteEntry) ([]byte, error) {
+func BackupWrite(tenantID, userID string, version, generation int64, entries []BackupWriteEntry) ([]byte, error) {
 	refs := make([]BackupEntry, len(entries))
 	sealed := make([][]byte, len(entries))
 	for i, e := range entries {
@@ -179,16 +179,17 @@ func BackupWrite(tenantID, userID string, version int64, entries []BackupWriteEn
 		refs[i] = BackupEntry{RoomID: e.RoomID, SenderKey: e.SenderKey, SessionID: e.SessionID, FirstIndex: e.FirstIndex}
 		sealed[i] = b
 	}
-	return BackupWriteMessage(tenantID, userID, version, refs, sealed), nil
+	return BackupWriteMessage(tenantID, userID, version, generation, refs, sealed), nil
 }
 
 func backupWriteMsg(_ *hybridsig.PublicKey, a []string) ([]byte, error) {
-	v, err := strconv.ParseInt(a[2], 10, 64)
+	v, err1 := strconv.ParseInt(a[2], 10, 64)
+	g, err2 := strconv.ParseInt(a[3], 10, 64)
 	var entries []BackupWriteEntry
-	if err != nil || v < 1 || json.Unmarshal([]byte(a[3]), &entries) != nil {
+	if err1 != nil || err2 != nil || v < 1 || g < 0 || json.Unmarshal([]byte(a[4]), &entries) != nil {
 		return nil, errArg
 	}
-	return BackupWrite(a[0], a[1], v, entries)
+	return BackupWrite(a[0], a[1], v, g, entries)
 }
 
 func deviceListMsg(_ *hybridsig.PublicKey, a []string) ([]byte, error) {
@@ -329,11 +330,11 @@ var calls = map[string]call{
 	// verifyPinsWrite(public_key, tenant, user, version, counter, sealed, signature).
 	"signPinsWrite":   {6, signWith(DomainPinsWrite, pinsWriteMsg)},
 	"verifyPinsWrite": {7, verifyWith(DomainPinsWrite, pinsWriteMsg)},
-	// signBackupWrite(seed, tenant, user, version, entries_json) and
-	// verifyBackupWrite(public_key, tenant, user, version, entries_json, signature), where
-	// entries_json is [{room_id, sender_key, session_id, first_index, sealed}] in the order sent.
-	"signBackupWrite":   {5, signWith(DomainBackupWrite, backupWriteMsg)},
-	"verifyBackupWrite": {6, verifyWith(DomainBackupWrite, backupWriteMsg)},
+	// signBackupWrite(seed, tenant, user, version, generation, entries_json) and
+	// verifyBackupWrite(public_key, tenant, user, version, generation, entries_json, signature),
+	// where entries_json is [{room_id, sender_key, session_id, first_index, sealed}] in order.
+	"signBackupWrite":   {6, signWith(DomainBackupWrite, backupWriteMsg)},
+	"verifyBackupWrite": {7, verifyWith(DomainBackupWrite, backupWriteMsg)},
 
 	// hash(args...) is lowercase hex SHA-256 of Fields(args): a compact, collision-resistant
 	// key for caching signature checks in the browser.
@@ -420,13 +421,13 @@ var calls = map[string]call{
 		}
 		return map[string]string{"pairing_id": b64url.EncodeToString(q.PairingID), "secret": b64.EncodeToString(q.Secret), "fingerprint": hex.EncodeToString(q.Fingerprint)}, nil
 	}},
-	// comparisonCode(secret, pairing_id, ephemeral_public_key)
-	"comparisonCode": {3, func(a []string) (any, error) {
-		k, err := decAll(a[0], a[2])
+	// comparisonCode(secret, pairing_id, new_device, ephemeral_public_key)
+	"comparisonCode": {4, func(a []string) (any, error) {
+		k, err := decAll(a[0], a[3])
 		if err != nil {
 			return nil, err
 		}
-		return ComparisonCode(k[0], a[1], k[1])
+		return ComparisonCode(k[0], a[1], a[2], k[1])
 	}},
 	// transferSeal(ephemeral_public_key, secret, pairing_id, verified_device, new_device, master_seed, backup_seed)
 	"transferSeal": {7, func(a []string) (any, error) {

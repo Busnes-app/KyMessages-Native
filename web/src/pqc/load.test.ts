@@ -25,11 +25,18 @@ describe('loading the post-quantum module', () => {
     await expect(loadPQCFrom(wasm, silent, 300)).rejects.toThrow('did not start');
     expect(pqcRunning()).toBe(false);
 
+    // The bound covers fetching and compiling too, not only the Go start.
+    await expect(loadPQCFrom(new Promise<BufferSource>(() => undefined), undefined, 300)).rejects.toThrow('did not start');
+    expect(pqcRunning()).toBe(false);
+
     // A start that finishes after it was given up on must not take over from a newer one.
+    // It reaches the newest start's kyPQCReady (there is one global), with its own generation.
     let late: (() => void) | undefined;
+    let lateGo: { exited: boolean } | undefined;
     const slow = () => {
       const go = new globalThis.Go();
       const run = go.run.bind(go);
+      lateGo = go as unknown as { exited: boolean };
       go.run = (inst) => new Promise<void>((resolve) => { late = () => void run(inst).then(resolve); });
       return go;
     };
@@ -38,6 +45,8 @@ describe('loading the post-quantum module', () => {
     const before = pqc.hash('a', 'bc');
     late?.();
     await wait(200);
+    // Had the stale start's call been installed, its exit would leave no working call.
+    if (lateGo) lateGo.exited = true;
     expect(pqcRunning()).toBe(true);
     expect(pqc.hash('a', 'bc')).toBe(before);
     expect(before).toBe('b534ce16ac9c8b36823f39a395ce8e0e3c7ad9605b82b5444f18cadacd217a5d');

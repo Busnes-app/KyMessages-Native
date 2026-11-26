@@ -233,14 +233,27 @@ func TestPinsNeedTheMasterSeed(t *testing.T) {
 	}
 }
 
-func TestComparisonCodeDependsOnSecretAndKey(t *testing.T) {
+func TestComparisonCodeDependsOnSecretDeviceAndKey(t *testing.T) {
 	s1, _ := e2eeid.NewSecret()
 	s2, _ := e2eeid.NewSecret()
-	c1, _ := e2eeid.ComparisonCode(s1, "pair", []byte("key-a"))
-	c2, _ := e2eeid.ComparisonCode(s2, "pair", []byte("key-a"))
-	c3, _ := e2eeid.ComparisonCode(s1, "pair", []byte("key-b"))
-	if len(c1) != 6 || c1 == c2 && c1 == c3 {
-		t.Fatalf("codes %s %s %s", c1, c2, c3)
+	c1, _ := e2eeid.ComparisonCode(s1, "pair", "DEV_A", []byte("key-a"))
+	c2, _ := e2eeid.ComparisonCode(s2, "pair", "DEV_A", []byte("key-a"))
+	c3, _ := e2eeid.ComparisonCode(s1, "pair", "DEV_A", []byte("key-b"))
+	c4, _ := e2eeid.ComparisonCode(s1, "pair", "DEV_B", []byte("key-a"))
+	if len(c1) != 6 || c1 == c2 && c1 == c3 && c1 == c4 {
+		t.Fatalf("codes %s %s %s %s", c1, c2, c3, c4)
+	}
+	if _, err := e2eeid.ComparisonCode(s1, "pair", "", []byte("key-a")); err == nil {
+		t.Fatal("a code without the joining device")
+	}
+}
+
+// The device list digest is the browser's hash of the same fields.
+func TestDeviceListDigest(t *testing.T) {
+	got := e2eeid.DeviceListDigest([]string{"a", "bc"})
+	want := must(t, "hash", "kymessages.device-list", "a", "bc").(string)
+	if got != want || len(got) != 64 {
+		t.Fatalf("digest %s, hash %s", got, want)
 	}
 }
 
@@ -354,13 +367,13 @@ func writeVectors(t *testing.T) {
 	forgedBackup := must(t, "backupSeal", xp, seed("other", e2eeid.MasterSeedBytes), "room-1", sender, "session-1", "3", plain).(string)
 	devList := str(must(t, "signDeviceList", ms, tenant, user, "1", "2", `["DEVICE_ALICE_1","DEVICE_ALICE_2"]`))
 	batch := `[{"room_id":"room-1","sender_key":"` + sender + `","session_id":"session-1","first_index":3,"sealed":"` + sealedBackup + `"}]`
-	batchW := str(must(t, "signBackupWrite", ms, tenant, user, "1", batch))
+	batchW := str(must(t, "signBackupWrite", ms, tenant, user, "1", "4", batch))
 	wrapM := must(t, "recoveryWrap", rk, "master-key", tenant, user, ms).(string)
 	wrapB := must(t, "recoveryWrap", rk, "backup-key", tenant, user, xs).(string)
 	pairing := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 16))
 	qr := obj(must(t, "qrNew", pairing, mp["fingerprint"]))
 	transfer := must(t, "transferSeal", ep, qr["secret"], pairing, "DEVICE_ALICE_1", "DEVICE_ALICE_2", ms, xs).(string)
-	code := must(t, "comparisonCode", qr["secret"], pairing, ep).(string)
+	code := must(t, "comparisonCode", qr["secret"], pairing, "DEVICE_ALICE_2", ep).(string)
 	pins := b64.EncodeToString([]byte(`{"usr_bob":"fingerprint"}`))
 	sealedPins := must(t, "pinsSeal", ms, tenant, user, "3", pins).(string)
 	pinsWrite := str(must(t, "signPinsWrite", ms, tenant, user, "1", "3", sealedPins))
@@ -404,9 +417,10 @@ func writeVectors(t *testing.T) {
 		{Name: "pin write verifies", Call: "verifyPinsWrite", Args: []string{mp["public_key"], tenant, user, "1", "3", sealedPins, pinsWrite}, Want: true},
 		{Name: "pin write at another counter", Call: "verifyPinsWrite", Args: []string{mp["public_key"], tenant, user, "1", "4", sealedPins, pinsWrite}, Want: false},
 		{Name: "pin write over other ciphertext", Call: "verifyPinsWrite", Args: []string{mp["public_key"], tenant, user, "1", "3", tampered(sealedPins), pinsWrite}, Want: false},
-		{Name: "backup write verifies", Call: "verifyBackupWrite", Args: []string{mp["public_key"], tenant, user, "1", batch, batchW}, Want: true},
-		{Name: "backup write with an entry moved", Call: "verifyBackupWrite", Args: []string{mp["public_key"], tenant, user, "1", strings.Replace(batch, `"first_index":3`, `"first_index":0`, 1), batchW}, Want: false},
-		{Name: "backup write for another version", Call: "verifyBackupWrite", Args: []string{mp["public_key"], tenant, user, "2", batch, batchW}, Want: false},
+		{Name: "backup write verifies", Call: "verifyBackupWrite", Args: []string{mp["public_key"], tenant, user, "1", "4", batch, batchW}, Want: true},
+		{Name: "backup write with an entry moved", Call: "verifyBackupWrite", Args: []string{mp["public_key"], tenant, user, "1", "4", strings.Replace(batch, `"first_index":3`, `"first_index":0`, 1), batchW}, Want: false},
+		{Name: "backup write for another version", Call: "verifyBackupWrite", Args: []string{mp["public_key"], tenant, user, "2", "4", batch, batchW}, Want: false},
+		{Name: "backup write for another generation", Call: "verifyBackupWrite", Args: []string{mp["public_key"], tenant, user, "1", "5", batch, batchW}, Want: false},
 		{Name: "hash", Call: "hash", Args: []string{"a", "bc"}, Want: "b534ce16ac9c8b36823f39a395ce8e0e3c7ad9605b82b5444f18cadacd217a5d"},
 		{Name: "recovery key format", Call: "recoveryFormat", Args: []string{rk}, Want: rtext},
 		{Name: "recovery key parse", Call: "recoveryParse", Args: []string{strings.ToLower(strings.ReplaceAll(rtext, " ", "-"))}, Want: rk},
@@ -416,7 +430,7 @@ func writeVectors(t *testing.T) {
 		{Name: "recovery wrap for another purpose", Call: "recoveryUnwrap", Args: []string{rk, "backup-key", tenant, user, wrapM}, Error: true},
 		{Name: "recovery wrap for another user", Call: "recoveryUnwrap", Args: []string{rk, "master-key", tenant, "usr_bob", wrapM}, Error: true},
 		{Name: "QR text parses", Call: "qrParse", Args: []string{qr["text"]}, Want: map[string]string{"pairing_id": pairing, "secret": qr["secret"], "fingerprint": mp["fingerprint"]}},
-		{Name: "comparison code", Call: "comparisonCode", Args: []string{qr["secret"], pairing, ep}, Want: code},
+		{Name: "comparison code", Call: "comparisonCode", Args: []string{qr["secret"], pairing, "DEVICE_ALICE_2", ep}, Want: code},
 		{Name: "two-layer transfer opens", Call: "transferOpen", Args: []string{es, qr["secret"], pairing, "DEVICE_ALICE_1", "DEVICE_ALICE_2", transfer}, Want: map[string]string{"master_seed": ms, "backup_seed": xs}},
 		{Name: "transfer without the QR secret", Call: "transferOpen", Args: []string{es, rk, pairing, "DEVICE_ALICE_1", "DEVICE_ALICE_2", transfer}, Error: true},
 		{Name: "pins open", Call: "pinsOpen", Args: []string{ms, tenant, user, "3", sealedPins}, Want: pins},

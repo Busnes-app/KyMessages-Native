@@ -2,12 +2,13 @@
 
 // Command pqc-wasm is the browser's post-quantum code: internal/e2eeid (and through it
 // internal/pqc/xwing and internal/pqc/hybridsig) compiled to js/wasm, the same Go the server
-// runs (PQC Stack Plan Q3). It hands the loader's kyPQCReady a call(name, ...args) answering
-// {ok: result} or {error: message}, also for a call that panics. build.sh writes the committed
-// web/src/pqc/pqc.wasm.
+// runs (PQC Stack Plan Q3). It hands the loader's kyPQCReady its start generation (its first
+// argument) and a call(name, ...args) answering {ok: result} or {error: message}, also for a
+// call that panics. build.sh writes the committed web/src/pqc/pqc.wasm.
 package main
 
 import (
+	"os"
 	"syscall/js"
 
 	"github.com/Busnes-app/ky_server_base/internal/e2eeid"
@@ -46,6 +47,12 @@ func main() {
 		}
 		return map[string]any{"ok": out}
 	})
-	js.Global().Get("kyPQCReady").Invoke(call)
+	// The generation travels with the call: a start the loader gave up on that reaches the newest
+	// start's kyPQCReady names its own, older generation and is ignored.
+	gen := ""
+	if len(os.Args) > 1 {
+		gen = os.Args[1]
+	}
+	js.Global().Get("kyPQCReady").Invoke(gen, call)
 	select {}
 }

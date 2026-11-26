@@ -1,4 +1,5 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { StrictMode } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as fake from '../../chat/e2eeFake';
 import { EncryptionIdentityGate, IdentityChangedBanner, SetUpEncryption, useIdentityStatus, VerifyAnotherDevice, VerifyThisDevice } from './EncryptionIdentity';
@@ -134,5 +135,66 @@ describe('identity screens', () => {
     expect(await screen.findByText(/Waiting for the new device to confirm/)).toBeTruthy();
     expect(await screen.findByText(/new device is verified/, {}, { timeout: 4000 })).toBeTruthy();
     expect(confirmed).toHaveBeenCalledWith('NEWDEVICE');
+  });
+
+  it('offers a reset when the server rolled back or forked this identity, and says what it does', async () => {
+    fake.setFakeIdentity({ state: 'verified', fingerprint: 'f'.repeat(64), restoring: false, backupFull: false, problem: 'rollback' });
+    render(<Gate />);
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toMatch(/older list of your devices/);
+    expect(alert.textContent).toMatch(/everyone you share rooms with will see/);
+    fireEvent.click(screen.getByRole('button', { name: 'Reset identity' }));
+    expect(await screen.findByText('Reset your encryption identity')).toBeTruthy();
+  });
+
+  it('shows waiting encryption work with a retry, and clears once it ran', async () => {
+    fake.setFakePending(true);
+    render(<Gate />);
+    expect(await screen.findByTestId('encryption-pending')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Retry now' }));
+    await waitFor(() => expect(screen.queryByTestId('encryption-pending')).toBeNull());
+  });
+
+  it('closes while waiting for the new device without cancelling the keys it sent, and stops watching', async () => {
+    const cancel = vi.fn(async () => undefined);
+    vi.spyOn(fake, 'offerVerification').mockResolvedValue({ text: 'QRTEXT', expiresInMs: 60_000, poll: async () => ({ code: '111222', device: 'NEWDEVICE' }), approve: async () => undefined, cancel });
+    const confirmed = vi.spyOn(fake, 'ownDeviceVerified').mockResolvedValue(false);
+    const closed = vi.fn();
+    render(<VerifyAnotherDevice onClose={closed} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'The codes match' }));
+    expect(await screen.findByText(/Waiting for the new device to confirm/)).toBeTruthy();
+    const close = screen.getAllByRole('button', { name: 'Close' }).find((b) => b.textContent === 'Close')!;
+    expect(close).toHaveProperty('disabled', false);
+    fireEvent.click(close);
+    expect(closed).toHaveBeenCalled();
+    expect(cancel).not.toHaveBeenCalled();
+    const calls = confirmed.mock.calls.length;
+    await new Promise((r) => setTimeout(r, 1700));
+    expect(confirmed.mock.calls.length).toBe(calls);
+  });
+
+  it('cancels a pairing closed before any keys were sent, and drops its poll', async () => {
+    const cancel = vi.fn(async () => undefined);
+    let seen: AbortSignal | undefined;
+    const poll = vi.fn(async (signal?: AbortSignal) => {
+      seen = signal;
+      return undefined;
+    });
+    vi.spyOn(fake, 'offerVerification').mockResolvedValue({ text: 'QRTEXT', expiresInMs: 60_000, poll, approve: async () => undefined, cancel });
+    const { unmount } = render(<VerifyAnotherDevice onClose={() => undefined} />);
+    await screen.findByTestId('verification-code');
+    await waitFor(() => expect(poll).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(cancel).toHaveBeenCalled();
+    expect(seen?.aborted).toBe(true);
+    unmount();
+  });
+
+  it('keeps polling under StrictMode, whose effects run twice', async () => {
+    const poll = vi.fn().mockResolvedValueOnce(undefined).mockResolvedValue({ code: '565656', device: 'NEWDEVICE' });
+    vi.spyOn(fake, 'offerVerification').mockResolvedValue({ text: 'QRTEXT', expiresInMs: 60_000, poll, approve: async () => undefined, cancel: async () => undefined });
+    render(<StrictMode><VerifyAnotherDevice onClose={() => undefined} /></StrictMode>);
+    expect((await screen.findByTestId('comparison-code', {}, { timeout: 3000 })).textContent).toBe('565656');
+    for (const [signal] of poll.mock.calls.slice(-1)) expect((signal as AbortSignal).aborted).toBe(false);
   });
 });

@@ -9,15 +9,17 @@ import './wasm_exec.js';
 
 interface GoRuntime {
   importObject: WebAssembly.Imports;
+  argv: string[];
   run(instance: WebAssembly.Instance): Promise<void>;
 }
 
 type PQCCall = (name: string, ...args: string[]) => { ok?: unknown; error?: string };
 
 declare global {
-  // Defined by wasm_exec.js; the Go program calls kyPQCReady with its call function.
+  // Defined by wasm_exec.js; the Go program calls kyPQCReady with the generation it was started
+  // with (its argv[1]) and its call function.
   var Go: new () => GoRuntime;
-  var kyPQCReady: ((call: PQCCall) => void) | undefined;
+  var kyPQCReady: ((gen: string, call: PQCCall) => void) | undefined;
 }
 
 /**
@@ -35,28 +37,34 @@ let live: PQCCall | undefined;
 let generation = 0;
 let reload: (() => Promise<void>) | undefined;
 
-/** How long the Go program may take to register its call after it starts. */
+/** How long a start may take, from fetching the module to the Go program handing over its call. */
 export const PQC_START_MS = 10_000;
 
 type Source = (this: GoRuntime) => Promise<WebAssembly.WebAssemblyInstantiatedSource>;
 
-// Starts the Go program and resolves once it handed over its call. Each start has a generation:
-// only the current one may install its call, and only its exit withdraws it, so a start given up
-// on (timed out) cannot replace a newer one when it finishes late.
+// Starts the Go program and resolves once it handed over its call, all within startMs (fetch,
+// compile and start). Each start has a generation, which the Go program is started with and
+// hands back with its call: only the current one may install its call, and only its exit
+// withdraws it, so a start given up on cannot replace a newer one when it finishes late, even
+// though both reach the one global kyPQCReady.
 async function start(source: Source, runtime: () => GoRuntime, startMs: number): Promise<void> {
   if (live) return;
   const gen = ++generation;
   const go = runtime();
+  go.argv = ['js', String(gen)];
   let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error('The post-quantum module did not start')), startMs);
+  });
   const ready = new Promise<void>((resolve) => {
-    globalThis.kyPQCReady = (call) => {
-      if (gen !== generation) return;
+    globalThis.kyPQCReady = (from, call) => {
+      if (from !== String(gen) || gen !== generation) return;
       live = call;
       resolve();
     };
   });
   try {
-    const { instance } = await source.call(go);
+    const { instance } = await Promise.race([source.call(go), timeout]);
     const exited = go.run(instance).then(
       () => { throw new Error('The post-quantum module exited'); },
       (e: unknown) => { throw e instanceof Error ? e : new Error('The post-quantum module crashed'); },
@@ -65,9 +73,6 @@ async function start(source: Source, runtime: () => GoRuntime, startMs: number):
       if (gen !== generation) return;
       live = undefined;
       loading = undefined;
-    });
-    const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error('The post-quantum module did not start')), startMs);
     });
     await Promise.race([ready, exited, timeout]);
   } catch (e) {
@@ -97,11 +102,11 @@ export function loadPQC(): Promise<void> {
   });
 }
 
-// Tests run in Node, where the module is read from disk; runtime and startMs let them fake a
-// failing Go.
-export function loadPQCFrom(bytes: BufferSource, runtime?: () => GoRuntime, startMs?: number): Promise<void> {
-  return load(function (this: GoRuntime) {
-    return WebAssembly.instantiate(bytes, this.importObject);
+// Tests run in Node, where the module is read from disk; a pending bytes, runtime and startMs let
+// them fake a stalled fetch or a failing Go.
+export function loadPQCFrom(bytes: BufferSource | Promise<BufferSource>, runtime?: () => GoRuntime, startMs?: number): Promise<void> {
+  return load(async function (this: GoRuntime) {
+    return WebAssembly.instantiate(await bytes, this.importObject);
   }, runtime, startMs);
 }
 
@@ -189,14 +194,14 @@ export const pqc = {
     pqcCall<boolean>('verifyDeviceList', k, tenant, user, String(version), String(epoch), JSON.stringify(deviceIds), s),
   signPinsWrite: (seed: string, tenant: string, user: string, version: number, counter: number, sealed: string) =>
     pqcCall<Hybrid>('signPinsWrite', seed, tenant, user, String(version), String(counter), sealed),
-  signBackupWrite: (seed: string, tenant: string, user: string, version: number, entries: (BackupRef & { sealed: string })[]) =>
-    pqcCall<Hybrid>('signBackupWrite', seed, tenant, user, String(version), JSON.stringify(entries.map((e) => ({
+  signBackupWrite: (seed: string, tenant: string, user: string, version: number, generation: number, entries: (BackupRef & { sealed: string })[]) =>
+    pqcCall<Hybrid>('signBackupWrite', seed, tenant, user, String(version), String(generation), JSON.stringify(entries.map((e) => ({
       room_id: e.room_id, sender_key: e.sender_key, session_id: e.session_id, first_index: e.first_index, sealed: e.sealed,
     })))),
   verifyPinsWrite: (k: Hybrid, tenant: string, user: string, version: number, counter: number, sealed: string, sig: Hybrid) =>
     pqcCall<boolean>('verifyPinsWrite', k, tenant, user, String(version), String(counter), sealed, sig),
-  verifyBackupWrite: (k: Hybrid, tenant: string, user: string, version: number, entries: (BackupRef & { sealed: string })[], sig: Hybrid) =>
-    pqcCall<boolean>('verifyBackupWrite', k, tenant, user, String(version), JSON.stringify(entries.map((e) => ({
+  verifyBackupWrite: (k: Hybrid, tenant: string, user: string, version: number, generation: number, entries: (BackupRef & { sealed: string })[], sig: Hybrid) =>
+    pqcCall<boolean>('verifyBackupWrite', k, tenant, user, String(version), String(generation), JSON.stringify(entries.map((e) => ({
       room_id: e.room_id, sender_key: e.sender_key, session_id: e.session_id, first_index: e.first_index, sealed: e.sealed,
     }))), sig),
   /** Hex SHA-256 of the length-prefixed fields: a compact cache key. */
@@ -213,7 +218,9 @@ export const pqc = {
     pqcCall<string>('pinsOpen', masterSeed, tenant, user, String(counter), sealed),
   qrNew: (pairingId: string, fingerprint: string) => pqcCall<{ secret: string; text: string }>('qrNew', pairingId, fingerprint),
   qrParse: (text: string) => pqcCall<{ pairing_id: string; secret: string; fingerprint: string }>('qrParse', text.trim()),
-  comparisonCode: (secret: string, pairingId: string, ephemeralKey: string) => pqcCall<string>('comparisonCode', secret, pairingId, ephemeralKey),
+  /** The six digits both screens show; bound to the joining device and its ephemeral key. */
+  comparisonCode: (secret: string, pairingId: string, newDevice: string, ephemeralKey: string) =>
+    pqcCall<string>('comparisonCode', secret, pairingId, newDevice, ephemeralKey),
   transferSeal: (ephemeralKey: string, secret: string, pairingId: string, verifiedDevice: string, newDevice: string, masterSeed: string, backupSeed: string) =>
     pqcCall<string>('transferSeal', ephemeralKey, secret, pairingId, verifiedDevice, newDevice, masterSeed, backupSeed),
   transferOpen: (ephemeralSeed: string, secret: string, pairingId: string, verifiedDevice: string, newDevice: string, sealed: string) =>

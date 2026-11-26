@@ -26,6 +26,8 @@ export const seenKey = (senderKey: string, sessionId: string, index: number) => 
 export const backupCoverKey = (senderKey: string, sessionId: string) => `inb:${senderKey}:${sessionId}`;
 /** A room session waiting to be sealed to the key backup; the value is its inbound key. */
 export const backupQueueKey = (inbound: string) => `bq:${inbound}`;
+/** A queued room session the backup refused for its caps: retried less often, shown as full. */
+export const backupRefusedKey = (inbound: string) => `bqf:${inbound}`;
 
 /** A failure worth retrying later (the network, the server), as opposed to bad data. */
 export class Transient extends Error {}

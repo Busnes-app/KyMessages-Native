@@ -93,8 +93,14 @@ func staleSession(t *testing.T, st store.Store, userID string) string {
 	return tok
 }
 
-// backupWrite is a PUT /api/v1/keys/backup body for sessions, signed by the master key.
+// backupWrite is a PUT /api/v1/keys/backup body for sessions, signed by the master key for
+// backup generation 0.
 func (i *testIdentity) backupWrite(t *testing.T, version int64, sessions ...map[string]any) map[string]any {
+	t.Helper()
+	return i.backupWriteGen(t, version, 0, sessions...)
+}
+
+func (i *testIdentity) backupWriteGen(t *testing.T, version, generation int64, sessions ...map[string]any) map[string]any {
 	t.Helper()
 	entries := make([]e2eeid.BackupWriteEntry, len(sessions))
 	for n, e := range sessions {
@@ -108,11 +114,11 @@ func (i *testIdentity) backupWrite(t *testing.T, version int64, sessions ...map[
 		sealed, _ := e["sealed"].(string)
 		entries[n] = e2eeid.BackupWriteEntry{RoomID: room, SenderKey: sender, SessionID: session, FirstIndex: fi, Sealed: sealed}
 	}
-	msg, err := e2eeid.BackupWrite(i.tenant, i.user, version, entries)
+	msg, err := e2eeid.BackupWrite(i.tenant, i.user, version, generation, entries)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return map[string]any{"version": version, "sessions": sessions, "signature": i.sign(t, e2eeid.DomainBackupWrite, msg)}
+	return map[string]any{"version": version, "generation": generation, "sessions": sessions, "signature": i.sign(t, e2eeid.DomainBackupWrite, msg)}
 }
 
 func registerDevice(t *testing.T, srv http.Handler, tok string, d *testDevice) {
@@ -466,12 +472,22 @@ func TestE2EEKeyBackupRoutes(t *testing.T) {
 	if rec := doBearerJSON(t, srv, http.MethodDelete, "/api/v1/keys/backup?version=1", staleSession(t, st, alice.ID), nil, nil); rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "reauthentication_required") {
 		t.Fatalf("delete from a stale session = %d %s", rec.Code, rec.Body.String())
 	}
-	if c := doBearerJSON(t, srv, http.MethodDelete, "/api/v1/keys/backup?version=1", tok, nil, nil).Code; c != http.StatusNoContent {
-		t.Fatalf("delete = %d", c)
+	if rec := doBearerJSON(t, srv, http.MethodDelete, "/api/v1/keys/backup?version=1", tok, nil, nil); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"generation":1`) {
+		t.Fatalf("delete = %d %s", rec.Code, rec.Body.String())
 	}
 	rec = doBearerJSON(t, srv, http.MethodGet, "/api/v1/keys/backup?version=1", tok, nil, nil)
-	if !strings.Contains(rec.Body.String(), `"sessions":[]`) {
+	if !strings.Contains(rec.Body.String(), `"sessions":[]`) || !strings.Contains(rec.Body.String(), `"generation":1`) {
 		t.Fatalf("after delete = %s", rec.Body.String())
+	}
+	// A write signed before the deletion, replayed, cannot refill the backup.
+	if c := putB(tok, 1, better); c != http.StatusConflict {
+		t.Fatalf("replayed write after deletion = %d", c)
+	}
+	if rec := doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/backup", tok, id.backupWriteGen(t, 1, 1, better), nil); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"refused":[]`) {
+		t.Fatalf("write to the new generation = %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := doBearerJSON(t, srv, http.MethodGet, "/api/v1/keys/master", tok, nil, nil); !strings.Contains(rec.Body.String(), `"backup_generation":1`) {
+		t.Fatalf("master = %s", rec.Body.String())
 	}
 }
 
@@ -728,6 +744,16 @@ func TestE2EEDeviceListIsSignedAndVersioned(t *testing.T) {
 	putL := func(tok string, body map[string]any) int {
 		return doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/devices/list", tok, body, nil).Code
 	}
+	reserve := func(tok string, expected int64, ids []string) int {
+		return doBearerJSON(t, srv, http.MethodPost, "/api/v1/keys/devices/list/reserve", tok, map[string]any{"version": 1, "expected_epoch": expected, "digest": e2eeid.DeviceListDigest(ids)}, nil).Code
+	}
+	// reserveAndPut is an honest edit: reserve the list's digest, then publish it.
+	reserveAndPut := func(body map[string]any) int {
+		if c := reserve(tok, body["expected_epoch"].(int64), body["device_ids"].([]string)); c != http.StatusOK {
+			return c
+		}
+		return putL(tok, body)
+	}
 	unsorted := list(1, []string{"DEVICE_A_00001"}, id)
 	unsorted["device_ids"] = []string{"DEVICE_B_00002", "DEVICE_A_00001"}
 	for name, c := range map[string]struct {
@@ -745,13 +771,34 @@ func TestE2EEDeviceListIsSignedAndVersioned(t *testing.T) {
 			t.Errorf("%s = %d, want %d", name, got, c.want)
 		}
 	}
-	if c := putL(tok, list(1, []string{"DEVICE_A_00001", "DEVICE_B_00002"}, id)); c != http.StatusOK {
+	both := []string{"DEVICE_A_00001", "DEVICE_B_00002"}
+	if c := putL(tok, list(1, both, id)); c != http.StatusConflict {
+		t.Fatalf("a list published without a reservation = %d", c)
+	}
+	if c := doBearerJSON(t, srv, http.MethodPost, "/api/v1/keys/devices/list/reserve", tok, map[string]any{"version": 1, "expected_epoch": 0, "digest": "ABC"}, nil).Code; c != http.StatusBadRequest {
+		t.Fatalf("a malformed digest = %d", c)
+	}
+	// Two devices proposing at once: the second is refused before it signs, and a list it
+	// signed anyway is not publishable.
+	if c := reserve(tok, 0, both); c != http.StatusOK {
+		t.Fatalf("reserve = %d", c)
+	}
+	if c := reserve(tok, 0, []string{"DEVICE_C_00003"}); c != http.StatusConflict {
+		t.Fatalf("a competing reservation = %d", c)
+	}
+	if c := putL(tok, list(1, []string{"DEVICE_C_00003"}, id)); c != http.StatusConflict {
+		t.Fatalf("the losing proposal published = %d", c)
+	}
+	if c := reserve(tok, 0, both); c != http.StatusOK {
+		t.Fatalf("an honest retry = %d", c)
+	}
+	if c := putL(tok, list(1, both, id)); c != http.StatusOK {
 		t.Fatalf("list = %d", c)
 	}
-	if c := putL(tok, list(1, []string{"DEVICE_A_00001"}, id)); c != http.StatusConflict {
+	if c := reserveAndPut(list(1, []string{"DEVICE_A_00001"}, id)); c != http.StatusConflict {
 		t.Fatalf("a stale epoch = %d", c)
 	}
-	if c := putL(tok, list(2, []string{"DEVICE_A_00001"}, id)); c != http.StatusOK {
+	if c := reserveAndPut(list(2, []string{"DEVICE_A_00001"}, id)); c != http.StatusOK {
 		t.Fatalf("removing a device = %d", c)
 	}
 	rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/keys/query", bobTok, map[string]any{"user_ids": []string{alice.ID}}, nil)
@@ -789,6 +836,21 @@ func TestE2EEIdentityWritesNeedTheMasterKeyAndCleanJSON(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("duplicate member name = %d %s", rec.Code, rec.Body.String())
 	}
+	// Member names match exactly: encoding/json (v1) would read "Expected_Version" as
+	// expected_version, a parser matching exactly would not, so the body is refused.
+	for name, body := range map[string][]byte{
+		"a member name in another case": bytes.Replace(raw, []byte(`"expected_version"`), []byte(`"Expected_Version"`), 1),
+		"trailing data":                 append(append([]byte(nil), raw...), []byte(` {}`)...),
+	} {
+		req, _ := http.NewRequest(http.MethodPut, "/api/v1/keys/master", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s = %d %s", name, rec.Code, rec.Body.String())
+		}
+	}
 	if c := doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/master", tok, id.put(t, 0), nil).Code; c != http.StatusOK {
 		t.Fatal(c)
 	}
@@ -809,8 +871,13 @@ func TestE2EEIdentityWritesNeedTheMasterKeyAndCleanJSON(t *testing.T) {
 	for name, b := range map[string]map[string]any{
 		"unsigned":              unsigned,
 		"signed by another key": newIdentity(t, orgA, alice.ID).backupWrite(t, 1, entry(3)),
-		"entries swapped":       swapped,
-		"index past uint32":     id.backupWrite(t, 1, entry(math.MaxUint32+1)),
+		"signed for another generation": func() map[string]any {
+			b := id.backupWriteGen(t, 1, 1, entry(3))
+			b["generation"] = 0
+			return b
+		}(),
+		"entries swapped":   swapped,
+		"index past uint32": id.backupWrite(t, 1, entry(math.MaxUint32+1)),
 	} {
 		if rec := put(b); rec.Code != http.StatusBadRequest {
 			t.Errorf("%s = %d %s", name, rec.Code, rec.Body.String())

@@ -70,7 +70,10 @@ describe('pqc.wasm', () => {
     const qr = pqc.qrNew('QkJCQkJCQkJCQkJCQkJCQg', m.fingerprint);
     const parsed = pqc.qrParse(qr.text);
     expect(parsed).toEqual({ pairing_id: 'QkJCQkJCQkJCQkJCQkJCQg', secret: qr.secret, fingerprint: m.fingerprint });
-    expect(pqc.comparisonCode(qr.secret, parsed.pairing_id, eph.public)).toMatch(/^\d{6}$/);
+    const code = pqc.comparisonCode(qr.secret, parsed.pairing_id, 'NEW_DEVICE', eph.public);
+    expect(code).toMatch(/^\d{6}$/);
+    // Another of the user's devices joining with the same key shows another code.
+    expect(pqc.comparisonCode(qr.secret, parsed.pairing_id, 'OTHER_DEVICE', eph.public)).not.toBe(code);
     const t = pqc.transferSeal(eph.public, qr.secret, parsed.pairing_id, 'OLD_DEVICE', 'NEW_DEVICE', m.seed, x.seed);
     expect(pqc.transferOpen(eph.seed, parsed.secret, parsed.pairing_id, 'OLD_DEVICE', 'NEW_DEVICE', t)).toEqual({ master_seed: m.seed, backup_seed: x.seed });
     expect(() => pqc.transferOpen(eph.seed, rk.key, parsed.pairing_id, 'OLD_DEVICE', 'NEW_DEVICE', t)).toThrow();

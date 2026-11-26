@@ -1,7 +1,8 @@
 import 'fake-indexeddb/auto';
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { abandonDevice, forgetCryptoStore, keyGeneration, NOT_YET, onRoomKeys, openMessage, replaceDevice, RETIRE_MS, retireDevice, retryable, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
+import { abandonDevice, encryptionPending, forgetCryptoStore, keyGeneration, NOT_YET, onRoomKeys, openMessage, receiveRoomKeys, replaceDevice, RETIRE_MS, retireDevice, retryable, retryEncryptionNow, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
+import { EARLY } from '../crypto/engine';
 import { openCryptoStore } from '../crypto/store';
 import { parseMessage } from './types';
 
@@ -21,6 +22,10 @@ vi.mock('../pqc/index', async (importOriginal) => {
   const real = await importOriginal<typeof import('../pqc/index')>();
   return { ...real, loadPQC: () => real.loadPQCFrom(readFileSync('src/pqc/pqc.wasm')) };
 });
+
+// Pending retirements, one localStorage key per device.
+const pendingRetirements = () => Object.keys(localStorage).filter((k) => k.startsWith('kymessages-e2ee-retire:'))
+  .map((k) => JSON.parse(localStorage.getItem(k) ?? 'null') as { user_id: string; device_id: string; deleted: boolean; delisted: boolean });
 
 const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { 'Content-Type': 'application/json' } });
 const ownRoom = { room: { id: 'r1', kind: 'channel' }, member: { room_id: 'r1', user_id: 'u_alice' }, members: [{ room_id: 'r1', user_id: 'u_alice' }] };
@@ -131,7 +136,7 @@ describe('the signed-in device', () => {
     const fresh = await startE2EE('u_alice');
     await vi.waitFor(() => expect(deleted).toEqual([old.deviceId]));
     expect(fresh.deviceId).not.toBe(old.deviceId);
-    expect(localStorage.getItem('kymessages-e2ee-retire')).toBeNull();
+    await vi.waitFor(() => expect(pendingRetirements()).toEqual([]));
   });
 
   it("retires another user's device whose store a sign-out wiped, at that user's next sign-in", async () => {
@@ -237,7 +242,7 @@ describe('the signed-in device', () => {
     // The session is revoked while the upload is still pending.
     await abandonDevice();
     expect(await stores()).toEqual([]);
-    expect(JSON.parse(localStorage.getItem('kymessages-e2ee-retire') ?? '[]')).toHaveLength(1);
+    expect(pendingRetirements()).toHaveLength(1);
     releaseUpload();
     await starting;
     // The cancelled start-up never brings the store back.
@@ -508,12 +513,105 @@ describe('retirement from the signed device list', () => {
     const e = await startE2EE('u_alice');
     expect(await retireDevice().wait).toBe(true);
     expect(deleted).toEqual([e.deviceId]);
-    const pending = JSON.parse(localStorage.getItem('kymessages-e2ee-retire') ?? '[]') as { device_id: string; deleted?: boolean; delisted?: boolean }[];
-    expect(pending).toEqual([expect.objectContaining({ device_id: e.deviceId, delisted: false })]);
+    expect(pendingRetirements()).toEqual([expect.objectContaining({ device_id: e.deviceId, deleted: true, delisted: false })]);
     await forgetCryptoStore();
     // Next sign-in, the identity no longer lists devices: nothing is left to sign away.
     listed = false;
     await startE2EE('u_alice');
-    await vi.waitFor(() => expect(localStorage.getItem('kymessages-e2ee-retire')).toBeNull());
+    await vi.waitFor(() => expect(pendingRetirements()).toEqual([]));
+  });
+
+  // Earlier builds kept one list; another tab records its own device while this one retires.
+  it('keeps each pending device apart, so a tab retiring some never drops another tab\'s', async () => {
+    localStorage.setItem('kymessages-e2ee-retire', JSON.stringify([{ user_id: 'u_alice', device_id: 'OLDDEVICE001' }]));
+    const deleted: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/v1/keys/upload') return json({ one_time_key_count: 50 });
+      if (url.startsWith('/api/v1/keys/devices/') && init?.method === 'DELETE') {
+        deleted.push(decodeURIComponent(url.slice('/api/v1/keys/devices/'.length)));
+        // Meanwhile another tab signs a different device out, which it records as pending.
+        localStorage.setItem('kymessages-e2ee-retire:u_alice:OTHERTAB0001', JSON.stringify({ user_id: 'u_alice', device_id: 'OTHERTAB0001', deleted: false, delisted: false }));
+        return new Response(null, { status: 204 });
+      }
+      if (url === '/api/v1/keys/master') return json({ tenant_id: 'default', master: null });
+      return json({ messages: [] });
+    }));
+    await startE2EE('u_alice');
+    await vi.waitFor(() => expect(deleted).toEqual(['OLDDEVICE001']));
+    await vi.waitFor(() => expect(pendingRetirements().map((d) => d.device_id)).toEqual(['OTHERTAB0001']));
+    expect(localStorage.getItem('kymessages-e2ee-retire')).toBeNull();
+  });
+
+  it('settles a sign-out whose removal from the list lands after sign-out moved on', async () => {
+    let releaseMaster: () => void = () => {};
+    const masterRead = new Promise<void>((r) => { releaseMaster = r; });
+    let hold = false;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/v1/keys/upload') return json({ one_time_key_count: 50 });
+      if (url.startsWith('/api/v1/keys/devices/') && init?.method === 'DELETE') return new Response(null, { status: 204 });
+      if (url === '/api/v1/keys/master') {
+        if (hold) await masterRead;
+        return json({ tenant_id: 'default', master: null });
+      }
+      return json({ messages: [] });
+    }));
+    const e = await startE2EE('u_alice');
+    hold = true; // the delist's identity read stalls past its bound
+    vi.useFakeTimers({ toFake: ['setTimeout'] });
+    let retiring: ReturnType<typeof retireDevice>;
+    try {
+      retiring = retireDevice();
+      await vi.advanceTimersByTimeAsync(RETIRE_MS);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(await retiring.wait).toBe(true);
+    expect(pendingRetirements()).toEqual([expect.objectContaining({ device_id: e.deviceId, deleted: true, delisted: false })]);
+    releaseMaster(); // the late removal confirms, and the entry goes
+    await vi.waitFor(() => expect(pendingRetirements()).toEqual([]));
+  });
+
+  it('replaces a device a refused sign-out took off the list though its deletion failed', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/v1/keys/upload') return json({ one_time_key_count: 50 });
+      if (url.startsWith('/api/v1/keys/devices/') && init?.method === 'DELETE') return json({ error: 'try later' }, 503);
+      if (url === '/api/v1/keys/master') return json({ tenant_id: 'default', master: null });
+      return json({ messages: [] });
+    }));
+    const old = await startE2EE('u_alice');
+    const retiring = retireDevice();
+    expect(await retiring.wait).toBe(false);
+    // The logout is refused (or cancelled): the retiring device no longer lists itself, so it is
+    // replaced by one that does, and the old one stays pending.
+    await retiring.replaceIfRetired();
+    expect((await startE2EE('u_alice')).deviceId).not.toBe(old.deviceId);
+    expect(pendingRetirements()).toEqual(expect.arrayContaining([expect.objectContaining({ device_id: old.deviceId })]));
+  });
+});
+
+describe('retrying encryption work', () => {
+  it('says work is waiting after a failed mailbox read, and clears once a retry ran', async () => {
+    let down = false;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/api/v1/keys/upload') return json({ one_time_key_count: 50 });
+      if (url === '/api/v1/keys/master') return json({ tenant_id: 'default', master: null });
+      if (url.startsWith('/api/v1/to-device')) return down ? json({ error: 'try later' }, 503) : json({ messages: [] });
+      return json({ error: `unexpected ${url}` }, 404);
+    }));
+    await startE2EE('u_alice');
+    down = true;
+    receiveRoomKeys();
+    await vi.waitFor(() => expect(encryptionPending()).toBe(true));
+    down = false;
+    await retryEncryptionNow();
+    expect(encryptionPending()).toBe(false);
+  });
+
+  it('opens a message from before this device’s session again when keys arrive', () => {
+    expect(retryable(EARLY)).toBe(true);
   });
 });

@@ -29,7 +29,20 @@ export class FakeKeyServer {
   readonly masters = new Map<string, OwnMaster>();
   readonly backups = new Map<string, Map<string, BackupEntry>>();
   readonly pairings = new Map<string, Pairing>();
+  /** Each user's device list reservation: the digest, its epoch and when it lapses. */
+  readonly reservations = new Map<string, { digest: string; epoch: number; until: number }>();
+  reservationMs = 30_000;
+  /** The backup's session cap, as the server's E2EEBackupMaxSessions. */
+  backupCap = 2000;
   private nextMail = 1;
+
+  /** A backup deletion from another of the user's devices: empties it and bumps its generation. */
+  deleteBackup(userId: string): void {
+    const m = this.masters.get(userId);
+    if (!m) return;
+    this.backups.delete(userId);
+    m.backup_generation++;
+  }
 
   join(roomId: string, ...userIds: string[]): void {
     const set = this.rooms.get(roomId) ?? new Set();
@@ -104,8 +117,9 @@ export class FakeKeyServer {
           !pqc.verifyBackupKey(req.master_key, TENANT, userId, version, req.backup_key.public_key, req.backup_key.signature)) {
           throw new Error('The encryption identity is not validly signed');
         }
-        this.masters.set(userId, { version, master_key: req.master_key, self_signature: req.self_signature, backup_key: req.backup_key, recovery: req.recovery, pins: { counter: 0, sealed: '' } });
+        this.masters.set(userId, { version, master_key: req.master_key, self_signature: req.self_signature, backup_key: req.backup_key, backup_generation: 0, recovery: req.recovery, pins: { counter: 0, sealed: '' } });
         this.backups.delete(userId);
+        this.reservations.delete(userId);
         for (const d of this.devices.get(userId)?.values() ?? []) delete d.master_signature;
         return version;
       },
@@ -115,10 +129,20 @@ export class FakeKeyServer {
         if (!pqc.verifyPinsWrite(m.master_key, TENANT, userId, version, expected + 1, sealed, signature)) throw new Error('The pin set is not signed by the current master key');
         m.pins = { counter: expected + 1, sealed };
       },
-      putDeviceList: async (version, expected, deviceIds, signature) => {
+      reserveDeviceList: async (version, expected, digest) => {
         const m = this.masters.get(userId);
         if (!m || m.version !== version || (m.device_list?.epoch ?? 0) !== expected) throw new Conflict('409');
-        if (!pqc.verifyDeviceList(m.master_key, TENANT, userId, version, expected + 1, deviceIds, signature)) throw new Error('The device list is not validly signed');
+        const r = this.reservations.get(userId);
+        if (r && r.epoch === expected && r.digest !== digest && r.until > Date.now()) throw new Conflict('409');
+        this.reservations.set(userId, { digest, epoch: expected, until: Date.now() + this.reservationMs });
+      },
+      putDeviceList: async (version, expected, deviceIds, signature) => {
+        const m = this.masters.get(userId);
+        if (!pqc.verifyDeviceList(m?.master_key ?? '', TENANT, userId, version, expected + 1, deviceIds, signature)) throw new Error('The device list is not validly signed');
+        const r = this.reservations.get(userId);
+        if (!m || m.version !== version || (m.device_list?.epoch ?? 0) !== expected ||
+          !r || r.epoch !== expected || r.until <= Date.now() || r.digest !== pqc.hash('kymessages.device-list', ...deviceIds)) throw new Conflict('409');
+        this.reservations.delete(userId);
         m.device_list = { epoch: expected + 1, device_ids: [...deviceIds], signature };
       },
       signDevice: async (deviceId, version, signature) => {
@@ -138,18 +162,21 @@ export class FakeKeyServer {
           .filter((e) => cmp(k(e), k(after)) > 0);
         return { sessions: rows.slice(0, 2).map((e) => ({ ...e })), more: rows.length > 2 };
       },
-      putBackup: async (version, sessions, signature) => {
+      putBackup: async (version, generation, sessions, signature) => {
         const m = this.masters.get(userId);
         if (m?.version !== version) throw new Conflict('409');
-        if (!pqc.verifyBackupWrite(m.master_key, TENANT, userId, version, sessions, signature)) throw new Error('The backup write is not signed by the current master key');
+        if (!pqc.verifyBackupWrite(m.master_key, TENANT, userId, version, generation, sessions, signature)) throw new Error('The backup write is not signed by the current master key');
+        if (m.backup_generation !== generation) throw new Conflict('409');
         const box = this.backups.get(userId) ?? new Map<string, BackupEntry>();
-        for (const e of sessions) {
+        const refused: number[] = [];
+        sessions.forEach((e, i) => {
           const k = `${e.room_id}\n${e.sender_key}\n${e.session_id}`;
           const known = box.get(k);
-          if (!known || e.first_index < known.first_index) box.set(k, { ...e });
-        }
+          if (!known && box.size >= this.backupCap) refused.push(i);
+          else if (!known || e.first_index < known.first_index) box.set(k, { ...e });
+        });
         this.backups.set(userId, box);
-        return { full: false };
+        return { refused };
       },
       pairingStart: async (deviceId) => {
         const d = this.devices.get(userId)?.get(deviceId);

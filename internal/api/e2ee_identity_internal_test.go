@@ -30,7 +30,7 @@ func TestE2EEIdentityBodiesCarryNoSecrets(t *testing.T) {
 			}
 		}
 	}
-	for _, v := range []any{e2eeMasterPut{}, e2eePinsPut{}, e2eeDeviceSignature{}, e2eeBackupPut{}, e2eePairingStart{}, e2eePairingJoin{}, e2eePairingSeal{}, e2eeDeviceListPut{}} {
+	for _, v := range []any{e2eeMasterPut{}, e2eePinsPut{}, e2eeDeviceSignature{}, e2eeBackupPut{}, e2eePairingStart{}, e2eePairingJoin{}, e2eePairingSeal{}, e2eeDeviceListPut{}, e2eeDeviceListReserve{}} {
 		walk(reflect.TypeOf(v), reflect.TypeOf(v).Name())
 	}
 }
