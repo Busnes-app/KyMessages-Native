@@ -6,8 +6,6 @@ interface CaptchaProps {
   onToken: (token: string) => void;
   /** Change it after each sign-in attempt: the server spends the token before checking the password. */
   round: number;
-  /** Told when a challenge is being solved (working) and when that ended (done or failed). */
-  onStatus?: (status: 'working' | 'done' | 'failed') => void;
 }
 
 function parseChallenge(v: unknown) {
@@ -23,11 +21,10 @@ function parseChallenge(v: unknown) {
 const refreshDelay = (expiresAt: number) => Math.max(60_000, expiresAt * 1000 - Date.now() - 10_000);
 
 /** Fetches and solves one challenge per mount, per `round`, and on expiry; never per render. */
-export const CaptchaWidget: React.FC<CaptchaProps> = ({ onToken, round, onStatus }) => {
+export const CaptchaWidget: React.FC<CaptchaProps> = ({ onToken, round }) => {
   const [status, setStatus] = useState<'working' | 'done' | 'failed'>('working');
-  const onStatusRef = useRef(onStatus);
-  useEffect(() => { onStatusRef.current = onStatus; });
-  useEffect(() => { onStatusRef.current?.(status); }, [status]);
+  // Bumped by "Try again" after a failed challenge.
+  const [attempt, setAttempt] = useState(0);
   const [progress, setProgress] = useState<number>(0);
   const [errorMsg, setErrorMsg] = useState<string>('');
   const [expired, setExpired] = useState<number>(0);
@@ -37,6 +34,8 @@ export const CaptchaWidget: React.FC<CaptchaProps> = ({ onToken, round, onStatus
   useEffect(() => {
     let cancelled = false;
     let expiry: ReturnType<typeof setTimeout> | undefined;
+    // A new round or attempt starts with no token: the last one is spent or never came.
+    onTokenRef.current('');
     setStatus('working');
     setProgress(0);
 
@@ -102,7 +101,7 @@ export const CaptchaWidget: React.FC<CaptchaProps> = ({ onToken, round, onStatus
       cancelled = true;
       clearTimeout(expiry);
     };
-  }, [round, expired]);
+  }, [round, expired, attempt]);
 
   return (
     <div
@@ -130,6 +129,7 @@ export const CaptchaWidget: React.FC<CaptchaProps> = ({ onToken, round, onStatus
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', color: 'var(--danger)' }}>
           <AlertCircle size={16} />
           <span>{errorMsg}</span>
+          <button type="button" className="btn-secondary" onClick={() => setAttempt((n) => n + 1)}>Try again</button>
         </div>
       )}
     </div>

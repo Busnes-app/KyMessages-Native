@@ -417,7 +417,7 @@ func (s *Server) handleE2EEPutDeviceList(w http.ResponseWriter, r *http.Request)
 	}
 	list, _ := json.Marshal(req.DeviceIDs)
 	digest := e2eeid.DeviceListDigest(req.DeviceIDs)
-	switch err := s.store.E2EE().PutDeviceList(r.Context(), tenantID, user.ID, req.Version, req.ExpectedEpoch, req.Epoch, string(list), digest, req.Signature, time.Now(), proofOf(e2eeid.DomainDeviceList, msg, req.Signature)); {
+	switch err := s.store.E2EE().PutDeviceList(r.Context(), tenantID, user.ID, req.Version, req.ExpectedEpoch, req.Epoch, string(list), digest, req.Signature, time.Now, proofOf(e2eeid.DomainDeviceList, msg, req.Signature)); {
 	case errors.Is(err, errProof):
 		s.writeError(w, http.StatusBadRequest, "The device list is not validly signed")
 	case errors.Is(err, store.ErrE2EEVersion):

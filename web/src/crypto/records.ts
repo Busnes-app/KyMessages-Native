@@ -32,6 +32,25 @@ export const backupRefusedKey = (inbound: string) => `bqf:${inbound}`;
 /** A failure worth retrying later (the network, the server), as opposed to bad data. */
 export class Transient extends Error {}
 
+/** Local storage (IndexedDB) failed or aborted the request: availability, not bad data. */
+export class StorageUnavailable extends Transient {}
+
+/** Waits ms, or until signal aborts (then rejects with its reason); leaves no listener behind. */
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+    const stop = () => {
+      clearTimeout(timer);
+      reject(signal!.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', stop);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', stop, { once: true });
+  });
+}
+
 /**
  * Whether e is about availability (the network or server, the post-quantum module, local
  * storage) rather than a verdict on data: such failures keep their work for a retry. An abort

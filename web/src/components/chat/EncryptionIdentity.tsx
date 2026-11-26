@@ -14,6 +14,7 @@ const POLL_MS = 1500;
 /** Consecutive failed polls (the network, the server) a screen rides out before giving up. */
 const POLL_RETRIES = 5;
 import { formatFingerprint, type IdentityChange, type IdentityStatus, type PairingJoin, type PairingOffer } from '../../crypto/identity';
+import { sleep } from '../../crypto/records';
 import { ChatDialog } from './ChatModals';
 
 const errText = (e: unknown, fallback: string) => (e instanceof Error && e.message ? e.message : fallback);
@@ -281,10 +282,8 @@ export function VerifyAnotherDevice({ onClose }: { onClose: () => void }) {
       } catch {
         if (watch.aborted || ++failures > POLL_RETRIES) break;
       }
-      await new Promise<void>((r) => {
-        const timer = setTimeout(r, POLL_MS);
-        watch.addEventListener('abort', () => { clearTimeout(timer); r(); }, { once: true });
-      });
+      // One listener per wait, removed when it ends: none pile up on watch.
+      await sleep(POLL_MS, watch).catch(() => undefined);
     }
     if (!signal.aborted) setErr('The keys were sent, but the new device has not confirmed. Check it, or start again.');
   };
@@ -348,7 +347,8 @@ export function EncryptionIdentityGate({ gate, refresh }: { gate: GateState; ref
   const [open, setOpen] = useState(false);
   const [reset, setReset] = useState(false);
   const retry = useEncryptionRetry();
-  if (gate.state === 'loading') return null;
+  // Encryption could not start yet (the module or the server unavailable): say so, with a retry.
+  if (gate.state === 'loading') return retry.pending ? <PendingBanner exhausted={retry.exhausted} /> : null;
   if (gate.state === 'verified') {
     const done = () => { setOpen(false); refresh(); };
     return (

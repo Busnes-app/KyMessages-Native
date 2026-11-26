@@ -134,9 +134,10 @@ type E2EEStore interface {
 	// Until is the holder's lapse (zero when the list moved on).
 	ReserveDeviceList(ctx context.Context, tenantID, userID string, version, expected int64, digest string, now time.Time, ttl time.Duration) (E2EEReservation, error)
 	// PutDeviceList stores the master-signed device list at epoch under version, once proof
-	// accepts it against that version's master key and a live reservation names its digest and
-	// epoch while the list is at expected (all in one transaction); ErrE2EEVersion otherwise.
-	PutDeviceList(ctx context.Context, tenantID, userID string, version, expected, epoch int64, list, digest, signature string, now time.Time, proof Proof) error
+	// accepts it against that version's master key and a reservation names its digest and epoch,
+	// live at now() read after the master row is locked, while the list is at expected (all in
+	// one transaction); ErrE2EEVersion otherwise.
+	PutDeviceList(ctx context.Context, tenantID, userID string, version, expected, epoch int64, list, digest, signature string, now func() time.Time, proof Proof) error
 	// PutBackupSessions adds sealed sessions to backup version and generation once proof
 	// accepts the batch against that version's master key: a session already stored is replaced
 	// only by a copy with a lower first index; either is stored only within maxSessions and

@@ -26,6 +26,11 @@ describe('loading the post-quantum module', () => {
     await expect(loadPQCFrom(wasm, silent, 300)).rejects.toBeInstanceOf(PQCUnavailable);
     expect(pqcRunning()).toBe(false);
 
+    // A module that could not be fetched or compiled is unavailability too.
+    await expect(loadPQCFrom(Promise.reject(new TypeError('Failed to fetch')))).rejects.toBeInstanceOf(PQCUnavailable);
+    await expect(loadPQCFrom(new Uint8Array([0, 1, 2, 3]))).rejects.toBeInstanceOf(PQCUnavailable);
+    expect(pqcRunning()).toBe(false);
+
     // The bound covers fetching and compiling too, not only the Go start.
     await expect(loadPQCFrom(new Promise<BufferSource>(() => undefined), undefined, 300)).rejects.toThrow('did not start');
     expect(pqcRunning()).toBe(false);

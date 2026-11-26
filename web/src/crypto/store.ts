@@ -4,6 +4,8 @@
 // only wrapped by a non-extractable AES-GCM key that never leaves this database. Signing out
 // deletes the database.
 
+import { StorageUnavailable } from './records';
+
 const DB_PREFIX = 'kymessages-crypto-';
 const KV = 'kv';
 
@@ -31,9 +33,10 @@ export interface CryptoStore {
 // How long a delete waits for other tabs to let go before reporting failure.
 const DELETE_TIMEOUT_MS = 5_000;
 
-// Storage failures always reject with a DOMException (an aborted transaction may carry no error
-// of its own), so callers can tell them from unreadable data and keep the work for a retry.
-const storageError = (e: DOMException | null, what: string) => e ?? new DOMException(what, 'AbortError');
+// Storage failures always reject as StorageUnavailable, an aborted request or transaction
+// included (it may carry no error of its own, or an AbortError), so callers tell them from
+// unreadable data and keep the work for a retry.
+const storageError = (e: DOMException | null, what: string) => new StorageUnavailable(e ? `${what}: ${e.name} ${e.message}` : what, { cause: e });
 
 function req<T>(r: IDBRequest<T>): Promise<T> {
   return new Promise((resolve, reject) => {

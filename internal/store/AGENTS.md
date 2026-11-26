@@ -112,8 +112,8 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   caller's `Proof` with its key before writing, all in one transaction. `ReserveDeviceList` holds
   the next epoch for one digest until it lapses and returns it (`E2EEReservation`; the same
   digest keeps its epoch, another gets one above every epoch granted, and a refusal names the
-  holder's lapse); `PutDeviceList` publishes at exactly that epoch under a live reservation of
-  its digest, ending it. `DeletePairingUnsealed` deletes only a pairing with nothing sealed. A backup
+  holder's lapse); `PutDeviceList` publishes at exactly that epoch under a reservation of its
+  digest live by its `now()`, read after the master row is locked, ending it. `DeletePairingUnsealed` deletes only a pairing with nothing sealed. A backup
   write must name the current `backup_generation`, which `DeleteBackup` bumps; every insert and
   replacement must fit the caps, and the others are returned as `Refused` indexes. A
   PostgreSQL schema test asserts the backup key columns collate `C`.

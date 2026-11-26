@@ -11,6 +11,21 @@ export type Block = (method: string, path: string) => Response | undefined | Pro
 
 export function httpFake(server: FakeKeyServer, userId: string, block: { fn?: Block } = {}) {
   const api = server.as(userId);
+  const serve = route(server, api, userId, block);
+  // As fetch: an abort rejects the request at once, whatever the server is doing.
+  return (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const signal = init?.signal;
+    if (!signal) return serve(input, init);
+    if (signal.aborted) return Promise.reject(signal.reason);
+    return new Promise((resolve, reject) => {
+      const stop = () => reject(signal.reason);
+      signal.addEventListener('abort', stop, { once: true });
+      serve(input, init).then(resolve, reject).finally(() => signal.removeEventListener('abort', stop));
+    });
+  };
+}
+
+function route(server: FakeKeyServer, api: ReturnType<FakeKeyServer['as']>, userId: string, block: { fn?: Block }) {
   return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = new URL(String(input), 'http://x');
     const path = url.pathname;
@@ -66,7 +81,8 @@ export function httpFake(server: FakeKeyServer, userId: string, block: { fn?: Bl
         return new Response(null, { status: 204 });
       }
       if (m && method === 'DELETE' && !m[2]) {
-        server.devices.get(userId)?.delete(decodeURIComponent(m[1]));
+        // As the server: a device already gone is a 404.
+        if (!server.devices.get(userId)?.delete(decodeURIComponent(m[1]))) return json({ error: 'Unknown device' }, 404);
         return new Response(null, { status: 204 });
       }
       const room = /^\/api\/v1\/rooms\/([^/]+)$/.exec(path);

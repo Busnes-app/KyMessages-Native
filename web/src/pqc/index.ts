@@ -65,10 +65,13 @@ async function start(source: Source, runtime: () => GoRuntime, startMs: number):
     };
   });
   try {
-    const { instance } = await Promise.race([source.call(go), timeout]);
+    // A module that could not be fetched or compiled is unavailable, retried like any other.
+    const { instance } = await Promise.race([source.call(go).catch((e: unknown) => {
+      throw new PQCUnavailable(`The post-quantum module did not load: ${e instanceof Error ? e.message : 'unknown error'}`);
+    }), timeout]);
     const exited = go.run(instance).then(
-      () => { throw new Error('The post-quantum module exited'); },
-      (e: unknown) => { throw e instanceof Error ? e : new Error('The post-quantum module crashed'); },
+      () => { throw new PQCUnavailable('The post-quantum module exited'); },
+      (e: unknown) => { throw new PQCUnavailable(`The post-quantum module crashed: ${e instanceof Error ? e.message : 'unknown error'}`); },
     );
     void exited.catch(() => {
       if (gen !== generation) return;
@@ -103,11 +106,11 @@ export function loadPQC(): Promise<void> {
   });
 }
 
-// Tests run in Node, where the module is read from disk; a pending bytes, runtime and startMs let
-// them fake a stalled fetch or a failing Go.
-export function loadPQCFrom(bytes: BufferSource | Promise<BufferSource>, runtime?: () => GoRuntime, startMs?: number): Promise<void> {
+// Tests run in Node, where the module is read from disk; bytes read on each start (a function),
+// a pending bytes, runtime and startMs let them fake a failing or stalled fetch or a failing Go.
+export function loadPQCFrom(bytes: BufferSource | Promise<BufferSource> | (() => Promise<BufferSource>), runtime?: () => GoRuntime, startMs?: number): Promise<void> {
   return load(async function (this: GoRuntime) {
-    return WebAssembly.instantiate(await bytes, this.importObject);
+    return WebAssembly.instantiate(await (typeof bytes === 'function' ? bytes() : bytes), this.importObject);
   }, runtime, startMs);
 }
 

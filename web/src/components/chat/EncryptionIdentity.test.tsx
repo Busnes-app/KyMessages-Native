@@ -234,4 +234,11 @@ describe('identity screens', () => {
     expect(lookup).toHaveBeenCalledTimes(1);
     expect(screen.queryByText(/has not confirmed/)).toBeNull();
   });
+
+  it('says encryption is waiting, with a retry, while the device could not start', async () => {
+    fake.setFakePending(true);
+    render(<EncryptionIdentityGate gate={{ state: 'loading' }} refresh={() => undefined} />);
+    expect(await screen.findByTestId('encryption-pending')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Retry now' })).toBeTruthy();
+  });
 });

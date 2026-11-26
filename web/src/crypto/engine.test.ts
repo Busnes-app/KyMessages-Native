@@ -2,6 +2,7 @@ import 'fake-indexeddb/auto';
 import { readFileSync } from 'node:fs';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { CryptoEngine, DeviceChanged, deviceSigned, oneTimeKeySigned, parseEnvelope, ROTATE_AFTER_MESSAGES, ROTATE_AFTER_MS, type SealedMessage } from './engine';
+import { StorageUnavailable } from './records';
 import { FakeKeyServer } from './fakeKeyServer';
 import { Account, GroupSession, loadCryptoSync } from './index';
 import { loadPQCFrom } from '../pqc/index';
@@ -588,7 +589,8 @@ describe('encrypted rooms between two client engines', () => {
     opened.push(bob);
     server.join('r1', 'u_alice', 'u_bob');
     const m1 = await send('r1', alice, 'kept for later'); // a pre-key message: spends a one-time key
-    expect(await bob.receive()).toEqual([]);
+    // The drain fails (so its retry comes), with the mail left queued.
+    await expect(bob.receive()).rejects.toThrow('quota exceeded');
     expect(server.mail.get(`u_bob\n${bob.deviceId}`)).toHaveLength(1);
     expect(await read(bob, m1)).toBe('waiting');
     expect(await bob.receive()).toHaveLength(1);
@@ -614,9 +616,43 @@ describe('encrypted rooms between two client engines', () => {
     opened.push(bob);
     server.join('r1', 'u_alice', 'u_bob');
     const m1 = await send('r1', alice, 'read on retry'); // a pre-key message: spends a one-time key
-    expect(await bob.receive()).toEqual([]);
+    await expect(bob.receive()).rejects.toThrow('store closed');
     expect(server.mail.get(`u_bob\n${bob.deviceId}`)).toHaveLength(1);
     expect(await bob.receive()).toHaveLength(1);
     expect(await read(bob, m1)).toBe('read on retry');
+  });
+});
+
+describe('Round 5: a mailbox drain fails at the first item it could not store', () => {
+  it('acknowledges only the stored prefix, announces its key, keeps the rest and still fails', async () => {
+    const server = new FakeKeyServer();
+    const alice = await device(server, 'u_alice');
+    const store = await openCryptoStore('u_bob');
+    const write = store.write.bind(store);
+    let roomKeys = 0;
+    store.write = async (puts, deletes) => {
+      // The second room key's write fails as local storage does.
+      if (puts.some(([k]) => k.startsWith('in:')) && ++roomKeys === 2) throw new StorageUnavailable('IndexedDB transaction aborted');
+      return write(puts, deletes);
+    };
+    const bob = await CryptoEngine.open('u_bob', server.as('u_bob'), store);
+    await verify(server, bob);
+    opened.push(bob);
+    const announced: string[][] = [];
+    bob.onKeys((ids) => announced.push(ids));
+    for (const r of ['r1', 'r2', 'r3']) {
+      server.join(r, 'u_alice', 'u_bob');
+      await send(r, alice, `in ${r}`);
+    }
+    const box = () => server.mail.get(`u_bob\n${bob.deviceId}`) ?? [];
+    const queued = box().map((m) => m.id);
+    expect(queued).toHaveLength(3);
+    await expect(bob.receive()).rejects.toBeInstanceOf(StorageUnavailable);
+    expect(box().map((m) => m.id)).toEqual(queued.slice(1));
+    expect(announced).toHaveLength(1);
+    expect(announced[0]).toHaveLength(1);
+    // The retry stores the rest.
+    expect(await bob.receive()).toHaveLength(2);
+    expect(box()).toEqual([]);
   });
 });

@@ -90,7 +90,7 @@ export interface Mail {
 export interface KeyServer extends IdentityServer {
   /** POST /api/v1/keys/upload; answers the stored one-time key count and whether a fallback key is live. */
   upload(req: UploadRequest): Promise<{ count: number; fallback: boolean }>;
-  query(userIds: string[]): Promise<QueryResult>;
+  query(userIds: string[], signal?: AbortSignal): Promise<QueryResult>;
   claim(devices: { user_id: string; device_id: string }[]): Promise<ClaimedKey[]>;
   sendToDevice(deviceId: string, messages: ToDeviceMessage[]): Promise<void>;
   mailbox(deviceId: string): Promise<Mail[]>;
@@ -213,13 +213,25 @@ function parseInner(s: string): RoomInner | undefined {
 
 // Serializes crypto work per user: Web Locks across tabs, a promise chain where there are none.
 const chains = new Map<string, Promise<unknown>>();
-function withLock<T>(name: string, fn: () => Promise<T>): Promise<T> {
+// signal gives up waiting for the lock (and, passed on by fn, its work): an aborted wait never
+// runs fn, so the lock is never taken for a caller that left.
+function withLock<T>(name: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
   if (typeof navigator !== 'undefined' && navigator.locks?.request) {
-    return navigator.locks.request(name, fn) as Promise<T>;
+    return (signal ? navigator.locks.request(name, { signal }, fn) : navigator.locks.request(name, fn)) as Promise<T>;
   }
-  const run = (chains.get(name) ?? Promise.resolve()).then(fn, fn);
+  const turn = () => {
+    signal?.throwIfAborted();
+    return fn();
+  };
+  const run = (chains.get(name) ?? Promise.resolve()).then(turn, turn);
   chains.set(name, run.catch(() => undefined));
-  return run;
+  if (!signal) return run;
+  return new Promise<T>((resolve, reject) => {
+    const stop = () => reject(signal.reason);
+    if (signal.aborted) return stop();
+    signal.addEventListener('abort', stop, { once: true });
+    run.then(resolve, reject).finally(() => signal.removeEventListener('abort', stop));
+  });
 }
 
 export class DeviceChanged extends Error {
@@ -338,11 +350,11 @@ export class CryptoEngine {
     return () => this.listeners.delete(fn);
   }
 
-  private locked<T>(fn: () => Promise<T>): Promise<T> {
+  private locked<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     return withLock(lockName(this.userId), async () => {
       await this.assertCurrent();
       return fn();
-    });
+    }, signal);
   }
 
   private async loadAccount(): Promise<Account> {
@@ -549,9 +561,19 @@ export class CryptoEngine {
     return this.identity.offer();
   }
 
-  /** Whether one of the user's own devices is verified: signed by the master key and listed. */
-  ownDeviceVerified(deviceId: string): Promise<boolean> {
-    return this.locked(async () => (await this.verifiedDevices([this.userId])).some((t) => t.device_id === deviceId));
+  /**
+   * Whether one of the user's own devices is verified: self-signed, cross-signed by this
+   * device's master key and on its newest list. Only the user's own entry is read (no pin sync,
+   * no colleague), and signal ends the wait for the lock and the request.
+   */
+  ownDeviceVerified(deviceId: string, signal?: AbortSignal): Promise<boolean> {
+    return this.locked(async () => {
+      const listed = await this.server.query([this.userId], signal);
+      const master = await this.identity.trustedMaster(this.userId, listed.master_keys?.[this.userId], listed.tenant_id, [], new Map());
+      if (!master) return false;
+      const d = (listed.devices?.[this.userId] ?? []).find((x) => isObj(x) && x.device_id === deviceId);
+      return !!d && (await this.checkDevice(this.userId, d)) !== undefined && this.identity.deviceTrusted(master, listed.tenant_id, this.userId, d);
+    }, signal);
   }
 
   /** On a new device: joins a pairing from the code a verified device shows. */
@@ -863,6 +885,7 @@ export class CryptoEngine {
         const trusted = await this.trustedSenders(mail);
         const handled: number[] = [];
         let stop = false;
+        let failure: unknown;
         for (const m of mail) {
           try {
             const r = await this.handleMail(m, trusted);
@@ -876,13 +899,17 @@ export class CryptoEngine {
             // mail that is itself unreadable (bad shape, unverified sender, failed Olm) is dropped.
             if (isTransient(e)) {
               stop = true;
+              failure = e;
               break;
             }
           }
           handled.push(m.id);
         }
+        // Only the prefix handled before a failure is acknowledged; the rest stays queued, and
+        // the drain still fails so its retry comes (keys already stored are announced anyway).
         if (handled.length > 0) await this.server.ack(this.deviceId, handled);
-        if (stop || mail.length < MAILBOX_PAGE) return;
+        if (stop) throw failure;
+        if (mail.length < MAILBOX_PAGE) return;
       }
     });
   }

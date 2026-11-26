@@ -101,8 +101,8 @@ const keyServer = (signal: AbortSignal): KeyServer => ({
     // Only an explicit false asks for a new fallback key.
     return { count: typeof o.one_time_key_count === 'number' ? o.one_time_key_count : 0, fallback: o.has_fallback_key !== false };
   },
-  async query(userIds) {
-    const res = obj(await call('/api/v1/keys/query', 'POST', { user_ids: userIds }, signal));
+  async query(userIds, screen) {
+    const res = obj(await call('/api/v1/keys/query', 'POST', { user_ids: userIds }, both(signal, screen)));
     const devices = obj(res.devices);
     const masters = res.master_keys === undefined ? {} : obj(res.master_keys);
     const out: Record<string, DeviceKeys[]> = {};
@@ -235,6 +235,8 @@ interface Entry {
   cancelled: boolean;
   failed: boolean;
   controller: AbortController;
+  /** The user's retry session, shared by their later start-ups until sign-out. */
+  retry: RetrySession;
   store?: CryptoStore;
 }
 
@@ -288,7 +290,8 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
   }
   if (deletedElsewhere) return Promise.reject(new Error('Encryption was reset in another tab; reload this tab to continue.'));
   stopE2EE();
-  const entry = { userId, cancelled: false, failed: false, controller: new AbortController() } as Entry;
+  const retry = sessionFor(userId);
+  const entry = { userId, cancelled: false, failed: false, controller: new AbortController(), retry } as Entry;
   const server = keyServer(entry.controller.signal);
   const live = () => {
     entry.controller.signal.throwIfAborted();
@@ -346,7 +349,7 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
     }
     void retireAbandoned(userId, entry.controller.signal, e).catch(() => undefined);
     e.onKeys(() => keysArrived(true));
-    e.onTransient(retryLater);
+    e.onTransient(() => retryLater(retry));
     e.onBackupState((full) => { for (const fn of backupListeners) fn(full); });
     // Verified now (QR or recovery key): retire pending devices, without waiting for the
     // backup restore that follows.
@@ -364,7 +367,9 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
   }, () => undefined);
   // Keep the user on a failed entry so the next send can retry without a socket reconnect.
   // Attach failure handling directly: it runs before a caller resumes from the rejected start.
-  void entry.engine.then((e) => void e.receive().catch(failedLater), () => {
+  void entry.engine.then((e) => void e.receive().catch((err: unknown) => failedLater(retry, err)), (err: unknown) => {
+    // A start-up that failed for availability (the module, the network) shows as waiting.
+    if (!entry.cancelled) failedLater(retry, err);
     entry.failed = true;
     entry.controller.abort();
     entry.store?.close();
@@ -376,10 +381,6 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
 function stopE2EE(): void {
   const old = current;
   current = undefined;
-  clearTimeout(retryTimer);
-  retryTimer = undefined;
-  retryAttempt = 0;
-  setRetry(false, false);
   if (!old) return;
   old.cancelled = true;
   old.controller.abort();
@@ -461,17 +462,9 @@ export async function restoreIdentity(recoveryKey: string): Promise<number> {
 export const offerVerification = (): Promise<PairingOffer> => identityEngine().then((e) => e.offerVerification());
 
 /** Whether the device a pairing handed keys to has verified itself (signed and listed). signal
- * (the screen closed, or its deadline passed) settles it at once with the abort reason. */
-export function ownDeviceVerified(deviceId: string, signal?: AbortSignal): Promise<boolean> {
-  const work = identityEngine().then((e) => e.ownDeviceVerified(deviceId));
-  if (!signal) return work;
-  return new Promise<boolean>((resolve, reject) => {
-    const stop = () => reject(signal.reason);
-    if (signal.aborted) return stop();
-    signal.addEventListener('abort', stop, { once: true });
-    work.then(resolve, reject).finally(() => signal.removeEventListener('abort', stop));
-  });
-}
+ * (the screen closed, or its deadline passed) aborts the wait for the lock and the request. */
+export const ownDeviceVerified = (deviceId: string, signal?: AbortSignal): Promise<boolean> =>
+  identityEngine().then((e) => e.ownDeviceVerified(deviceId, signal));
 
 export async function joinVerification(text: string): Promise<PairingJoin> {
   const j = await (await identityEngine()).joinVerification(text);
@@ -493,23 +486,37 @@ export function checkRoomIdentities(roomId: string): void {
 
 /** Reads the device mailbox: on start, on a `to_device` wake and after a reconnect. */
 export function receiveRoomKeys(): void {
-  void withEngine((e) => e.receive()).catch(failedLater);
+  const s = session;
+  void withEngine((e) => e.receive()).catch((err: unknown) => failedLater(s, err));
 }
 
-// Work that failed for availability (the post-quantum module, the network, the server) is
-// retried on a bounded schedule. A retry awaits the work itself (the mailbox, then a restore in
-// progress, then the backup queue, refused entries included), so the attempt count resets and
-// encryptionRetry().pending clears only once it all finished. One retry runs at a time. Once
-// the schedule is spent, exhausted says so; retryEncryptionNow runs it again by hand.
+// Work that failed for availability (the post-quantum module, the network, the server, local
+// storage, a device that could not start) is retried on a bounded schedule. A retry awaits the
+// work itself (the mailbox, then a restore in progress, then the backup queue, refused entries
+// included), so the attempt count resets and the pending notice clears only once it all
+// finished. One retry runs at a time; a failure reported while it runs earns one more pass. The
+// budget belongs to the signed-in user's session, not to one device start-up, so a start-up
+// failing again does not refill it, and nothing from a session that ended (a sign-out, another
+// user) can schedule or change the next one. Once the schedule is spent, exhausted says so;
+// retryEncryptionNow runs it again by hand.
 const RETRY_MS = [2_000, 5_000, 15_000, 30_000, 60_000];
-let retryAttempt = 0;
-let retryTimer: ReturnType<typeof setTimeout> | undefined;
-let retryRun: Promise<void> | undefined;
-let retryState = { pending: false, exhausted: false };
+
+interface RetrySession {
+  userId: string;
+  attempt: number;
+  timer?: ReturnType<typeof setTimeout>;
+  run?: Promise<void>;
+  again: boolean;
+  state: { pending: boolean; exhausted: boolean };
+  ended: boolean;
+}
+
+let session: RetrySession | undefined;
+const idle = { pending: false, exhausted: false };
 const pendingListeners = new Set<() => void>();
 
 /** Whether encryption work waits for a retry, and whether the automatic retries ran out. */
-export const encryptionRetry = () => retryState;
+export const encryptionRetry = () => session?.state ?? idle;
 
 /** Calls fn when encryptionRetry changes. */
 export function onEncryptionPending(fn: () => void): () => void {
@@ -517,52 +524,83 @@ export function onEncryptionPending(fn: () => void): () => void {
   return () => pendingListeners.delete(fn);
 }
 
-function setRetry(pending: boolean, exhausted: boolean): void {
-  if (retryState.pending === pending && retryState.exhausted === exhausted) return;
-  retryState = { pending, exhausted };
+/** The retry session of userId: the current one if it is theirs, else a new one. */
+function sessionFor(userId: string): RetrySession {
+  if (session?.userId === userId) return session;
+  endSession();
+  session = { userId, attempt: 0, again: false, state: idle, ended: false };
+  return session;
+}
+
+/** Ends the retry session (sign-out): its timers stop and late failures are ignored. */
+function endSession(): void {
+  const s = session;
+  if (!s) return;
+  s.ended = true;
+  clearTimeout(s.timer);
+  session = undefined;
   for (const fn of pendingListeners) fn();
 }
 
-function failedLater(e: unknown): void {
-  if (isTransient(e)) retryLater();
+function setRetry(s: RetrySession, pending: boolean, exhausted: boolean): void {
+  if (s.ended || (s.state.pending === pending && s.state.exhausted === exhausted)) return;
+  s.state = { pending, exhausted };
+  for (const fn of pendingListeners) fn();
 }
 
-function retryLater(): void {
-  if (retryRun) return; // the running retry schedules the next one if it fails
-  if (retryTimer !== undefined) return setRetry(true, false);
-  if (retryAttempt >= RETRY_MS.length) return setRetry(true, true);
-  setRetry(true, false);
-  retryTimer = setTimeout(() => void runRetry(), RETRY_MS[retryAttempt++]);
+function failedLater(s: RetrySession | undefined, e: unknown): void {
+  if (s && isTransient(e)) retryLater(s);
 }
 
-function runRetry(): Promise<void> {
-  clearTimeout(retryTimer);
-  retryTimer = undefined;
-  retryRun ??= (async () => {
+function retryLater(s: RetrySession): void {
+  if (s.ended) return;
+  if (s.run) {
+    s.again = true; // the running pass schedules one more
+    return;
+  }
+  if (s.timer !== undefined) return setRetry(s, true, false);
+  if (s.attempt >= RETRY_MS.length) return setRetry(s, true, true);
+  setRetry(s, true, false);
+  s.timer = setTimeout(() => void runRetry(s), RETRY_MS[s.attempt++]);
+}
+
+function runRetry(s: RetrySession): Promise<void> {
+  clearTimeout(s.timer);
+  s.timer = undefined;
+  s.run ??= (async () => {
     let again = false;
+    s.again = false;
     try {
       await ensurePQC();
+      if (s.ended || current?.userId !== s.userId) return;
       await withEngine((e) => e.resumeWork());
-      retryAttempt = 0;
-      setRetry(false, false);
+      if (s.ended) return;
+      if (s.again) {
+        again = true; // a failure while this ran: one more bounded pass
+      } else {
+        s.attempt = 0;
+        setRetry(s, false, false);
+      }
       keysArrived(false);
     } catch (e) {
       // A verdict (a rollback, bad data) is not retried; the identity status reports it.
       again = isTransient(e);
-      if (!again) setRetry(false, false);
+      if (!again) setRetry(s, false, false);
     } finally {
-      retryRun = undefined;
+      s.run = undefined;
     }
-    if (again) retryLater();
+    if (again) retryLater(s);
   })();
-  return retryRun;
+  return s.run;
 }
 
 /** Runs the waiting work now (joining a retry already running), and restarts the schedule. */
 export function retryEncryptionNow(): Promise<void> {
-  retryAttempt = 0;
-  if (!retryRun) setRetry(true, false);
-  return runRetry();
+  const s = current ? sessionFor(current.userId) : session;
+  if (!s) return Promise.resolve();
+  s.attempt = 0;
+  if (!s.run) setRetry(s, true, false);
+  return runRetry(s);
 }
 
 /** Starts a new room session when someone left or was removed, so they never get its key. */
@@ -638,11 +676,14 @@ const DELIST_MS = 2000;
  */
 export function retireDevice() {
   const entry = current;
-  let touched = false;
+  let touched: string | undefined;
+  // Set once a refused logout gave up on an attempt that had not reached a device yet: a
+  // start-up finishing later must not take the device then in use off the list or the server.
+  let fenced = false;
   const attempt = (async () => {
     const e = await entry?.engine.catch(() => undefined);
-    if (!e) return false;
-    touched = true;
+    if (!e || fenced) return false;
+    touched = e.deviceId;
     // Pending from the start, per device: a refused or interrupted sign-out leaves it to retire.
     saveAbandoned({ user_id: e.userId, device_id: e.deviceId });
     // Off the signed device list first, so the server cannot bring the device back later;
@@ -651,7 +692,7 @@ export function retireDevice() {
     const me = { user_id: e.userId, device_id: e.deviceId };
     const delisting = e.delistDevices([e.deviceId]);
     void delisting.then(() => {
-      saveAbandoned({ ...me, delisted: true });
+      markAbandoned({ ...me, delisted: true });
       settleAbandoned(me);
     }, () => undefined);
     await Promise.race([delisting.catch(() => undefined), new Promise((r) => setTimeout(r, DELIST_MS))]);
@@ -660,7 +701,7 @@ export function retireDevice() {
     } catch (err) {
       if (!(err instanceof KeyServerError && err.status === 404)) return false;
     }
-    saveAbandoned({ ...me, deleted: true });
+    markAbandoned({ ...me, deleted: true });
     settleAbandoned(me);
     return true;
   })();
@@ -669,8 +710,13 @@ export function retireDevice() {
     async replaceIfRetired(): Promise<void> {
       // Bounded like wait: a DELETE that never answers must not leave the touched device in use.
       await Promise.race([attempt, new Promise((r) => setTimeout(r, RETIRE_MS))]);
-      // Never reset a different device after another sign-out, sign-in or revocation.
-      if (touched && entry && current === entry) await replaceDevice();
+      if (!touched) {
+        fenced = true; // nothing was changed, and nothing will be
+        return;
+      }
+      // The outcome may be unknown (a delist or DELETE still in flight): the touched device is
+      // replaced, never a different one after another sign-out, sign-in or revocation.
+      if (entry && current === entry) await replaceDevice(touched);
     },
   };
 }
@@ -708,10 +754,11 @@ function abandoned(): Abandoned[] {
 }
 
 /** Records d as pending, keeping whatever was already confirmed for it. */
-function saveAbandoned(d: Abandoned): void {
+function saveAbandoned(d: Abandoned, onlyIfPending = false): void {
   try {
     const was: unknown = JSON.parse(localStorage.getItem(retireKey(d)) ?? 'null');
     const w = isAbandoned(was) ? was : undefined;
+    if (onlyIfPending && !w) return;
     localStorage.setItem(retireKey(d), JSON.stringify({ user_id: d.user_id, device_id: d.device_id, deleted: !!(d.deleted || w?.deleted), delisted: !!(d.delisted || w?.delisted) }));
   } catch {
     // No storage: the device stays listed until it is removed by hand.
@@ -720,6 +767,10 @@ function saveAbandoned(d: Abandoned): void {
 
 /** Devices this tab saw fully retired: a sign-out's wipe must not record them as pending again. */
 const settled = new Set<string>();
+
+/** Records a confirmation for d only while it is still pending: one arriving after d was
+ * settled (by this tab or another) never brings its record back. */
+const markAbandoned = (d: Abandoned) => saveAbandoned(d, true);
 
 /** Drops d once both its removal and its deletion are confirmed (by any tab). */
 function settleAbandoned(d: Abandoned): void {
@@ -750,7 +801,7 @@ async function retireAbandoned(userId: string, signal: AbortSignal, e?: CryptoEn
         deleted = err instanceof KeyServerError && err.status === 404;
       }
     }
-    saveAbandoned({ ...d, deleted, delisted: d.delisted || delisted });
+    markAbandoned({ ...d, deleted, delisted: d.delisted || delisted });
     settleAbandoned(d);
   }
 }
@@ -776,6 +827,7 @@ const DEVICE_READ_MS = 1000;
 
 export async function forgetCryptoStore(): Promise<void> {
   stopE2EE();
+  endSession();
   deletedElsewhere = false;
   // Best effort: a device read that fails or stalls must never stop the wipe.
   const devices = await Promise.race([storedDevices().catch(() => []), new Promise<[]>((r) => setTimeout(r, DEVICE_READ_MS, []))]);
@@ -783,12 +835,17 @@ export async function forgetCryptoStore(): Promise<void> {
   await deleteCryptoStores();
 }
 
-/** Replaces this browser's device with a new one, for a sign-out the server refused after the old device was retired. */
-export async function replaceDevice(): Promise<void> {
+/**
+ * Replaces this browser's device with a new one, for a sign-out the server refused after the old
+ * device was retired; only if the device is still expected (when given). resetDevice deletes only
+ * the device's own keys (`device`, `account`, `fallback`, `olm:`, `out:`); the identity seeds,
+ * room keys (`in:`, `inb:`), replay log, pins and backup queue stay.
+ */
+export async function replaceDevice(expected?: string): Promise<void> {
   const entry = current;
   if (!entry) return;
   const old = await entry.engine;
-  if (current !== entry) return;
+  if (current !== entry || (expected !== undefined && old.deviceId !== expected)) return;
   invalidateEntry(entry);
   entry.deviceId = undefined;
   const store = await openCryptoStore(entry.userId);

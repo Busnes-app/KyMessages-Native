@@ -228,13 +228,14 @@ func (s *e2eeStore) ReserveDeviceList(ctx context.Context, tenantID, userID stri
 	return E2EEReservation{}, ErrE2EEVersion
 }
 
-func (s *e2eeStore) PutDeviceList(ctx context.Context, tenantID, userID string, version, expected, epoch int64, list, digest, signature string, now time.Time, proof Proof) error {
+func (s *e2eeStore) PutDeviceList(ctx context.Context, tenantID, userID string, version, expected, epoch int64, list, digest, signature string, now func() time.Time, proof Proof) error {
 	return s.fenced(ctx, tenantID, userID, version, proof, func(tx *sql.Tx) error {
 		// The finalized state: published only under its own live reservation, at its epoch,
-		// which it ends (the epoch stays granted).
+		// which it ends (the epoch stays granted). Live is judged now, holding the row lock, not
+		// when the request arrived: a write that waited on the lock past the lease is refused.
 		res, err := tx.ExecContext(ctx, s.store.rebind(`UPDATE e2ee_master_keys SET device_list = ?, device_list_signature = ?, device_list_epoch = ?, device_list_reserved = '', device_list_reserved_until = 0
 			WHERE user_id = ? AND tenant_id = ? AND version = ? AND device_list_epoch = ? AND device_list_reserved = ? AND device_list_reserved_epoch = ? AND device_list_reserved_until > ?`),
-			list, signature, epoch, userID, tenantID, version, expected, digest, epoch, now.Unix())
+			list, signature, epoch, userID, tenantID, version, expected, digest, epoch, now().Unix())
 		if err != nil {
 			return err
 		}

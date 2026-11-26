@@ -1037,3 +1037,134 @@ describe('Round 4: QR cancel after a seal', () => {
     expect(await laptop.identityStatus()).toMatchObject({ state: 'verified' });
   });
 });
+
+describe('Round 5: accepting needs the shared pin', () => {
+  it('refuses while the shared set lacks the member, restores the baseline, then accepts', async () => {
+    const server = new FakeKeyServer();
+    const [alice, rk] = await firstDevice(server, 'u_alice');
+    const [bob] = await firstDevice(server, 'u_bob');
+    server.join('r1', 'u_alice', 'u_bob');
+    await send('r1', alice, 'pinned');
+    await (await bob.prepareIdentity(true)).commit();
+    await bob.identityStatus();
+    await send('r1', alice, 'sees the change');
+    const [c] = await alice.identityChanges();
+    // The shared set loses bob (a validly signed write without him).
+    const seed = masterSeed(server, 'u_alice', rk);
+    const m = server.masters.get('u_alice')!;
+    const next = m.pins.counter + 1;
+    const sealed = pqc.pinsSeal(seed, TENANT, 'u_alice', next, b64('{}'));
+    await server.as('u_alice').putPins(m.version, m.pins.counter, sealed, pqc.signPinsWrite(seed, TENANT, 'u_alice', m.version, next, sealed));
+    await expect(alice.acceptIdentity('u_bob', c.previous, c.fingerprint)).rejects.toThrow(/changed again/);
+    expect(await alice.identityChanges()).toEqual([c]);
+    // That attempt wrote the baseline back; accepting again now lands.
+    await alice.acceptIdentity('u_bob', c.previous, c.fingerprint);
+    expect(await alice.identityChanges()).toEqual([]);
+    expect(await read(bob, await send('r1', alice, 'accepted'))).toBe('accepted');
+  });
+
+  it('adopts a change another device already accepted, keeping its record, one hop or several', async () => {
+    for (const hops of [1, 2]) {
+      const server = new FakeKeyServer();
+      const [alice, rk] = await firstDevice(server, 'u_alice');
+      const [bob] = await firstDevice(server, 'u_bob');
+      server.join('r1', 'u_alice', 'u_bob');
+      await send('r1', alice, 'pinned');
+      const laptop = await open(server, 'u_alice', 'alice_laptop');
+      await laptop.restoreIdentity(rk);
+      for (let i = 0; i < hops; i++) {
+        await (await bob.prepareIdentity(true)).commit();
+        await bob.identityStatus();
+        await send('r1', laptop, `laptop sees change ${i}`);
+        const [lc] = await laptop.identityChanges();
+        await laptop.acceptIdentity('u_bob', lc.previous, lc.fingerprint);
+      }
+      // Alice's first browser was prompted for the newest key before it synced the laptop's accept.
+      const newest = pqc.fingerprint(server.masters.get('u_bob')!.master_key);
+      const shared = structuredClone(server.masters.get('u_alice')!.pins);
+      const store = await openCryptoStore('u_alice');
+      const pinned = (await store.get<{ fingerprint: string }>('mpin:u_bob'))!.fingerprint;
+      await store.write([['mchg:u_bob', { user_id: 'u_bob', fingerprint: newest, previous: pinned }]]);
+      store.close();
+      await alice.acceptIdentity('u_bob', pinned, newest);
+      expect(await alice.identityChanges()).toEqual([]);
+      // The shared record (its predecessor too) is the laptop's, unchanged.
+      expect(server.masters.get('u_alice')!.pins).toEqual(shared);
+      expect(await read(bob, await send('r1', alice, `adopted after ${hops}`))).toBe(`adopted after ${hops}`);
+      for (const e of opened.splice(0)) e.close();
+      await deleteCryptoStores();
+    }
+  });
+});
+
+describe('Round 5: device list leases and the lock', () => {
+  it('does not hold the lock through another device\'s lease, and lists itself once it lapses', async () => {
+    const server = new FakeKeyServer();
+    const [bob, rk] = await firstDevice(server, 'u_bob');
+    const laptop = await open(server, 'u_bob', 'bob_laptop');
+    await laptop.restoreIdentity(rk);
+    await bob.delistDevices([laptop.deviceId]); // taken off by another device, not retiring
+    const m = server.masters.get('u_bob')!;
+    await server.as('u_bob').reserveDeviceList(m.version, m.device_list!.epoch, 'ab'.repeat(32)); // a full 30 s lease, abandoned
+    const retry = vi.fn();
+    laptop.onTransient(retry);
+    const t0 = Date.now();
+    expect(await laptop.identityStatus()).toMatchObject({ state: 'verified' });
+    expect(Date.now() - t0).toBeLessThan(3_000);
+    expect(retry).toHaveBeenCalled();
+    // The lock is free meanwhile.
+    server.join('r1', 'u_bob');
+    await send('r1', laptop, 'not blocked');
+    server.reservations.get('u_bob')!.until = Date.now() + 800;
+    await laptop.resumeWork(); // the retry waits (unlocked) for the lapse, then lists
+    expect(server.masters.get('u_bob')!.device_list!.device_ids).toContain(laptop.deviceId);
+  });
+
+  it('never signs under a grant that arrived after its lease ran out', async () => {
+    const server = new FakeKeyServer();
+    const [, rk] = await firstDevice(server, 'u_bob');
+    const api = server.as('u_bob');
+    const reserve = api.reserveDeviceList;
+    let calls = 0;
+    const tablet = await open(server, 'u_bob', 'bob_tablet', { ...api, reserveDeviceList: async (v, e, d) => {
+      const r = await reserve(v, e, d);
+      if (++calls > 1) return r;
+      await new Promise((res) => setTimeout(res, 150)); // the answer stalls past its 100 ms lease
+      return { ...r, expires_in_ms: 100 };
+    } });
+    const signs = vi.spyOn(pqc, 'signDeviceList');
+    await tablet.restoreIdentity(rk);
+    expect(calls).toBe(2);
+    expect(signs).toHaveBeenCalledTimes(1);
+    expect(server.masters.get('u_bob')!.device_list!.device_ids).toContain(tablet.deviceId);
+  });
+});
+
+describe('Round 5: backup notice after a partial flush', () => {
+  it('says the backup is full once refused entries are stored, even when a later batch fails', async () => {
+    const server = new FakeKeyServer();
+    const api = server.as('u_alice');
+    const alice = await open(server, 'u_alice', 'u_alice', api);
+    await (await alice.prepareIdentity()).commit();
+    server.join('r1', 'u_alice');
+    await send('r1', alice, 'own session');
+    await vi.waitFor(() => expect(server.backups.get('u_alice')?.size).toBe(1));
+    server.backups.delete('u_alice');
+    server.backupCap = 0;
+    // 150 queued entries: a first batch the cap refuses, then a second the network loses.
+    const store = await openCryptoStore('u_alice');
+    const [[ik]] = await store.list('in:');
+    await store.write(Array.from({ length: 150 }, (_, i): [string, unknown] => [`bq:x${String(i).padStart(3, '0')}`, ik]));
+    store.close();
+    const put = api.putBackup;
+    let n = 0;
+    vi.spyOn(api, 'putBackup').mockImplementation(async (...a) => {
+      if (++n === 2) throw new TypeError('network');
+      return put(...a);
+    });
+    const full = vi.fn();
+    alice.onBackupState(full);
+    await expect(alice.resumeWork()).rejects.toThrow('network');
+    expect(full).toHaveBeenCalledWith(true);
+  });
+});

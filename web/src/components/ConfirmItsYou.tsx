@@ -12,9 +12,8 @@ function SignInAgain({ username, onDone }: { username: string; onDone: () => voi
   const [password, setPassword] = useState('');
   const [mfa, setMfa] = useState<string>('');
   const [code, setCode] = useState('');
+  // The current round's token: empty until its challenge is solved, and again once spent.
   const [captcha, setCaptcha] = useState('');
-  // While a challenge is being solved, signing in would send no token or a spent one.
-  const [solving, setSolving] = useState(true);
   const [round, setRound] = useState(0);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
@@ -63,10 +62,11 @@ function SignInAgain({ username, onDone }: { username: string; onDone: () => voi
           <label>Password for @{username}
             <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" autoFocus required />
           </label>
-          <CaptchaWidget onToken={setCaptcha} round={round} onStatus={(s) => setSolving(s === 'working')} />
+          <CaptchaWidget onToken={setCaptcha} round={round} />
         </>
       )}
-      <button type="submit" disabled={busy || (!mfa && solving)}>{busy ? 'Checking…' : mfa ? 'Verify' : 'Sign in again'}</button>
+      {/* The server spends the token before it checks the password: no sign-in without one. */}
+      <button type="submit" disabled={busy || (!mfa && !captcha)}>{busy ? 'Checking…' : mfa ? 'Verify' : 'Sign in again'}</button>
     </form>
   );
 }

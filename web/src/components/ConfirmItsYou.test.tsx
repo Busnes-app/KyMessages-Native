@@ -7,16 +7,13 @@ import { adminFetch } from '../api';
 vi.mock('./CaptchaWidget', async () => {
   const { useEffect, useRef } = await import('react');
   return {
-    CaptchaWidget: ({ onToken, round, onStatus }: { onToken: (t: string) => void; round: number; onStatus?: (s: string) => void }) => {
-      const cb = useRef({ onToken, onStatus });
-      cb.current = { onToken, onStatus };
+    CaptchaWidget: ({ onToken, round }: { onToken: (t: string) => void; round: number }) => {
+      const cb = useRef(onToken);
+      cb.current = onToken;
       useEffect(() => {
-        cb.current.onStatus?.('working');
+        cb.current('');
         // Solved a moment later, as a real challenge is.
-        const timer = setTimeout(() => {
-          cb.current.onToken(`captcha-${round}`);
-          cb.current.onStatus?.('done');
-        }, 20);
+        const timer = setTimeout(() => cb.current(`captcha-${round}`), 20);
         return () => clearTimeout(timer);
       }, [round]);
       return null;

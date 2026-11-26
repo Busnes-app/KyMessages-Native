@@ -14,6 +14,9 @@ import (
 func okProof(string) error                  { return nil }
 func okDev(string, *store.E2EEDevice) error { return nil }
 
+// at is a clock stopped at t.
+func at(t time.Time) func() time.Time { return func() time.Time { return t } }
+
 func master(user, tenant, tag string) *store.E2EEMasterKey {
 	return &store.E2EEMasterKey{TenantID: tenant, UserID: user, MasterKey: "mk-" + tag, SelfSignature: "ss-" + tag,
 		BackupKey: "bk-" + tag, BackupSignature: "bs-" + tag, RecoveryMaster: "rm-" + tag, RecoveryBackup: "rb-" + tag}
@@ -86,10 +89,10 @@ func TestE2EEMasterKeyVersions(t *testing.T) {
 	if _, err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-1", now, time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, 1, `["D1"]`, "dg-1", "list-sig", now, okProof); err != nil {
+	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, 1, `["D1"]`, "dg-1", "list-sig", at(now), okProof); err != nil {
 		t.Fatal(err)
 	}
-	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, 1, `["D1","D9"]`, "dg-1", "stale", now, okProof); !errors.Is(err, store.ErrE2EEVersion) {
+	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, 1, `["D1","D9"]`, "dg-1", "stale", at(now), okProof); !errors.Is(err, store.ErrE2EEVersion) {
 		t.Fatalf("stale device list epoch: %v", err)
 	}
 	if _, err := k.PutBackupSessions(ctx, "t1", "u-a", 1, 0, []store.E2EEBackupSession{{RoomID: "r", SenderKey: "k", SessionID: "s", FirstIndex: 0, Sealed: "x"}}, 10, 1<<20, okProof); err != nil {
@@ -443,7 +446,7 @@ func TestE2EEDeviceListReservation(t *testing.T) {
 	if !errors.Is(err, store.ErrE2EEVersion) || !r.Until.Equal(now.Add(time.Minute)) {
 		t.Fatalf("second reservation: %+v %v", r, err)
 	}
-	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, 1, `["B"]`, "dg-b", "sig-b", now, okProof); !errors.Is(err, store.ErrE2EEVersion) {
+	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, 1, `["B"]`, "dg-b", "sig-b", at(now), okProof); !errors.Is(err, store.ErrE2EEVersion) {
 		t.Fatalf("unreserved publish: %v", err)
 	}
 	// Wrong version, epoch or org reserve nothing, and name no holder.
@@ -460,7 +463,7 @@ func TestE2EEDeviceListReservation(t *testing.T) {
 		t.Fatalf("renewal: %+v %v", r, err)
 	}
 	later := now.Add(2 * time.Minute)
-	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, 1, `["A"]`, "dg-a", "sig-a", later, okProof); !errors.Is(err, store.ErrE2EEVersion) {
+	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, 1, `["A"]`, "dg-a", "sig-a", at(later), okProof); !errors.Is(err, store.ErrE2EEVersion) {
 		t.Fatalf("publish after the reservation lapsed: %v", err)
 	}
 	// B replaces the lapsed reservation at a higher epoch: A may have signed epoch 1 already.
@@ -468,14 +471,14 @@ func TestE2EEDeviceListReservation(t *testing.T) {
 	if err != nil || r.Epoch != 2 {
 		t.Fatalf("reservation after a lapse: %+v %v", r, err)
 	}
-	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, 1, `["B"]`, "dg-b", "sig-b", later, okProof); !errors.Is(err, store.ErrE2EEVersion) {
+	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, 1, `["B"]`, "dg-b", "sig-b", at(later), okProof); !errors.Is(err, store.ErrE2EEVersion) {
 		t.Fatalf("published at an epoch other than the reserved one: %v", err)
 	}
-	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, 2, `["B"]`, "dg-b", "sig-b", later, okProof); err != nil {
+	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, 2, `["B"]`, "dg-b", "sig-b", at(later), okProof); err != nil {
 		t.Fatal(err)
 	}
 	// Publishing ends the reservation, and the next one starts above it.
-	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 2, 3, `["B"]`, "dg-b", "sig-b", later, okProof); !errors.Is(err, store.ErrE2EEVersion) {
+	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 2, 3, `["B"]`, "dg-b", "sig-b", at(later), okProof); !errors.Is(err, store.ErrE2EEVersion) {
 		t.Fatalf("publish without a reservation of epoch 3: %v", err)
 	}
 	if r, err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 2, "dg-c", later, time.Minute); err != nil || r.Epoch != 3 {
@@ -523,5 +526,36 @@ func TestE2EEPairingUnsealedCancel(t *testing.T) {
 	}
 	if err := k.DeletePairingUnsealed(ctx, "t1", "u-a", "p2"); err != nil {
 		t.Fatalf("cancel of an unsealed pairing: %v", err)
+	}
+}
+
+// A list write judges its reservation's lease by the clock read once it holds the master row
+// (after the proof ran in that transaction), not when the request arrived: one that waited on
+// the lock past the lease is refused.
+func TestE2EEDeviceListLeaseCheckedUnderTheLock(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	e2eeUser(t, st, "u-a")
+	k := st.E2EE()
+	if err := k.PutMasterKey(ctx, master("u-a", "t1", "1"), 0); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Truncate(time.Second)
+	if _, err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-a", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	locked := false
+	proof := func(string) error { locked = true; return nil }
+	clock := func() time.Time {
+		if !locked {
+			t.Fatal("the lease clock was read before the row was locked")
+		}
+		return now.Add(2 * time.Minute) // the write waited past the lease
+	}
+	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, 1, `["A"]`, "dg-a", "sig", clock, proof); !errors.Is(err, store.ErrE2EEVersion) {
+		t.Fatalf("a write past the lease: %v", err)
+	}
+	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, 1, `["A"]`, "dg-a", "sig", at(now.Add(30*time.Second)), okProof); err != nil {
+		t.Fatalf("a write within the lease: %v", err)
 	}
 }
