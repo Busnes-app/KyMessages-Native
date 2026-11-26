@@ -165,9 +165,12 @@ Owns HTTP routing, request parsing, session cookie validation, CORS headers, and
   `PUT master` and `DELETE backup` needs a session younger than `stepUpWindow` (`e2eeFresh`);
   each recovery wrap must be exactly its own length (93/61 bytes) with version 1; bodies are
   decoded by `encoding/json/v2` (case-sensitive names; an unknown or repeated name or trailing
-  data is refused). A device list is published only under a live reservation of its digest
-  (`e2eeid.DeviceListDigest`, `E2EEDeviceListReservation` 30 s), so the losing one of two
-  concurrent proposals is refused before it is signed. Pin, backup and device-list writes and device
+  data is refused). A device list is published only under a live reservation of its digest at
+  the epoch the reservation granted (`e2eeid.DeviceListDigest`, `E2EEDeviceListReservation`
+  30 s; reserve answers `{epoch, expires_in_ms}`, a `409` names `retry_in_ms` while held), so the
+  losing one of two concurrent proposals is refused before it is signed and two proposals never
+  share an epoch; `device_ids` must be an array. The verified device cancels a pairing with
+  `?unsealed=1`, which keeps a sealed one. Pin, backup and device-list writes and device
   cross-signatures carry master-key signatures that the store checks (`proofOf`, a
   `store.Proof`) against the master row it locks in the write's transaction. Backup rows carry
   `sender_key`, a uint32 `first_index`, and are capped by `E2EEBackupMaxSessions` and

@@ -29,8 +29,9 @@ export class FakeKeyServer {
   readonly masters = new Map<string, OwnMaster>();
   readonly backups = new Map<string, Map<string, BackupEntry>>();
   readonly pairings = new Map<string, Pairing>();
-  /** Each user's device list reservation: the digest, its epoch and when it lapses. */
-  readonly reservations = new Map<string, { digest: string; epoch: number; until: number }>();
+  /** Each user's device list reservation, as the server keeps it: the digest, the list epoch it
+   * was taken at, the epoch it grants and when it lapses. */
+  readonly reservations = new Map<string, { digest: string; epoch: number; granted: number; until: number }>();
   reservationMs = 30_000;
   /** The backup's session cap, as the server's E2EEBackupMaxSessions. */
   backupCap = 2000;
@@ -133,17 +134,21 @@ export class FakeKeyServer {
         const m = this.masters.get(userId);
         if (!m || m.version !== version || (m.device_list?.epoch ?? 0) !== expected) throw new Conflict('409');
         const r = this.reservations.get(userId);
-        if (r && r.epoch === expected && r.digest !== digest && r.until > Date.now()) throw new Conflict('409');
-        this.reservations.set(userId, { digest, epoch: expected, until: Date.now() + this.reservationMs });
+        const now = Date.now();
+        if (r && r.epoch === expected && r.digest !== digest && r.until > now) throw new Conflict('409', r.until - now);
+        // As the server: the same digest keeps its epoch; another gets one above all granted.
+        const granted = r && r.granted > expected ? (r.digest === digest ? r.granted : r.granted + 1) : expected + 1;
+        this.reservations.set(userId, { digest, epoch: expected, granted, until: now + this.reservationMs });
+        return { epoch: granted, expires_in_ms: Math.max(this.reservationMs - 1000, 0) };
       },
-      putDeviceList: async (version, expected, deviceIds, signature) => {
+      putDeviceList: async (version, expected, epoch, deviceIds, signature) => {
         const m = this.masters.get(userId);
-        if (!pqc.verifyDeviceList(m?.master_key ?? '', TENANT, userId, version, expected + 1, deviceIds, signature)) throw new Error('The device list is not validly signed');
+        if (!pqc.verifyDeviceList(m?.master_key ?? '', TENANT, userId, version, epoch, deviceIds, signature)) throw new Error('The device list is not validly signed');
         const r = this.reservations.get(userId);
-        if (!m || m.version !== version || (m.device_list?.epoch ?? 0) !== expected ||
-          !r || r.epoch !== expected || r.until <= Date.now() || r.digest !== pqc.hash('kymessages.device-list', ...deviceIds)) throw new Conflict('409');
-        this.reservations.delete(userId);
-        m.device_list = { epoch: expected + 1, device_ids: [...deviceIds], signature };
+        if (!m || m.version !== version || (m.device_list?.epoch ?? 0) !== expected || !r || r.epoch !== expected || r.granted !== epoch ||
+          r.until <= Date.now() || r.digest !== pqc.hash('kymessages.device-list', ...deviceIds)) throw new Conflict('409');
+        this.reservations.set(userId, { ...r, digest: '', until: 0 });
+        m.device_list = { epoch, device_ids: [...deviceIds], signature };
       },
       signDevice: async (deviceId, version, signature) => {
         const m = this.masters.get(userId);
@@ -208,8 +213,9 @@ export class FakeKeyServer {
         this.pairings.delete(id);
         return { initiator_device: p.initiator, sealed: p.sealed };
       },
-      pairingCancel: async (id) => {
-        this.pairing(userId, id);
+      pairingCancel: async (id, unsealedOnly) => {
+        const p = this.pairing(userId, id);
+        if (unsealedOnly && p.sealed) return;
         this.pairings.delete(id);
       },
       claim: async (devices) => {

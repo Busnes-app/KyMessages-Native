@@ -144,10 +144,12 @@ type (
 		Sealed     string `json:"sealed"`
 	}
 	e2eeDeviceListPut struct {
-		Version       int64    `json:"version"`
-		ExpectedEpoch int64    `json:"expected_epoch"`
-		DeviceIDs     []string `json:"device_ids"`
-		Signature     string   `json:"signature"`
+		Version       int64 `json:"version"`
+		ExpectedEpoch int64 `json:"expected_epoch"`
+		// The epoch the reservation granted, which the signature names.
+		Epoch     int64    `json:"epoch"`
+		DeviceIDs []string `json:"device_ids"`
+		Signature string   `json:"signature"`
 	}
 	e2eeDeviceListReserve struct {
 		Version       int64 `json:"version"`
@@ -193,7 +195,8 @@ func masterJSON(m *store.E2EEMasterKey) e2eeMasterJSON {
 	out := e2eeMasterJSON{Version: m.Version, MasterKey: m.MasterKey, SelfSignature: m.SelfSignature}
 	var ids []string
 	if m.DeviceListEpoch > 0 && json.Unmarshal([]byte(m.DeviceList), &ids) == nil {
-		out.DeviceList = &e2eeDeviceListJSON{m.DeviceListEpoch, ids, m.DeviceListSignature}
+		// An empty list is an array, never null.
+		out.DeviceList = &e2eeDeviceListJSON{m.DeviceListEpoch, append([]string{}, ids...), m.DeviceListSignature}
 	}
 	return out
 }
@@ -354,9 +357,12 @@ func (s *Server) handleE2EESignDevice(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /api/v1/keys/devices/list/reserve reserves the next device list epoch for one proposed
-// list, named by its digest, for E2EEDeviceListReservation. A device signs a list only after
-// reserving it, so of two devices editing the list at once only one ever signs; the other gets
-// 409 and reads the winner. Reserving the same digest again renews it (an honest retry).
+// list, named by its digest, for E2EEDeviceListReservation, and answers {epoch, expires_in_ms}:
+// the epoch the list is signed for. A device signs a list only after reserving it, so of two
+// devices editing the list at once only one ever signs; the other gets 409, with retry_in_ms
+// while a live reservation holds the list, and reads the winner. Reserving the same digest again
+// renews it at the same epoch (an honest retry); a different digest replacing a lapsed
+// reservation gets a higher epoch, so the two are never signed for one epoch.
 func (s *Server) handleE2EEReserveDeviceList(w http.ResponseWriter, r *http.Request) {
 	user, tenantID, ok := s.e2eeCaller(w, r)
 	if !ok {
@@ -367,13 +373,19 @@ func (s *Server) handleE2EEReserveDeviceList(w http.ResponseWriter, r *http.Requ
 		s.writeError(w, http.StatusBadRequest, "Invalid device list reservation")
 		return
 	}
-	switch err := s.store.E2EE().ReserveDeviceList(r.Context(), tenantID, user.ID, req.Version, req.ExpectedEpoch, req.Digest, time.Now(), E2EEDeviceListReservation); {
+	now := time.Now()
+	switch res, err := s.store.E2EE().ReserveDeviceList(r.Context(), tenantID, user.ID, req.Version, req.ExpectedEpoch, req.Digest, now, E2EEDeviceListReservation); {
 	case errors.Is(err, store.ErrE2EEVersion):
-		s.writeError(w, http.StatusConflict, "The device list changed or is being changed; reload it")
+		out := map[string]any{"error": "The device list changed or is being changed; reload it"}
+		if !res.Until.IsZero() {
+			out["retry_in_ms"] = min(max(res.Until.Sub(now).Milliseconds(), 0), E2EEDeviceListReservation.Milliseconds())
+		}
+		s.writeJSON(w, http.StatusConflict, out)
 	case err != nil:
 		s.writeError(w, http.StatusInternalServerError, "Failed to reserve the device list")
 	default:
-		s.writeJSON(w, http.StatusOK, map[string]any{"epoch": req.ExpectedEpoch + 1, "expires_in_ms": E2EEDeviceListReservation.Milliseconds()})
+		// Counted from before the write, so the browser never thinks it holds longer than it does.
+		s.writeJSON(w, http.StatusOK, map[string]any{"epoch": res.Epoch, "expires_in_ms": max(res.Until.Sub(now).Milliseconds()-1000, 0)})
 	}
 }
 
@@ -387,7 +399,8 @@ func (s *Server) handleE2EEPutDeviceList(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	var req e2eeDeviceListPut
-	if !decodeIdentity(w, r, e2eeIdentityBody, &req) || req.Version < 1 || req.ExpectedEpoch < 0 || len(req.DeviceIDs) > e2eeMaxDeviceList {
+	// device_ids must be present: a missing or null list is no list, not an empty one.
+	if !decodeIdentity(w, r, e2eeIdentityBody, &req) || req.Version < 1 || req.ExpectedEpoch < 0 || req.Epoch <= req.ExpectedEpoch || req.DeviceIDs == nil || len(req.DeviceIDs) > e2eeMaxDeviceList {
 		s.writeError(w, http.StatusBadRequest, "Invalid device list")
 		return
 	}
@@ -397,14 +410,14 @@ func (s *Server) handleE2EEPutDeviceList(w http.ResponseWriter, r *http.Request)
 			return
 		}
 	}
-	msg, err := e2eeid.DeviceListMessage(tenantID, user.ID, req.Version, req.ExpectedEpoch+1, req.DeviceIDs)
+	msg, err := e2eeid.DeviceListMessage(tenantID, user.ID, req.Version, req.Epoch, req.DeviceIDs)
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, "Invalid device list")
 		return
 	}
 	list, _ := json.Marshal(req.DeviceIDs)
 	digest := e2eeid.DeviceListDigest(req.DeviceIDs)
-	switch err := s.store.E2EE().PutDeviceList(r.Context(), tenantID, user.ID, req.Version, req.ExpectedEpoch, string(list), digest, req.Signature, time.Now(), proofOf(e2eeid.DomainDeviceList, msg, req.Signature)); {
+	switch err := s.store.E2EE().PutDeviceList(r.Context(), tenantID, user.ID, req.Version, req.ExpectedEpoch, req.Epoch, string(list), digest, req.Signature, time.Now(), proofOf(e2eeid.DomainDeviceList, msg, req.Signature)); {
 	case errors.Is(err, errProof):
 		s.writeError(w, http.StatusBadRequest, "The device list is not validly signed")
 	case errors.Is(err, store.ErrE2EEVersion):
@@ -412,7 +425,7 @@ func (s *Server) handleE2EEPutDeviceList(w http.ResponseWriter, r *http.Request)
 	case err != nil:
 		s.writeError(w, http.StatusInternalServerError, "Failed to store the device list")
 	default:
-		s.writeJSON(w, http.StatusOK, map[string]int64{"epoch": req.ExpectedEpoch + 1})
+		s.writeJSON(w, http.StatusOK, map[string]int64{"epoch": req.Epoch})
 	}
 }
 
@@ -708,13 +721,19 @@ func (s *Server) handleE2EEPairingConsume(w http.ResponseWriter, r *http.Request
 	s.writeJSON(w, http.StatusOK, map[string]string{"initiator_device": got.InitiatorDevice, "sealed": got.Sealed})
 }
 
-// DELETE /api/v1/keys/pairings/{id} cancels a pairing from either device.
+// DELETE /api/v1/keys/pairings/{id} cancels a pairing from either device. With ?unsealed=1 (the
+// verified device's cancel) it cancels only while no keys were sealed to it: a seal whose answer
+// was lost must not be undone under the new device that is fetching it.
 func (s *Server) handleE2EEPairingDelete(w http.ResponseWriter, r *http.Request) {
 	user, tenantID, p, ok := s.e2eePairing(w, r)
 	if !ok {
 		return
 	}
-	if err := s.store.E2EE().DeletePairing(r.Context(), tenantID, user.ID, p.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
+	del := s.store.E2EE().DeletePairing
+	if r.URL.Query().Get("unsealed") == "1" {
+		del = s.store.E2EE().DeletePairingUnsealed
+	}
+	if err := del(r.Context(), tenantID, user.ID, p.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 		s.writeError(w, http.StatusInternalServerError, "Failed to cancel pairing")
 		return
 	}

@@ -8,7 +8,7 @@ import { Conflict, CryptoEngine, DeviceChanged, EARLY, type ClaimedKey, type Dev
 import type { BackupEntry, DeviceList, IdentityChange, IdentityStatus, MasterKeyRecord, OwnMaster, PairingJoin, PairingOffer } from '../crypto/identity';
 import { loadCrypto } from '../crypto/index';
 import { ensurePQC, loadPQC, type Hybrid } from '../pqc/index';
-import { isTransient } from '../crypto/records';
+import { isTransient, Transient } from '../crypto/records';
 import { type CryptoStore, deleteCryptoStores, openCryptoStore, storedDevices } from '../crypto/store';
 import { parseRoomDetail, type ChatMessage, type E2EEState } from './types';
 
@@ -18,17 +18,37 @@ export class KeyServerError extends Error {
   }
 }
 
+/** The key server could not be reached (status 0), is rate limiting (429) or failed (5xx):
+ * availability, so the work is kept and retried. */
+export class KeyServerUnavailable extends Transient {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
+}
+
 // Through adminFetch: a step-up refusal (identity setup, reset, backup deletion) opens
 // "Confirm it's you" and retries once the user signed in again in place.
 async function call(path: string, method: string, body?: unknown, signal?: AbortSignal): Promise<unknown> {
-  const res = await adminFetch(path, {
-    method,
-    signal,
-    credentials: 'same-origin',
-    headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  if (res.status === 409) throw new Conflict(await errorMessage(res, 'The encryption identity changed'));
+  let res: Response;
+  try {
+    res = await adminFetch(path, {
+      method,
+      signal,
+      credentials: 'same-origin',
+      headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } catch (e) {
+    // An abort keeps its meaning; anything else fetch throws is the network.
+    if (signal?.aborted || (e instanceof DOMException && e.name === 'AbortError')) throw e;
+    throw new KeyServerUnavailable(0, 'The key server could not be reached');
+  }
+  if (res.status === 409) {
+    const o: unknown = await res.clone().json().catch(() => null);
+    const retry = typeof o === 'object' && o !== null && typeof (o as { retry_in_ms?: unknown }).retry_in_ms === 'number' ? (o as { retry_in_ms: number }).retry_in_ms : undefined;
+    throw new Conflict(await errorMessage(res, 'The encryption identity changed'), retry);
+  }
+  if (res.status === 429 || res.status >= 500) throw new KeyServerUnavailable(res.status, await errorMessage(res, 'The key server is unavailable'));
   if (!res.ok) throw new KeyServerError(res.status, await errorMessage(res, 'Encryption request failed'));
   return res.status === 204 ? null : res.json();
 }
@@ -156,10 +176,12 @@ const keyServer = (signal: AbortSignal): KeyServer => ({
     await call(`/api/v1/keys/devices/${encodeURIComponent(deviceId)}/signature`, 'POST', { version, signature }, signal);
   },
   async reserveDeviceList(version, expectedEpoch, digest) {
-    await call('/api/v1/keys/devices/list/reserve', 'POST', { version, expected_epoch: expectedEpoch, digest }, signal);
+    const o = obj(await call('/api/v1/keys/devices/list/reserve', 'POST', { version, expected_epoch: expectedEpoch, digest }, signal));
+    if (typeof o.epoch !== 'number' || o.epoch <= expectedEpoch) throw new Error('Invalid device list reservation');
+    return { epoch: o.epoch, expires_in_ms: typeof o.expires_in_ms === 'number' ? o.expires_in_ms : 0 };
   },
-  async putDeviceList(version, expectedEpoch, deviceIds, signature) {
-    await call('/api/v1/keys/devices/list', 'PUT', { version, expected_epoch: expectedEpoch, device_ids: deviceIds, signature }, signal);
+  async putDeviceList(version, expectedEpoch, epoch, deviceIds, signature) {
+    await call('/api/v1/keys/devices/list', 'PUT', { version, expected_epoch: expectedEpoch, epoch, device_ids: deviceIds, signature }, signal);
   },
   async getBackup(version, after) {
     const q = new URLSearchParams({ version: String(version), after_room: after.room_id, after_sender: after.sender_key, after_session: after.session_id });
@@ -197,8 +219,8 @@ const keyServer = (signal: AbortSignal): KeyServer => ({
     const o = obj(await call(`${pairingPath(id)}/consume`, 'POST', { device_id: deviceId }, both(signal, screen)));
     return { initiator_device: str(o.initiator_device, 64), sealed: str(o.sealed, 16384) };
   },
-  async pairingCancel(id) {
-    await call(pairingPath(id), 'DELETE', undefined, signal);
+  async pairingCancel(id, unsealedOnly) {
+    await call(pairingPath(id) + (unsealedOnly ? '?unsealed=1' : ''), 'DELETE', undefined, signal);
   },
 });
 
@@ -295,6 +317,14 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
     await Promise.all([loadCrypto(), loadPQC()]);
     let e: CryptoEngine;
     const store = await openStore();
+    // A stored device already pending retirement (a sign-out that did not finish) is never used
+    // again: its local keys are replaced by a new device's before it starts, and its server row
+    // is left for retireAbandoned, so the device running here is never the one being deleted.
+    const stored = await store.get<{ device_id?: unknown }>('device');
+    if (typeof stored?.device_id === 'string' && abandoned().some((d) => d.user_id === userId && d.device_id === stored.device_id)) {
+      await resetDevice(userId, stored.device_id, store);
+      live();
+    }
     try {
       e = await CryptoEngine.open(userId, server, store, onIdentity);
     } catch (err) {
@@ -317,6 +347,10 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
     void retireAbandoned(userId, entry.controller.signal, e).catch(() => undefined);
     e.onKeys(() => keysArrived(true));
     e.onTransient(retryLater);
+    e.onBackupState((full) => { for (const fn of backupListeners) fn(full); });
+    // Verified now (QR or recovery key): retire pending devices, without waiting for the
+    // backup restore that follows.
+    e.onAdopted(() => void retireAbandoned(userId, entry.controller.signal, e).catch(() => undefined));
     return e;
   })();
   current = entry;
@@ -345,7 +379,7 @@ function stopE2EE(): void {
   clearTimeout(retryTimer);
   retryTimer = undefined;
   retryAttempt = 0;
-  setPending(false);
+  setRetry(false, false);
   if (!old) return;
   old.cancelled = true;
   old.controller.abort();
@@ -381,7 +415,14 @@ export function onRoomKeys(fn: () => void): () => void {
 // --- Identity and verification (crypto/identity.ts), for the UI ---
 
 const identityListeners = new Set<() => void>();
+const backupListeners = new Set<(full: boolean) => void>();
 let identityWired: CryptoEngine | undefined;
+
+/** Calls fn when whether the key backup is refusing sessions changes. */
+export function onBackupStateChanged(fn: (full: boolean) => void): () => void {
+  backupListeners.add(fn);
+  return () => backupListeners.delete(fn);
+}
 
 /** Calls fn when this device's identity state or a member's pinned identity changes. */
 export function onIdentityChanged(fn: () => void): () => void {
@@ -407,25 +448,34 @@ export const identityStatus = (): Promise<IdentityStatus> => identityEngine().th
 /** A new identity for this account: show recoveryKey, then commit once the user saved it. */
 export async function prepareIdentity(reset = false): Promise<{ recoveryKey: string; commit(): Promise<void> }> {
   const p = await (await identityEngine()).prepareIdentity(reset);
-  return { recoveryKey: p.recoveryKey, commit: async () => { await p.commit(); announceIdentity(); keysArrived(true); retireAfterVerify(); } };
+  return { recoveryKey: p.recoveryKey, commit: async () => { await p.commit(); announceIdentity(); keysArrived(true); } };
 }
 
 export async function restoreIdentity(recoveryKey: string): Promise<number> {
   const n = await (await identityEngine()).restoreIdentity(recoveryKey);
   announceIdentity();
   keysArrived(true);
-  retireAfterVerify();
   return n;
 }
 
 export const offerVerification = (): Promise<PairingOffer> => identityEngine().then((e) => e.offerVerification());
 
-/** Whether the device a pairing handed keys to has verified itself (signed and listed). */
-export const ownDeviceVerified = (deviceId: string): Promise<boolean> => identityEngine().then((e) => e.ownDeviceVerified(deviceId));
+/** Whether the device a pairing handed keys to has verified itself (signed and listed). signal
+ * (the screen closed, or its deadline passed) settles it at once with the abort reason. */
+export function ownDeviceVerified(deviceId: string, signal?: AbortSignal): Promise<boolean> {
+  const work = identityEngine().then((e) => e.ownDeviceVerified(deviceId));
+  if (!signal) return work;
+  return new Promise<boolean>((resolve, reject) => {
+    const stop = () => reject(signal.reason);
+    if (signal.aborted) return stop();
+    signal.addEventListener('abort', stop, { once: true });
+    work.then(resolve, reject).finally(() => signal.removeEventListener('abort', stop));
+  });
+}
 
 export async function joinVerification(text: string): Promise<PairingJoin> {
   const j = await (await identityEngine()).joinVerification(text);
-  return { ...j, finish: async (signal) => { const n = await j.finish(signal); announceIdentity(); keysArrived(true); retireAfterVerify(); return n; } };
+  return { ...j, finish: async (signal) => { const n = await j.finish(signal); announceIdentity(); keysArrived(true); return n; } };
 }
 
 export const identityChanges = (): Promise<IdentityChange[]> => identityEngine().then((e) => e.identityChanges());
@@ -446,62 +496,72 @@ export function receiveRoomKeys(): void {
   void withEngine((e) => e.receive()).catch(failedLater);
 }
 
-// Work that failed for availability (the post-quantum module restarting, the network, the
-// server) is retried on a bounded schedule: the mailbox, then the identity status, which resumes
-// a key backup restore and drains the backup queue. While some is waiting, encryptionPending
-// says so and the UI offers retryEncryptionNow.
+// Work that failed for availability (the post-quantum module, the network, the server) is
+// retried on a bounded schedule. A retry awaits the work itself (the mailbox, then a restore in
+// progress, then the backup queue, refused entries included), so the attempt count resets and
+// encryptionRetry().pending clears only once it all finished. One retry runs at a time. Once
+// the schedule is spent, exhausted says so; retryEncryptionNow runs it again by hand.
 const RETRY_MS = [2_000, 5_000, 15_000, 30_000, 60_000];
 let retryAttempt = 0;
 let retryTimer: ReturnType<typeof setTimeout> | undefined;
-let pending = false;
+let retryRun: Promise<void> | undefined;
+let retryState = { pending: false, exhausted: false };
 const pendingListeners = new Set<() => void>();
 
-/** Whether encryption work is waiting for a retry. */
-export const encryptionPending = () => pending;
+/** Whether encryption work waits for a retry, and whether the automatic retries ran out. */
+export const encryptionRetry = () => retryState;
 
-/** Calls fn when encryptionPending changes. */
+/** Calls fn when encryptionRetry changes. */
 export function onEncryptionPending(fn: () => void): () => void {
   pendingListeners.add(fn);
   return () => pendingListeners.delete(fn);
 }
 
-function setPending(v: boolean): void {
-  if (pending === v) return;
-  pending = v;
+function setRetry(pending: boolean, exhausted: boolean): void {
+  if (retryState.pending === pending && retryState.exhausted === exhausted) return;
+  retryState = { pending, exhausted };
   for (const fn of pendingListeners) fn();
 }
 
 function failedLater(e: unknown): void {
-  if (isTransient(e) || e instanceof KeyServerError && e.status >= 500 || e instanceof TypeError) retryLater();
+  if (isTransient(e)) retryLater();
 }
 
 function retryLater(): void {
-  setPending(true);
-  if (retryTimer !== undefined || retryAttempt >= RETRY_MS.length) return;
+  if (retryRun) return; // the running retry schedules the next one if it fails
+  if (retryTimer !== undefined) return setRetry(true, false);
+  if (retryAttempt >= RETRY_MS.length) return setRetry(true, true);
+  setRetry(true, false);
   retryTimer = setTimeout(() => void runRetry(), RETRY_MS[retryAttempt++]);
 }
 
-async function runRetry(): Promise<void> {
+function runRetry(): Promise<void> {
   clearTimeout(retryTimer);
   retryTimer = undefined;
-  try {
-    await ensurePQC();
-    await withEngine(async (e) => {
-      await e.receive();
-      // Resumes the restore and the backup; their own failures call retryLater again.
-      await e.identityStatus();
-    });
-    retryAttempt = 0;
-    setPending(false);
-    keysArrived(false);
-  } catch (e) {
-    failedLater(e);
-  }
+  retryRun ??= (async () => {
+    let again = false;
+    try {
+      await ensurePQC();
+      await withEngine((e) => e.resumeWork());
+      retryAttempt = 0;
+      setRetry(false, false);
+      keysArrived(false);
+    } catch (e) {
+      // A verdict (a rollback, bad data) is not retried; the identity status reports it.
+      again = isTransient(e);
+      if (!again) setRetry(false, false);
+    } finally {
+      retryRun = undefined;
+    }
+    if (again) retryLater();
+  })();
+  return retryRun;
 }
 
-/** Runs the waiting work now, and restarts the retry schedule. */
+/** Runs the waiting work now (joining a retry already running), and restarts the schedule. */
 export function retryEncryptionNow(): Promise<void> {
   retryAttempt = 0;
+  if (!retryRun) setRetry(true, false);
   return runRetry();
 }
 
@@ -607,7 +667,8 @@ export function retireDevice() {
   return {
     wait: Promise.race([attempt, new Promise<boolean>((r) => setTimeout(r, RETIRE_MS, false))]),
     async replaceIfRetired(): Promise<void> {
-      await attempt;
+      // Bounded like wait: a DELETE that never answers must not leave the touched device in use.
+      await Promise.race([attempt, new Promise((r) => setTimeout(r, RETIRE_MS))]);
       // Never reset a different device after another sign-out, sign-in or revocation.
       if (touched && entry && current === entry) await replaceDevice();
     },
@@ -657,11 +718,17 @@ function saveAbandoned(d: Abandoned): void {
   }
 }
 
+/** Devices this tab saw fully retired: a sign-out's wipe must not record them as pending again. */
+const settled = new Set<string>();
+
 /** Drops d once both its removal and its deletion are confirmed (by any tab). */
 function settleAbandoned(d: Abandoned): void {
   try {
     const cur: unknown = JSON.parse(localStorage.getItem(retireKey(d)) ?? 'null');
-    if (isAbandoned(cur) && cur.deleted && cur.delisted) localStorage.removeItem(retireKey(d));
+    if (isAbandoned(cur) && cur.deleted && cur.delisted) {
+      localStorage.removeItem(retireKey(d));
+      settled.add(retireKey(d));
+    }
   } catch {
     // Kept: retried at the next start.
   }
@@ -688,12 +755,6 @@ async function retireAbandoned(userId: string, signal: AbortSignal, e?: CryptoEn
   }
 }
 
-/** Retires pending devices again once this device can sign (it was just verified). */
-function retireAfterVerify(): void {
-  const entry = current;
-  const e = entry?.ready;
-  if (entry && e) void retireAbandoned(entry.userId, entry.controller.signal, e).catch(() => undefined);
-}
 
 /**
  * For a revoked session: deletes the local store now and removes the device from the key server
@@ -718,7 +779,7 @@ export async function forgetCryptoStore(): Promise<void> {
   deletedElsewhere = false;
   // Best effort: a device read that fails or stalls must never stop the wipe.
   const devices = await Promise.race([storedDevices().catch(() => []), new Promise<[]>((r) => setTimeout(r, DEVICE_READ_MS, []))]);
-  for (const d of devices) saveAbandoned(d);
+  for (const d of devices) if (!settled.has(retireKey(d))) saveAbandoned(d);
   await deleteCryptoStores();
 }
 

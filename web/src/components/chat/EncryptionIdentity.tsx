@@ -6,8 +6,8 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import QRCode from 'qrcode';
 import { ShieldAlert, ShieldCheck } from 'lucide-react';
 import {
-  acceptIdentity, encryptionPending, identityChanges, identityStatus, joinVerification, offerVerification, onEncryptionPending, onIdentityChanged, ownDeviceVerified,
-  prepareIdentity, restoreIdentity, retryEncryptionNow,
+  acceptIdentity, encryptionRetry, identityChanges, identityStatus, joinVerification, offerVerification, onBackupStateChanged, onEncryptionPending, onIdentityChanged,
+  ownDeviceVerified, prepareIdentity, restoreIdentity, retryEncryptionNow,
 } from '../../chat/e2ee';
 
 const POLL_MS = 1500;
@@ -266,23 +266,24 @@ export function VerifyAnotherDevice({ onClose }: { onClose: () => void }) {
       return;
     }
     setBusy(false);
-    // Verified only once the new device has signed itself on and is listed, not on upload; the
-    // wait is bounded, and ends when this screen closes.
+    // Verified only once the new device has signed itself on and is listed, not on upload. Each
+    // lookup, and every wait, ends at the deadline or when this screen closes.
     let failures = 0;
     const until = Math.max(deadlineRef.current, Date.now()) + 60_000;
-    while (Date.now() < until && !signal.aborted) {
+    const watch = AbortSignal.any([signal, AbortSignal.timeout(until - Date.now())]);
+    while (!watch.aborted) {
       try {
-        if (await ownDeviceVerified(joined!.device)) {
+        if (await ownDeviceVerified(joined!.device, watch)) {
           if (!signal.aborted) setDone(true);
           return;
         }
         failures = 0;
       } catch {
-        if (++failures > POLL_RETRIES) break;
+        if (watch.aborted || ++failures > POLL_RETRIES) break;
       }
       await new Promise<void>((r) => {
         const timer = setTimeout(r, POLL_MS);
-        signal.addEventListener('abort', () => { clearTimeout(timer); r(); }, { once: true });
+        watch.addEventListener('abort', () => { clearTimeout(timer); r(); }, { once: true });
       });
     }
     if (!signal.aborted) setErr('The keys were sent, but the new device has not confirmed. Check it, or start again.');
@@ -329,7 +330,11 @@ export function useIdentityStatus(ready: boolean): [GateState, () => void] {
   useEffect(() => {
     if (!ready) return;
     refresh();
-    return onIdentityChanged(refresh);
+    const offIdentity = onIdentityChanged(refresh);
+    // A change in what the backup refused updates the notice alone: no status check, which
+    // would start the backup and restore work again.
+    const offBackup = onBackupStateChanged((full) => setGate((g) => (g.state === 'verified' && g.backupFull !== full ? { ...g, backupFull: full } : g)));
+    return () => { offIdentity(); offBackup(); };
   }, [ready, refresh]);
   return [gate, refresh];
 }
@@ -342,7 +347,7 @@ export function useIdentityStatus(ready: boolean): [GateState, () => void] {
 export function EncryptionIdentityGate({ gate, refresh }: { gate: GateState; refresh: () => void }) {
   const [open, setOpen] = useState(false);
   const [reset, setReset] = useState(false);
-  const pending = useEncryptionPending();
+  const retry = useEncryptionRetry();
   if (gate.state === 'loading') return null;
   if (gate.state === 'verified') {
     const done = () => { setOpen(false); refresh(); };
@@ -366,7 +371,7 @@ export function EncryptionIdentityGate({ gate, refresh }: { gate: GateState; ref
             <span>Your key backup is full: some messages are readable on this device but not backed up for a new one. They stay queued here.</span>
           </div>
         )}
-        {pending && <PendingBanner />}
+        {retry.pending && <PendingBanner exhausted={retry.exhausted} />}
         {open && <SetUpEncryption reset onClose={() => setOpen(false)} onDone={done} />}
       </>
     );
@@ -403,26 +408,30 @@ export function EncryptionIdentityGate({ gate, refresh }: { gate: GateState; ref
   );
 }
 
-function useEncryptionPending(): boolean {
-  const [pending, setPending] = useState(encryptionPending);
+function useEncryptionRetry(): { pending: boolean; exhausted: boolean } {
+  const [retry, setRetry] = useState(encryptionRetry);
   useEffect(() => {
-    setPending(encryptionPending());
-    return onEncryptionPending(() => setPending(encryptionPending()));
+    setRetry(encryptionRetry());
+    return onEncryptionPending(() => setRetry(encryptionRetry()));
   }, []);
-  return pending;
+  return retry;
 }
 
 /** Encryption work (reading keys, the key backup, a restore) waits for a retry. */
-function PendingBanner() {
+function PendingBanner({ exhausted }: { exhausted: boolean }) {
   const [busy, setBusy] = useState(false);
   const retry = () => {
     setBusy(true);
     void retryEncryptionNow().finally(() => setBusy(false));
   };
   return (
-    <div className="chat-banner chat-banner-info" role="status" data-testid="encryption-pending">
+    <div className={`chat-banner ${exhausted ? 'chat-banner-error' : 'chat-banner-info'}`} role="status" data-testid="encryption-pending">
       <ShieldAlert size={16} aria-hidden="true" />
-      <span>Some encryption work is waiting: messages or the key backup may be behind. It is retried by itself.</span>
+      <span>
+        {exhausted
+          ? 'Some encryption work keeps failing: messages or the key backup are behind, and it is no longer retried by itself.'
+          : 'Some encryption work is waiting: messages or the key backup may be behind. It is retried by itself.'}
+      </span>
       <button type="button" className="btn-secondary" onClick={retry} disabled={busy}>{busy ? 'Retrying…' : 'Retry now'}</button>
     </div>
   );

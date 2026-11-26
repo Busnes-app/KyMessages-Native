@@ -13,6 +13,8 @@ function SignInAgain({ username, onDone }: { username: string; onDone: () => voi
   const [mfa, setMfa] = useState<string>('');
   const [code, setCode] = useState('');
   const [captcha, setCaptcha] = useState('');
+  // While a challenge is being solved, signing in would send no token or a spent one.
+  const [solving, setSolving] = useState(true);
   const [round, setRound] = useState(0);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
@@ -61,10 +63,10 @@ function SignInAgain({ username, onDone }: { username: string; onDone: () => voi
           <label>Password for @{username}
             <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" autoFocus required />
           </label>
-          <CaptchaWidget onToken={setCaptcha} round={round} />
+          <CaptchaWidget onToken={setCaptcha} round={round} onStatus={(s) => setSolving(s === 'working')} />
         </>
       )}
-      <button type="submit" disabled={busy}>{busy ? 'Checking…' : mfa ? 'Verify' : 'Sign in again'}</button>
+      <button type="submit" disabled={busy || (!mfa && solving)}>{busy ? 'Checking…' : mfa ? 'Verify' : 'Sign in again'}</button>
     </form>
   );
 }

@@ -103,15 +103,17 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   (`(user, version, room, sender_key, session)`, the lowest `first_index` wins, capped per call
   by session count and sealed bytes, bytewise `COLLATE "C"` key columns on PostgreSQL), the
   master-signed device list columns with the reservation of its next epoch
-  (`device_list_reserved`, `_until`), `backup_generation`, and `e2ee_pairings`
+  (`device_list_reserved`, `_until`, `_epoch`), `backup_generation`, and `e2ee_pairings`
   (QR pairings, unique per `(tenant_id, user_id)`, carrying the `master_version` they were opened
   under). `PutMasterKey` is compare-and-swap on `version`; a first setup drops a row the user left
   in another org; a replacement deletes the backup, pairings, pins and device list and clears
   every cross-signature in the same transaction. Pin, device-list and backup writes and
   `SignDevice` run `fenced`: they lock the master row at (tenant, user, version) and call the
   caller's `Proof` with its key before writing, all in one transaction. `ReserveDeviceList` holds
-  epoch `expected+1` for one digest until it lapses (the same digest renews it), and
-  `PutDeviceList` publishes only under a live reservation of its digest, ending it. A backup
+  the next epoch for one digest until it lapses and returns it (`E2EEReservation`; the same
+  digest keeps its epoch, another gets one above every epoch granted, and a refusal names the
+  holder's lapse); `PutDeviceList` publishes at exactly that epoch under a live reservation of
+  its digest, ending it. `DeletePairingUnsealed` deletes only a pairing with nothing sealed. A backup
   write must name the current `backup_generation`, which `DeleteBackup` bumps; every insert and
   replacement must fit the caps, and the others are returned as `Refused` indexes. A
   PostgreSQL schema test asserts the backup key columns collate `C`.

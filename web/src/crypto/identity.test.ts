@@ -6,6 +6,7 @@ import { FakeKeyServer, TENANT } from './fakeKeyServer';
 import { loadCryptoSync } from './index';
 import { deleteCryptoStores, openCryptoStore } from './store';
 import { b64, loadPQCFrom, pqc, PQCUnavailable } from '../pqc/index';
+import { LIST_WAIT_MAX_MS } from './identity';
 
 beforeAll(async () => {
   loadCryptoSync(readFileSync('src/crypto/pkg/kycrypto_bg.wasm'));
@@ -718,25 +719,34 @@ describe('Round 3: device list reservations', () => {
     const laptop = await open(server, 'u_bob', 'bob_laptop');
     await laptop.restoreIdentity(rk);
     const m = server.masters.get('u_bob')!;
-    // A device reserved the next epoch and went away.
-    server.reservationMs = 700;
-    await server.as('u_bob').reserveDeviceList(m.version, m.device_list!.epoch, 'ab'.repeat(32));
-    server.reservationMs = 30_000;
+    const epoch = m.device_list!.epoch;
+    // A device took the server's full 30 s lease and went away; it lapses in a little over a
+    // second. The edit waits it out (the wait bound is past the lease) instead of failing.
+    expect(LIST_WAIT_MAX_MS).toBeGreaterThan(server.reservationMs);
+    await server.as('u_bob').reserveDeviceList(m.version, epoch, 'ab'.repeat(32));
+    server.reservations.get('u_bob')!.until = Date.now() + 1_200;
     await bob.delistDevices([laptop.deviceId]);
-    expect(server.masters.get('u_bob')!.device_list!.device_ids).toEqual([bob.deviceId]);
-    // This device's own reservation lapses before it publishes: it reserves again and publishes.
+    const list = server.masters.get('u_bob')!.device_list!;
+    expect(list.device_ids).toEqual([bob.deviceId]);
+    // A different list replacing the lapsed reservation gets an epoch of its own.
+    expect(list.epoch).toBe(epoch + 2);
+    // This device's reservation is known to have lapsed before it signs: it does not sign then.
+    // Its next one lapses after it signed: the server refuses, and it reserves again.
     const api = server.as('u_bob');
     const reserve = api.reserveDeviceList;
-    let first = true;
+    let call = 0;
+    const signs = vi.spyOn(pqc, 'signDeviceList');
     const tablet = await open(server, 'u_bob', 'bob_tablet', { ...api, reserveDeviceList: async (v, e, d) => {
-      await reserve(v, e, d);
-      if (first) {
-        first = false;
-        server.reservations.get('u_bob')!.until = 0;
-      }
+      const r = await reserve(v, e, d);
+      call++;
+      if (call === 1) return { ...r, expires_in_ms: 0 };
+      if (call === 2) server.reservations.get('u_bob')!.until = 0;
+      return r;
     } });
     await tablet.restoreIdentity(rk);
     expect(server.masters.get('u_bob')!.device_list!.device_ids).toContain(tablet.deviceId);
+    expect(call).toBe(3);
+    expect(signs).toHaveBeenCalledTimes(2);
   });
 
   it('reports a rolled-back list without signing over it, and a reset clears it', async () => {
@@ -765,10 +775,10 @@ describe('Round 3: device list reservations', () => {
     const put = api.putDeviceList;
     let laptop: CryptoEngine | undefined;
     let signingOut: Promise<void> | undefined;
-    const fenced = await open(server, 'u_bob', 'bob_laptop', { ...api, putDeviceList: async (v, e, ids, s) => {
+    const fenced = await open(server, 'u_bob', 'bob_laptop', { ...api, putDeviceList: async (v, e, epoch, ids, s) => {
       // The enrollment's write is on its way when sign-out starts (not under the lock).
       if (!signingOut && laptop && ids.includes(laptop.deviceId)) signingOut = laptop.delistDevices([laptop.deviceId]);
-      return put(v, e, ids, s);
+      return put(v, e, epoch, ids, s);
     } });
     laptop = fenced;
     await laptop.restoreIdentity(rk);
@@ -890,5 +900,140 @@ describe('Round 3: background retries', () => {
     await laptop.identityStatus(); // its resume fails too, in the background
     await vi.waitFor(() => expect(retry).toHaveBeenCalled());
     openSpy.mockRestore();
+  });
+});
+
+describe('Round 4: a sign-out is ordered after an enrollment holding the list', () => {
+  it('does not settle the removal of an absent device while its reserved enrollment can still publish', async () => {
+    const server = new FakeKeyServer();
+    const [, rk] = await firstDevice(server, 'u_bob');
+    const api = server.as('u_bob');
+    const reserve = api.reserveDeviceList;
+    const order: string[] = [];
+    let laptop: CryptoEngine | undefined;
+    let signingOut: Promise<void> | undefined;
+    const enrolling = await open(server, 'u_bob', 'bob_laptop', { ...api, reserveDeviceList: async (v, e, d) => {
+      const r = await reserve(v, e, d);
+      if (!signingOut && laptop) {
+        // The enrollment holds the list; the device is not on it yet when sign-out starts.
+        signingOut = laptop.delistDevices([laptop.deviceId]).then(() => { order.push('delisted'); });
+        await new Promise((res) => setTimeout(res, 100));
+        order.push('enrollment publishing');
+      }
+      return r;
+    } });
+    laptop = enrolling;
+    await laptop.restoreIdentity(rk);
+    await signingOut;
+    expect(order).toEqual(['enrollment publishing', 'delisted']);
+    expect(server.masters.get('u_bob')!.device_list!.device_ids).not.toContain(laptop.deviceId);
+  });
+});
+
+describe('Round 4: forks stay forks', () => {
+  it('keeps trusting no device after a fork until a validly signed higher list', async () => {
+    const server = new FakeKeyServer();
+    const [alice] = await firstDevice(server, 'u_alice');
+    const [bob, rk] = await firstDevice(server, 'u_bob');
+    const laptop = await open(server, 'u_bob', 'bob_laptop');
+    await laptop.restoreIdentity(rk);
+    server.join('r1', 'u_alice', 'u_bob');
+    expect(await read(bob, await send('r1', alice, 'seen the list'))).toBe('seen the list');
+    const m = server.masters.get('u_bob')!;
+    const good = structuredClone(m.device_list!);
+    const fork = [...good.device_ids, 'FORKED_DEVICE_1'].sort();
+    m.device_list = { epoch: good.epoch, device_ids: fork, signature: pqc.signDeviceList(masterSeed(server, 'u_bob', rk), TENANT, 'u_bob', m.version, good.epoch, fork) };
+    expect(await read(bob, await send('r1', alice, 'forked'))).toBe('waiting');
+    // The server shows the first list again: still a fork for alice.
+    m.device_list = good;
+    expect(await read(bob, await send('r1', alice, 'old list again'))).toBe('waiting');
+    // Bob's laptop never saw the fork and publishes the next epoch: trusted again.
+    await laptop.delistDevices(['NOT_LISTED_0001']);
+    expect(server.masters.get('u_bob')!.device_list!.epoch).toBeGreaterThan(good.epoch);
+    expect(await read(bob, await send('r1', alice, 'after a higher list'))).toBe('after a higher list');
+  });
+});
+
+describe('Round 4: an accept goes through the shared pin set', () => {
+  it('refuses a stale prompt clicked right after another browser accepted a different key, and changes nothing', async () => {
+    const server = new FakeKeyServer();
+    const [alice, rk] = await firstDevice(server, 'u_alice');
+    const [bob] = await firstDevice(server, 'u_bob');
+    server.join('r1', 'u_alice', 'u_bob');
+    expect(await read(bob, await send('r1', alice, 'pinned'))).toBe('pinned');
+    const pinned = pqc.fingerprint(server.masters.get('u_bob')!.master_key);
+    const laptop = await open(server, 'u_alice', 'alice_laptop');
+    await laptop.restoreIdentity(rk);
+    // Bob resets; the laptop sees and accepts that key.
+    await (await bob.prepareIdentity(true)).commit();
+    await bob.identityStatus();
+    const first = structuredClone(server.masters.get('u_bob')!);
+    await send('r1', laptop, 'laptop sees the change');
+    // Bob resets again before alice's first browser looks: it is prompted for the newer key.
+    await (await bob.prepareIdentity(true)).commit();
+    await bob.identityStatus();
+    await send('r1', alice, 'alice sees the newer change');
+    const [stale] = await alice.identityChanges();
+    expect(stale.previous).toBe(pinned);
+    const current = structuredClone(server.masters.get('u_bob')!);
+    server.masters.set('u_bob', first);
+    const [lc] = await laptop.identityChanges();
+    await laptop.acceptIdentity('u_bob', lc.previous, lc.fingerprint);
+    server.masters.set('u_bob', current);
+    const shared = structuredClone(server.masters.get('u_alice')!.pins);
+    // At once, no send or status in between: the click on the stale prompt is refused.
+    await expect(alice.acceptIdentity('u_bob', stale.previous, stale.fingerprint)).rejects.toThrow(/changed again/);
+    expect(server.masters.get('u_alice')!.pins).toEqual(shared);
+    const local = await openCryptoStore('u_alice');
+    expect((await local.get<{ fingerprint: string }>('mpin:u_bob'))!.fingerprint).toBe(lc.fingerprint);
+    local.close();
+    // The refreshed prompt changes from the laptop's accepted key, and accepting it lands.
+    const [fresh] = await alice.identityChanges();
+    expect(fresh).toEqual({ user_id: 'u_bob', previous: lc.fingerprint, fingerprint: stale.fingerprint });
+    await alice.acceptIdentity('u_bob', fresh.previous, fresh.fingerprint);
+    expect(await alice.identityChanges()).toEqual([]);
+    expect(await read(bob, await send('r1', alice, 'accepted'))).toBe('accepted');
+  });
+
+  it('keeps the prompt and the pin when the shared write fails', async () => {
+    const server = new FakeKeyServer();
+    const api = server.as('u_alice');
+    const alice = await open(server, 'u_alice', 'u_alice', api);
+    await (await alice.prepareIdentity()).commit();
+    const [bob] = await firstDevice(server, 'u_bob');
+    server.join('r1', 'u_alice', 'u_bob');
+    await send('r1', alice, 'pinned');
+    await (await bob.prepareIdentity(true)).commit();
+    await bob.identityStatus();
+    await send('r1', alice, 'sees the change');
+    const [c] = await alice.identityChanges();
+    vi.spyOn(api, 'putPins').mockRejectedValueOnce(new TypeError('network'));
+    await expect(alice.acceptIdentity('u_bob', c.previous, c.fingerprint)).rejects.toThrow();
+    expect(await alice.identityChanges()).toEqual([c]);
+    const local = await openCryptoStore('u_alice');
+    expect((await local.get<{ fingerprint: string }>('mpin:u_bob'))!.fingerprint).toBe(c.previous);
+    local.close();
+  });
+});
+
+describe('Round 4: QR cancel after a seal', () => {
+  it('never takes back keys whose seal answer was lost', async () => {
+    const server = new FakeKeyServer();
+    const [alice] = await firstDevice(server, 'u_alice');
+    const api = server.as('u_alice');
+    const seal = api.pairingSeal;
+    const sender = await open(server, 'u_alice', 'u_alice', { ...api, pairingSeal: async (...a) => {
+      await seal(...a);
+      throw new TypeError('the answer was lost');
+    } });
+    void alice;
+    const laptop = await open(server, 'u_alice', 'alice_laptop');
+    const offer = await sender.offerVerification();
+    const join = await laptop.joinVerification(offer.text);
+    await offer.poll();
+    await expect(offer.approve()).rejects.toThrow();
+    await offer.cancel(); // the screen closes after the error
+    expect(await join.finish()).toBeGreaterThanOrEqual(0);
+    expect(await laptop.identityStatus()).toMatchObject({ state: 'verified' });
   });
 });

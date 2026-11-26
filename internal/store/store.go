@@ -126,14 +126,17 @@ type E2EEStore interface {
 	// PutPins stores the user's sealed pin set as counter expected+1 under master key version,
 	// once proof accepts the write against that version's master key (all in one transaction).
 	PutPins(ctx context.Context, tenantID, userID string, version, expected int64, pins string, proof Proof) error
-	// ReserveDeviceList reserves epoch expected+1 of the device list under version for the list
-	// whose digest is given, until now+ttl: ErrE2EEVersion unless the list is at epoch expected
-	// and no other unexpired reservation holds it. Reserving the same digest again renews it.
-	ReserveDeviceList(ctx context.Context, tenantID, userID string, version, expected int64, digest string, now time.Time, ttl time.Duration) error
-	// PutDeviceList stores the master-signed device list as epoch expected+1 under version, once
-	// proof accepts it against that version's master key and an unexpired reservation names its
-	// digest (all in one transaction); ErrE2EEVersion otherwise.
-	PutDeviceList(ctx context.Context, tenantID, userID string, version, expected int64, list, digest, signature string, now time.Time, proof Proof) error
+	// ReserveDeviceList reserves the device list's next epoch under version, while it is at epoch
+	// expected, for the list whose digest is given, until now+ttl, and answers that epoch. The
+	// same digest keeps its epoch (an honest retry, also after a lapse); a different one gets an
+	// epoch above every one granted before, so two proposals are never signable at one epoch.
+	// ErrE2EEVersion unless the list is at expected and no other live reservation holds it; then
+	// Until is the holder's lapse (zero when the list moved on).
+	ReserveDeviceList(ctx context.Context, tenantID, userID string, version, expected int64, digest string, now time.Time, ttl time.Duration) (E2EEReservation, error)
+	// PutDeviceList stores the master-signed device list at epoch under version, once proof
+	// accepts it against that version's master key and a live reservation names its digest and
+	// epoch while the list is at expected (all in one transaction); ErrE2EEVersion otherwise.
+	PutDeviceList(ctx context.Context, tenantID, userID string, version, expected, epoch int64, list, digest, signature string, now time.Time, proof Proof) error
 	// PutBackupSessions adds sealed sessions to backup version and generation once proof
 	// accepts the batch against that version's master key: a session already stored is replaced
 	// only by a copy with a lower first index; either is stored only within maxSessions and
@@ -143,6 +146,9 @@ type E2EEStore interface {
 	// ListBackupSessions pages backup version in bytewise (room, sender key, session) order
 	// after the cursor.
 	ListBackupSessions(ctx context.Context, tenantID, userID string, version int64, after E2EEBackupCursor, limit int) ([]E2EEBackupSession, error)
+	// DeletePairingUnsealed cancels a pairing only while no keys were sealed to it, so a sender
+	// whose seal answer was lost cannot destroy keys it already transmitted.
+	DeletePairingUnsealed(ctx context.Context, tenantID, userID, id string) error
 	// DeleteBackup removes every session of backup version and bumps its generation, so no
 	// write signed before it lands after; it returns the new generation. ErrE2EEVersion when
 	// version is not current.
@@ -196,6 +202,12 @@ type E2EEBackupSession struct {
 type E2EEBackupResult struct {
 	Stored, Kept int
 	Refused      []int
+}
+
+// E2EEReservation is a device list reservation: the epoch it may sign and when it lapses.
+type E2EEReservation struct {
+	Epoch int64
+	Until time.Time
 }
 
 // E2EEBackupCursor is the last (room, sender key, session) a backup page ended on.

@@ -22,7 +22,8 @@ describe('loading the post-quantum module', () => {
       go.run = () => new Promise<void>(() => undefined); // never hands over, never exits
       return go;
     };
-    await expect(loadPQCFrom(wasm, silent, 300)).rejects.toThrow('did not start');
+    // A start out of time is unavailability, which callers retry, not a verdict.
+    await expect(loadPQCFrom(wasm, silent, 300)).rejects.toBeInstanceOf(PQCUnavailable);
     expect(pqcRunning()).toBe(false);
 
     // The bound covers fetching and compiling too, not only the Go start.

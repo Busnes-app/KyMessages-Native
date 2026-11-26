@@ -27,8 +27,8 @@ declare global {
  * never a verdict on data. Callers keep their work for a retry; the module reloads meanwhile.
  */
 export class PQCUnavailable extends Error {
-  constructor() {
-    super('The post-quantum module is not running');
+  constructor(message = 'The post-quantum module is not running') {
+    super(message);
   }
 }
 
@@ -54,7 +54,8 @@ async function start(source: Source, runtime: () => GoRuntime, startMs: number):
   go.argv = ['js', String(gen)];
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error('The post-quantum module did not start')), startMs);
+    // A start that ran out of time is unavailability, retried like any other.
+    timer = setTimeout(() => reject(new PQCUnavailable('The post-quantum module did not start')), startMs);
   });
   const ready = new Promise<void>((resolve) => {
     globalThis.kyPQCReady = (from, call) => {

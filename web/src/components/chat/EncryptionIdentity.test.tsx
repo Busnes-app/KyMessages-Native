@@ -134,7 +134,7 @@ describe('identity screens', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'The codes match' }));
     expect(await screen.findByText(/Waiting for the new device to confirm/)).toBeTruthy();
     expect(await screen.findByText(/new device is verified/, {}, { timeout: 4000 })).toBeTruthy();
-    expect(confirmed).toHaveBeenCalledWith('NEWDEVICE');
+    expect(confirmed).toHaveBeenCalledWith('NEWDEVICE', expect.any(AbortSignal));
   });
 
   it('offers a reset when the server rolled back or forked this identity, and says what it does', async () => {
@@ -196,5 +196,42 @@ describe('identity screens', () => {
     render(<StrictMode><VerifyAnotherDevice onClose={() => undefined} /></StrictMode>);
     expect((await screen.findByTestId('comparison-code', {}, { timeout: 3000 })).textContent).toBe('565656');
     for (const [signal] of poll.mock.calls.slice(-1)) expect((signal as AbortSignal).aborted).toBe(false);
+  });
+
+  it('says when retries ran out, and a manual retry still runs', async () => {
+    fake.setFakePending(true, true);
+    render(<Gate />);
+    expect((await screen.findByTestId('encryption-pending')).textContent).toMatch(/no longer retried by itself/);
+    fireEvent.click(screen.getByRole('button', { name: 'Retry now' }));
+    await waitFor(() => expect(screen.queryByTestId('encryption-pending')).toBeNull());
+  });
+
+  it('shows the backup as full when the engine says so, without checking the status again', async () => {
+    render(<Gate />);
+    await act(async () => undefined);
+    const status = vi.spyOn(fake, 'identityStatus');
+    act(() => fake.setFakeBackupFull(true));
+    expect(await screen.findByText(/key backup is full/)).toBeTruthy();
+    act(() => fake.setFakeBackupFull(false));
+    await waitFor(() => expect(screen.queryByText(/key backup is full/)).toBeNull());
+    expect(status).not.toHaveBeenCalled();
+  });
+
+  it('drops an in-flight confirmation lookup when the screen closes', async () => {
+    vi.spyOn(fake, 'offerVerification').mockResolvedValue({ text: 'QRTEXT', expiresInMs: 60_000, poll: async () => ({ code: '111222', device: 'NEWDEVICE' }), approve: async () => undefined, cancel: async () => undefined });
+    let seen: AbortSignal | undefined;
+    const lookup = vi.spyOn(fake, 'ownDeviceVerified').mockImplementation((_d: string, signal?: AbortSignal) => {
+      seen = signal;
+      return new Promise<boolean>(() => undefined); // never answers
+    });
+    render(<VerifyAnotherDevice onClose={() => undefined} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'The codes match' }));
+    await waitFor(() => expect(lookup).toHaveBeenCalledTimes(1));
+    expect(seen?.aborted).toBe(false);
+    fireEvent.click(screen.getAllByRole('button', { name: 'Close' }).find((b) => b.textContent === 'Close')!);
+    expect(seen?.aborted).toBe(true);
+    await new Promise((r) => setTimeout(r, 1700));
+    expect(lookup).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(/has not confirmed/)).toBeNull();
   });
 });

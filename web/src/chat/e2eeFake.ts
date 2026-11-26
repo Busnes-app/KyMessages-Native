@@ -48,7 +48,7 @@ export function resetFakeE2EE(): void {
   unavailable = false;
   fakeIdentity = { state: 'verified', fingerprint: 'f'.repeat(64), restoring: false, backupFull: false };
   fakeChanges = [];
-  fakePending = false;
+  fakePending = { pending: false, exhausted: false };
 }
 
 export const startE2EE = async () => ({});
@@ -136,9 +136,18 @@ export async function acceptIdentity(userId: string, previous: string, fingerpri
 export const prepareIdentity = async () => ({ recoveryKey: 'ABCD '.repeat(14).trim(), commit: async () => setFakeIdentity({ state: 'verified', fingerprint: 'f'.repeat(64), restoring: false, backupFull: false }) });
 export const restoreIdentity = async () => 0;
 export const checkRoomIdentities = () => undefined;
-let fakePending = false;
+let fakePending = { pending: false, exhausted: false };
 const pendingListeners = new Set<() => void>();
-export const encryptionPending = () => fakePending;
+export const encryptionRetry = () => fakePending;
+export const onBackupStateChanged = (fn: (full: boolean) => void) => {
+  backupListeners.add(fn);
+  return () => backupListeners.delete(fn);
+};
+const backupListeners = new Set<(full: boolean) => void>();
+/** Says the backup started or stopped refusing sessions, as the engine does. */
+export function setFakeBackupFull(full: boolean): void {
+  for (const fn of backupListeners) fn(full);
+}
 export const onEncryptionPending = (fn: () => void) => {
   pendingListeners.add(fn);
   return () => pendingListeners.delete(fn);
@@ -146,11 +155,11 @@ export const onEncryptionPending = (fn: () => void) => {
 export async function retryEncryptionNow(): Promise<void> {
   setFakePending(false);
 }
-/** Makes encryption work wait for a retry, as after the post-quantum module restarted. */
-export function setFakePending(v: boolean): void {
-  fakePending = v;
+/** Makes encryption work wait for a retry (exhausted: the automatic retries ran out). */
+export function setFakePending(pending: boolean, exhausted = false): void {
+  fakePending = { pending, exhausted };
   for (const fn of pendingListeners) fn();
 }
 export const offerVerification = async () => ({ text: 'x'.repeat(108), expiresInMs: 180_000, poll: async (): Promise<{ code: string; device: string } | undefined> => undefined, approve: async () => undefined, cancel: async () => undefined });
-export const ownDeviceVerified = async () => true;
+export const ownDeviceVerified = async (_deviceId: string, _signal?: AbortSignal) => true;
 export const joinVerification = async () => ({ code: '123456', finish: async () => 0, cancel: async () => undefined });

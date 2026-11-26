@@ -34,14 +34,21 @@ export class Transient extends Error {}
 
 /**
  * Whether e is about availability (the network or server, the post-quantum module, local
- * storage) rather than a verdict on data: such failures keep their work for a retry.
+ * storage) rather than a verdict on data: such failures keep their work for a retry. An abort
+ * (a closed screen, a stopped device) is neither: nothing asked for that work any more.
  */
 export function isTransient(e: unknown): boolean {
-  return e instanceof Transient || e instanceof PQCUnavailable || e instanceof DOMException;
+  return e instanceof Transient || e instanceof PQCUnavailable ||
+    (e instanceof DOMException && e.name !== 'AbortError' && e.name !== 'TimeoutError');
 }
 
-/** The key server refused a write because the identity, pin set or backup version moved on. */
-export class Conflict extends Error {}
+/** The key server refused a write because the identity, pin set or backup version moved on.
+ * retryInMs: when a device list reservation in the way lapses. */
+export class Conflict extends Error {
+  constructor(message?: string, readonly retryInMs?: number) {
+    super(message);
+  }
+}
 
 export function isObj(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);

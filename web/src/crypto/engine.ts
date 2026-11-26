@@ -233,6 +233,8 @@ export const EARLY = 'This message was sent before this device could read the ro
 export class CryptoEngine {
   private readonly listeners = new Set<(sessionIds: string[]) => void>();
   private readonly transient = new Set<() => void>();
+  private readonly backupState = new Set<(full: boolean) => void>();
+  private readonly adopted = new Set<() => void>();
   private readonly identity: Identity;
 
   private constructor(
@@ -248,6 +250,8 @@ export class CryptoEngine {
       userId, deviceId, curve25519, ed25519, server, store, pickleKey: key, locked: (fn) => this.locked(fn),
       onRestored: (ids) => { for (const fn of this.listeners) fn(ids); },
       onTransient: () => { for (const fn of this.transient) fn(); },
+      onBackupState: (full) => { for (const fn of this.backupState) fn(full); },
+      onAdopted: () => { for (const fn of this.adopted) fn(); },
     });
   }
 
@@ -305,6 +309,27 @@ export class CryptoEngine {
   onTransient(fn: () => void): () => void {
     this.transient.add(fn);
     return () => this.transient.delete(fn);
+  }
+
+  /** Calls fn when whether the key backup refused sessions (it is full) changes. */
+  onBackupState(fn: (full: boolean) => void): () => void {
+    this.backupState.add(fn);
+    return () => this.backupState.delete(fn);
+  }
+
+  /** Calls fn once this device durably took on the identity (before any backup paging). */
+  onAdopted(fn: () => void): () => void {
+    this.adopted.add(fn);
+    return () => this.adopted.delete(fn);
+  }
+
+  /**
+   * The work a retry resumes, awaited to the end: the mailbox, then the key backup restore in
+   * progress and the backup queue (refused entries too). Throws what stopped it.
+   */
+  async resumeWork(): Promise<void> {
+    await this.receive();
+    await this.identity.drain();
   }
 
   /** Calls fn with the IDs of room sessions whose keys just arrived; returns an unsubscribe. */

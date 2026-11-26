@@ -32,9 +32,11 @@ CREATE TABLE IF NOT EXISTS e2ee_master_keys (
 	device_list TEXT NOT NULL DEFAULT '',
 	device_list_epoch BIGINT NOT NULL DEFAULT 0,
 	device_list_signature TEXT NOT NULL DEFAULT '',
-	-- The one proposed successor list (its digest) a device may sign and publish, until then.
+	-- The one proposed successor list (its digest) a device may sign and publish, until then, at
+	-- its own epoch: a different proposal never reuses an epoch an earlier one was granted.
 	device_list_reserved TEXT NOT NULL DEFAULT '',
 	device_list_reserved_until BIGINT NOT NULL DEFAULT 0,
+	device_list_reserved_epoch BIGINT NOT NULL DEFAULT 0,
 	-- Bumped by each backup deletion; backup writes are signed for one generation.
 	backup_generation BIGINT NOT NULL DEFAULT 0,
 	updated_at BIGINT NOT NULL

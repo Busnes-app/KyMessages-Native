@@ -1,8 +1,11 @@
 import 'fake-indexeddb/auto';
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { abandonDevice, encryptionPending, forgetCryptoStore, keyGeneration, NOT_YET, onRoomKeys, openMessage, receiveRoomKeys, replaceDevice, RETIRE_MS, retireDevice, retryable, retryEncryptionNow, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
+import { abandonDevice, encryptionRetry, prepareIdentity, restoreIdentity, forgetCryptoStore, keyGeneration, NOT_YET, onRoomKeys, openMessage, receiveRoomKeys, replaceDevice, RETIRE_MS, retireDevice, retryable, retryEncryptionNow, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
 import { EARLY } from '../crypto/engine';
+import { FakeKeyServer } from '../crypto/fakeKeyServer';
+import { isTransient } from '../crypto/records';
+import { httpFake, type Block } from './httpFake';
 import { openCryptoStore } from '../crypto/store';
 import { parseMessage } from './types';
 
@@ -605,13 +608,175 @@ describe('retrying encryption work', () => {
     await startE2EE('u_alice');
     down = true;
     receiveRoomKeys();
-    await vi.waitFor(() => expect(encryptionPending()).toBe(true));
+    await vi.waitFor(() => expect(encryptionRetry().pending).toBe(true));
     down = false;
     await retryEncryptionNow();
-    expect(encryptionPending()).toBe(false);
+    expect(encryptionRetry().pending).toBe(false);
   });
 
   it('opens a message from before this device’s session again when keys arrive', () => {
     expect(retryable(EARLY)).toBe(true);
+  });
+});
+
+describe('Round 4: the retry pipeline over the real key routes', () => {
+  it('awaits the backup it retries, stops after its schedule, and recovers by hand', async () => {
+    const server = new FakeKeyServer();
+    server.join('r1', 'u_alice');
+    let backup: 'down' | 'hold' | 'up' = 'up';
+    let release = () => {};
+    let puts = 0;
+    const block: { fn?: Block } = { fn: (method, path) => {
+      if (method !== 'PUT' || path !== '/api/v1/keys/backup') return undefined;
+      puts++;
+      if (backup === 'down') return json({ error: 'down' }, 503);
+      if (backup === 'hold') return new Promise<undefined>((r) => { release = () => r(undefined); });
+      return undefined;
+    } };
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice', block)));
+    // Fake timers throughout, so the schedule's own timers are the ones advanced; vi.waitFor
+    // advances them while it polls.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    let spent = 0;
+    try {
+      await startE2EE('u_alice');
+      await (await prepareIdentity()).commit();
+      await vi.waitFor(() => expect(server.backups.get('u_alice')?.size ?? 0).toBe(0));
+      backup = 'down';
+      await sealRoomMessage('r1', { type: 'text', body: 'backed up later' });
+      await vi.waitFor(() => expect(puts).toBe(1));
+      expect(encryptionRetry()).toEqual({ pending: true, exhausted: false });
+      // Five scheduled retries, each awaiting a drain that fails, then no more by itself.
+      for (const [i, ms] of [2_000, 5_000, 15_000, 30_000, 60_000].entries()) {
+        await vi.advanceTimersByTimeAsync(ms);
+        await vi.waitFor(() => expect(puts).toBe(i + 2), { interval: 1 });
+      }
+      await vi.waitFor(() => expect(encryptionRetry()).toEqual({ pending: true, exhausted: true }), { interval: 1 });
+      spent = puts;
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(puts).toBe(spent);
+      expect(server.backups.get('u_alice')?.size ?? 0).toBe(0);
+
+      // By hand, while the server still fails: tried, and scheduled again.
+      await retryEncryptionNow();
+      expect(puts).toBe(spent + 1);
+      expect(encryptionRetry()).toEqual({ pending: true, exhausted: false });
+
+      // The server is back but slow: pending holds until the write itself finished, and a second
+      // retry joins the running one.
+      backup = 'hold';
+      const run = retryEncryptionNow();
+      expect(retryEncryptionNow()).toBe(run);
+      await vi.waitFor(() => expect(puts).toBe(spent + 2), { interval: 1 });
+      expect(encryptionRetry().pending).toBe(true);
+      release();
+      await run;
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(puts).toBe(spent + 2);
+    expect(encryptionRetry()).toEqual({ pending: false, exhausted: false });
+    expect(server.backups.get('u_alice')?.size).toBe(1);
+  });
+
+  it('treats an unreachable or failing key server as unavailability, and a refusal as a verdict', async () => {
+    const server = new FakeKeyServer();
+    let mailbox: 'offline' | '429' | 'refused' | 'up' = 'up';
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice', { fn: (method, path) => {
+      if (path !== '/api/v1/to-device' || method !== 'GET' || mailbox === 'up') return undefined;
+      if (mailbox === 'offline') throw new TypeError('Failed to fetch');
+      return mailbox === '429' ? json({ error: 'slow down' }, 429) : json({ error: 'bad request' }, 400);
+    } })));
+    await startE2EE('u_alice');
+    for (const state of ['offline', '429'] as const) {
+      mailbox = state;
+      receiveRoomKeys();
+      await vi.waitFor(() => expect(encryptionRetry().pending).toBe(true));
+      mailbox = 'up';
+      await retryEncryptionNow();
+      expect(encryptionRetry().pending).toBe(false);
+    }
+    mailbox = 'refused';
+    receiveRoomKeys();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(encryptionRetry().pending).toBe(false);
+    // A closed screen's abort is not unavailability.
+    expect(isTransient(new DOMException('closed', 'AbortError'))).toBe(false);
+  });
+});
+
+describe('Round 4: retirement races', () => {
+  it('retires pending devices once verified, even when the backup restore that follows fails', async () => {
+    const server = new FakeKeyServer();
+    let backupDown = false;
+    const deleted: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice', { fn: (method, path) => {
+      if (method === 'DELETE' && path.startsWith('/api/v1/keys/devices/')) deleted.push(decodeURIComponent(path.slice('/api/v1/keys/devices/'.length)));
+      if (backupDown && method === 'GET' && path === '/api/v1/keys/backup') return json({ error: 'down' }, 503);
+      return undefined;
+    } })));
+    const first = await startE2EE('u_alice');
+    const p = await prepareIdentity();
+    await p.commit();
+    await forgetCryptoStore(); // a sign-out whose removal from the list did not land
+    await startE2EE('u_alice');
+    await vi.waitFor(() => expect(deleted).toContain(first.deviceId));
+    expect(pendingRetirements()).toEqual([expect.objectContaining({ device_id: first.deviceId, deleted: true, delisted: false })]);
+    backupDown = true;
+    await expect(restoreIdentity(p.recoveryKey)).rejects.toThrow();
+    await vi.waitFor(() => expect(pendingRetirements()).toEqual([]));
+    expect(server.masters.get('u_alice')!.device_list!.device_ids).not.toContain(first.deviceId);
+  });
+
+  it('replaces a stored device whose retirement is pending instead of running it, and deletes only that one', async () => {
+    const server = new FakeKeyServer();
+    const deleted: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice', { fn: (method, path) => {
+      if (method === 'DELETE' && path.startsWith('/api/v1/keys/devices/')) deleted.push(decodeURIComponent(path.slice('/api/v1/keys/devices/'.length)));
+      return undefined;
+    } })));
+    const old = await startE2EE('u_alice');
+    localStorage.setItem(`kymessages-e2ee-retire:u_alice:${old.deviceId}`, JSON.stringify({ user_id: 'u_alice', device_id: old.deviceId, deleted: false, delisted: false }));
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_bob')));
+    await startE2EE('u_bob'); // closes alice's device, keeping its store
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice', { fn: (method, path) => {
+      if (method === 'DELETE' && path.startsWith('/api/v1/keys/devices/')) deleted.push(decodeURIComponent(path.slice('/api/v1/keys/devices/'.length)));
+      return undefined;
+    } })));
+    const fresh = await startE2EE('u_alice');
+    expect(fresh.deviceId).not.toBe(old.deviceId);
+    await vi.waitFor(() => expect(deleted).toEqual([old.deviceId]));
+    expect(server.devices.get('u_alice')?.has(fresh.deviceId)).toBe(true);
+  });
+
+  it('replaces the touched device when a refused sign-out ends its bounded attempt, though the deletion hangs', async () => {
+    const server = new FakeKeyServer();
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice', { fn: (method, path) =>
+      method === 'DELETE' && path.startsWith('/api/v1/keys/devices/') ? new Promise<Response>(() => undefined) : undefined })));
+    const old = await startE2EE('u_alice');
+    vi.useFakeTimers({ toFake: ['setTimeout'] });
+    let repaired: Promise<void>;
+    try {
+      const retiring = retireDevice();
+      await vi.advanceTimersByTimeAsync(RETIRE_MS);
+      expect(await retiring.wait).toBe(false);
+      repaired = retiring.replaceIfRetired();
+      await vi.advanceTimersByTimeAsync(RETIRE_MS);
+    } finally {
+      vi.useRealTimers();
+    }
+    await repaired;
+    expect((await startE2EE('u_alice')).deviceId).not.toBe(old.deviceId);
+    expect(pendingRetirements()).toEqual(expect.arrayContaining([expect.objectContaining({ device_id: old.deviceId })]));
+  });
+
+  it('does not record a fully retired device again when a clean sign-out wipes the store', async () => {
+    const server = new FakeKeyServer();
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice')));
+    await startE2EE('u_alice');
+    expect(await retireDevice().wait).toBe(true);
+    await vi.waitFor(() => expect(pendingRetirements()).toEqual([]));
+    await forgetCryptoStore();
+    expect(pendingRetirements()).toEqual([]);
   });
 });

@@ -83,7 +83,7 @@ func (s *e2eeStore) PutMasterKey(ctx context.Context, m *E2EEMasterKey, expected
 		res, err = tx.ExecContext(ctx, s.store.rebind(`INSERT INTO e2ee_master_keys (`+masterColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', '', 0, '', 0, ?) ON CONFLICT (user_id) DO NOTHING`),
 			m.UserID, m.TenantID, version, m.MasterKey, m.SelfSignature, m.BackupKey, m.BackupSignature, m.RecoveryMaster, m.RecoveryBackup, now)
 	} else {
-		res, err = tx.ExecContext(ctx, s.store.rebind(`UPDATE e2ee_master_keys SET version = ?, master_key = ?, self_signature = ?, backup_key = ?, backup_signature = ?, recovery_master = ?, recovery_backup = ?, pins_counter = 0, pins = '', device_list = '', device_list_epoch = 0, device_list_signature = '', device_list_reserved = '', device_list_reserved_until = 0, backup_generation = 0, updated_at = ? WHERE user_id = ? AND tenant_id = ? AND version = ?`),
+		res, err = tx.ExecContext(ctx, s.store.rebind(`UPDATE e2ee_master_keys SET version = ?, master_key = ?, self_signature = ?, backup_key = ?, backup_signature = ?, recovery_master = ?, recovery_backup = ?, pins_counter = 0, pins = '', device_list = '', device_list_epoch = 0, device_list_signature = '', device_list_reserved = '', device_list_reserved_until = 0, device_list_reserved_epoch = 0, backup_generation = 0, updated_at = ? WHERE user_id = ? AND tenant_id = ? AND version = ?`),
 			version, m.MasterKey, m.SelfSignature, m.BackupKey, m.BackupSignature, m.RecoveryMaster, m.RecoveryBackup, now, m.UserID, m.TenantID, expected)
 	}
 	if err != nil {
@@ -197,28 +197,44 @@ func (s *e2eeStore) PutPins(ctx context.Context, tenantID, userID string, versio
 // ReserveDeviceList is the device list's tentative state: one proposed successor at a time,
 // which only its proposer signs. A proposal that loses the reservation is never signed, so it
 // cannot later be shown as a signed successor.
-func (s *e2eeStore) ReserveDeviceList(ctx context.Context, tenantID, userID string, version, expected int64, digest string, now time.Time, ttl time.Duration) error {
-	return oneRowVersion(s.store.db.ExecContext(ctx, s.store.rebind(`UPDATE e2ee_master_keys SET device_list_reserved = ?, device_list_reserved_until = ?
-		WHERE user_id = ? AND tenant_id = ? AND version = ? AND device_list_epoch = ? AND (device_list_reserved = ? OR device_list_reserved_until <= ?)`),
-		digest, now.Add(ttl).Unix(), userID, tenantID, version, expected, digest, now.Unix()))
+func (s *e2eeStore) ReserveDeviceList(ctx context.Context, tenantID, userID string, version, expected int64, digest string, now time.Time, ttl time.Duration) (E2EEReservation, error) {
+	until := now.Add(ttl).Unix()
+	var epoch int64
+	// Right-hand sides read the row as it was: the same digest keeps its epoch, another one gets
+	// the next above both the list and every epoch granted before.
+	err := s.store.db.QueryRowContext(ctx, s.store.rebind(`UPDATE e2ee_master_keys SET
+			device_list_reserved_epoch = CASE WHEN device_list_reserved = ? AND device_list_reserved_epoch > device_list_epoch THEN device_list_reserved_epoch
+				WHEN device_list_reserved_epoch > device_list_epoch THEN device_list_reserved_epoch + 1 ELSE device_list_epoch + 1 END,
+			device_list_reserved = ?, device_list_reserved_until = ?
+		WHERE user_id = ? AND tenant_id = ? AND version = ? AND device_list_epoch = ? AND (device_list_reserved = ? OR device_list_reserved_until <= ?)
+		RETURNING device_list_reserved_epoch`),
+		digest, digest, until, userID, tenantID, version, expected, digest, now.Unix()).Scan(&epoch)
+	if err == nil {
+		return E2EEReservation{Epoch: epoch, Until: time.Unix(until, 0)}, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return E2EEReservation{}, err
+	}
+	// Refused: say when the holder's reservation lapses, if that is what is in the way.
+	var listEpoch, held int64
+	err = s.store.db.QueryRowContext(ctx, s.store.rebind(`SELECT device_list_epoch, device_list_reserved_until FROM e2ee_master_keys WHERE user_id = ? AND tenant_id = ? AND version = ?`),
+		userID, tenantID, version).Scan(&listEpoch, &held)
+	if err == nil && listEpoch == expected && held > now.Unix() {
+		return E2EEReservation{Until: time.Unix(held, 0)}, ErrE2EEVersion
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return E2EEReservation{}, err
+	}
+	return E2EEReservation{}, ErrE2EEVersion
 }
 
-func oneRowVersion(res sql.Result, err error) error {
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n != 1 {
-		return ErrE2EEVersion
-	}
-	return nil
-}
-
-func (s *e2eeStore) PutDeviceList(ctx context.Context, tenantID, userID string, version, expected int64, list, digest, signature string, now time.Time, proof Proof) error {
+func (s *e2eeStore) PutDeviceList(ctx context.Context, tenantID, userID string, version, expected, epoch int64, list, digest, signature string, now time.Time, proof Proof) error {
 	return s.fenced(ctx, tenantID, userID, version, proof, func(tx *sql.Tx) error {
-		// The finalized state: published only under its own live reservation, which it ends.
+		// The finalized state: published only under its own live reservation, at its epoch,
+		// which it ends (the epoch stays granted).
 		res, err := tx.ExecContext(ctx, s.store.rebind(`UPDATE e2ee_master_keys SET device_list = ?, device_list_signature = ?, device_list_epoch = ?, device_list_reserved = '', device_list_reserved_until = 0
-			WHERE user_id = ? AND tenant_id = ? AND version = ? AND device_list_epoch = ? AND device_list_reserved = ? AND device_list_reserved_until > ?`),
-			list, signature, expected+1, userID, tenantID, version, expected, digest, now.Unix())
+			WHERE user_id = ? AND tenant_id = ? AND version = ? AND device_list_epoch = ? AND device_list_reserved = ? AND device_list_reserved_epoch = ? AND device_list_reserved_until > ?`),
+			list, signature, epoch, userID, tenantID, version, expected, digest, epoch, now.Unix())
 		if err != nil {
 			return err
 		}
@@ -392,6 +408,10 @@ func (s *e2eeStore) ConsumePairing(ctx context.Context, tenantID, userID, id, ne
 	return scanPairing(s.store.db.QueryRowContext(ctx, s.store.rebind(`DELETE FROM e2ee_pairings
 		WHERE id = ? AND tenant_id = ? AND user_id = ? AND new_device = ? AND sealed <> '' AND expires_at > ?
 		RETURNING `+pairingColumns), id, tenantID, userID, newDevice, now.Unix()))
+}
+
+func (s *e2eeStore) DeletePairingUnsealed(ctx context.Context, tenantID, userID, id string) error {
+	return oneRow(s.store.db.ExecContext(ctx, s.store.rebind(`DELETE FROM e2ee_pairings WHERE id = ? AND tenant_id = ? AND user_id = ? AND sealed = ''`), id, tenantID, userID))
 }
 
 func (s *e2eeStore) DeletePairing(ctx context.Context, tenantID, userID, id string) error {

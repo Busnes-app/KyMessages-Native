@@ -643,6 +643,10 @@ func TestE2EEPairingRelaysTwoLayerTransferOnce(t *testing.T) {
 	if strings.Contains(doBearerJSON(t, srv, http.MethodGet, path, tok, nil, nil).Body.String(), b64.EncodeToString(sealed[:64])) {
 		t.Fatal("GET exposes the sealed keys")
 	}
+	// The verified device's cancel, sent after its seal answer was lost, leaves the keys in place.
+	if c := doBearerJSON(t, srv, http.MethodDelete, path+"?unsealed=1", tok, nil, nil).Code; c != http.StatusNoContent {
+		t.Fatalf("unsealed-only cancel = %d", c)
+	}
 	consume := func(device string) *http.Response {
 		rec := doBearerJSON(t, srv, http.MethodPost, path+"/consume", tok, map[string]string{"device_id": device}, nil)
 		return rec.Result()
@@ -739,7 +743,7 @@ func TestE2EEDeviceListIsSignedAndVersioned(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return map[string]any{"version": 1, "expected_epoch": epoch - 1, "device_ids": ids, "signature": signer.sign(t, e2eeid.DomainDeviceList, msg)}
+		return map[string]any{"version": 1, "expected_epoch": epoch - 1, "epoch": epoch, "device_ids": ids, "signature": signer.sign(t, e2eeid.DomainDeviceList, msg)}
 	}
 	putL := func(tok string, body map[string]any) int {
 		return doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/devices/list", tok, body, nil).Code
@@ -761,11 +765,19 @@ func TestE2EEDeviceListIsSignedAndVersioned(t *testing.T) {
 		body map[string]any
 		want int
 	}{
-		"signed by another key":      {tok, list(1, []string{"DEVICE_A_00001"}, newIdentity(t, orgA, alice.ID)), http.StatusBadRequest},
-		"a list not sorted":          {tok, unsorted, http.StatusBadRequest},
-		"signed for a later epoch":   {tok, func() map[string]any { b := list(2, []string{"DEVICE_A_00001"}, id); b["expected_epoch"] = 0; return b }(), http.StatusBadRequest},
+		"signed by another key": {tok, list(1, []string{"DEVICE_A_00001"}, newIdentity(t, orgA, alice.ID)), http.StatusBadRequest},
+		"a list not sorted":     {tok, unsorted, http.StatusBadRequest},
+		"signed for a later epoch": {tok, func() map[string]any {
+			b := list(2, []string{"DEVICE_A_00001"}, id)
+			b["expected_epoch"] = 0
+			b["epoch"] = 1
+			return b
+		}(), http.StatusBadRequest},
 		"another user's list":        {bobTok, list(1, []string{"DEVICE_A_00001"}, id), http.StatusConflict},
 		"a private key riding along": {tok, func() map[string]any { b := list(1, []string{"DEVICE_A_00001"}, id); b["seed"] = "x"; return b }(), http.StatusBadRequest},
+		"no device_ids":              {tok, func() map[string]any { b := list(1, []string{}, id); delete(b, "device_ids"); return b }(), http.StatusBadRequest},
+		"null device_ids":            {tok, func() map[string]any { b := list(1, []string{}, id); b["device_ids"] = nil; return b }(), http.StatusBadRequest},
+		"an epoch not past expected": {tok, func() map[string]any { b := list(1, []string{"DEVICE_A_00001"}, id); b["epoch"] = 0; return b }(), http.StatusBadRequest},
 	} {
 		if got := putL(c.tok, c.body); got != c.want {
 			t.Errorf("%s = %d, want %d", name, got, c.want)
@@ -783,8 +795,13 @@ func TestE2EEDeviceListIsSignedAndVersioned(t *testing.T) {
 	if c := reserve(tok, 0, both); c != http.StatusOK {
 		t.Fatalf("reserve = %d", c)
 	}
-	if c := reserve(tok, 0, []string{"DEVICE_C_00003"}); c != http.StatusConflict {
-		t.Fatalf("a competing reservation = %d", c)
+	held := doBearerJSON(t, srv, http.MethodPost, "/api/v1/keys/devices/list/reserve", tok, map[string]any{"version": 1, "expected_epoch": 0, "digest": e2eeid.DeviceListDigest([]string{"DEVICE_C_00003"})}, nil)
+	var hint struct {
+		RetryInMs int64 `json:"retry_in_ms"`
+	}
+	decodeBody(t, held.Body.Bytes(), &hint)
+	if held.Code != http.StatusConflict || hint.RetryInMs <= 0 || hint.RetryInMs > api.E2EEDeviceListReservation.Milliseconds() {
+		t.Fatalf("a competing reservation = %d %s", held.Code, held.Body.String())
 	}
 	if c := putL(tok, list(1, []string{"DEVICE_C_00003"}, id)); c != http.StatusConflict {
 		t.Fatalf("the losing proposal published = %d", c)

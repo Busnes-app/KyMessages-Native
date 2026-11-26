@@ -1,14 +1,24 @@
 import { afterEach, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { ConfirmItsYou } from './ConfirmItsYou';
 import { adminFetch } from '../api';
 
 // A captcha that hands out one token per round, as the real widget solves one challenge each.
 vi.mock('./CaptchaWidget', async () => {
-  const { useEffect } = await import('react');
+  const { useEffect, useRef } = await import('react');
   return {
-    CaptchaWidget: ({ onToken, round }: { onToken: (t: string) => void; round: number }) => {
-      useEffect(() => onToken(`captcha-${round}`), [onToken, round]);
+    CaptchaWidget: ({ onToken, round, onStatus }: { onToken: (t: string) => void; round: number; onStatus?: (s: string) => void }) => {
+      const cb = useRef({ onToken, onStatus });
+      cb.current = { onToken, onStatus };
+      useEffect(() => {
+        cb.current.onStatus?.('working');
+        // Solved a moment later, as a real challenge is.
+        const timer = setTimeout(() => {
+          cb.current.onToken(`captcha-${round}`);
+          cb.current.onStatus?.('done');
+        }, 20);
+        return () => clearTimeout(timer);
+      }, [round]);
       return null;
     },
   };
@@ -17,6 +27,13 @@ vi.mock('./CaptchaWidget', async () => {
 const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { 'Content-Type': 'application/json' } });
 const STEP_UP = { error: "Confirm it's you: this change needs a sign-in from the last 10 minutes", code: 'reauthentication_required', reauth_url: '/api/sso/kyidentity/login?fresh=1' };
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
+
+/** Waits until the captcha handed over its token (the button is enabled), then signs in. */
+async function signInReady(dialog: HTMLElement) {
+  const button = within(dialog).getByRole('button', { name: 'Sign in again' });
+  await waitFor(() => expect(button).toHaveProperty('disabled', false));
+  fireEvent.click(button);
+}
 
 /** fetch answers each path from its queue, repeating the last answer. */
 function answers(byPath: Record<string, Response[]>) {
@@ -116,7 +133,7 @@ it('signs a local account in again in place, through TOTP, then retries', async 
   const dialog = await screen.findByRole('dialog', { name: "Confirm it's you" });
   expect(within(dialog).queryByText(/sign out/)).toBeNull();
   fireEvent.change(within(dialog).getByLabelText('Password for @alice'), { target: { value: 'pw' } });
-  fireEvent.click(within(dialog).getByRole('button', { name: 'Sign in again' }));
+  await signInReady(dialog);
   fireEvent.change(await within(dialog).findByLabelText(/Authentication code/), { target: { value: '123456' } });
   fireEvent.click(within(dialog).getByRole('button', { name: 'Verify' }));
   expect((await pending).status).toBe(200);
@@ -136,7 +153,7 @@ it('goes back to the password when a refused code spent its challenge, and then 
   const dialog = await screen.findByRole('dialog', { name: "Confirm it's you" });
   const signIn = async () => {
     fireEvent.change(await within(dialog).findByLabelText('Password for @alice'), { target: { value: 'pw' } });
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Sign in again' }));
+    await signInReady(dialog);
     fireEvent.change(await within(dialog).findByLabelText(/Authentication code/), { target: { value: '123456' } });
     fireEvent.click(within(dialog).getByRole('button', { name: 'Verify' }));
   };
@@ -163,9 +180,11 @@ it('never sends a captcha token again that a login spent, also after a refused c
   render(<ConfirmItsYou username="alice" />);
   const pending = adminFetch('/x', { method: 'PUT' });
   const dialog = await screen.findByRole('dialog', { name: "Confirm it's you" });
+  // No sign-in while the challenge is still being solved.
+  expect(within(dialog).getByRole('button', { name: 'Sign in again' })).toHaveProperty('disabled', true);
   for (let i = 0; i < 2; i++) {
     fireEvent.change(await within(dialog).findByLabelText('Password for @alice'), { target: { value: 'pw' } });
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Sign in again' }));
+    await signInReady(dialog);
     fireEvent.change(await within(dialog).findByLabelText(/Authentication code/), { target: { value: '123456' } });
     fireEvent.click(within(dialog).getByRole('button', { name: 'Verify' }));
   }

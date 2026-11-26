@@ -83,13 +83,13 @@ func TestE2EEMasterKeyVersions(t *testing.T) {
 		t.Fatalf("pins written from another org: %v", err)
 	}
 	now := time.Now()
-	if err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-1", now, time.Minute); err != nil {
+	if _, err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-1", now, time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, `["D1"]`, "dg-1", "list-sig", now, okProof); err != nil {
+	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, 1, `["D1"]`, "dg-1", "list-sig", now, okProof); err != nil {
 		t.Fatal(err)
 	}
-	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, `["D1","D9"]`, "dg-1", "stale", now, okProof); !errors.Is(err, store.ErrE2EEVersion) {
+	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, 1, `["D1","D9"]`, "dg-1", "stale", now, okProof); !errors.Is(err, store.ErrE2EEVersion) {
 		t.Fatalf("stale device list epoch: %v", err)
 	}
 	if _, err := k.PutBackupSessions(ctx, "t1", "u-a", 1, 0, []store.E2EEBackupSession{{RoomID: "r", SenderKey: "k", SessionID: "s", FirstIndex: 0, Sealed: "x"}}, 10, 1<<20, okProof); err != nil {
@@ -423,8 +423,9 @@ func TestE2EEKeyBackupPagesBytewise(t *testing.T) {
 }
 
 // Two devices proposing different successors of one device list: only the first to reserve
-// may publish, the other is refused before it signs, an honest retry renews its own
-// reservation, and an abandoned one lapses so the list cannot be held forever.
+// may publish, the other is refused before it signs (and told when the holder lapses), an honest
+// retry keeps its epoch, and a different proposal replacing a lapsed one gets a higher epoch, so
+// the two are never signable at one epoch.
 func TestE2EEDeviceListReservation(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
@@ -433,56 +434,94 @@ func TestE2EEDeviceListReservation(t *testing.T) {
 	if err := k.PutMasterKey(ctx, master("u-a", "t1", "1"), 0); err != nil {
 		t.Fatal(err)
 	}
-	now := time.Now()
-	if err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-a", now, time.Minute); err != nil {
-		t.Fatal(err)
+	now := time.Now().Truncate(time.Second)
+	if r, err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-a", now, time.Minute); err != nil || r.Epoch != 1 {
+		t.Fatal(r, err)
 	}
-	// The losing proposal: refused while A's reservation is live, and unpublishable.
-	if err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-b", now, time.Minute); !errors.Is(err, store.ErrE2EEVersion) {
-		t.Fatalf("second reservation: %v", err)
+	// The losing proposal: refused while A's reservation is live, with its lapse, and unpublishable.
+	r, err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-b", now, time.Minute)
+	if !errors.Is(err, store.ErrE2EEVersion) || !r.Until.Equal(now.Add(time.Minute)) {
+		t.Fatalf("second reservation: %+v %v", r, err)
 	}
-	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, `["B"]`, "dg-b", "sig-b", now, okProof); !errors.Is(err, store.ErrE2EEVersion) {
+	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, 1, `["B"]`, "dg-b", "sig-b", now, okProof); !errors.Is(err, store.ErrE2EEVersion) {
 		t.Fatalf("unreserved publish: %v", err)
 	}
-	// Wrong version, epoch or org reserve nothing.
+	// Wrong version, epoch or org reserve nothing, and name no holder.
 	for _, c := range []struct {
-		tenant           string
-		version, expired int64
+		tenant            string
+		version, expected int64
 	}{{"t1", 2, 0}, {"t1", 1, 1}, {"t2", 1, 0}} {
-		if err := k.ReserveDeviceList(ctx, c.tenant, "u-a", c.version, c.expired, "dg-a", now, time.Minute); !errors.Is(err, store.ErrE2EEVersion) {
-			t.Fatalf("reservation %+v: %v", c, err)
+		if r, err := k.ReserveDeviceList(ctx, c.tenant, "u-a", c.version, c.expected, "dg-a", now, time.Minute); !errors.Is(err, store.ErrE2EEVersion) || !r.Until.IsZero() {
+			t.Fatalf("reservation %+v: %+v %v", c, r, err)
 		}
 	}
-	// A's honest retry renews it; past its lapse A cannot publish, and B may reserve.
-	if err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-a", now.Add(30*time.Second), time.Minute); err != nil {
-		t.Fatalf("renewal: %v", err)
+	// A's honest retry renews it at the same epoch; past its lapse A cannot publish.
+	if r, err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-a", now.Add(30*time.Second), time.Minute); err != nil || r.Epoch != 1 {
+		t.Fatalf("renewal: %+v %v", r, err)
 	}
 	later := now.Add(2 * time.Minute)
-	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, `["A"]`, "dg-a", "sig-a", later, okProof); !errors.Is(err, store.ErrE2EEVersion) {
+	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, 1, `["A"]`, "dg-a", "sig-a", later, okProof); !errors.Is(err, store.ErrE2EEVersion) {
 		t.Fatalf("publish after the reservation lapsed: %v", err)
 	}
-	if err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-b", later, time.Minute); err != nil {
-		t.Fatalf("reservation after a lapse: %v", err)
+	// B replaces the lapsed reservation at a higher epoch: A may have signed epoch 1 already.
+	r, err = k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-b", later, time.Minute)
+	if err != nil || r.Epoch != 2 {
+		t.Fatalf("reservation after a lapse: %+v %v", r, err)
 	}
-	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, `["B"]`, "dg-b", "sig-b", later, okProof); err != nil {
+	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, 1, `["B"]`, "dg-b", "sig-b", later, okProof); !errors.Is(err, store.ErrE2EEVersion) {
+		t.Fatalf("published at an epoch other than the reserved one: %v", err)
+	}
+	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, 2, `["B"]`, "dg-b", "sig-b", later, okProof); err != nil {
 		t.Fatal(err)
 	}
-	// Publishing ends the reservation, and the next epoch starts free.
-	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 1, `["B"]`, "dg-b", "sig-b", later, okProof); !errors.Is(err, store.ErrE2EEVersion) {
-		t.Fatalf("publish without a reservation of epoch 2: %v", err)
+	// Publishing ends the reservation, and the next one starts above it.
+	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 2, 3, `["B"]`, "dg-b", "sig-b", later, okProof); !errors.Is(err, store.ErrE2EEVersion) {
+		t.Fatalf("publish without a reservation of epoch 3: %v", err)
 	}
-	if err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 1, "dg-c", later, time.Minute); err != nil {
-		t.Fatal(err)
+	if r, err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 2, "dg-c", later, time.Minute); err != nil || r.Epoch != 3 {
+		t.Fatal(r, err)
 	}
 	m, _ := k.GetMasterKey(ctx, "u-a")
-	if m.DeviceListEpoch != 1 || m.DeviceList != `["B"]` || m.DeviceListSignature != "sig-b" {
+	if m.DeviceListEpoch != 2 || m.DeviceList != `["B"]` || m.DeviceListSignature != "sig-b" {
 		t.Fatalf("published %+v", m)
 	}
-	// A reset clears a pending reservation with the list.
+	// A reset clears a pending reservation with the list, and its epochs.
 	if err := k.PutMasterKey(ctx, master("u-a", "t1", "2"), 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := k.ReserveDeviceList(ctx, "t1", "u-a", 2, 0, "dg-d", later, time.Minute); err != nil {
-		t.Fatalf("reservation after a reset: %v", err)
+	if r, err := k.ReserveDeviceList(ctx, "t1", "u-a", 2, 0, "dg-d", later, time.Minute); err != nil || r.Epoch != 1 {
+		t.Fatalf("reservation after a reset: %+v %v", r, err)
+	}
+}
+
+// The verified device's cancel removes a pairing only while nothing was sealed to it.
+func TestE2EEPairingUnsealedCancel(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	e2eeUser(t, st, "u-a")
+	signedInitiator(t, st, "u-a", "t1", "D1")
+	k := st.E2EE()
+	now := time.Now()
+	p := &store.E2EEPairing{ID: "p1", TenantID: "t1", UserID: "u-a", InitiatorDevice: "D1", MasterVersion: 1, ExpiresAt: now.Add(time.Minute)}
+	if err := k.CreatePairing(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	if err := k.JoinPairing(ctx, "t1", "u-a", "p1", "D2", "eph", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := k.SealPairing(ctx, "t1", "u-a", "p1", "D1", "sealed", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := k.DeletePairingUnsealed(ctx, "t1", "u-a", "p1"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("cancel of a sealed pairing: %v", err)
+	}
+	if got, err := k.ConsumePairing(ctx, "t1", "u-a", "p1", "D2", now); err != nil || got.Sealed != "sealed" {
+		t.Fatalf("the sealed keys did not survive: %+v %v", got, err)
+	}
+	if err := k.CreatePairing(ctx, &store.E2EEPairing{ID: "p2", TenantID: "t1", UserID: "u-a", InitiatorDevice: "D1", MasterVersion: 1, ExpiresAt: now.Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := k.DeletePairingUnsealed(ctx, "t1", "u-a", "p2"); err != nil {
+		t.Fatalf("cancel of an unsealed pairing: %v", err)
 	}
 }
