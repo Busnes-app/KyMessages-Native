@@ -40,6 +40,7 @@ lint:
 	@go vet ./...
 	@bash scripts/check-compose-proxy.sh
 	@bash scripts/check-build-tags.sh
+	@bash scripts/check-pqc-tls.sh
 
 smoke: build
 	@./scripts/smoke-test.sh

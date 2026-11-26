@@ -208,7 +208,7 @@ When the user requests a durable behavior change, record it here or in the relev
 ## Verification
 
 CI (`.github/workflows/ci.yml`) runs on every push and pull request:
-- `make lint` equivalent: gofmt, `go vet`, `go mod tidy`/`verify`, and `scripts/check-compose-proxy.sh`, and `scripts/check-release-required.sh` (every CI job is in the release workflow's `REQUIRED` list), and `scripts/check-build-tags.sh` (the `kye2e` tag only in `internal/config/gate_*.go`; no build tags in release build inputs)
+- `make lint` equivalent: gofmt, `go vet`, `go mod tidy`/`verify`, and `scripts/check-compose-proxy.sh`, and `scripts/check-release-required.sh` (every CI job is in the release workflow's `REQUIRED` list), and `scripts/check-build-tags.sh` (the `kye2e` tag only in `internal/config/gate_*.go`; no build tags in release build inputs), and `scripts/check-pqc-tls.sh` (no `CurvePreferences` in non-test Go code, no `tlsmlkem` overrides outside tests/docs, and `TestOutboundPQTLS` passes normally and under `GODEBUG=fips140=on`)
 - `go test -race` with coverage on SQLite, and the same suite against PostgreSQL 18
 - Bounded fuzzing (`go test -fuzz=… -fuzztime=Nx`, one step per target) of `FuzzClientIP`,
   `FuzzParseTrustedProxies`, `FuzzValidateName` and `FuzzNormalizePNG`; a crasher kept under
