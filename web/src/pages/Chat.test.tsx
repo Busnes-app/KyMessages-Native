@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { Chat } from './Chat';
 import { HybridCallController } from '../rtc/hybridCall';
-import { deliverKey, fakeEnvelope, heldOpenCount, holdFakeOpens, resetFakeE2EE, setFakeUnavailable, storeKeySilently } from '../chat/e2eeFake';
+import { deliverKey, fakeEnvelope, heldOpenCount, holdFakeOpens, resetFakeE2EE, setFakeIdentity, setFakeUnavailable, storeKeySilently } from '../chat/e2eeFake';
 
 // Pages run without the WebAssembly core; crypto/engine.test.ts covers the real one.
 vi.mock('../chat/e2ee', () => import('../chat/e2eeFake'));
@@ -377,6 +377,33 @@ describe('Native Chat page', () => {
     const btn = await screen.findByRole('button', { name: 'Create #general' });
     fireEvent.click(btn);
     expect(await screen.findByRole('heading', { name: 'Welcome to #general' })).toBeTruthy();
+  });
+
+  it('offers encryption setup and device verification with no room at all', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === '/api/v1/bootstrap') {
+          return json({
+            user: { id: 'u_admin', username: 'admin', display_name: 'Admin', role: 'admin' },
+            tenant: { id: 'default', slug: 'default', display_name: 'KyMessages', plan: 'self_hosted' },
+            rooms: [],
+          });
+        }
+        if (url === '/api/v1/users') return json({ users: [] });
+        if (url === '/api/v1/rooms') return json({ rooms: [] });
+        return json({ error: 'not found' }, 404);
+      }),
+    );
+    setFakeIdentity({ state: 'none', quarantined: false });
+    const { unmount } = render(<Chat />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Set up encryption' }));
+    expect(await screen.findByText('Save your recovery key')).toBeTruthy();
+    unmount();
+    setFakeIdentity({ state: 'verified', fingerprint: 'f'.repeat(64), restoring: false, backupFull: false });
+    render(<Chat />);
+    expect(await screen.findByRole('button', { name: 'Verify a device' })).toBeTruthy();
   });
 
   it('opens the direct message a suite #dm= link names', async () => {

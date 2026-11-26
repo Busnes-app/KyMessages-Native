@@ -1,3 +1,5 @@
+import { PQCUnavailable } from '../pqc/index';
+
 // Stored records the device engine (engine.ts) and its identity (identity.ts) share.
 
 /** A room session this device can read, bound to the device that sent its key. */
@@ -19,11 +21,22 @@ export interface InboundRecord {
 // entry, and can neither displace the real sender's key nor claim its message indexes.
 export const inboundKey = (senderKey: string, sessionId: string) => `in:${senderKey}:${sessionId}`;
 export const seenKey = (senderKey: string, sessionId: string, index: number) => `seen:${senderKey}:${sessionId}:${index}`;
+/** A key-backup copy of a session that reaches earlier than the verified one this device holds:
+ * used only for messages before that one's first index, and never as authenticated. */
+export const backupCoverKey = (senderKey: string, sessionId: string) => `inb:${senderKey}:${sessionId}`;
 /** A room session waiting to be sealed to the key backup; the value is its inbound key. */
 export const backupQueueKey = (inbound: string) => `bq:${inbound}`;
 
 /** A failure worth retrying later (the network, the server), as opposed to bad data. */
 export class Transient extends Error {}
+
+/**
+ * Whether e is about availability (the network or server, the post-quantum module, local
+ * storage) rather than a verdict on data: such failures keep their work for a retry.
+ */
+export function isTransient(e: unknown): boolean {
+  return e instanceof Transient || e instanceof PQCUnavailable || e instanceof DOMException;
+}
 
 /** The key server refused a write because the identity, pin set or backup version moved on. */
 export class Conflict extends Error {}

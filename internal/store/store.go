@@ -120,21 +120,28 @@ type E2EEStore interface {
 	// else ErrE2EEVersion. Replacing a master key deletes its key backup and pin set and every
 	// device cross-signature it made, in the same transaction.
 	PutMasterKey(ctx context.Context, m *E2EEMasterKey, expected int64) error
-	// SignDevice stores a device's cross-signature by master key version; ErrE2EEVersion when
-	// that is not the user's current version, ErrNotFound when there is no such device.
-	SignDevice(ctx context.Context, userID, deviceID string, version int64, signature string) error
-	// PutPins stores the user's sealed pin set as counter expected+1 under master key version.
-	PutPins(ctx context.Context, tenantID, userID string, version, expected int64, pins string) error
-	// PutDeviceList stores the master-signed device list as epoch expected+1 under version.
-	PutDeviceList(ctx context.Context, tenantID, userID string, version, expected int64, list, signature string) error
-	// PutBackupSessions adds sealed sessions to backup version, keeping for each (room, sender
-	// key, session) the copy with the lowest first index; ErrE2EEVersion when version is not
-	// current and ErrE2EEBackupFull (storing nothing) past maxSessions or maxBytes of sealed text.
-	PutBackupSessions(ctx context.Context, userID string, version int64, sessions []E2EEBackupSession, maxSessions int, maxBytes int64) error
-	// ListBackupSessions pages backup version in (room, sender key, session) order after the cursor.
-	ListBackupSessions(ctx context.Context, userID string, version int64, after E2EEBackupCursor, limit int) ([]E2EEBackupSession, error)
+	// SignDevice stores a device's cross-signature by master key version once proof accepts it
+	// against that version's master key and the device row, both read in the write's
+	// transaction; ErrE2EEVersion when version is not current in tenantID, ErrNotFound when
+	// there is no such device there.
+	SignDevice(ctx context.Context, tenantID, userID, deviceID string, version int64, signature string, proof func(masterKey string, d *E2EEDevice) error) error
+	// PutPins stores the user's sealed pin set as counter expected+1 under master key version,
+	// once proof accepts the write against that version's master key (all in one transaction).
+	PutPins(ctx context.Context, tenantID, userID string, version, expected int64, pins string, proof Proof) error
+	// PutDeviceList stores the master-signed device list as epoch expected+1 under version, once
+	// proof accepts it against that version's master key (all in one transaction).
+	PutDeviceList(ctx context.Context, tenantID, userID string, version, expected int64, list, signature string, proof Proof) error
+	// PutBackupSessions adds sealed sessions to backup version once proof accepts the batch
+	// against that version's master key: a session already stored is replaced only by a copy
+	// with a lower first index; a new one is stored only within maxSessions and maxBytes of
+	// sealed text (the result says Full when one was not). ErrE2EEVersion when version is not
+	// current in tenantID.
+	PutBackupSessions(ctx context.Context, tenantID, userID string, version int64, sessions []E2EEBackupSession, maxSessions int, maxBytes int64, proof Proof) (E2EEBackupResult, error)
+	// ListBackupSessions pages backup version in bytewise (room, sender key, session) order
+	// after the cursor.
+	ListBackupSessions(ctx context.Context, tenantID, userID string, version int64, after E2EEBackupCursor, limit int) ([]E2EEBackupSession, error)
 	// DeleteBackup removes every session of backup version; ErrE2EEVersion when not current.
-	DeleteBackup(ctx context.Context, userID string, version int64) error
+	DeleteBackup(ctx context.Context, tenantID, userID string, version int64) error
 
 	// CreatePairing opens a QR pairing, cancelling the user's other pairings, only while
 	// p.MasterVersion is the user's identity version and the initiator is cross-signed by it
@@ -175,6 +182,13 @@ type E2EEBackupSession struct {
 	RoomID, SenderKey, SessionID string
 	FirstIndex                   int64
 	Sealed                       string
+}
+
+// E2EEBackupResult says what a backup write did: Stored new rows and better copies, Kept rows
+// already as good, and Full when a new session did not fit the caps.
+type E2EEBackupResult struct {
+	Stored, Kept int
+	Full         bool
 }
 
 // E2EEBackupCursor is the last (room, sender key, session) a backup page ended on.

@@ -45,7 +45,7 @@ export function resetFakeE2EE(): void {
   keys.clear();
   keys.add('s_own');
   unavailable = false;
-  fakeIdentity = { state: 'verified', fingerprint: 'f'.repeat(64), restoring: false };
+  fakeIdentity = { state: 'verified', fingerprint: 'f'.repeat(64), restoring: false, backupFull: false };
   fakeChanges = [];
 }
 
@@ -110,8 +110,8 @@ export function openMessages(list: ChatMessage[]): Promise<ChatMessage[]> {
 }
 
 // Identity (E3): page tests see a verified device with no identity changes unless they say so.
-type FakeIdentity = { state: 'none'; quarantined: boolean } | { state: 'unverified'; fingerprint: string; quarantined: boolean } | { state: 'verified'; fingerprint: string; restoring: boolean };
-let fakeIdentity: FakeIdentity = { state: 'verified', fingerprint: 'f'.repeat(64), restoring: false };
+type FakeIdentity = { state: 'none'; quarantined: boolean } | { state: 'unverified'; fingerprint: string; quarantined: boolean } | { state: 'verified'; fingerprint: string; restoring: boolean; backupFull: boolean };
+let fakeIdentity: FakeIdentity = { state: 'verified', fingerprint: 'f'.repeat(64), restoring: false, backupFull: false };
 let fakeChanges: { user_id: string; fingerprint: string; previous: string }[] = [];
 const identityListeners = new Set<() => void>();
 export function setFakeIdentity(s: typeof fakeIdentity, changes: typeof fakeChanges = []): void {
@@ -130,8 +130,9 @@ export async function acceptIdentity(userId: string, previous: string, fingerpri
   fakeChanges = fakeChanges.filter((c) => c.user_id !== userId);
   for (const fn of identityListeners) fn();
 }
-export const prepareIdentity = async () => ({ recoveryKey: 'ABCD '.repeat(14).trim(), commit: async () => setFakeIdentity({ state: 'verified', fingerprint: 'f'.repeat(64), restoring: false }) });
+export const prepareIdentity = async () => ({ recoveryKey: 'ABCD '.repeat(14).trim(), commit: async () => setFakeIdentity({ state: 'verified', fingerprint: 'f'.repeat(64), restoring: false, backupFull: false }) });
 export const restoreIdentity = async () => 0;
 export const checkRoomIdentities = () => undefined;
-export const offerVerification = async () => ({ text: 'x'.repeat(108), expiresInMs: 180_000, poll: async () => undefined, approve: async () => undefined, cancel: async () => undefined });
+export const offerVerification = async () => ({ text: 'x'.repeat(108), expiresInMs: 180_000, poll: async (): Promise<{ code: string; device: string } | undefined> => undefined, approve: async () => undefined, cancel: async () => undefined });
+export const ownDeviceVerified = async () => true;
 export const joinVerification = async () => ({ code: '123456', finish: async () => 0, cancel: async () => undefined });

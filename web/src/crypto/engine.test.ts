@@ -559,10 +559,14 @@ describe('encrypted rooms between two client engines', () => {
     server.join('r1', 'u_alice', 'u_bob');
     const m1 = await send('r1', alice, 'later');
     const query = bobServer.query;
+    // While the sender cannot be looked up, the mail stays queued: its key is not stored as
+    // unvouched because the lookup failed.
     bobServer.query = () => Promise.reject(new Error('offline'));
+    await expect(bob.receive()).rejects.toThrow();
+    expect(server.mail.get(`u_bob\n${bob.deviceId}`)).toHaveLength(1);
+    bobServer.query = query;
     await bob.receive();
     expect(await read(bob, m1)).toBe('later');
-    bobServer.query = query;
   });
 
   it('keeps a room key whose write fails in local storage, even after its one-time key is spent', async () => {

@@ -16,7 +16,7 @@
 import { Account, GroupSession, InboundGroupSession, Session, verifyEd25519 } from './index';
 import type { Hybrid } from '../pqc/index';
 import { Identity, type IdentityChange, type IdentityServer, type IdentityStatus, type MasterKeyRecord, type PairingJoin, type PairingOffer } from './identity';
-import { backupQueueKey, inboundKey, isObj, isStr, parseJSON, seenKey, Transient, type InboundRecord } from './records';
+import { backupCoverKey, backupQueueKey, inboundKey, isObj, isStr, isTransient, parseJSON, seenKey, Transient, type InboundRecord } from './records';
 import type { CryptoStore } from './store';
 
 export { Conflict } from './records';
@@ -132,7 +132,7 @@ export interface SealedMessage {
 export type Opened =
   /** authenticated: the session came over Olm from a device its member's master key vouches
    * for; false for one from an unverified device or restored from the key backup. */
-  | { state: 'decrypted'; inner: RoomInner; authenticated: boolean }
+  | { state: 'decrypted'; inner: RoomInner; authenticated: boolean; restored: boolean }
   | { state: 'waiting'; sessionId: string }
   | { state: 'failed'; reason: string };
 
@@ -239,7 +239,10 @@ export class CryptoEngine {
     private readonly store: CryptoStore,
     private readonly key: Uint8Array,
   ) {
-    this.identity = new Identity({ userId, deviceId, curve25519, ed25519, server, store, pickleKey: key, locked: (fn) => this.locked(fn) });
+    this.identity = new Identity({
+      userId, deviceId, curve25519, ed25519, server, store, pickleKey: key, locked: (fn) => this.locked(fn),
+      onRestored: (ids) => { for (const fn of this.listeners) fn(ids); },
+    });
   }
 
   /** Restores this browser's device for userId, or creates one, and publishes its keys. */
@@ -385,7 +388,12 @@ export class CryptoEngine {
    * saw before, without this device. A device whose keys changed is dropped, never re-pinned.
    */
   async verifiedDevices(userIds: string[]): Promise<Target[]> {
-    this.identity.startBatch();
+    // One authenticated pin sync before the whole check; a failure fails the check.
+    try {
+      await this.identity.beforeTrust();
+    } catch (e) {
+      throw new Transient(e instanceof Error ? e.message : 'Could not sync pinned identities');
+    }
     const out: Target[] = [];
     const pins: [string, unknown][] = [];
     for (let i = 0; i < userIds.length; i += BATCH) {
@@ -474,6 +482,11 @@ export class CryptoEngine {
   /** On a verified device: a QR pairing to verify a new one. */
   offerVerification(): Promise<PairingOffer> {
     return this.identity.offer();
+  }
+
+  /** Whether one of the user's own devices is verified: signed by the master key and listed. */
+  ownDeviceVerified(deviceId: string): Promise<boolean> {
+    return this.locked(async () => (await this.verifiedDevices([this.userId])).some((t) => t.device_id === deviceId));
   }
 
   /** On a new device: joins a pairing from the code a verified device shows. */
@@ -721,29 +734,41 @@ export class CryptoEngine {
       return { state: 'failed', reason: 'This message did not come from the device it names.' };
     }
     if (rec.room_id !== m.room_id) return { state: 'failed', reason: 'This message was encrypted for another room.' };
-    const session = InboundGroupSession.fromPickle(rec.pickle, this.key);
-    let plaintext: string;
-    let index: number;
-    try {
-      const d = session.decrypt(env.ciphertext);
-      try {
-        plaintext = d.plaintext;
-        index = d.messageIndex;
-      } finally {
-        d.free();
-      }
-    } catch {
-      return { state: 'failed', reason: 'This message was sent before this device could read the room.' };
-    } finally {
-      session.free();
+    // An earlier-reaching copy from the key backup, bound to the same sender and room, reads only
+    // what the verified copy cannot, and never as authenticated.
+    const cover = await this.store.get<InboundRecord>(backupCoverKey(env.sender_key, env.session_id));
+    const usable = cover && cover.room_id === rec.room_id && cover.sender_user === rec.sender_user && cover.sender_device === rec.sender_device ? cover : undefined;
+    let opened = this.openWith(rec, env.ciphertext);
+    let via = rec;
+    if (!opened && usable) {
+      opened = this.openWith(usable, env.ciphertext);
+      via = usable;
     }
+    if (!opened) return { state: 'failed', reason: 'This message was sent before this device could read the room.' };
+    const { plaintext, index } = opened;
     const inner = parseInner(plaintext);
     if (!inner) return { state: 'failed', reason: 'This message is damaged.' };
     if (inner.room_id !== m.room_id) return { state: 'failed', reason: 'This message was encrypted for another room.' };
     if (inner.type === 'edit' && inner.message_id !== m.id) return { state: 'failed', reason: 'This edit belongs to another message.' };
     const owner = await this.store.putIfAbsent(seenKey(env.sender_key, env.session_id, index), m.id);
     if (owner !== m.id) return { state: 'failed', reason: 'This message is a replay of another message.' };
-    return { state: 'decrypted', inner, authenticated: rec.verified === true && !rec.from_backup };
+    return { state: 'decrypted', inner, authenticated: via.verified === true && !via.from_backup, restored: via.from_backup === true };
+  }
+
+  private openWith(rec: InboundRecord, ciphertext: string): { plaintext: string; index: number } | undefined {
+    const session = InboundGroupSession.fromPickle(rec.pickle, this.key);
+    try {
+      const d = session.decrypt(ciphertext);
+      try {
+        return { plaintext: d.plaintext, index: d.messageIndex };
+      } finally {
+        d.free();
+      }
+    } catch {
+      return undefined;
+    } finally {
+      session.free();
+    }
   }
 
   /**
@@ -784,7 +809,7 @@ export class CryptoEngine {
             // A network or local storage failure (IndexedDB raises DOMException: quota, an aborted
             // write, a store closed by another tab) keeps this mail and the rest for a retry; only
             // mail that is itself unreadable (bad shape, unverified sender, failed Olm) is dropped.
-            if (e instanceof Transient || e instanceof DOMException) {
+            if (isTransient(e)) {
               stop = true;
               break;
             }
@@ -800,14 +825,15 @@ export class CryptoEngine {
   /**
    * The senders of mail whose master key vouches for them, as "user\ndevice\ncurve25519".
    * Only their sessions go to the key backup, so no one can fill a member's backup or bake an
-   * impersonation into it by mailing room keys. A lookup that fails trusts no one.
+   * impersonation into it by mailing room keys. A lookup that fails is a transient failure:
+   * the mail stays queued rather than having its keys stored as unvouched.
    */
   private async trustedSenders(mail: Mail[]): Promise<Set<string>> {
     const users = [...new Set(mail.map((m) => m.sender_user_id).filter((u) => isStr(u, 128)))];
     try {
       return new Set((await this.verifiedDevices(users)).map((t) => `${devKey(t)}\n${t.curve25519}`));
-    } catch {
-      return new Set();
+    } catch (e) {
+      throw isTransient(e) ? e : new Transient(e instanceof Error ? e.message : 'Could not check the senders');
     }
   }
 
@@ -827,17 +853,18 @@ export class CryptoEngine {
     const { plaintext, preKey, writes } = await this.olmDecrypt(sender.curve25519, c.type, c.body);
     // The Olm step succeeded, so its state is kept even if what it carried is refused below.
     let bad: unknown;
-    let room: { sessionId: string; key: string; record: InboundRecord } | undefined;
+    let room: { sessionId: string; key: string; record: InboundRecord; cover?: InboundRecord } | undefined;
     try {
       room = await this.roomKey(plaintext, sender, trusted.has(`${devKey(sender)}\n${sender.curve25519}`));
     } catch (e) {
       // A storage failure says nothing about the payload: keep the Olm state as it was, so the
       // queued mail decrypts again on retry. Only a definite refusal commits the spent state.
-      if (e instanceof Transient || e instanceof DOMException) throw e;
+      if (isTransient(e)) throw e;
       bad = e;
     }
     const backup: [string, unknown][] = room?.record.verified ? [[backupQueueKey(room.key), room.key]] : [];
-    await this.store.write(room ? [...pin, ...writes, [room.key, room.record], ...backup] : [...pin, ...writes]);
+    const cover: [string, unknown][] = room?.cover ? [[backupCoverKey(room.record.sender_key, room.sessionId), room.cover]] : [];
+    await this.store.write(room ? [...pin, ...writes, [room.key, room.record], ...cover, ...backup] : [...pin, ...writes]);
     if (backup.length > 0) this.backupSoon();
     if (bad !== undefined) throw bad;
     return room ? { sessionId: room.sessionId, preKey } : undefined;
@@ -845,7 +872,7 @@ export class CryptoEngine {
 
   // Checks a decrypted room key and returns the record to store, or undefined when an equal or
   // better copy is already stored.
-  private async roomKey(plaintext: string, sender: Target, verified: boolean): Promise<{ sessionId: string; key: string; record: InboundRecord } | undefined> {
+  private async roomKey(plaintext: string, sender: Target, verified: boolean): Promise<{ sessionId: string; key: string; record: InboundRecord; cover?: InboundRecord } | undefined> {
     const p = parseJSON(plaintext);
     if (
       !isObj(p) || p.type !== ROOM_KEY_TYPE ||
@@ -864,13 +891,20 @@ export class CryptoEngine {
       if (session.sessionId !== k.session_id) throw new Error('Room key does not match its session');
       const key = inboundKey(sender.curve25519, k.session_id);
       const known = await this.store.get<InboundRecord>(key);
+      let cover: InboundRecord | undefined;
       if (known) {
-        // A session is bound to its first sender and room; a later copy may only reach further back.
+        // A session is bound to its first sender and room; a later copy may only reach further
+        // back, except that a vouched copy over Olm takes over from one restored from the key
+        // backup, which stays beside it for the older messages it alone can read.
         const same = known.sender_key === sender.curve25519 && known.sender_user === sender.user_id &&
           known.sender_device === sender.device_id && known.room_id === k.room_id;
-        if (!same || known.first_index <= session.firstKnownIndex) return undefined;
+        if (!same) return undefined;
+        const takesOver = verified && known.from_backup === true;
+        if (!takesOver && known.first_index <= session.firstKnownIndex) return undefined;
+        if (takesOver && known.first_index < session.firstKnownIndex) cover = known;
       }
       return {
+        cover,
         sessionId: k.session_id,
         key,
         record: {

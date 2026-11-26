@@ -163,9 +163,13 @@ Owns HTTP routing, request parsing, session cookie validation, CORS headers, and
   `PUT /api/v1/keys/pins`, `PUT /api/v1/keys/devices/list`, `POST /api/v1/keys/devices/{id}/signature`, `GET/PUT/DELETE
   /api/v1/keys/backup` and `/api/v1/keys/pairings[/{id}[/join|/sealed|/consume]]`. Every
   `PUT master` and `DELETE backup` needs a session younger than `stepUpWindow` (`e2eeFresh`);
-  recovery wraps must be exactly 93/61 bytes with version 1; backup rows carry `sender_key` and
-  are capped by `E2EEBackupMaxSessions` and `E2EEBackupMaxBytes` (2 MiB; the database is one
-  64 MiB capsule member). Bodies are
+  each recovery wrap must be exactly its own length (93/61 bytes) with version 1; bodies with a
+  repeated member name are refused (`jsontext`). Pin, backup and device-list writes and device
+  cross-signatures carry master-key signatures that the store checks (`proofOf`, a
+  `store.Proof`) against the master row it locks in the write's transaction. Backup rows carry
+  `sender_key`, a uint32 `first_index`, and are capped by `E2EEBackupMaxSessions` and
+  `E2EEBackupMaxBytes` (2 MiB; the database is one 64 MiB capsule member); a write answers
+  `{stored, kept, full}`. Bodies are
   decoded strictly (`decodeIdentity`) and carry no secret field; every hybrid signature is
   verified for the caller's org and user before it is stored; versions are compare-and-swap
   (`409`); `/keys/query` adds `tenant_id`, `master_keys` and current-version

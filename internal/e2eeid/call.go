@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 
 	"github.com/Busnes-app/ky_server_base/internal/pqc/hybridsig"
@@ -141,10 +142,53 @@ func backupKeyMsg(_ *hybridsig.PublicKey, a []string) ([]byte, error) {
 
 func backupEntry(a []string) (BackupEntry, error) {
 	n, err := strconv.ParseInt(a[3], 10, 64)
-	if err != nil || n < 0 || n > 1<<32 {
+	if err != nil || n < 0 || n > math.MaxUint32 {
 		return BackupEntry{}, errArg
 	}
 	return BackupEntry{RoomID: a[0], SenderKey: a[1], SessionID: a[2], FirstIndex: n}, nil
+}
+
+func pinsWriteMsg(_ *hybridsig.PublicKey, a []string) ([]byte, error) {
+	v, err1 := strconv.ParseInt(a[2], 10, 64)
+	c, err2 := strconv.ParseInt(a[3], 10, 64)
+	sealed, err3 := dec(a[4])
+	if err1 != nil || err2 != nil || err3 != nil || v < 1 || c < 1 {
+		return nil, errArg
+	}
+	return PinsWriteMessage(a[0], a[1], v, c, sealed), nil
+}
+
+// BackupWriteEntry is one entry of a key backup write as the API and the browser send it.
+type BackupWriteEntry struct {
+	RoomID     string `json:"room_id"`
+	SenderKey  string `json:"sender_key"`
+	SessionID  string `json:"session_id"`
+	FirstIndex int64  `json:"first_index"`
+	Sealed     string `json:"sealed"`
+}
+
+// BackupWrite parses entries into what BackupWriteMessage signs.
+func BackupWrite(tenantID, userID string, version int64, entries []BackupWriteEntry) ([]byte, error) {
+	refs := make([]BackupEntry, len(entries))
+	sealed := make([][]byte, len(entries))
+	for i, e := range entries {
+		b, err := dec(e.Sealed)
+		if err != nil {
+			return nil, err
+		}
+		refs[i] = BackupEntry{RoomID: e.RoomID, SenderKey: e.SenderKey, SessionID: e.SessionID, FirstIndex: e.FirstIndex}
+		sealed[i] = b
+	}
+	return BackupWriteMessage(tenantID, userID, version, refs, sealed), nil
+}
+
+func backupWriteMsg(_ *hybridsig.PublicKey, a []string) ([]byte, error) {
+	v, err := strconv.ParseInt(a[2], 10, 64)
+	var entries []BackupWriteEntry
+	if err != nil || v < 1 || json.Unmarshal([]byte(a[3]), &entries) != nil {
+		return nil, errArg
+	}
+	return BackupWrite(a[0], a[1], v, entries)
 }
 
 func deviceListMsg(_ *hybridsig.PublicKey, a []string) ([]byte, error) {
@@ -280,6 +324,16 @@ var calls = map[string]call{
 	"signDeviceList": {6, signWith(DomainDeviceList, deviceListMsg)},
 	// verifyDeviceList(public_key, tenant, user, version, epoch, device_ids_json, signature)
 	"verifyDeviceList": {7, verifyWith(DomainDeviceList, deviceListMsg)},
+
+	// signPinsWrite(seed, tenant, user, version, counter, sealed) and
+	// verifyPinsWrite(public_key, tenant, user, version, counter, sealed, signature).
+	"signPinsWrite":   {6, signWith(DomainPinsWrite, pinsWriteMsg)},
+	"verifyPinsWrite": {7, verifyWith(DomainPinsWrite, pinsWriteMsg)},
+	// signBackupWrite(seed, tenant, user, version, entries_json) and
+	// verifyBackupWrite(public_key, tenant, user, version, entries_json, signature), where
+	// entries_json is [{room_id, sender_key, session_id, first_index, sealed}] in the order sent.
+	"signBackupWrite":   {5, signWith(DomainBackupWrite, backupWriteMsg)},
+	"verifyBackupWrite": {6, verifyWith(DomainBackupWrite, backupWriteMsg)},
 
 	// hash(args...) is lowercase hex SHA-256 of Fields(args): a compact, collision-resistant
 	// key for caching signature checks in the browser.

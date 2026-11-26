@@ -49,6 +49,7 @@ describe('the signed-in device', () => {
       if (url === '/api/v1/rooms/r1') return json(ownRoom);
       if (url === '/api/v1/keys/query') return json({ tenant_id: 'default', devices: {}, master_keys: {} });
       if (url.startsWith('/api/v1/to-device')) return json({ messages: [] });
+      if (url === '/api/v1/keys/master') return json({ tenant_id: 'default', master: null });
       return json({ error: `unexpected ${url}` }, 404);
     }));
 
@@ -121,6 +122,7 @@ describe('the signed-in device', () => {
         return new Response(null, { status: 204 });
       }
       if (url.startsWith('/api/v1/to-device')) return json({ messages: [] });
+      if (url === '/api/v1/keys/master') return json({ tenant_id: 'default', master: null });
       return json({ error: `unexpected ${url}` }, 404);
     }));
     const old = await startE2EE('u_alice');
@@ -145,6 +147,7 @@ describe('the signed-in device', () => {
         return new Response(null, { status: 204 });
       }
       if (url.startsWith('/api/v1/to-device')) return json({ messages: [] });
+      if (url === '/api/v1/keys/master') return json({ tenant_id: 'default', master: null });
       return json({ error: `unexpected ${url}` }, 404);
     }));
     const bob = await startE2EE('u_bob'); // Bob used this shared browser
@@ -166,6 +169,7 @@ describe('the signed-in device', () => {
         return json({ one_time_key_count: req.one_time_keys.length });
       }
       if (url.startsWith('/api/v1/to-device')) return json({ messages: [] });
+      if (url === '/api/v1/keys/master') return json({ tenant_id: 'default', master: null });
       return json({ error: `unexpected ${url}` }, 404);
     }));
     await startE2EE('u_alice');
@@ -330,6 +334,7 @@ describe('the signed-in device', () => {
         return deleteStatus === 204 ? new Response(null, { status: 204 }) : json({ error: 'x' }, deleteStatus);
       }
       if (url.startsWith('/api/v1/to-device')) return json({ messages: [] });
+      if (url === '/api/v1/keys/master') return json({ tenant_id: 'default', master: null });
       return json({ error: `unexpected ${url}` }, 404);
     }));
     await startE2EE('u_alice');
@@ -409,6 +414,7 @@ describe('the signed-in device', () => {
         return json({ one_time_key_count: req.one_time_keys.length });
       }
       if (url.startsWith('/api/v1/to-device')) return json({ messages: [] });
+      if (url === '/api/v1/keys/master') return json({ tenant_id: 'default', master: null });
       return json({ error: `unexpected ${url}` }, 404);
     }));
     const old = await startE2EE('u_alice');
@@ -473,5 +479,41 @@ describe('the signed-in device', () => {
     // 10 KiB of control characters is under the 16 KiB text limit but escapes to 60 KiB of JSON.
     await expect(sealRoomMessage('r1', { type: 'text', body: '\u0001'.repeat(10 << 10) })).rejects.toThrow('Message is too long');
     await expect(sealRoomMessage('r1', { type: 'text', body: 'x'.repeat((16 << 10) + 1) })).rejects.toThrow('Message is too long');
+  });
+});
+
+describe('retirement from the signed device list', () => {
+  it('keeps a sign-out pending until the removal is signed, even once the server row is gone', async () => {
+    const deleted: string[] = [];
+    let listed = true; // the account's identity lists devices; this browser is not verified
+    const s = 'A'.repeat(64);
+    const master = () => ({
+      version: 1, master_key: s, self_signature: s, device_list: { epoch: 1, device_ids: ['SOMEDEVICE01'], signature: s },
+      backup_key: { public_key: s, signature: s }, recovery: { wrapped_master_key: s, wrapped_backup_key: s }, pins: { counter: 0, sealed: '' },
+    });
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/v1/keys/upload') {
+        const req = JSON.parse(String(init?.body)) as { one_time_keys: unknown[] };
+        return json({ one_time_key_count: req.one_time_keys.length });
+      }
+      if (url.startsWith('/api/v1/keys/devices/') && init?.method === 'DELETE') {
+        deleted.push(decodeURIComponent(url.slice('/api/v1/keys/devices/'.length)));
+        return new Response(null, { status: 204 });
+      }
+      if (url === '/api/v1/keys/master') return json({ tenant_id: 'default', master: listed ? master() : null });
+      if (url.startsWith('/api/v1/to-device')) return json({ messages: [] });
+      return json({ error: `unexpected ${url}` }, 404);
+    }));
+    const e = await startE2EE('u_alice');
+    expect(await retireDevice().wait).toBe(true);
+    expect(deleted).toEqual([e.deviceId]);
+    const pending = JSON.parse(localStorage.getItem('kymessages-e2ee-retire') ?? '[]') as { device_id: string; deleted?: boolean; delisted?: boolean }[];
+    expect(pending).toEqual([expect.objectContaining({ device_id: e.deviceId, delisted: false })]);
+    await forgetCryptoStore();
+    // Next sign-in, the identity no longer lists devices: nothing is left to sign away.
+    listed = false;
+    await startE2EE('u_alice');
+    await vi.waitFor(() => expect(localStorage.getItem('kymessages-e2ee-retire')).toBeNull());
   });
 });

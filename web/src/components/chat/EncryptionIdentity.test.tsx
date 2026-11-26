@@ -43,7 +43,7 @@ describe('identity screens', () => {
     expect(screen.queryByText('Save your recovery key')).toBeNull();
     expect(screen.getByRole('button', { name: 'Set up encryption' })).toBeTruthy();
     unmount();
-    fake.setFakeIdentity({ state: 'verified', fingerprint: 'f'.repeat(64), restoring: false });
+    fake.setFakeIdentity({ state: 'verified', fingerprint: 'f'.repeat(64), restoring: false, backupFull: false });
     const { container } = render(<Gate />);
     await act(async () => undefined);
     expect(container.textContent).toBe('');
@@ -75,7 +75,7 @@ describe('identity screens', () => {
   });
 
   it('warns in a room whose member changed identity until the viewer accepts it', async () => {
-    fake.setFakeIdentity({ state: 'verified', fingerprint: 'f'.repeat(64), restoring: false }, [
+    fake.setFakeIdentity({ state: 'verified', fingerprint: 'f'.repeat(64), restoring: false, backupFull: false }, [
       { user_id: 'u_bob', fingerprint: 'cd'.repeat(32), previous: 'ef'.repeat(32) },
       { user_id: 'u_elsewhere', fingerprint: 'cd'.repeat(32), previous: 'ef'.repeat(32) },
     ]);
@@ -111,17 +111,28 @@ describe('identity screens', () => {
   });
 
   it('shows the whole new fingerprint and refuses an accept for a change that moved on', async () => {
-    fake.setFakeIdentity({ state: 'verified', fingerprint: 'f'.repeat(64), restoring: false }, [
+    fake.setFakeIdentity({ state: 'verified', fingerprint: 'f'.repeat(64), restoring: false, backupFull: false }, [
       { user_id: 'u_bob', fingerprint: '12'.repeat(32), previous: 'ef'.repeat(32) },
     ]);
     render(<IdentityChangedBanner memberIds={['u_bob']} nameOf={() => 'Bob'} />);
     expect((await screen.findByTestId('new-fingerprint')).textContent?.replace(/ /g, '')).toBe('12'.repeat(32));
     // Another tab replaced the candidate after this banner rendered.
-    fake.setFakeIdentity({ state: 'verified', fingerprint: 'f'.repeat(64), restoring: false }, [
+    fake.setFakeIdentity({ state: 'verified', fingerprint: 'f'.repeat(64), restoring: false, backupFull: false }, [
       { user_id: 'u_bob', fingerprint: '34'.repeat(32), previous: 'ef'.repeat(32) },
     ]);
     const accept = vi.spyOn(fake, 'acceptIdentity');
     fireEvent.click(screen.getByRole('button', { name: 'Accept new identity' }));
     await waitFor(() => expect(accept).toHaveBeenCalledWith('u_bob', 'ef'.repeat(32), expect.any(String)));
+  });
+
+  it('says verified only once the new device has confirmed, not when the keys are sent', async () => {
+    const approve = vi.fn(async () => undefined);
+    vi.spyOn(fake, 'offerVerification').mockResolvedValue({ text: 'QRTEXT', expiresInMs: 60_000, poll: async () => ({ code: '111222', device: 'NEWDEVICE' }), approve, cancel: async () => undefined });
+    const confirmed = vi.spyOn(fake, 'ownDeviceVerified').mockResolvedValueOnce(false).mockResolvedValue(true);
+    render(<VerifyAnotherDevice onClose={() => undefined} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'The codes match' }));
+    expect(await screen.findByText(/Waiting for the new device to confirm/)).toBeTruthy();
+    expect(await screen.findByText(/new device is verified/, {}, { timeout: 4000 })).toBeTruthy();
+    expect(confirmed).toHaveBeenCalledWith('NEWDEVICE');
   });
 });

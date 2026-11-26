@@ -78,10 +78,10 @@ func TestRestoreInvalidatesGrants(t *testing.T) {
 	if err := st.E2EE().PutMasterKey(ctx, &store.E2EEMasterKey{TenantID: store.DefaultTenantID, UserID: "u", MasterKey: "mk", SelfSignature: "ss", BackupKey: "bk", BackupSignature: "bs", RecoveryMaster: "rm", RecoveryBackup: "rb"}, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.E2EE().PutBackupSessions(ctx, "u", 1, []store.E2EEBackupSession{{RoomID: "r", SenderKey: "k", SessionID: "s", Sealed: "x"}}, 10, 1<<20); err != nil {
+	if _, err := st.E2EE().PutBackupSessions(ctx, store.DefaultTenantID, "u", 1, []store.E2EEBackupSession{{RoomID: "r", SenderKey: "k", SessionID: "s", Sealed: "x"}}, 10, 1<<20, func(string) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.E2EE().SignDevice(ctx, "u", "D1", 1, "sig"); err != nil {
+	if err := st.E2EE().SignDevice(ctx, store.DefaultTenantID, "u", "D1", 1, "sig", func(string, *store.E2EEDevice) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.E2EE().CreatePairing(ctx, &store.E2EEPairing{ID: "qr", TenantID: store.DefaultTenantID, UserID: "u", InitiatorDevice: "D1", MasterVersion: 1, ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
@@ -150,7 +150,7 @@ func TestRestoreInvalidatesGrants(t *testing.T) {
 	if m, err := st.E2EE().GetMasterKey(ctx, "u"); err != nil || m.MasterKey != "mk" {
 		t.Fatalf("master key lost in restore: %+v %v", m, err)
 	}
-	if rows, err := st.E2EE().ListBackupSessions(ctx, "u", 1, store.E2EEBackupCursor{}, 10); err != nil || len(rows) != 1 {
+	if rows, err := st.E2EE().ListBackupSessions(ctx, store.DefaultTenantID, "u", 1, store.E2EEBackupCursor{}, 10); err != nil || len(rows) != 1 {
 		t.Fatalf("key backup lost in restore: %+v %v", rows, err)
 	}
 }

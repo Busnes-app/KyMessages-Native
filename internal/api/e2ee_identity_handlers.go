@@ -1,11 +1,14 @@
 package api
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -77,10 +80,32 @@ func (s *Server) e2eeFresh(w http.ResponseWriter, r *http.Request, user *store.U
 
 // decodeIdentity is decodeStrict with a larger cap: master keys and their signatures are
 // several kilobytes, and a pin set or backup batch more.
+//
+// The body must also be valid JSON text with no repeated member name (encoding/json/jsontext),
+// so a signed field cannot be shadowed by a second copy that a different parser would read.
 func decodeIdentity(w http.ResponseWriter, r *http.Request, limit int64, v any) bool {
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, limit))
+	b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
+	if err != nil || !jsontext.Value(b).IsValid() {
+		return false
+	}
+	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()
 	return dec.Decode(v) == nil && dec.Decode(&struct{}{}) == io.EOF
+}
+
+// errProof is a write whose master-key signature does not verify.
+var errProof = errors.New("e2ee: the write is not signed by the current master key")
+
+// proofOf verifies sig over msg under the master key the store hands it, inside the write's
+// transaction.
+func proofOf(domain string, msg []byte, sig string) store.Proof {
+	return func(masterKey string) error {
+		pub, ok := parseMasterKey(masterKey)
+		if !ok || !verifyHybrid(pub, domain, msg, sig) {
+			return errProof
+		}
+		return nil
+	}
 }
 
 func decodedLen(s string) (int, bool) {
@@ -108,6 +133,8 @@ type (
 		Version         int64  `json:"version"`
 		ExpectedCounter int64  `json:"expected_counter"`
 		Sealed          string `json:"sealed"`
+		// The master key's kymessages.pins-write.v1 signature over this write.
+		Signature string `json:"signature"`
 	}
 	e2eeDeviceSignature struct {
 		Version   int64  `json:"version"`
@@ -129,6 +156,8 @@ type (
 	e2eeBackupPut struct {
 		Version  int64             `json:"version"`
 		Sessions []e2eeBackupEntry `json:"sessions"`
+		// The master key's kymessages.backup-write.v1 signature over the batch.
+		Signature string `json:"signature"`
 	}
 	e2eePairingStart struct {
 		DeviceID string `json:"device_id"`
@@ -220,12 +249,10 @@ func (s *Server) handleE2EEPutMaster(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "The encryption identity is not validly signed")
 		return
 	}
-	for wrap, want := range map[string]int{req.Recovery.WrappedMasterKey: e2eeMasterWrapBytes, req.Recovery.WrappedBackupKey: e2eeBackupWrapBytes} {
-		b, err := base64.RawStdEncoding.DecodeString(wrap)
-		if err != nil || len(b) != want || b[0] != 1 {
-			s.writeError(w, http.StatusBadRequest, "Invalid recovery wraps")
-			return
-		}
+	// Each wrap on its own: two equal strings must not stand in for both checks.
+	if !wrapOK(req.Recovery.WrappedMasterKey, e2eeMasterWrapBytes) || !wrapOK(req.Recovery.WrappedBackupKey, e2eeBackupWrapBytes) {
+		s.writeError(w, http.StatusBadRequest, "Invalid recovery wraps")
+		return
 	}
 	m := &store.E2EEMasterKey{TenantID: tenantID, UserID: user.ID, MasterKey: req.MasterKey, SelfSignature: req.SelfSignature,
 		BackupKey: req.BackupKey.PublicKey, BackupSignature: req.BackupKey.Signature,
@@ -246,6 +273,12 @@ func (s *Server) handleE2EEPutMaster(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]int64{"version": m.Version})
 }
 
+// wrapOK reports whether wrap is version 1 and exactly n bytes.
+func wrapOK(wrap string, n int) bool {
+	b, err := base64.RawStdEncoding.DecodeString(wrap)
+	return err == nil && len(b) == n && b[0] == 1
+}
+
 func xwingKey(b []byte) error {
 	_, err := xwing.ParsePublicKey(b)
 	return err
@@ -262,11 +295,15 @@ func (s *Server) handleE2EEPutPins(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "Invalid pin set")
 		return
 	}
-	if n, ok := decodedLen(req.Sealed); !ok || n < 29 || n > e2eeMaxPins {
+	sealed, err := base64.RawStdEncoding.DecodeString(req.Sealed)
+	if err != nil || len(sealed) < 29 || len(sealed) > e2eeMaxPins {
 		s.writeError(w, http.StatusBadRequest, "Invalid pin set")
 		return
 	}
-	switch err := s.store.E2EE().PutPins(r.Context(), tenantID, user.ID, req.Version, req.ExpectedCounter, req.Sealed); {
+	proof := proofOf(e2eeid.DomainPinsWrite, e2eeid.PinsWriteMessage(tenantID, user.ID, req.Version, req.ExpectedCounter+1, sealed), req.Signature)
+	switch err := s.store.E2EE().PutPins(r.Context(), tenantID, user.ID, req.Version, req.ExpectedCounter, req.Sealed, proof); {
+	case errors.Is(err, errProof):
+		s.writeError(w, http.StatusBadRequest, "The pin set is not signed by the current master key")
 	case errors.Is(err, store.ErrE2EEVersion):
 		s.writeError(w, http.StatusConflict, "The pin set changed; reload it")
 	case err != nil:
@@ -288,25 +325,19 @@ func (s *Server) handleE2EESignDevice(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "Invalid device signature")
 		return
 	}
-	dev, ok := s.ownDevice(w, r, user, r.PathValue("id"))
-	if !ok {
-		return
+	deviceID := r.PathValue("id")
+	// Verified against the master key and device row read in the write's own transaction, so
+	// a reset committing meanwhile cannot let a signature by the old key land.
+	proof := func(masterKey string, d *store.E2EEDevice) error {
+		return proofOf(e2eeid.DomainDevice, e2eeid.DeviceMessage(tenantID, user.ID, d.DeviceID, d.Curve25519, d.Ed25519), req.Signature)(masterKey)
 	}
-	m, err := s.store.E2EE().GetMasterKey(r.Context(), user.ID)
-	if errors.Is(err, store.ErrNotFound) || (err == nil && (m.TenantID != tenantID || dev.TenantID != tenantID || m.Version != req.Version)) {
-		s.writeError(w, http.StatusConflict, "The encryption identity changed; reload it")
+	switch err := s.store.E2EE().SignDevice(r.Context(), tenantID, user.ID, deviceID, req.Version, req.Signature, proof); {
+	case errors.Is(err, store.ErrNotFound):
+		s.writeError(w, http.StatusNotFound, "Unknown device")
 		return
-	}
-	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "Failed to load the encryption identity")
-		return
-	}
-	pub, ok := parseMasterKey(m.MasterKey)
-	if !ok || !verifyHybrid(pub, e2eeid.DomainDevice, e2eeid.DeviceMessage(tenantID, user.ID, dev.DeviceID, dev.Curve25519, dev.Ed25519), req.Signature) {
+	case errors.Is(err, errProof):
 		s.writeError(w, http.StatusBadRequest, "The device signature does not verify")
 		return
-	}
-	switch err := s.store.E2EE().SignDevice(r.Context(), user.ID, dev.DeviceID, req.Version, req.Signature); {
 	case errors.Is(err, store.ErrE2EEVersion):
 		s.writeError(w, http.StatusConflict, "The encryption identity changed; reload it")
 		return
@@ -314,7 +345,7 @@ func (s *Server) handleE2EESignDevice(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusInternalServerError, "Failed to store the device signature")
 		return
 	}
-	s.audit(r.Context(), user.ID, r, "e2ee.device_verified", dev.DeviceID, "")
+	s.audit(r.Context(), user.ID, r, "e2ee.device_verified", deviceID, "")
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -342,22 +373,10 @@ func (s *Server) handleE2EEPutDeviceList(w http.ResponseWriter, r *http.Request)
 		s.writeError(w, http.StatusBadRequest, "Invalid device list")
 		return
 	}
-	m, err := s.store.E2EE().GetMasterKey(r.Context(), user.ID)
-	if errors.Is(err, store.ErrNotFound) || (err == nil && (m.TenantID != tenantID || m.Version != req.Version)) {
-		s.writeError(w, http.StatusConflict, "The encryption identity changed; reload it")
-		return
-	}
-	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "Failed to load the encryption identity")
-		return
-	}
-	pub, ok := parseMasterKey(m.MasterKey)
-	if !ok || !verifyHybrid(pub, e2eeid.DomainDeviceList, msg, req.Signature) {
-		s.writeError(w, http.StatusBadRequest, "The device list is not validly signed")
-		return
-	}
 	list, _ := json.Marshal(req.DeviceIDs)
-	switch err := s.store.E2EE().PutDeviceList(r.Context(), tenantID, user.ID, req.Version, req.ExpectedEpoch, string(list), req.Signature); {
+	switch err := s.store.E2EE().PutDeviceList(r.Context(), tenantID, user.ID, req.Version, req.ExpectedEpoch, string(list), req.Signature, proofOf(e2eeid.DomainDeviceList, msg, req.Signature)); {
+	case errors.Is(err, errProof):
+		s.writeError(w, http.StatusBadRequest, "The device list is not validly signed")
 	case errors.Is(err, store.ErrE2EEVersion):
 		s.writeError(w, http.StatusConflict, "The device list changed; reload it")
 	case err != nil:
@@ -398,7 +417,7 @@ func (s *Server) handleE2EEGetBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	after := store.E2EEBackupCursor{RoomID: q.Get("after_room"), SenderKey: q.Get("after_sender"), SessionID: q.Get("after_session")}
-	rows, err := s.store.E2EE().ListBackupSessions(r.Context(), user.ID, version, after, e2eeBackupPage)
+	rows, err := s.store.E2EE().ListBackupSessions(r.Context(), tenantID, user.ID, version, after, e2eeBackupPage)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to load the key backup")
 		return
@@ -424,27 +443,36 @@ func (s *Server) handleE2EEPutBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rows := make([]store.E2EEBackupSession, len(req.Sessions))
+	signed := make([]e2eeid.BackupWriteEntry, len(req.Sessions))
 	for i, b := range req.Sessions {
 		n, ok := decodedLen(b.Sealed)
 		_, senderOK := e2eeKey(b.SenderKey)
-		if !e2eeRoomID.MatchString(b.RoomID) || !senderOK || !e2eeSessionID.MatchString(b.SessionID) || b.FirstIndex < 0 || b.FirstIndex > 1<<32 || !ok || n < xwing.Overhead || n > e2eeid.MaxSealedSession {
+		// A Megolm ratchet index is a uint32.
+		if !e2eeRoomID.MatchString(b.RoomID) || !senderOK || !e2eeSessionID.MatchString(b.SessionID) || b.FirstIndex < 0 || b.FirstIndex > math.MaxUint32 || !ok || n < xwing.Overhead || n > e2eeid.MaxSealedSession {
 			s.writeError(w, http.StatusBadRequest, "Invalid backed-up session")
 			return
 		}
 		rows[i] = store.E2EEBackupSession{RoomID: b.RoomID, SenderKey: b.SenderKey, SessionID: b.SessionID, FirstIndex: b.FirstIndex, Sealed: b.Sealed}
+		signed[i] = e2eeid.BackupWriteEntry(b)
 	}
-	if !s.e2eeBackupVersion(w, r, user.ID, tenantID, req.Version) {
+	msg, err := e2eeid.BackupWrite(tenantID, user.ID, req.Version, signed)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, "Invalid backed-up session")
 		return
 	}
-	switch err := s.store.E2EE().PutBackupSessions(r.Context(), user.ID, req.Version, rows, E2EEBackupMaxSessions, E2EEBackupMaxBytes); {
+	// Only a device holding the master key writes the backup: the batch is signed, and checked
+	// against the master key of the version it names inside the write's transaction.
+	res, err := s.store.E2EE().PutBackupSessions(r.Context(), tenantID, user.ID, req.Version, rows, E2EEBackupMaxSessions, E2EEBackupMaxBytes, proofOf(e2eeid.DomainBackupWrite, msg, req.Signature))
+	switch {
+	case errors.Is(err, errProof):
+		s.writeError(w, http.StatusBadRequest, "The backup write is not signed by the current master key")
 	case errors.Is(err, store.ErrE2EEVersion):
 		s.writeError(w, http.StatusConflict, "The key backup version is not current")
-	case errors.Is(err, store.ErrE2EEBackupFull):
-		s.writeError(w, http.StatusInsufficientStorage, "The key backup is full")
 	case err != nil:
 		s.writeError(w, http.StatusInternalServerError, "Failed to store the key backup")
 	default:
-		s.writeJSON(w, http.StatusOK, map[string]int{"stored": len(rows)})
+		// full: a new session did not fit the caps; improvements to stored ones still landed.
+		s.writeJSON(w, http.StatusOK, map[string]any{"stored": res.Stored, "kept": res.Kept, "full": res.Full})
 	}
 }
 
@@ -465,7 +493,7 @@ func (s *Server) handleE2EEDeleteBackup(w http.ResponseWriter, r *http.Request) 
 	if !s.e2eeBackupVersion(w, r, user.ID, tenantID, version) {
 		return
 	}
-	switch err := s.store.E2EE().DeleteBackup(r.Context(), user.ID, version); {
+	switch err := s.store.E2EE().DeleteBackup(r.Context(), tenantID, user.ID, version); {
 	case errors.Is(err, store.ErrE2EEVersion):
 		s.writeError(w, http.StatusConflict, "The key backup version is not current")
 	case err != nil:

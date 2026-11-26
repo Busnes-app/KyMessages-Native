@@ -12,29 +12,48 @@ interface GoRuntime {
   run(instance: WebAssembly.Instance): Promise<void>;
 }
 
+type PQCCall = (name: string, ...args: string[]) => { ok?: unknown; error?: string };
+
 declare global {
-  // Defined by wasm_exec.js and by the Go program.
+  // Defined by wasm_exec.js; the Go program calls kyPQCReady with its call function.
   var Go: new () => GoRuntime;
-  var kyPQCCall: ((name: string, ...args: string[]) => { ok?: unknown; error?: string }) | undefined;
-  var kyPQCReady: (() => void) | undefined;
+  var kyPQCReady: ((call: PQCCall) => void) | undefined;
+}
+
+/**
+ * The module is not running (not loaded yet, crashed, or exited): a failure of availability,
+ * never a verdict on data. Callers keep their work for a retry; the module reloads meanwhile.
+ */
+export class PQCUnavailable extends Error {
+  constructor() {
+    super('The post-quantum module is not running');
+  }
 }
 
 let loading: Promise<void> | undefined;
+let live: PQCCall | undefined;
+let generation = 0;
+let reload: (() => Promise<void>) | undefined;
 
-/** How long the Go program may take to register kyPQCCall after it starts. */
+/** How long the Go program may take to register its call after it starts. */
 export const PQC_START_MS = 10_000;
 
 type Source = (this: GoRuntime) => Promise<WebAssembly.WebAssemblyInstantiatedSource>;
 
-// Starts the Go program and resolves once it registered kyPQCCall. If the program exits (a
-// crash, or a start that never registers), the call is withdrawn and the next load starts
-// over, so one failure never leaves a dead function behind or a load pending forever.
+// Starts the Go program and resolves once it handed over its call. Each start has a generation:
+// only the current one may install its call, and only its exit withdraws it, so a start given up
+// on (timed out) cannot replace a newer one when it finishes late.
 async function start(source: Source, runtime: () => GoRuntime, startMs: number): Promise<void> {
-  if (globalThis.kyPQCCall) return;
+  if (live) return;
+  const gen = ++generation;
   const go = runtime();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const ready = new Promise<void>((resolve) => {
-    globalThis.kyPQCReady = resolve;
+    globalThis.kyPQCReady = (call) => {
+      if (gen !== generation) return;
+      live = call;
+      resolve();
+    };
   });
   try {
     const { instance } = await source.call(go);
@@ -43,7 +62,8 @@ async function start(source: Source, runtime: () => GoRuntime, startMs: number):
       (e: unknown) => { throw e instanceof Error ? e : new Error('The post-quantum module crashed'); },
     );
     void exited.catch(() => {
-      globalThis.kyPQCCall = undefined;
+      if (gen !== generation) return;
+      live = undefined;
       loading = undefined;
     });
     const timeout = new Promise<never>((_, reject) => {
@@ -51,15 +71,18 @@ async function start(source: Source, runtime: () => GoRuntime, startMs: number):
     });
     await Promise.race([ready, exited, timeout]);
   } catch (e) {
-    globalThis.kyPQCCall = undefined;
+    if (gen === generation) {
+      generation++; // a late hand-over from this start is ignored
+      live = undefined;
+    }
     throw e;
   } finally {
     clearTimeout(timer);
-    globalThis.kyPQCReady = undefined;
   }
 }
 
 function load(source: Source, runtime: () => GoRuntime = () => new globalThis.Go(), startMs = PQC_START_MS): Promise<void> {
+  reload = () => load(source, runtime, startMs);
   loading ??= start(source, runtime, startMs).catch((e: unknown) => {
     loading = undefined;
     throw e;
@@ -82,11 +105,35 @@ export function loadPQCFrom(bytes: BufferSource, runtime?: () => GoRuntime, star
   }, runtime, startMs);
 }
 
+/** Resolves once the module runs, loading it again if it stopped. */
+export function ensurePQC(): Promise<void> {
+  return live ? Promise.resolve() : reload ? reload() : Promise.reject(new PQCUnavailable());
+}
+
+/** Whether the module is running now. */
+export const pqcRunning = () => live !== undefined;
+
 /** Calls internal/e2eeid.Call by name; throws its error. */
+// A missing or dead module throws PQCUnavailable and starts a reload; an {error} answer is the
+// call's verdict on its arguments and throws a plain Error.
 export function pqcCall<T = unknown>(name: string, ...args: string[]): T {
-  const call = globalThis.kyPQCCall;
-  if (!call) throw new Error('The post-quantum module is not loaded');
-  const r = call(name, ...args);
+  const call = live;
+  if (!call) {
+    void ensurePQC().catch(() => undefined);
+    throw new PQCUnavailable();
+  }
+  let r: ReturnType<PQCCall>;
+  try {
+    r = call(name, ...args);
+  } catch {
+    // The Go program is gone (wasm_exec throws once it exited): reload, and retry later.
+    if (live === call) {
+      live = undefined;
+      loading = undefined;
+    }
+    void ensurePQC().catch(() => undefined);
+    throw new PQCUnavailable();
+  }
   if (r.error !== undefined) throw new Error(r.error);
   return r.ok as T;
 }
@@ -140,6 +187,18 @@ export const pqc = {
     pqcCall<Hybrid>('signDeviceList', seed, tenant, user, String(version), String(epoch), JSON.stringify(deviceIds)),
   verifyDeviceList: (k: Hybrid, tenant: string, user: string, version: number, epoch: number, deviceIds: string[], s: Hybrid) =>
     pqcCall<boolean>('verifyDeviceList', k, tenant, user, String(version), String(epoch), JSON.stringify(deviceIds), s),
+  signPinsWrite: (seed: string, tenant: string, user: string, version: number, counter: number, sealed: string) =>
+    pqcCall<Hybrid>('signPinsWrite', seed, tenant, user, String(version), String(counter), sealed),
+  signBackupWrite: (seed: string, tenant: string, user: string, version: number, entries: (BackupRef & { sealed: string })[]) =>
+    pqcCall<Hybrid>('signBackupWrite', seed, tenant, user, String(version), JSON.stringify(entries.map((e) => ({
+      room_id: e.room_id, sender_key: e.sender_key, session_id: e.session_id, first_index: e.first_index, sealed: e.sealed,
+    })))),
+  verifyPinsWrite: (k: Hybrid, tenant: string, user: string, version: number, counter: number, sealed: string, sig: Hybrid) =>
+    pqcCall<boolean>('verifyPinsWrite', k, tenant, user, String(version), String(counter), sealed, sig),
+  verifyBackupWrite: (k: Hybrid, tenant: string, user: string, version: number, entries: (BackupRef & { sealed: string })[], sig: Hybrid) =>
+    pqcCall<boolean>('verifyBackupWrite', k, tenant, user, String(version), JSON.stringify(entries.map((e) => ({
+      room_id: e.room_id, sender_key: e.sender_key, session_id: e.session_id, first_index: e.first_index, sealed: e.sealed,
+    }))), sig),
   /** Hex SHA-256 of the length-prefixed fields: a compact cache key. */
   hash: (...fields: string[]) => pqcCall<string>('hash', ...fields),
   recoveryGenerate: () => pqcCall<{ key: string; text: string }>('recoveryGenerate'),

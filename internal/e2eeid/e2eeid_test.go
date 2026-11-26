@@ -353,6 +353,8 @@ func writeVectors(t *testing.T) {
 	sealedBackup := must(t, "backupSeal", xp, ms, "room-1", sender, "session-1", "3", plain).(string)
 	forgedBackup := must(t, "backupSeal", xp, seed("other", e2eeid.MasterSeedBytes), "room-1", sender, "session-1", "3", plain).(string)
 	devList := str(must(t, "signDeviceList", ms, tenant, user, "1", "2", `["DEVICE_ALICE_1","DEVICE_ALICE_2"]`))
+	batch := `[{"room_id":"room-1","sender_key":"` + sender + `","session_id":"session-1","first_index":3,"sealed":"` + sealedBackup + `"}]`
+	batchW := str(must(t, "signBackupWrite", ms, tenant, user, "1", batch))
 	wrapM := must(t, "recoveryWrap", rk, "master-key", tenant, user, ms).(string)
 	wrapB := must(t, "recoveryWrap", rk, "backup-key", tenant, user, xs).(string)
 	pairing := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 16))
@@ -361,6 +363,7 @@ func writeVectors(t *testing.T) {
 	code := must(t, "comparisonCode", qr["secret"], pairing, ep).(string)
 	pins := b64.EncodeToString([]byte(`{"usr_bob":"fingerprint"}`))
 	sealedPins := must(t, "pinsSeal", ms, tenant, user, "3", pins).(string)
+	pinsWrite := str(must(t, "signPinsWrite", ms, tenant, user, "1", "3", sealedPins))
 
 	tamperedAt := func(s string, i int) string {
 		b, _ := b64.DecodeString(s)
@@ -398,6 +401,12 @@ func writeVectors(t *testing.T) {
 		{Name: "device list verifies", Call: "verifyDeviceList", Args: []string{mp["public_key"], tenant, user, "1", "2", `["DEVICE_ALICE_1","DEVICE_ALICE_2"]`, devList}, Want: true},
 		{Name: "device list at another epoch", Call: "verifyDeviceList", Args: []string{mp["public_key"], tenant, user, "1", "3", `["DEVICE_ALICE_1","DEVICE_ALICE_2"]`, devList}, Want: false},
 		{Name: "device list with a device added", Call: "verifyDeviceList", Args: []string{mp["public_key"], tenant, user, "1", "2", `["DEVICE_ALICE_1","DEVICE_ALICE_2","DEVICE_EVIL"]`, devList}, Want: false},
+		{Name: "pin write verifies", Call: "verifyPinsWrite", Args: []string{mp["public_key"], tenant, user, "1", "3", sealedPins, pinsWrite}, Want: true},
+		{Name: "pin write at another counter", Call: "verifyPinsWrite", Args: []string{mp["public_key"], tenant, user, "1", "4", sealedPins, pinsWrite}, Want: false},
+		{Name: "pin write over other ciphertext", Call: "verifyPinsWrite", Args: []string{mp["public_key"], tenant, user, "1", "3", tampered(sealedPins), pinsWrite}, Want: false},
+		{Name: "backup write verifies", Call: "verifyBackupWrite", Args: []string{mp["public_key"], tenant, user, "1", batch, batchW}, Want: true},
+		{Name: "backup write with an entry moved", Call: "verifyBackupWrite", Args: []string{mp["public_key"], tenant, user, "1", strings.Replace(batch, `"first_index":3`, `"first_index":0`, 1), batchW}, Want: false},
+		{Name: "backup write for another version", Call: "verifyBackupWrite", Args: []string{mp["public_key"], tenant, user, "2", batch, batchW}, Want: false},
 		{Name: "hash", Call: "hash", Args: []string{"a", "bc"}, Want: "b534ce16ac9c8b36823f39a395ce8e0e3c7ad9605b82b5444f18cadacd217a5d"},
 		{Name: "recovery key format", Call: "recoveryFormat", Args: []string{rk}, Want: rtext},
 		{Name: "recovery key parse", Call: "recoveryParse", Args: []string{strings.ToLower(strings.ReplaceAll(rtext, " ", "-"))}, Want: rk},

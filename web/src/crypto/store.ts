@@ -15,6 +15,12 @@ export interface CryptoStore {
   write(puts: [string, unknown][], deletes?: string[]): Promise<void>;
   /** Stores value under key unless one is there; returns what is stored afterwards. */
   putIfAbsent<T>(key: string, value: T): Promise<T>;
+  /**
+   * Reads key and writes next(current) in one transaction (nothing when it returns current
+   * itself), so concurrent tabs and unlocked paths cannot interleave; returns what is stored.
+   * next must be synchronous.
+   */
+  update<T>(key: string, next: (current: T | undefined) => T | undefined): Promise<T | undefined>;
   /** The 32-byte key vodozemac encrypts pickles under. */
   pickleKey(): Promise<Uint8Array>;
   close(): void;
@@ -93,6 +99,16 @@ class IdbCryptoStore implements CryptoStore {
     if (found === undefined) store.put(value, key);
     await done(tx);
     return found === undefined ? value : found;
+  }
+
+  async update<T>(key: string, next: (current: T | undefined) => T | undefined): Promise<T | undefined> {
+    const tx = this.db.transaction(KV, 'readwrite');
+    const store = tx.objectStore(KV);
+    const current = (await req(store.get(key))) as T | undefined;
+    const value = next(current);
+    if (value !== current && value !== undefined) store.put(value, key);
+    await done(tx);
+    return value ?? current;
   }
 
   pickleKey(): Promise<Uint8Array> {

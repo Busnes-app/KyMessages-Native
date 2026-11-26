@@ -1,12 +1,22 @@
 package migrations
 
+import "strings"
+
 // E3 of docs/superpowers/specs/2026-11-22-e2ee-design.md: each user's hybrid master key and
 // X-Wing backup key (public halves and their signatures), the recovery-key wraps of their
 // private seeds (ciphertext the server cannot open), the user's synced pin set (ciphertext
 // under a master-derived key), the master-signed device list, each device's master-key
 // cross-signature, the key backup of sealed Megolm sessions (keyed by sender key too), and
 // short-lived QR pairing sessions. No private key is stored.
-const e2eeIdentitySchema = `
+//
+// The key backup's key columns compare bytewise on both engines, as the browser's cursor check
+// does: SQLite's default BINARY, and COLLATE "C" on PostgreSQL, whatever the database's locale.
+var (
+	e2eeIdentitySQLite   = strings.ReplaceAll(e2eeIdentityTemplate, "{{C}}", "")
+	e2eeIdentityPostgres = strings.ReplaceAll(e2eeIdentityTemplate, "{{C}}", ` COLLATE "C"`)
+)
+
+const e2eeIdentityTemplate = `
 CREATE TABLE IF NOT EXISTS e2ee_master_keys (
 	user_id VARCHAR(64) PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
 	tenant_id VARCHAR(64) NOT NULL,
@@ -31,9 +41,9 @@ CREATE TABLE IF NOT EXISTS e2ee_key_backup (
 	user_id VARCHAR(64) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 	tenant_id VARCHAR(64) NOT NULL,
 	version BIGINT NOT NULL,
-	room_id VARCHAR(128) NOT NULL,
-	sender_key VARCHAR(64) NOT NULL,
-	session_id VARCHAR(128) NOT NULL,
+	room_id VARCHAR(128){{C}} NOT NULL,
+	sender_key VARCHAR(64){{C}} NOT NULL,
+	session_id VARCHAR(128){{C}} NOT NULL,
 	first_index BIGINT NOT NULL,
 	sealed TEXT NOT NULL,
 	updated_at BIGINT NOT NULL,

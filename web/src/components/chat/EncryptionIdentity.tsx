@@ -6,8 +6,12 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import QRCode from 'qrcode';
 import { ShieldAlert, ShieldCheck } from 'lucide-react';
 import {
-  acceptIdentity, identityChanges, identityStatus, joinVerification, offerVerification, onIdentityChanged, prepareIdentity, restoreIdentity,
+  acceptIdentity, identityChanges, identityStatus, joinVerification, offerVerification, onIdentityChanged, ownDeviceVerified, prepareIdentity, restoreIdentity,
 } from '../../chat/e2ee';
+
+const POLL_MS = 1500;
+/** Consecutive failed polls (the network, the server) a screen rides out before giving up. */
+const POLL_RETRIES = 5;
 import { formatFingerprint, type IdentityChange, type IdentityStatus, type PairingJoin, type PairingOffer } from '../../crypto/identity';
 import { ChatDialog } from './ChatModals';
 
@@ -188,7 +192,10 @@ export function VerifyAnotherDevice({ onClose }: { onClose: () => void }) {
   const [offer, setOffer] = useState<PairingOffer>();
   const [qr, setQr] = useState('');
   const [joined, setJoined] = useState<{ code: string; device: string }>();
+  // sent: the keys went up; done: the new device then verified itself (signed and listed).
+  const [sent, setSent] = useState(false);
   const [done, setDone] = useState(false);
+  const deadlineRef = useRef(0);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
   const offerRef = useRef<PairingOffer | undefined>(undefined);
@@ -201,20 +208,25 @@ export function VerifyAnotherDevice({ onClose }: { onClose: () => void }) {
         if (!live) return void o.cancel().catch(() => undefined);
         // The server's lifetime, counted on this clock: the two clocks may disagree.
         const deadline = Date.now() + o.expiresInMs;
+        deadlineRef.current = deadline;
         offerRef.current = o;
         setOffer(o);
         // The copyable code works without the picture.
         setQr(await QRCode.toDataURL(o.text, { margin: 1, width: 220 }).catch(() => ''));
+        let failures = 0;
         const poll = async () => {
           if (!live) return;
           if (Date.now() >= deadline) return setErr('The code expired. Close this and start again.');
           try {
             const j = await o.poll();
+            failures = 0;
             if (j) return live && setJoined(j);
-          } catch {
-            return live && setErr('The code expired or was used. Close this and start again.');
+          } catch (e) {
+            if ((e as { status?: number }).status === 404 || ++failures > POLL_RETRIES) {
+              return live && setErr('The code expired or was used. Close this and start again.');
+            }
           }
-          timer = setTimeout(() => void poll(), 1500);
+          timer = setTimeout(() => void poll(), POLL_MS);
         };
         void poll();
       } catch (e) {
@@ -234,12 +246,30 @@ export function VerifyAnotherDevice({ onClose }: { onClose: () => void }) {
     setBusy(true);
     try {
       await offer!.approve();
-      setDone(true);
+      setSent(true);
     } catch (e) {
       setErr(errText(e, 'The keys could not be sent.'));
-    } finally {
       setBusy(false);
+      return;
     }
+    // Verified only once the new device has signed itself on and is listed, not on upload.
+    let failures = 0;
+    const until = Math.max(deadlineRef.current, Date.now()) + 60_000;
+    while (Date.now() < until) {
+      try {
+        if (await ownDeviceVerified(joined!.device)) {
+          setDone(true);
+          setBusy(false);
+          return;
+        }
+        failures = 0;
+      } catch {
+        if (++failures > POLL_RETRIES) break;
+      }
+      await new Promise((r) => setTimeout(r, POLL_MS));
+    }
+    setErr('The keys were sent, but the new device has not confirmed. Check it, or start again.');
+    setBusy(false);
   };
   return (
     <ChatDialog title="Verify a device" onClose={close} busy={busy}>
@@ -247,6 +277,8 @@ export function VerifyAnotherDevice({ onClose }: { onClose: () => void }) {
         <Alert text={err} />
         {done ? (
           <p role="status"><ShieldCheck size={16} aria-hidden="true" /> The new device is verified.</p>
+        ) : sent ? (
+          <p role="status">Keys sent. Waiting for the new device to confirm…</p>
         ) : joined ? (
           <div role="status">
             <p>Does the new device show this code?</p>
@@ -264,7 +296,7 @@ export function VerifyAnotherDevice({ onClose }: { onClose: () => void }) {
       </div>
       <div className="chat-modal-foot">
         <button type="button" className="btn-secondary" onClick={close} disabled={busy}>{done ? 'Close' : joined ? 'It does not match' : 'Cancel'}</button>
-        {joined && !done && <button type="button" onClick={() => void approve()} disabled={busy}>{busy ? 'Sending…' : 'The codes match'}</button>}
+        {joined && !sent && <button type="button" onClick={() => void approve()} disabled={busy}>{busy ? 'Sending…' : 'The codes match'}</button>}
       </div>
     </ChatDialog>
   );
@@ -294,7 +326,15 @@ export function useIdentityStatus(ready: boolean): [GateState, () => void] {
 export function EncryptionIdentityGate({ gate, refresh }: { gate: GateState; refresh: () => void }) {
   const [open, setOpen] = useState(false);
   const [reset, setReset] = useState(false);
-  if (gate.state === 'loading' || gate.state === 'verified') return null;
+  if (gate.state === 'loading') return null;
+  if (gate.state === 'verified') {
+    return gate.backupFull ? (
+      <div className="chat-banner chat-banner-info" role="status">
+        <ShieldAlert size={16} aria-hidden="true" />
+        <span>Your key backup is full: messages from now on are readable on this device, but are not backed up for a new one.</span>
+      </div>
+    ) : null;
+  }
   if (gate.state === 'error') {
     return (
       <div className="chat-banner chat-banner-error" role="alert">

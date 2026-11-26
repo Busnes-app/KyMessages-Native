@@ -111,3 +111,26 @@ it('signs a local account in again in place, through TOTP, then retries', async 
   expect((await pending).status).toBe(200);
   expect(calls.filter((c) => !c.includes('pow-challenge'))).toEqual(['/x', '/api/auth/login', '/api/auth/mfa/totp', '/x']);
 });
+
+it('goes back to the password when a refused code spent its challenge, and then succeeds', async () => {
+  const LOCAL = { error: STEP_UP.error, code: STEP_UP.code };
+  answers({
+    '/x': [json(LOCAL, 403), json({ ok: true })],
+    '/api/auth/pow-challenge': [json({ error: 'off' }, 404)],
+    '/api/auth/login': [json({ mfa_required: true, mfa_token: 'mfa-1' }), json({ mfa_required: true, mfa_token: 'mfa-2' })],
+    '/api/auth/mfa/totp': [json({ error: 'Invalid code' }, 401), json({ authenticated: true, user: { username: 'alice', role: 'user' } })],
+  });
+  render(<ConfirmItsYou username="alice" />);
+  const pending = adminFetch('/x', { method: 'PUT' });
+  const dialog = await screen.findByRole('dialog', { name: "Confirm it's you" });
+  const signIn = async () => {
+    fireEvent.change(await within(dialog).findByLabelText('Password for @alice'), { target: { value: 'pw' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Sign in again' }));
+    fireEvent.change(await within(dialog).findByLabelText(/Authentication code/), { target: { value: '123456' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Verify' }));
+  };
+  await signIn();
+  expect((await within(dialog).findByRole('alert')).textContent).toMatch(/Enter your password again/);
+  await signIn();
+  expect((await pending).status).toBe(200);
+});

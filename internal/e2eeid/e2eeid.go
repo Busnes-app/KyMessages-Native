@@ -30,6 +30,8 @@ const (
 	DomainDevice      = "kymessages.device.v2"
 	DomainBackupKey   = "kymessages.backup-key.v1"
 	DomainDeviceList  = "kymessages.device-list.v1"
+	DomainPinsWrite   = "kymessages.pins-write.v1"
+	DomainBackupWrite = "kymessages.backup-write.v1"
 	labelFingerprint  = "kymessages.master-fingerprint.v1"
 	labelRecovery     = "kymessages.recovery.v1"
 	LabelRecoveryMKey = "kymessages.recovery.v1/master-key"
@@ -131,6 +133,26 @@ func DeviceListMessage(tenantID, userID string, version, epoch int64, deviceIDs 
 		fields = append(fields, s(id))
 	}
 	return Fields(fields...), nil
+}
+
+// PinsWriteMessage is what the master key signs to replace the sealed pin set: it names the
+// org, user, identity version and new counter, and the SHA-256 of the sealed set, so the server
+// stores only what a verified device wrote, at exactly that place.
+func PinsWriteMessage(tenantID, userID string, version, counter int64, sealed []byte) []byte {
+	d := sha256.Sum256(sealed)
+	return Fields(s(hybridsig.Alg), s(tenantID), s(userID), s(strconv.FormatInt(version, 10)), s(strconv.FormatInt(counter, 10)), d[:])
+}
+
+// BackupWriteMessage is what the master key signs over one key backup write: the org, user,
+// identity version and each entry's (room, sender key, session, first index) with the SHA-256
+// of its sealed bytes, in the order sent.
+func BackupWriteMessage(tenantID, userID string, version int64, entries []BackupEntry, sealed [][]byte) []byte {
+	f := [][]byte{s(hybridsig.Alg), s(tenantID), s(userID), s(strconv.FormatInt(version, 10)), s(strconv.Itoa(len(entries)))}
+	for i, e := range entries {
+		d := sha256.Sum256(sealed[i])
+		f = append(f, e.fields(), d[:])
+	}
+	return Fields(f...)
 }
 
 // Fingerprint is SHA-256 over a label and the full hybrid master public key (its tagged

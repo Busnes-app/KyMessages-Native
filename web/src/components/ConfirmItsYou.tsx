@@ -34,6 +34,13 @@ function SignInAgain({ username, onDone }: { username: string; onDone: () => voi
       else if (data.authenticated) onDone();
     } catch (x) {
       setErr(x instanceof Error ? x.message : 'Sign-in failed');
+      // A refused code may have spent its challenge: start again from the password, rather
+      // than leave a code box that can never succeed.
+      if (mfa) {
+        setMfa('');
+        setCode('');
+        setErr(`${x instanceof Error ? x.message : 'The code was not accepted'}. Enter your password again.`);
+      }
     } finally {
       setBusy(false);
       if (!mfa) {

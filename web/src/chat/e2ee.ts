@@ -145,8 +145,8 @@ const keyServer = (signal: AbortSignal): KeyServer => ({
     const o = obj(await call('/api/v1/keys/master', 'PUT', req, signal));
     return typeof o.version === 'number' ? o.version : 0;
   },
-  async putPins(version, expected, sealed) {
-    await call('/api/v1/keys/pins', 'PUT', { version, expected_counter: expected, sealed }, signal);
+  async putPins(version, expected, sealed, signature) {
+    await call('/api/v1/keys/pins', 'PUT', { version, expected_counter: expected, sealed, signature }, signal);
   },
   async signDevice(deviceId, version, signature) {
     await call(`/api/v1/keys/devices/${encodeURIComponent(deviceId)}/signature`, 'POST', { version, signature }, signal);
@@ -167,8 +167,8 @@ const keyServer = (signal: AbortSignal): KeyServer => ({
     });
     return { sessions, more: o.more === true };
   },
-  async putBackup(version, sessions) {
-    await call('/api/v1/keys/backup', 'PUT', { version, sessions }, signal);
+  async putBackup(version, sessions, signature) {
+    return { full: obj(await call('/api/v1/keys/backup', 'PUT', { version, sessions, signature }, signal)).full === true };
   },
   async pairingStart(deviceId) {
     const o = obj(await call('/api/v1/keys/pairings', 'POST', { device_id: deviceId }, signal));
@@ -406,6 +406,9 @@ export async function restoreIdentity(recoveryKey: string): Promise<number> {
 
 export const offerVerification = (): Promise<PairingOffer> => identityEngine().then((e) => e.offerVerification());
 
+/** Whether the device a pairing handed keys to has verified itself (signed and listed). */
+export const ownDeviceVerified = (deviceId: string): Promise<boolean> => identityEngine().then((e) => e.ownDeviceVerified(deviceId));
+
 export async function joinVerification(text: string): Promise<PairingJoin> {
   const j = await (await identityEngine()).joinVerification(text);
   return { ...j, finish: async (signal) => { const n = await j.finish(signal); announceIdentity(); keysArrived(true); return n; } };
@@ -474,7 +477,7 @@ export async function openMessage(m: ChatMessage): Promise<ChatMessage> {
     if (r.state === 'waiting') return shut({ kind: 'waiting', gen });
     if (r.state === 'failed') return shut({ kind: 'failed', reason: r.reason });
     // The encrypted reply target is the true one; the server's copy is only a hint.
-    return { ...m, body: r.inner.body, reply_to_id: r.inner.reply_to_id, e2ee: r.authenticated ? { kind: 'decrypted' } : { kind: 'decrypted', unauthenticated: true } };
+    return { ...m, body: r.inner.body, reply_to_id: r.inner.reply_to_id, e2ee: r.authenticated ? { kind: 'decrypted' } : { kind: 'decrypted', trust: r.restored ? 'backup' : 'unverified' } };
   } catch {
     // Not a verdict on the message: the engine's own checks return 'failed' without throwing.
     return shut({ kind: 'failed', reason: NOT_YET, gen });
@@ -501,10 +504,15 @@ export function retireDevice() {
   const attempt = (async () => {
     const e = await entry?.engine.catch(() => undefined);
     if (!e) return false;
+    // Off the signed device list first, so the server cannot bring the device back later;
+    // bounded, so sign-out never waits long on it. A removal that did not become durable here
+    // stays pending (it outlives this browser's store) until a verified device signs it.
+    const delisted = await Promise.race([
+      e.delistDevices([e.deviceId]).then(() => true, () => false),
+      new Promise<boolean>((r) => setTimeout(r, DELIST_MS, false)),
+    ]);
+    if (!delisted) saveAbandoned([...abandoned(), { user_id: e.userId, device_id: e.deviceId, delisted: false }]);
     try {
-      // Off the signed device list first, so the server cannot bring the device back later;
-      // bounded, so sign-out never waits long on it.
-      await Promise.race([e.delistDevices([e.deviceId]).catch(() => undefined), new Promise((r) => setTimeout(r, DELIST_MS))]);
       await call(`/api/v1/keys/devices/${encodeURIComponent(e.deviceId)}`, 'DELETE', undefined, entry?.controller.signal);
       return true;
     } catch (err) {
@@ -520,26 +528,32 @@ export function retireDevice() {
   };
 }
 
-// Devices abandoned when a session was revoked: the server no longer accepts that session, so
-// each is removed from the key server the next time its user's device starts here.
+// Devices to retire later: abandoned when a session was revoked (the server no longer accepts
+// that session), or signed out before their removal from the signed device list was durable.
+// Each is removed from the key server, and from the list by a verified device, the next time
+// its user's device starts here; an entry goes only once both are done (deleted, delisted).
 const RETIRE_KEY = 'kymessages-e2ee-retire';
-type Abandoned = { user_id: string; device_id: string };
+type Abandoned = { user_id: string; device_id: string; deleted?: boolean; delisted?: boolean };
 
 function abandoned(): Abandoned[] {
   try {
     const v: unknown = JSON.parse(localStorage.getItem(RETIRE_KEY) ?? '[]');
-    return Array.isArray(v) ? v.filter((d): d is Abandoned => typeof d?.user_id === 'string' && typeof d?.device_id === 'string') : [];
+    return Array.isArray(v) ? v.filter((d): d is Abandoned => typeof d?.user_id === 'string' && typeof d?.device_id === 'string')
+      .map((d) => ({ user_id: d.user_id, device_id: d.device_id, deleted: d.deleted === true, delisted: d.delisted === true })) : [];
   } catch {
     return [];
   }
 }
 
 function saveAbandoned(list: Abandoned[]): void {
-  const seen = new Set<string>();
-  list = list.filter((d) => {
+  // One entry per device; a later record of the same device keeps what an earlier one did.
+  const byKey = new Map<string, Abandoned>();
+  for (const d of list) {
     const k = `${d.user_id}\u0000${d.device_id}`;
-    return !seen.has(k) && !!seen.add(k);
-  });
+    const was = byKey.get(k);
+    byKey.set(k, { ...d, deleted: !!(d.deleted || was?.deleted), delisted: !!(d.delisted && (was?.delisted ?? true)) });
+  }
+  list = [...byKey.values()];
   try {
     if (list.length === 0) localStorage.removeItem(RETIRE_KEY);
     else localStorage.setItem(RETIRE_KEY, JSON.stringify(list.slice(-20)));
@@ -549,20 +563,27 @@ function saveAbandoned(list: Abandoned[]): void {
 }
 
 async function retireAbandoned(userId: string, signal: AbortSignal, e?: CryptoEngine): Promise<void> {
-  const mine = abandoned().filter((d) => d.user_id === userId).map((d) => d.device_id);
-  // A verified device takes them off the signed device list; an unverified one cannot sign.
-  if (e && mine.length > 0) await e.delistDevices(mine).catch(() => undefined);
   const left: Abandoned[] = [];
-  for (const d of abandoned()) {
+  const pending = abandoned();
+  const toDelist = pending.filter((d) => d.user_id === userId && !d.delisted).map((d) => d.device_id);
+  // A verified device takes them off the signed device list; an unverified one cannot sign, so
+  // they stay pending. Deleting the server row alone does not complete a retirement.
+  const delisted = toDelist.length > 0 && !!e && await e.delistDevices(toDelist).then(() => true, () => false);
+  for (const d of pending) {
     if (d.user_id !== userId) {
       left.push(d);
       continue;
     }
-    try {
-      await call(`/api/v1/keys/devices/${encodeURIComponent(d.device_id)}`, 'DELETE', undefined, signal);
-    } catch (e) {
-      if (!(e instanceof KeyServerError && e.status === 404)) left.push(d);
+    const next = { ...d, delisted: d.delisted || delisted };
+    if (!next.deleted) {
+      try {
+        await call(`/api/v1/keys/devices/${encodeURIComponent(d.device_id)}`, 'DELETE', undefined, signal);
+        next.deleted = true;
+      } catch (err) {
+        next.deleted = err instanceof KeyServerError && err.status === 404;
+      }
     }
+    if (!(next.deleted && next.delisted)) left.push(next);
   }
   saveAbandoned(left);
 }

@@ -5,7 +5,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strconv"
 	"strings"
@@ -89,6 +91,28 @@ func staleSession(t *testing.T, st store.Store, userID string) string {
 		t.Fatal(err)
 	}
 	return tok
+}
+
+// backupWrite is a PUT /api/v1/keys/backup body for sessions, signed by the master key.
+func (i *testIdentity) backupWrite(t *testing.T, version int64, sessions ...map[string]any) map[string]any {
+	t.Helper()
+	entries := make([]e2eeid.BackupWriteEntry, len(sessions))
+	for n, e := range sessions {
+		fi, _ := e["first_index"].(int64)
+		if f, ok := e["first_index"].(int); ok {
+			fi = int64(f)
+		}
+		room, _ := e["room_id"].(string)
+		sender, _ := e["sender_key"].(string)
+		session, _ := e["session_id"].(string)
+		sealed, _ := e["sealed"].(string)
+		entries[n] = e2eeid.BackupWriteEntry{RoomID: room, SenderKey: sender, SessionID: session, FirstIndex: fi, Sealed: sealed}
+	}
+	msg, err := e2eeid.BackupWrite(i.tenant, i.user, version, entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return map[string]any{"version": version, "sessions": sessions, "signature": i.sign(t, e2eeid.DomainBackupWrite, msg)}
 }
 
 func registerDevice(t *testing.T, srv http.Handler, tok string, d *testDevice) {
@@ -378,7 +402,7 @@ func TestE2EEKeyBackupRoutes(t *testing.T) {
 	}
 	entry := func(room, session string, idx int64) map[string]any { return entryFrom(room, senderA, session, idx) }
 	putB := func(tok string, version int64, sessions ...map[string]any) int {
-		return doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/backup", tok, map[string]any{"version": version, "sessions": sessions}, nil).Code
+		return doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/backup", tok, id.backupWrite(t, version, sessions...), nil).Code
 	}
 	if c := putB(tok, 1, entry("rm_1", "sessA", 0)); c != http.StatusConflict {
 		t.Fatalf("backup before an identity = %d", c)
@@ -459,7 +483,22 @@ func TestE2EEPinSet(t *testing.T) {
 		t.Fatal(rec.Body.String())
 	}
 	sealed, _ := e2eeid.SealPins(e2eeid.MasterSeed(id.master), orgA, alice.ID, 1, []byte(`{}`))
-	body := map[string]any{"version": 1, "expected_counter": 0, "sealed": b64.EncodeToString(sealed)}
+	signed := func(signer *testIdentity, counter int64) map[string]any {
+		return map[string]any{"version": 1, "expected_counter": counter - 1, "sealed": b64.EncodeToString(sealed),
+			"signature": signer.sign(t, e2eeid.DomainPinsWrite, e2eeid.PinsWriteMessage(orgA, alice.ID, 1, counter, sealed))}
+	}
+	// Only a holder of the master key writes the pin set: no proof, another key, or a proof for
+	// another counter is refused before anything is stored.
+	unsigned := signed(id, 1)
+	delete(unsigned, "signature")
+	wrongCounter := signed(id, 2)
+	wrongCounter["expected_counter"] = 0
+	for name, b := range map[string]map[string]any{"unsigned": unsigned, "another key": signed(newIdentity(t, orgA, alice.ID), 1), "another counter": wrongCounter} {
+		if c := doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/pins", tok, b, nil).Code; c != http.StatusBadRequest {
+			t.Errorf("%s = %d", name, c)
+		}
+	}
+	body := signed(id, 1)
 	if rec := doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/pins", tok, body, nil); rec.Code != http.StatusOK || rec.Body.String() != `{"counter":1}`+"\n" {
 		t.Fatalf("pins = %d %s", rec.Code, rec.Body.String())
 	}
@@ -721,5 +760,66 @@ func TestE2EEDeviceListIsSignedAndVersioned(t *testing.T) {
 	}
 	if strings.Contains(rec.Body.String(), "wrapped_") || strings.Contains(rec.Body.String(), "pins") {
 		t.Fatalf("a colleague's query carries the user's wraps or pins: %s", rec.Body.String())
+	}
+}
+
+func TestE2EEIdentityWritesNeedTheMasterKeyAndCleanJSON(t *testing.T) {
+	srv, st, _ := newMultiTenantTestServer(t)
+	alice, tok := createOrgUser(t, st, "usr_e3w_alice", "e3walice", "user", orgA)
+	id := newIdentity(t, orgA, alice.ID)
+	// Two wraps that are the same string must not pass as one check: each is checked for its
+	// own length.
+	same := clone(id.put(t, 0))
+	rc := same["recovery"].(map[string]any)
+	rc["wrapped_backup_key"] = rc["wrapped_master_key"]
+	if c := doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/master", tok, same, nil).Code; c != http.StatusBadRequest {
+		t.Fatalf("the master wrap passed as the backup wrap = %d", c)
+	}
+	// A repeated member name could let a second copy shadow the signed one: refused.
+	raw, _ := json.Marshal(id.put(t, 0))
+	dup := bytes.Replace(raw, []byte(`{"backup_key"`), []byte(`{"expected_version":7,"backup_key"`), 1)
+	if bytes.Equal(dup, raw) {
+		t.Fatal("test body did not change")
+	}
+	req, _ := http.NewRequest(http.MethodPut, "/api/v1/keys/master", bytes.NewReader(dup))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("duplicate member name = %d %s", rec.Code, rec.Body.String())
+	}
+	if c := doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/master", tok, id.put(t, 0), nil).Code; c != http.StatusOK {
+		t.Fatal(c)
+	}
+
+	sender := b64.EncodeToString(bytes.Repeat([]byte{7}, 32))
+	entry := func(idx int64) map[string]any {
+		e := e2eeid.BackupEntry{RoomID: "rm_1", SenderKey: sender, SessionID: "sess", FirstIndex: idx}
+		sealed, _ := e2eeid.SealBackup(id.backup.Public(), e2eeid.MasterSeed(id.master), e, []byte("x"))
+		return map[string]any{"room_id": "rm_1", "sender_key": sender, "session_id": "sess", "first_index": idx, "sealed": b64.EncodeToString(sealed)}
+	}
+	put := func(body map[string]any) *httptest.ResponseRecorder {
+		return doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/backup", tok, body, nil)
+	}
+	unsigned := id.backupWrite(t, 1, entry(3))
+	delete(unsigned, "signature")
+	swapped := id.backupWrite(t, 1, entry(3))
+	swapped["sessions"] = []map[string]any{entry(0)} // signed for index 3, sent as 0
+	for name, b := range map[string]map[string]any{
+		"unsigned":              unsigned,
+		"signed by another key": newIdentity(t, orgA, alice.ID).backupWrite(t, 1, entry(3)),
+		"entries swapped":       swapped,
+		"index past uint32":     id.backupWrite(t, 1, entry(math.MaxUint32+1)),
+	} {
+		if rec := put(b); rec.Code != http.StatusBadRequest {
+			t.Errorf("%s = %d %s", name, rec.Code, rec.Body.String())
+		}
+	}
+	if rec := put(id.backupWrite(t, 1, entry(math.MaxUint32))); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"stored":1`) {
+		t.Fatalf("highest index = %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := put(id.backupWrite(t, 1, entry(2))); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"full":false`) {
+		t.Fatalf("better copy = %d %s", rec.Code, rec.Body.String())
 	}
 }

@@ -116,7 +116,8 @@ interface ChatProps {
 type ActiveModal = 'none' | 'new-channel' | 'new-dm' | 'search' | 'verify-device';
 
 // What a row says about its encryption state; a retry replaces the row only when this changes.
-const e2eeLabel = (m: ChatMessage) => (m.e2ee?.kind === 'failed' ? `failed:${m.e2ee.reason}` : m.e2ee?.kind ?? '');
+const e2eeLabel = (m: ChatMessage) =>
+  m.e2ee?.kind === 'failed' ? `failed:${m.e2ee.reason}` : m.e2ee?.kind === 'decrypted' ? `decrypted:${m.e2ee.trust ?? ''}` : m.e2ee?.kind ?? '';
 
 interface RoomMessageBucket {
   messages: ChatMessage[];
@@ -2596,6 +2597,8 @@ export const Chat: React.FC<ChatProps> = ({
                 <span>{bannerError}</span>
               </div>
             )}
+            {/* Setting up or verifying this device needs no room. */}
+            <EncryptionIdentityGate gate={identity} refresh={refreshIdentity} />
 
             <div className="chat-empty-stage">
               <MessageSquarePlus size={36} style={{ color: 'var(--accent)' }} aria-hidden="true" />
@@ -2612,6 +2615,12 @@ export const Chat: React.FC<ChatProps> = ({
                 <button type="button" className="btn-secondary" onClick={() => setModal('new-dm')}>
                   New direct message
                 </button>
+                {identity.state === 'verified' && (
+                  <button type="button" className="btn-secondary" onClick={() => setModal('verify-device')}>
+                    <ShieldCheck size={15} aria-hidden="true" />
+                    Verify a device
+                  </button>
+                )}
               </div>
             </div>
           </>

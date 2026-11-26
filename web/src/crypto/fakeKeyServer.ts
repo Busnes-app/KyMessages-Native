@@ -109,9 +109,10 @@ export class FakeKeyServer {
         for (const d of this.devices.get(userId)?.values() ?? []) delete d.master_signature;
         return version;
       },
-      putPins: async (version, expected, sealed) => {
+      putPins: async (version, expected, sealed, signature) => {
         const m = this.masters.get(userId);
         if (!m || m.version !== version || m.pins.counter !== expected) throw new Conflict('409');
+        if (!pqc.verifyPinsWrite(m.master_key, TENANT, userId, version, expected + 1, sealed, signature)) throw new Error('The pin set is not signed by the current master key');
         m.pins = { counter: expected + 1, sealed };
       },
       putDeviceList: async (version, expected, deviceIds, signature) => {
@@ -137,8 +138,10 @@ export class FakeKeyServer {
           .filter((e) => cmp(k(e), k(after)) > 0);
         return { sessions: rows.slice(0, 2).map((e) => ({ ...e })), more: rows.length > 2 };
       },
-      putBackup: async (version, sessions) => {
-        if (this.masters.get(userId)?.version !== version) throw new Conflict('409');
+      putBackup: async (version, sessions, signature) => {
+        const m = this.masters.get(userId);
+        if (m?.version !== version) throw new Conflict('409');
+        if (!pqc.verifyBackupWrite(m.master_key, TENANT, userId, version, sessions, signature)) throw new Error('The backup write is not signed by the current master key');
         const box = this.backups.get(userId) ?? new Map<string, BackupEntry>();
         for (const e of sessions) {
           const k = `${e.room_id}\n${e.sender_key}\n${e.session_id}`;
@@ -146,6 +149,7 @@ export class FakeKeyServer {
           if (!known || e.first_index < known.first_index) box.set(k, { ...e });
         }
         this.backups.set(userId, box);
+        return { full: false };
       },
       pairingStart: async (deviceId) => {
         const d = this.devices.get(userId)?.get(deviceId);

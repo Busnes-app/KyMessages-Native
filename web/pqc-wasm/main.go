@@ -2,7 +2,7 @@
 
 // Command pqc-wasm is the browser's post-quantum code: internal/e2eeid (and through it
 // internal/pqc/xwing and internal/pqc/hybridsig) compiled to js/wasm, the same Go the server
-// runs (PQC Stack Plan Q3). It defines globalThis.kyPQCCall(name, ...args), which answers
+// runs (PQC Stack Plan Q3). It hands the loader's kyPQCReady a call(name, ...args) answering
 // {ok: result} or {error: message}, also for a call that panics. build.sh writes the committed
 // web/src/pqc/pqc.wasm.
 package main
@@ -14,7 +14,9 @@ import (
 )
 
 func main() {
-	js.Global().Set("kyPQCCall", js.FuncOf(func(_ js.Value, argv []js.Value) (result any) {
+	// The call is handed to the loader rather than set as a global: a start the loader gave up
+	// on must not replace a newer one when it finishes late.
+	call := js.FuncOf(func(_ js.Value, argv []js.Value) (result any) {
 		// A panic in a call must answer an error, not kill the Go runtime every later call needs.
 		defer func() {
 			if r := recover(); r != nil {
@@ -43,7 +45,7 @@ func main() {
 			out = o
 		}
 		return map[string]any{"ok": out}
-	}))
-	js.Global().Get("kyPQCReady").Invoke()
+	})
+	js.Global().Get("kyPQCReady").Invoke(call)
 	select {}
 }
