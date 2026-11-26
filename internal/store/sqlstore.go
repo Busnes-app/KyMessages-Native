@@ -802,8 +802,9 @@ func (s *sessionStore) DeleteSession(ctx context.Context, tokenHash string) erro
 	return err
 }
 
-// DeleteUserSessions revokes every grant the user holds: sessions, pending MFA challenges and
-// device pairings, which would otherwise still mint a session.
+// DeleteUserSessions revokes every grant the user holds: sessions, pending MFA challenges,
+// device pairings (which would otherwise still mint a session) and QR encryption pairings
+// (which would otherwise still hand out the account's keys).
 func (s *sessionStore) DeleteUserSessions(ctx context.Context, userID string) error {
 	tx, err := s.store.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -820,7 +821,8 @@ func deleteGrants(ctx context.Context, st *SQLStore, tx *sql.Tx, userID string) 
 	if err := queueCallSeatsTx(ctx, st, tx, `call_seats.user_id=?`, userID); err != nil {
 		return err
 	}
-	for _, table := range []string{"sessions", "mfa_challenges", "device_pairings", "push_subscriptions"} {
+	// e2ee_pairings: a pending QR offer is a short-lived grant of the account's encryption keys.
+	for _, table := range []string{"sessions", "mfa_challenges", "device_pairings", "push_subscriptions", "e2ee_pairings"} {
 		if _, err := tx.ExecContext(ctx, st.rebind("DELETE FROM "+table+" WHERE user_id = ?"), userID); err != nil {
 			return err
 		}

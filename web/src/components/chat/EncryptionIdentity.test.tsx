@@ -241,4 +241,17 @@ describe('identity screens', () => {
     expect(await screen.findByTestId('encryption-pending')).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Retry now' })).toBeTruthy();
   });
+
+  it('ends a poll in flight when the code expires, and says so', async () => {
+    let seen: AbortSignal | undefined;
+    const poll = vi.fn((signal?: AbortSignal) => {
+      seen = signal;
+      return new Promise<undefined>((_, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true }));
+    });
+    vi.spyOn(fake, 'offerVerification').mockResolvedValue({ text: 'QRTEXT', expiresInMs: 300, poll, approve: async () => undefined, cancel: async () => undefined });
+    render(<VerifyAnotherDevice onClose={() => undefined} />);
+    expect(await screen.findByText(/The code expired/, {}, { timeout: 2000 })).toBeTruthy();
+    expect(poll).toHaveBeenCalledTimes(1);
+    expect(seen?.aborted).toBe(true);
+  });
 });

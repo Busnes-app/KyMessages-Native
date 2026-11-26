@@ -1,5 +1,6 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { test, expect } from '@playwright/test';
+import { ensureEncryption } from './identity.mjs';
 
 // The chat modals (Base UI Dialog) and their teammate and search pickers (Base UI Combobox and
 // Autocomplete): keyboard from the search box, focus kept in and returned to the opener, the
@@ -178,6 +179,7 @@ test('new DM and search: arrows move through options from the box and Enter pick
   const openList = page.getByRole('button', { name: 'Open room list' }).filter({ visible: true });
   if (!(await page.locator('aside.chat-rail.mobile-open').count()) && await openList.count()) await openList.first().click();
   await page.getByRole('complementary', { name: 'Workspace and conversations' }).locator('.chat-room-btn', { hasText: room.name }).first().click();
+  await ensureEncryption(page);
   const composer = page.getByLabel('Message input');
   await expect(composer).toHaveAttribute('placeholder', `Message #${room.name}`);
   for (const body of [`first ${word} note`, `second ${word} note`]) {

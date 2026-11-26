@@ -89,7 +89,7 @@ import { RoomDetailsDrawer, type DrawerTab } from '../components/chat/RoomDetail
 import { CreateChannelModal, SearchModal, StartDMModal } from '../components/chat/ChatModals';
 import { EncryptionIdentityGate, IdentityChangedBanner, useIdentityStatus, VerifyAnotherDevice } from '../components/chat/EncryptionIdentity';
 import { searchIndexFor } from '../chat/searchIndex';
-import { checkRoomIdentities, keyGeneration, onRoomKeys, openMessages, receiveRoomKeys, retryable, roomMemberLeft, startE2EE } from '../chat/e2ee';
+import { checkRoomIdentities, encryptionReadyFor, keyGeneration, onEncryptionPending, onRoomKeys, openMessages, receiveRoomKeys, retryable, roomMemberLeft, startE2EE } from '../chat/e2ee';
 import { CallAudioLayer, CallStage } from '../components/chat/CallStage';
 import { HybridCallController, type HybridCallSnapshot } from '../rtc/hybridCall';
 
@@ -135,6 +135,8 @@ const isMac =
   typeof navigator !== 'undefined' && /mac|iphone|ipad|ipod/i.test(navigator.platform || navigator.userAgent);
 const SEARCH_HINT = isMac ? '⌘K' : 'Ctrl+K';
 
+const E2EE_START_ERROR = 'Encryption could not start in this browser, so messages cannot be sent or read.';
+
 export const Chat: React.FC<ChatProps> = ({
   appName,
   user,
@@ -151,6 +153,21 @@ export const Chat: React.FC<ChatProps> = ({
   const [e2eeReady, setE2eeReady] = useState(false);
   const [identity, refreshIdentity] = useIdentityStatus(e2eeReady);
   const [currentUser, setCurrentUser] = useState<ChatCurrentUser | null>(null);
+  // Readiness follows the signed-in user's device, however it got running: the first start, a
+  // retry after a failed one, or a replacement. Once it runs, the start-up error goes (only it).
+  useEffect(() => {
+    const userId = currentUser?.id;
+    if (!userId) return;
+    const check = () => {
+      const ready = encryptionReadyFor(userId);
+      setE2eeReady(ready);
+      if (ready) setBannerError((b) => (b === E2EE_START_ERROR ? '' : b));
+    };
+    check();
+    const offKeys = onRoomKeys(check);
+    const offRetry = onEncryptionPending(check);
+    return () => { offKeys(); offRetry(); };
+  }, [currentUser?.id]);
   const [tenantName, setTenantName] = useState('KyMessages');
   const [rooms, setRooms] = useState<ChatRoomSummary[]>([]);
   const [directory, setDirectory] = useState<ChatDirectoryUser[]>([]);
@@ -915,7 +932,7 @@ export const Chat: React.FC<ChatProps> = ({
         void startE2EE(boot.user.id).then(() => {
           if (!cancelled) setE2eeReady(true);
         }, () => {
-          if (!cancelled) setBannerError('Encryption could not start in this browser, so messages cannot be sent or read.');
+          if (!cancelled && !encryptionReadyFor(boot.user.id)) setBannerError(E2EE_START_ERROR);
         });
         setCurrentUser(boot.user);
         setTenantName(boot.tenant.display_name || 'KyMessages');

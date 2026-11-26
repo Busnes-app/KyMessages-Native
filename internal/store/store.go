@@ -130,9 +130,11 @@ type E2EEStore interface {
 	// expected, for the list whose digest is given, until now+ttl, and answers that epoch. The
 	// same digest keeps its epoch (an honest retry, also after a lapse); a different one gets an
 	// epoch above every one granted before, so two proposals are never signable at one epoch.
-	// ErrE2EEVersion unless the list is at expected and no other live reservation holds it; then
-	// Until is the holder's lapse (zero when the list moved on).
-	ReserveDeviceList(ctx context.Context, tenantID, userID string, version, expected int64, digest string, now time.Time, ttl time.Duration) (E2EEReservation, error)
+	// proof checks the reservation's master-key signature against that version's master key,
+	// read and locked in the same transaction (its error is returned as is). ErrE2EEVersion
+	// unless the list is at expected and no other live reservation holds it; then Until is the
+	// holder's lapse (zero when the list moved on).
+	ReserveDeviceList(ctx context.Context, tenantID, userID string, version, expected int64, digest string, now time.Time, ttl time.Duration, proof Proof) (E2EEReservation, error)
 	// PutDeviceList stores the master-signed device list at epoch under version, once proof
 	// accepts it against that version's master key and a reservation names its digest and epoch,
 	// live at now() read after the master row is locked, while the list is at expected (all in

@@ -12,7 +12,8 @@ and the two-layer QR transfer.
   `.device-list.v1`, `.pins-write.v1` and `.backup-write.v1` (`BackupWrite` builds the last from
   API entries and the backup generation, so the server and the browser sign the same bytes).
   `DeviceListDigest` names a proposed list for its reservation (the browser's `hash` of the same
-  fields). `ComparisonCode` binds the joining device's ID as well as its ephemeral key.
+  fields), which the master key signs as `DeviceListReserveMessage` under
+  `.device-list-reserve.v1`. `ComparisonCode` binds the joining device's ID as well as its ephemeral key.
 - `call.go`: `Call(name, args)`, the string API (unpadded base64; base64url for pairing IDs and
   QR text) that `web/pqc-wasm` exposes to the browser as `kyPQCCall`.
 

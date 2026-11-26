@@ -366,6 +366,8 @@ func writeVectors(t *testing.T) {
 	sealedBackup := must(t, "backupSeal", xp, ms, "room-1", sender, "session-1", "3", plain).(string)
 	forgedBackup := must(t, "backupSeal", xp, seed("other", e2eeid.MasterSeedBytes), "room-1", sender, "session-1", "3", plain).(string)
 	devList := str(must(t, "signDeviceList", ms, tenant, user, "1", "2", `["DEVICE_ALICE_1","DEVICE_ALICE_2"]`))
+	digest := e2eeid.DeviceListDigest([]string{"DEVICE_ALICE_1", "DEVICE_ALICE_2"})
+	reserve := str(must(t, "signDeviceListReserve", ms, tenant, user, "1", "1", digest))
 	batch := `[{"room_id":"room-1","sender_key":"` + sender + `","session_id":"session-1","first_index":3,"sealed":"` + sealedBackup + `"}]`
 	batchW := str(must(t, "signBackupWrite", ms, tenant, user, "1", "4", batch))
 	wrapM := must(t, "recoveryWrap", rk, "master-key", tenant, user, ms).(string)
@@ -411,6 +413,11 @@ func writeVectors(t *testing.T) {
 		{Name: "backup session claiming an earlier first index", Call: "backupOpen", Args: []string{xs, ms, "room-1", sender, "session-1", "0", sealedBackup}, Error: true},
 		{Name: "backup session, tampered", Call: "backupOpen", Args: []string{xs, ms, "room-1", sender, "session-1", "3", tampered(sealedBackup)}, Error: true},
 		{Name: "backup session forged without the master seed", Call: "backupOpen", Args: []string{xs, ms, "room-1", sender, "session-1", "3", forgedBackup}, Error: true},
+		{Name: "reservation verifies", Call: "verifyDeviceListReserve", Args: []string{mp["public_key"], tenant, user, "1", "1", digest, reserve}, Want: true},
+		{Name: "reservation from another epoch", Call: "verifyDeviceListReserve", Args: []string{mp["public_key"], tenant, user, "1", "2", digest, reserve}, Want: false},
+		{Name: "reservation of another list", Call: "verifyDeviceListReserve", Args: []string{mp["public_key"], tenant, user, "1", "1", e2eeid.DeviceListDigest([]string{"DEVICE_EVIL"}), reserve}, Want: false},
+		{Name: "a published list is no reservation", Call: "verifyDeviceListReserve", Args: []string{mp["public_key"], tenant, user, "1", "1", digest, devList}, Want: false},
+		{Name: "a reservation is no published list", Call: "verifyDeviceList", Args: []string{mp["public_key"], tenant, user, "1", "2", `["DEVICE_ALICE_1","DEVICE_ALICE_2"]`, reserve}, Want: false},
 		{Name: "device list verifies", Call: "verifyDeviceList", Args: []string{mp["public_key"], tenant, user, "1", "2", `["DEVICE_ALICE_1","DEVICE_ALICE_2"]`, devList}, Want: true},
 		{Name: "device list at another epoch", Call: "verifyDeviceList", Args: []string{mp["public_key"], tenant, user, "1", "3", `["DEVICE_ALICE_1","DEVICE_ALICE_2"]`, devList}, Want: false},
 		{Name: "device list with a device added", Call: "verifyDeviceList", Args: []string{mp["public_key"], tenant, user, "1", "2", `["DEVICE_ALICE_1","DEVICE_ALICE_2","DEVICE_EVIL"]`, devList}, Want: false},

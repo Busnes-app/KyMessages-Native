@@ -46,12 +46,27 @@ export function resetFakeE2EE(): void {
   keys.clear();
   keys.add('s_own');
   unavailable = false;
+  started = true;
   fakeIdentity = { state: 'verified', fingerprint: 'f'.repeat(64), restoring: false, backupFull: false };
   fakeChanges = [];
   fakePending = { pending: false, exhausted: false };
 }
 
-export const startE2EE = async () => ({});
+// The device starts unless a test says it failed; a later retry can bring it up (setFakeStarted).
+let started = true;
+export const startE2EE = async () => {
+  if (!started) throw new Error('The post-quantum module did not load');
+  return {};
+};
+export const encryptionReadyFor = () => started;
+/** Fails (false) or brings up (true) the device, announcing it as a real start-up does. */
+export function setFakeStarted(v: boolean): void {
+  started = v;
+  if (v) {
+    keyGen++;
+    for (const fn of listeners) fn();
+  }
+}
 export const receiveRoomKeys = () => undefined;
 export const roomMemberLeft = () => undefined;
 export const retireDevice = () => ({
@@ -68,6 +83,8 @@ export function onRoomKeys(fn: () => void): () => void {
 }
 
 export async function sealRoomMessage(roomId: string, inner: Omit<RoomInner, 'room_id'>): Promise<string> {
+  // As the engine: a device that is not verified does not send.
+  if (fakeIdentity.state !== 'verified') throw new Error('Set up encryption or verify this device to send encrypted messages.');
   return fakeEnvelope({ ...inner, room_id: roomId });
 }
 

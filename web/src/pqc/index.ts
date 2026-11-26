@@ -196,6 +196,11 @@ export const pqc = {
     pqcCall<Hybrid>('signDeviceList', seed, tenant, user, String(version), String(epoch), JSON.stringify(deviceIds)),
   verifyDeviceList: (k: Hybrid, tenant: string, user: string, version: number, epoch: number, deviceIds: string[], s: Hybrid) =>
     pqcCall<boolean>('verifyDeviceList', k, tenant, user, String(version), String(epoch), JSON.stringify(deviceIds), s),
+  /** A reservation of the next device list epoch, for the list with this digest (its own domain). */
+  signDeviceListReserve: (seed: string, tenant: string, user: string, version: number, expectedEpoch: number, digest: string) =>
+    pqcCall<Hybrid>('signDeviceListReserve', seed, tenant, user, String(version), String(expectedEpoch), digest),
+  verifyDeviceListReserve: (k: Hybrid, tenant: string, user: string, version: number, expectedEpoch: number, digest: string, s: Hybrid) =>
+    pqcCall<boolean>('verifyDeviceListReserve', k, tenant, user, String(version), String(expectedEpoch), digest, s),
   signPinsWrite: (seed: string, tenant: string, user: string, version: number, counter: number, sealed: string) =>
     pqcCall<Hybrid>('signPinsWrite', seed, tenant, user, String(version), String(counter), sealed),
   signBackupWrite: (seed: string, tenant: string, user: string, version: number, generation: number, entries: (BackupRef & { sealed: string })[]) =>

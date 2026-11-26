@@ -234,6 +234,13 @@ function withLock<T>(name: string, fn: () => Promise<T>, signal?: AbortSignal): 
   });
 }
 
+/** An encrypted send from a device that is not verified (or an account with no identity yet). */
+export class NotVerified extends Error {
+  constructor() {
+    super('Set up encryption or verify this device to send encrypted messages.');
+  }
+}
+
 export class DeviceChanged extends Error {
   constructor() { super('This browser device was replaced'); }
 }
@@ -245,6 +252,9 @@ export const EARLY = 'This message was sent before this device could read the ro
 export class CryptoEngine {
   private readonly listeners = new Set<(sessionIds: string[]) => void>();
   private readonly transient = new Set<() => void>();
+  // A failure reported before anyone listened (the status check open starts): handed to the
+  // first listener, so it is still retried.
+  private missedTransient = false;
   private readonly backupState = new Set<(full: boolean) => void>();
   private readonly adopted = new Set<() => void>();
   private readonly identity: Identity;
@@ -261,7 +271,7 @@ export class CryptoEngine {
     this.identity = new Identity({
       userId, deviceId, curve25519, ed25519, server, store, pickleKey: key, locked: (fn) => this.locked(fn),
       onRestored: (ids) => { for (const fn of this.listeners) fn(ids); },
-      onTransient: () => { for (const fn of this.transient) fn(); },
+      onTransient: () => this.reportTransient(),
       onBackupState: (full) => { for (const fn of this.backupState) fn(full); },
       onAdopted: () => { for (const fn of this.adopted) fn(); },
     });
@@ -320,7 +330,16 @@ export class CryptoEngine {
    * a retry (identityStatus runs it again); returns an unsubscribe. */
   onTransient(fn: () => void): () => void {
     this.transient.add(fn);
+    if (this.missedTransient) {
+      this.missedTransient = false;
+      fn();
+    }
     return () => this.transient.delete(fn);
+  }
+
+  private reportTransient(): void {
+    if (this.transient.size === 0) this.missedTransient = true;
+    for (const fn of this.transient) fn();
   }
 
   /** Calls fn when whether the key backup refused sessions (it is full) changes. */
@@ -537,7 +556,7 @@ export class CryptoEngine {
   /** Seals queued room sessions to the key backup, after the current locked operation. */
   private backupSoon(): void {
     setTimeout(() => void this.locked(() => this.identity.flushBackup()).catch((e: unknown) => {
-      if (isTransient(e)) for (const fn of this.transient) fn();
+      if (isTransient(e)) this.reportTransient();
     }), 0);
   }
 
@@ -757,6 +776,9 @@ export class CryptoEngine {
    */
   encrypt(roomId: string, inner: Omit<RoomInner, 'room_id'>): Promise<string> {
     return this.locked(async () => {
+      // An unverified device trusts no one, so its message would reach no one, silently: it is
+      // refused before any session is made or ratcheted, and sends once the device is verified.
+      if (!(await this.identity.isVerified())) throw new NotVerified();
       const { members, devices } = await this.devicesInRoom(roomId);
       const outKey = `out:${roomId}`;
       let out = await this.store.get<OutboundRecord>(outKey);
@@ -945,7 +967,7 @@ export class CryptoEngine {
     const { plaintext, preKey, writes } = await this.olmDecrypt(sender.curve25519, c.type, c.body);
     // The Olm step succeeded, so its state is kept even if what it carried is refused below.
     let bad: unknown;
-    let room: { sessionId: string; key: string; record: InboundRecord; cover?: InboundRecord } | undefined;
+    let room: { sessionId: string; key: string; record?: InboundRecord; cover?: InboundRecord } | undefined;
     try {
       room = await this.roomKey(plaintext, sender, trusted.has(`${devKey(sender)}\n${sender.curve25519}`));
     } catch (e) {
@@ -954,9 +976,11 @@ export class CryptoEngine {
       if (isTransient(e)) throw e;
       bad = e;
     }
-    const backup: [string, unknown][] = room?.record.verified ? [[backupQueueKey(room.key), room.key]] : [];
-    const cover: [string, unknown][] = room?.cover ? [[backupCoverKey(room.record.sender_key, room.sessionId), room.cover]] : [];
-    await this.store.write(room ? [...pin, ...writes, [room.key, room.record], ...cover, ...backup] : [...pin, ...writes]);
+    // Only a copy that authenticates is queued for the key backup; a cover never is.
+    const backup: [string, unknown][] = room?.record?.verified ? [[backupQueueKey(room.key), room.key]] : [];
+    const primary: [string, unknown][] = room?.record ? [[room.key, room.record]] : [];
+    const cover: [string, unknown][] = room?.cover ? [[backupCoverKey(room.cover.sender_key, room.sessionId), room.cover]] : [];
+    await this.store.write([...pin, ...writes, ...primary, ...cover, ...backup]);
     if (backup.length > 0) this.backupSoon();
     if (bad !== undefined) throw bad;
     return room ? { sessionId: room.sessionId, preKey } : undefined;
@@ -964,7 +988,7 @@ export class CryptoEngine {
 
   // Checks a decrypted room key and returns the record to store, or undefined when an equal or
   // better copy is already stored.
-  private async roomKey(plaintext: string, sender: Target, verified: boolean): Promise<{ sessionId: string; key: string; record: InboundRecord; cover?: InboundRecord } | undefined> {
+  private async roomKey(plaintext: string, sender: Target, verified: boolean): Promise<{ sessionId: string; key: string; record?: InboundRecord; cover?: InboundRecord } | undefined> {
     const p = parseJSON(plaintext);
     if (
       !isObj(p) || p.type !== ROOM_KEY_TYPE ||
@@ -983,32 +1007,45 @@ export class CryptoEngine {
       if (session.sessionId !== k.session_id) throw new Error('Room key does not match its session');
       const key = inboundKey(sender.curve25519, k.session_id);
       const known = await this.store.get<InboundRecord>(key);
-      let cover: InboundRecord | undefined;
-      if (known) {
-        // A session is bound to its first sender and room; a later copy may only reach further
-        // back, except that a vouched copy over Olm takes over from one restored from the key
-        // backup, which stays beside it for the older messages it alone can read.
-        const same = known.sender_key === sender.curve25519 && known.sender_user === sender.user_id &&
-          known.sender_device === sender.device_id && known.room_id === k.room_id;
-        if (!same) return undefined;
-        const takesOver = verified && known.from_backup === true;
-        if (!takesOver && known.first_index <= session.firstKnownIndex) return undefined;
-        if (takesOver && known.first_index < session.firstKnownIndex) cover = known;
-      }
-      return {
-        cover,
-        sessionId: k.session_id,
-        key,
-        record: {
-          pickle: session.pickle(this.key),
-          room_id: k.room_id,
-          sender_user: sender.user_id,
-          sender_device: sender.device_id,
-          sender_key: sender.curve25519,
-          first_index: session.firstKnownIndex,
-          verified,
-        },
+      const record: InboundRecord = {
+        pickle: session.pickle(this.key),
+        room_id: k.room_id,
+        sender_user: sender.user_id,
+        sender_device: sender.device_id,
+        sender_key: sender.curve25519,
+        first_index: session.firstKnownIndex,
+        verified,
       };
+      if (!known) return { sessionId: k.session_id, key, record };
+      // A session is bound to its first sender and room.
+      const same = known.sender_key === sender.curve25519 && known.sender_user === sender.user_id &&
+        known.sender_device === sender.device_id && known.room_id === k.room_id;
+      if (!same) return undefined;
+      // The primary copy authenticates what it covers when it came over Olm from a vouched
+      // device. Such a copy is never replaced by one that does not (that would read later
+      // messages as unauthenticated, or let an unvouched device speak for the sender); an earlier
+      // reach from one is kept beside it, as the cover, for older messages only. A vouched copy
+      // supersedes an unvouched or restored primary from its own index on, at an equal index
+      // too, and the old one becomes the cover for what only it reaches.
+      const authenticates = (r: InboundRecord) => r.verified === true && !r.from_backup;
+      const asCover = async (c: InboundRecord): Promise<InboundRecord | undefined> => {
+        const cur = await this.store.get<InboundRecord>(backupCoverKey(sender.curve25519, session.sessionId));
+        return cur && cur.first_index <= c.first_index ? undefined : c;
+      };
+      if (authenticates(known)) {
+        if (verified && record.first_index < known.first_index) return { sessionId: k.session_id, key, record };
+        if (!verified && record.first_index < known.first_index) {
+          const cover = await asCover(record);
+          return cover ? { sessionId: k.session_id, key, cover } : undefined;
+        }
+        return undefined;
+      }
+      if (verified) {
+        const cover = known.first_index < record.first_index ? await asCover(known) : undefined;
+        return { sessionId: k.session_id, key, record, cover };
+      }
+      // Neither authenticates: the one reaching further back stays.
+      return record.first_index < known.first_index ? { sessionId: k.session_id, key, record } : undefined;
     } finally {
       session.free();
     }

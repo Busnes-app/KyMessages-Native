@@ -197,35 +197,47 @@ func (s *e2eeStore) PutPins(ctx context.Context, tenantID, userID string, versio
 // ReserveDeviceList is the device list's tentative state: one proposed successor at a time,
 // which only its proposer signs. A proposal that loses the reservation is never signed, so it
 // cannot later be shown as a signed successor.
-func (s *e2eeStore) ReserveDeviceList(ctx context.Context, tenantID, userID string, version, expected int64, digest string, now time.Time, ttl time.Duration) (E2EEReservation, error) {
+func (s *e2eeStore) ReserveDeviceList(ctx context.Context, tenantID, userID string, version, expected int64, digest string, now time.Time, ttl time.Duration, proof Proof) (E2EEReservation, error) {
 	until := now.Add(ttl).Unix()
-	var epoch int64
-	// Right-hand sides read the row as it was: the same digest keeps its epoch, another one gets
-	// the next above both the list and every epoch granted before.
-	err := s.store.db.QueryRowContext(ctx, s.store.rebind(`UPDATE e2ee_master_keys SET
-			device_list_reserved_epoch = CASE WHEN device_list_reserved = ? AND device_list_reserved_epoch > device_list_epoch THEN device_list_reserved_epoch
-				WHEN device_list_reserved_epoch > device_list_epoch THEN device_list_reserved_epoch + 1 ELSE device_list_epoch + 1 END,
-			device_list_reserved = ?, device_list_reserved_until = ?
-		WHERE user_id = ? AND tenant_id = ? AND version = ? AND device_list_epoch = ? AND (device_list_reserved = ? OR device_list_reserved_until <= ?)
-		RETURNING device_list_reserved_epoch`),
-		digest, digest, until, userID, tenantID, version, expected, digest, now.Unix()).Scan(&epoch)
-	if err == nil {
-		return E2EEReservation{Epoch: epoch, Until: time.Unix(until, 0)}, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
+	var res E2EEReservation
+	refused := false
+	err := s.fenced(ctx, tenantID, userID, version, proof, func(tx *sql.Tx) error {
+		// Right-hand sides read the row as it was: the same digest keeps its epoch, another one
+		// gets the next above both the list and every epoch granted before.
+		var epoch int64
+		err := tx.QueryRowContext(ctx, s.store.rebind(`UPDATE e2ee_master_keys SET
+				device_list_reserved_epoch = CASE WHEN device_list_reserved = ? AND device_list_reserved_epoch > device_list_epoch THEN device_list_reserved_epoch
+					WHEN device_list_reserved_epoch > device_list_epoch THEN device_list_reserved_epoch + 1 ELSE device_list_epoch + 1 END,
+				device_list_reserved = ?, device_list_reserved_until = ?
+			WHERE user_id = ? AND tenant_id = ? AND version = ? AND device_list_epoch = ? AND (device_list_reserved = ? OR device_list_reserved_until <= ?)
+			RETURNING device_list_reserved_epoch`),
+			digest, digest, until, userID, tenantID, version, expected, digest, now.Unix()).Scan(&epoch)
+		if err == nil {
+			res = E2EEReservation{Epoch: epoch, Until: time.Unix(until, 0)}
+			return nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		// Refused: say when the holder's reservation lapses, if that is what is in the way.
+		refused = true
+		var listEpoch, held int64
+		if err := tx.QueryRowContext(ctx, s.store.rebind(`SELECT device_list_epoch, device_list_reserved_until FROM e2ee_master_keys WHERE user_id = ? AND tenant_id = ? AND version = ?`),
+			userID, tenantID, version).Scan(&listEpoch, &held); err != nil {
+			return err
+		}
+		if listEpoch == expected && held > now.Unix() {
+			res = E2EEReservation{Until: time.Unix(held, 0)}
+		}
+		return nil
+	})
+	if err != nil {
 		return E2EEReservation{}, err
 	}
-	// Refused: say when the holder's reservation lapses, if that is what is in the way.
-	var listEpoch, held int64
-	err = s.store.db.QueryRowContext(ctx, s.store.rebind(`SELECT device_list_epoch, device_list_reserved_until FROM e2ee_master_keys WHERE user_id = ? AND tenant_id = ? AND version = ?`),
-		userID, tenantID, version).Scan(&listEpoch, &held)
-	if err == nil && listEpoch == expected && held > now.Unix() {
-		return E2EEReservation{Until: time.Unix(held, 0)}, ErrE2EEVersion
+	if refused {
+		return res, ErrE2EEVersion
 	}
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return E2EEReservation{}, err
-	}
-	return E2EEReservation{}, ErrE2EEVersion
+	return res, nil
 }
 
 func (s *e2eeStore) PutDeviceList(ctx context.Context, tenantID, userID string, version, expected, epoch int64, list, digest, signature string, now func() time.Time, proof Proof) error {

@@ -748,8 +748,14 @@ func TestE2EEDeviceListIsSignedAndVersioned(t *testing.T) {
 	putL := func(tok string, body map[string]any) int {
 		return doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/devices/list", tok, body, nil).Code
 	}
+	// reservation is a reserve body for ids at expected, signed by signer's master key.
+	reservation := func(expected int64, ids []string, signer *testIdentity) map[string]any {
+		digest := e2eeid.DeviceListDigest(ids)
+		return map[string]any{"version": 1, "expected_epoch": expected, "digest": digest,
+			"signature": signer.sign(t, e2eeid.DomainDeviceListReserve, e2eeid.DeviceListReserveMessage(orgA, alice.ID, 1, expected, digest))}
+	}
 	reserve := func(tok string, expected int64, ids []string) int {
-		return doBearerJSON(t, srv, http.MethodPost, "/api/v1/keys/devices/list/reserve", tok, map[string]any{"version": 1, "expected_epoch": expected, "digest": e2eeid.DeviceListDigest(ids)}, nil).Code
+		return doBearerJSON(t, srv, http.MethodPost, "/api/v1/keys/devices/list/reserve", tok, reservation(expected, ids, id), nil).Code
 	}
 	// reserveAndPut is an honest edit: reserve the list's digest, then publish it.
 	reserveAndPut := func(body map[string]any) int {
@@ -790,12 +796,27 @@ func TestE2EEDeviceListIsSignedAndVersioned(t *testing.T) {
 	if c := doBearerJSON(t, srv, http.MethodPost, "/api/v1/keys/devices/list/reserve", tok, map[string]any{"version": 1, "expected_epoch": 0, "digest": "ABC"}, nil).Code; c != http.StatusBadRequest {
 		t.Fatalf("a malformed digest = %d", c)
 	}
+	// A session without the master seed cannot hold the list: no signature, another key's, or
+	// a published list's signature in its place are all refused, and reserve nothing.
+	noSig := reservation(0, both, id)
+	delete(noSig, "signature")
+	listSig := reservation(0, both, id)
+	listSig["signature"] = list(1, both, id)["signature"]
+	for name, body := range map[string]map[string]any{
+		"no signature":          noSig,
+		"signed by another key": reservation(0, both, newIdentity(t, orgA, alice.ID)),
+		"a list's signature":    listSig,
+	} {
+		if c := doBearerJSON(t, srv, http.MethodPost, "/api/v1/keys/devices/list/reserve", tok, body, nil).Code; c != http.StatusBadRequest {
+			t.Errorf("reservation with %s = %d", name, c)
+		}
+	}
 	// Two devices proposing at once: the second is refused before it signs, and a list it
 	// signed anyway is not publishable.
 	if c := reserve(tok, 0, both); c != http.StatusOK {
 		t.Fatalf("reserve = %d", c)
 	}
-	held := doBearerJSON(t, srv, http.MethodPost, "/api/v1/keys/devices/list/reserve", tok, map[string]any{"version": 1, "expected_epoch": 0, "digest": e2eeid.DeviceListDigest([]string{"DEVICE_C_00003"})}, nil)
+	held := doBearerJSON(t, srv, http.MethodPost, "/api/v1/keys/devices/list/reserve", tok, reservation(0, []string{"DEVICE_C_00003"}, id), nil)
 	var hint struct {
 		RetryInMs int64 `json:"retry_in_ms"`
 	}

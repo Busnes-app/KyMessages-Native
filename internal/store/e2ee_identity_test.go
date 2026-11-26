@@ -86,7 +86,7 @@ func TestE2EEMasterKeyVersions(t *testing.T) {
 		t.Fatalf("pins written from another org: %v", err)
 	}
 	now := time.Now()
-	if _, err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-1", now, time.Minute); err != nil {
+	if _, err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-1", now, time.Minute, okProof); err != nil {
 		t.Fatal(err)
 	}
 	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, 1, `["D1"]`, "dg-1", "list-sig", at(now), okProof); err != nil {
@@ -438,11 +438,16 @@ func TestE2EEDeviceListReservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().Truncate(time.Second)
-	if r, err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-a", now, time.Minute); err != nil || r.Epoch != 1 {
+	// Without a proof the master key accepts, nothing is reserved.
+	refuse := errors.New("not signed by the master key")
+	if _, err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-x", now, time.Minute, func(string) error { return refuse }); !errors.Is(err, refuse) {
+		t.Fatalf("unproved reservation: %v", err)
+	}
+	if r, err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-a", now, time.Minute, okProof); err != nil || r.Epoch != 1 {
 		t.Fatal(r, err)
 	}
 	// The losing proposal: refused while A's reservation is live, with its lapse, and unpublishable.
-	r, err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-b", now, time.Minute)
+	r, err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-b", now, time.Minute, okProof)
 	if !errors.Is(err, store.ErrE2EEVersion) || !r.Until.Equal(now.Add(time.Minute)) {
 		t.Fatalf("second reservation: %+v %v", r, err)
 	}
@@ -454,12 +459,12 @@ func TestE2EEDeviceListReservation(t *testing.T) {
 		tenant            string
 		version, expected int64
 	}{{"t1", 2, 0}, {"t1", 1, 1}, {"t2", 1, 0}} {
-		if r, err := k.ReserveDeviceList(ctx, c.tenant, "u-a", c.version, c.expected, "dg-a", now, time.Minute); !errors.Is(err, store.ErrE2EEVersion) || !r.Until.IsZero() {
+		if r, err := k.ReserveDeviceList(ctx, c.tenant, "u-a", c.version, c.expected, "dg-a", now, time.Minute, okProof); !errors.Is(err, store.ErrE2EEVersion) || !r.Until.IsZero() {
 			t.Fatalf("reservation %+v: %+v %v", c, r, err)
 		}
 	}
 	// A's honest retry renews it at the same epoch; past its lapse A cannot publish.
-	if r, err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-a", now.Add(30*time.Second), time.Minute); err != nil || r.Epoch != 1 {
+	if r, err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-a", now.Add(30*time.Second), time.Minute, okProof); err != nil || r.Epoch != 1 {
 		t.Fatalf("renewal: %+v %v", r, err)
 	}
 	later := now.Add(2 * time.Minute)
@@ -467,7 +472,7 @@ func TestE2EEDeviceListReservation(t *testing.T) {
 		t.Fatalf("publish after the reservation lapsed: %v", err)
 	}
 	// B replaces the lapsed reservation at a higher epoch: A may have signed epoch 1 already.
-	r, err = k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-b", later, time.Minute)
+	r, err = k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-b", later, time.Minute, okProof)
 	if err != nil || r.Epoch != 2 {
 		t.Fatalf("reservation after a lapse: %+v %v", r, err)
 	}
@@ -481,7 +486,7 @@ func TestE2EEDeviceListReservation(t *testing.T) {
 	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 2, 3, `["B"]`, "dg-b", "sig-b", at(later), okProof); !errors.Is(err, store.ErrE2EEVersion) {
 		t.Fatalf("publish without a reservation of epoch 3: %v", err)
 	}
-	if r, err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 2, "dg-c", later, time.Minute); err != nil || r.Epoch != 3 {
+	if r, err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 2, "dg-c", later, time.Minute, okProof); err != nil || r.Epoch != 3 {
 		t.Fatal(r, err)
 	}
 	m, _ := k.GetMasterKey(ctx, "u-a")
@@ -492,7 +497,7 @@ func TestE2EEDeviceListReservation(t *testing.T) {
 	if err := k.PutMasterKey(ctx, master("u-a", "t1", "2"), 1); err != nil {
 		t.Fatal(err)
 	}
-	if r, err := k.ReserveDeviceList(ctx, "t1", "u-a", 2, 0, "dg-d", later, time.Minute); err != nil || r.Epoch != 1 {
+	if r, err := k.ReserveDeviceList(ctx, "t1", "u-a", 2, 0, "dg-d", later, time.Minute, okProof); err != nil || r.Epoch != 1 {
 		t.Fatalf("reservation after a reset: %+v %v", r, err)
 	}
 }
@@ -541,7 +546,7 @@ func TestE2EEDeviceListLeaseCheckedUnderTheLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().Truncate(time.Second)
-	if _, err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-a", now, time.Minute); err != nil {
+	if _, err := k.ReserveDeviceList(ctx, "t1", "u-a", 1, 0, "dg-a", now, time.Minute, okProof); err != nil {
 		t.Fatal(err)
 	}
 	locked := false

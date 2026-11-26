@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { newIdentity } from './identity.mjs';
 
 async function login(page) {
   await page.goto('/');
@@ -28,20 +29,6 @@ async function send(page, text) {
 // E3: room keys reach only devices the account's master key signed. The first browser sets up
 // a fresh identity through the real screens (or resets the one an earlier test made) and reads
 // the recovery key off the screen; the peer verifies itself with that key.
-async function newIdentity(page) {
-  const banner = page.getByRole('status').filter({ hasText: /Set up encryption|Verify this device/ });
-  await banner.getByRole('button').click();
-  const dialog = page.getByRole('dialog');
-  if (await dialog.getByRole('heading', { name: 'Verify this device' }).isVisible()) {
-    await dialog.getByRole('button', { name: 'I lost my recovery key and every other device' }).click();
-  }
-  const key = (await page.getByTestId('recovery-key').textContent()).trim();
-  await page.getByRole('checkbox', { name: /I saved my recovery key/ }).check();
-  await page.getByRole('button', { name: 'Continue' }).click();
-  await expect(banner).toHaveCount(0);
-  return key;
-}
-
 async function verifyWithRecoveryKey(page, key) {
   const banner = page.getByRole('status').filter({ hasText: 'Verify this device' });
   await banner.getByRole('button').click();

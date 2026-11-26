@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { Chat } from './Chat';
 import { HybridCallController } from '../rtc/hybridCall';
-import { deliverKey, fakeEnvelope, heldOpenCount, holdFakeOpens, resetFakeE2EE, setFakeIdentity, setFakeUnavailable, storeKeySilently } from '../chat/e2eeFake';
+import { deliverKey, fakeEnvelope, heldOpenCount, holdFakeOpens, resetFakeE2EE, setFakeIdentity, setFakeStarted, setFakeUnavailable, storeKeySilently } from '../chat/e2eeFake';
 
 // Pages run without the WebAssembly core; crypto/engine.test.ts covers the real one.
 vi.mock('../chat/e2ee', () => import('../chat/e2eeFake'));
@@ -404,6 +404,74 @@ describe('Native Chat page', () => {
     setFakeIdentity({ state: 'verified', fingerprint: 'f'.repeat(64), restoring: false, backupFull: false });
     render(<Chat />);
     expect(await screen.findByRole('button', { name: 'Verify a device' })).toBeTruthy();
+  });
+
+  it('makes a mounted page usable once a failed encryption start-up recovers, clearing only its error', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === '/api/v1/bootstrap') {
+          return json({
+            user: { id: 'u_admin', username: 'admin', display_name: 'Admin', role: 'admin' },
+            tenant: { id: 'default', slug: 'default', display_name: 'KyMessages', plan: 'self_hosted' },
+            rooms: [],
+          });
+        }
+        if (url === '/api/v1/users') return json({ users: [] });
+        if (url === '/api/v1/rooms') return json({ rooms: [] });
+        return json({ error: 'not found' }, 404);
+      }),
+    );
+    setFakeIdentity({ state: 'none', quarantined: false });
+    setFakeStarted(false);
+    render(<Chat />);
+    expect(await screen.findByText(/Encryption could not start in this browser/)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Set up encryption' })).toBeNull();
+    // The retry brings the device up without a reload.
+    act(() => setFakeStarted(true));
+    expect(await screen.findByRole('button', { name: 'Set up encryption' })).toBeTruthy();
+    await waitFor(() => expect(screen.queryByText(/Encryption could not start in this browser/)).toBeNull());
+  });
+
+  it('says why an encrypted send from an unverified device failed, and sends on retry once verified', async () => {
+    const posts: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? 'GET';
+        if (url === '/api/v1/bootstrap') {
+          return json({
+            user: { id: 'u_alice', username: 'alice', display_name: 'Alice', role: 'user' },
+            tenant: { id: 'default', slug: 'default', display_name: 'Busnes HQ', plan: 'self_hosted' },
+            rooms: [{ id: 'rm_gen', tenant_id: 'default', kind: 'channel', name: 'general', topic: '', is_private: false, last_seq: 0, created_by: 'u_alice', created_at: 1_700_000_000_000, role: 'owner', last_read_seq: 0, unread_count: 0, notify_mode: 'all' }],
+          });
+        }
+        if (url === '/api/v1/users') return json({ users: [{ id: 'u_alice', username: 'alice', display_name: 'Alice' }] });
+        if (url.startsWith('/api/v1/rooms/rm_gen/messages') && method === 'GET') return json({ messages: [], has_more: false });
+        if (url === '/api/v1/rooms/rm_gen/messages' && method === 'POST') {
+          const sent = JSON.parse(String(init?.body)) as { body: string; encoding: string };
+          posts.push(sent.encoding);
+          return json({ message: { id: 'msg_1', tenant_id: 'default', room_id: 'rm_gen', seq: 1, sender_id: 'u_alice', sender_name: 'Alice', encoding: sent.encoding, body: sent.body, created_at: 1_700_000_010_000, reactions: [] } }, 201);
+        }
+        if (url === '/api/v1/rooms/rm_gen/read' && method === 'POST') return json({ room_id: 'rm_gen', last_read_seq: 1 });
+        return json({ error: `unexpected ${method} ${url}` }, 404);
+      }),
+    );
+    setFakeIdentity({ state: 'unverified', fingerprint: 'ab'.repeat(32), quarantined: false });
+    render(<Chat />);
+    const input = await screen.findByLabelText('Message input');
+    fireEvent.change(input, { target: { value: 'not to no one' } });
+    fireEvent.submit(input.closest('form')!);
+    expect((await screen.findByText(/Failed to send:/)).textContent).toMatch(/verify this device/i);
+    expect(posts).toEqual([]);
+    // The gate offers the way out; once verified, Retry sends it.
+    expect(screen.getByRole('button', { name: 'Verify this device' })).toBeTruthy();
+    act(() => setFakeIdentity({ state: 'verified', fingerprint: 'ab'.repeat(32), restoring: false, backupFull: false }));
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(posts).toEqual(['e2ee_room_v1']));
+    await waitFor(() => expect(screen.queryByText(/Failed to send:/)).toBeNull());
   });
 
   it('opens the direct message a suite #dm= link names', async () => {

@@ -1,12 +1,13 @@
 import 'fake-indexeddb/auto';
 import { readFileSync } from 'node:fs';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { Conflict, CryptoEngine, type KeyServer, type SealedMessage } from './engine';
+import { Conflict, CryptoEngine, NotVerified, type KeyServer, type SealedMessage } from './engine';
 import { FakeKeyServer, TENANT } from './fakeKeyServer';
 import { loadCryptoSync } from './index';
 import { deleteCryptoStores, openCryptoStore } from './store';
 import { b64, loadPQCFrom, pqc, PQCUnavailable } from '../pqc/index';
 import { LIST_WAIT_MAX_MS } from './identity';
+import { Transient } from './records';
 
 beforeAll(async () => {
   loadCryptoSync(readFileSync('src/crypto/pkg/kycrypto_bg.wasm'));
@@ -56,12 +57,14 @@ describe('device trust (master-key cross-signing)', () => {
     const before = await send('r1', alice, 'before bob verified');
     expect(await read(bob, before)).toBe('waiting');
     expect(server.sent.filter((s) => s.to === 'u_bob')).toHaveLength(0);
-    // An unverified device can still send, but it trusts no one, so no one gets its room key.
-    const fromUnverified = await send('r1', bob, 'from an unverified device');
-    expect(await read(alice, fromUnverified)).toBe('waiting');
+    // An unverified device trusts no one, so its message would reach no one: the send is refused,
+    // visibly, before any session is made, and nothing goes out.
+    await expect(bob.encrypt('r1', { type: 'text', body: 'from an unverified device' })).rejects.toBeInstanceOf(NotVerified);
     expect(server.sent.filter((s) => s.from === 'u_bob')).toHaveLength(0);
 
     await (await bob.prepareIdentity()).commit();
+    // Verified now: the same send goes through, and alice reads it.
+    expect(await read(alice, await send('r1', bob, 'from bob, verified'))).toBe('from bob, verified');
     const after = await send('r1', alice, 'after');
     expect(await read(bob, after)).toBe('after');
     // The key bob gets starts at the current index: what was sent before stays unreadable.
@@ -723,7 +726,7 @@ describe('Round 3: device list reservations', () => {
     // A device took the server's full 30 s lease and went away; it lapses in a little over a
     // second. The edit waits it out (the wait bound is past the lease) instead of failing.
     expect(LIST_WAIT_MAX_MS).toBeGreaterThan(server.reservationMs);
-    await server.as('u_bob').reserveDeviceList(m.version, epoch, 'ab'.repeat(32));
+    await server.as('u_bob').reserveDeviceList(m.version, epoch, 'ab'.repeat(32), pqc.signDeviceListReserve(masterSeed(server, 'u_bob', rk), TENANT, 'u_bob', m.version, epoch, 'ab'.repeat(32)));
     server.reservations.get('u_bob')!.until = Date.now() + 1_200;
     await bob.delistDevices([laptop.deviceId]);
     const list = server.masters.get('u_bob')!.device_list!;
@@ -736,8 +739,8 @@ describe('Round 3: device list reservations', () => {
     const reserve = api.reserveDeviceList;
     let call = 0;
     const signs = vi.spyOn(pqc, 'signDeviceList');
-    const tablet = await open(server, 'u_bob', 'bob_tablet', { ...api, reserveDeviceList: async (v, e, d) => {
-      const r = await reserve(v, e, d);
+    const tablet = await open(server, 'u_bob', 'bob_tablet', { ...api, reserveDeviceList: async (v, e, d, s) => {
+      const r = await reserve(v, e, d, s);
       call++;
       if (call === 1) return { ...r, expires_in_ms: 0 };
       if (call === 2) server.reservations.get('u_bob')!.until = 0;
@@ -912,8 +915,8 @@ describe('Round 4: a sign-out is ordered after an enrollment holding the list', 
     const order: string[] = [];
     let laptop: CryptoEngine | undefined;
     let signingOut: Promise<void> | undefined;
-    const enrolling = await open(server, 'u_bob', 'bob_laptop', { ...api, reserveDeviceList: async (v, e, d) => {
-      const r = await reserve(v, e, d);
+    const enrolling = await open(server, 'u_bob', 'bob_laptop', { ...api, reserveDeviceList: async (v, e, d, s) => {
+      const r = await reserve(v, e, d, s);
       if (!signingOut && laptop) {
         // The enrollment holds the list; the device is not on it yet when sign-out starts.
         signingOut = laptop.delistDevices([laptop.deviceId]).then(() => { order.push('delisted'); });
@@ -1105,7 +1108,8 @@ describe('Round 5: device list leases and the lock', () => {
     await laptop.restoreIdentity(rk);
     await bob.delistDevices([laptop.deviceId]); // taken off by another device, not retiring
     const m = server.masters.get('u_bob')!;
-    await server.as('u_bob').reserveDeviceList(m.version, m.device_list!.epoch, 'ab'.repeat(32)); // a full 30 s lease, abandoned
+    // A full 30 s lease, taken by another of bob's devices and abandoned.
+    await server.as('u_bob').reserveDeviceList(m.version, m.device_list!.epoch, 'ab'.repeat(32), pqc.signDeviceListReserve(masterSeed(server, 'u_bob', rk), TENANT, 'u_bob', m.version, m.device_list!.epoch, 'ab'.repeat(32)));
     const retry = vi.fn();
     laptop.onTransient(retry);
     const t0 = Date.now();
@@ -1126,8 +1130,8 @@ describe('Round 5: device list leases and the lock', () => {
     const api = server.as('u_bob');
     const reserve = api.reserveDeviceList;
     let calls = 0;
-    const tablet = await open(server, 'u_bob', 'bob_tablet', { ...api, reserveDeviceList: async (v, e, d) => {
-      const r = await reserve(v, e, d);
+    const tablet = await open(server, 'u_bob', 'bob_tablet', { ...api, reserveDeviceList: async (v, e, d, s) => {
+      const r = await reserve(v, e, d, s);
       if (++calls > 1) return r;
       await new Promise((res) => setTimeout(res, 150)); // the answer stalls past its 100 ms lease
       return { ...r, expires_in_ms: 100 };
@@ -1166,5 +1170,287 @@ describe('Round 5: backup notice after a partial flush', () => {
     alice.onBackupState(full);
     await expect(alice.resumeWork()).rejects.toThrow('network');
     expect(full).toHaveBeenCalledWith(true);
+  });
+});
+
+describe('Round 6: an accept acts only on what the user saw', () => {
+  it('refuses a stale prompt whose key is already shared, keeping the newer candidate across trust checks', async () => {
+    const server = new FakeKeyServer();
+    const [alice, rk] = await firstDevice(server, 'u_alice');
+    const [bob] = await firstDevice(server, 'u_bob');
+    server.join('r1', 'u_alice', 'u_bob');
+    await send('r1', alice, 'pinned');
+    const p0 = pqc.fingerprint(server.masters.get('u_bob')!.master_key);
+    const laptop = await open(server, 'u_alice', 'alice_laptop');
+    await laptop.restoreIdentity(rk);
+    // Bob resets; both of alice's browsers see that key, and alice's first one shows the prompt.
+    await (await bob.prepareIdentity(true)).commit();
+    await bob.identityStatus();
+    const p1 = pqc.fingerprint(server.masters.get('u_bob')!.master_key);
+    await send('r1', alice, 'sees p1');
+    await send('r1', laptop, 'laptop sees p1');
+    const [shown] = await alice.identityChanges();
+    expect(shown).toEqual({ user_id: 'u_bob', previous: p0, fingerprint: p1 });
+    // While that prompt is open, bob resets again: alice's candidate becomes the newer key...
+    await (await bob.prepareIdentity(true)).commit();
+    await bob.identityStatus();
+    const p2 = pqc.fingerprint(server.masters.get('u_bob')!.master_key);
+    await send('r1', alice, 'sees p2');
+    expect(await alice.identityChanges()).toEqual([{ user_id: 'u_bob', previous: p0, fingerprint: p2 }]);
+    // ...and the laptop accepts the older one, which is now the shared pin.
+    const [lc] = await laptop.identityChanges();
+    await laptop.acceptIdentity('u_bob', lc.previous, lc.fingerprint);
+    const shared = structuredClone(server.masters.get('u_alice')!.pins);
+    // The click on the prompt as first shown is refused: the newer candidate stays, rebased.
+    await expect(alice.acceptIdentity('u_bob', shown.previous, shown.fingerprint)).rejects.toThrow(/changed again/);
+    const rebased = [{ user_id: 'u_bob', previous: p1, fingerprint: p2 }];
+    expect(await alice.identityChanges()).toEqual(rebased);
+    expect(server.masters.get('u_alice')!.pins).toEqual(shared);
+    for (let i = 0; i < 2; i++) {
+      expect(await read(bob, await send('r1', alice, `held ${i}`))).toBe('waiting');
+      expect(await alice.identityChanges()).toEqual(rebased);
+    }
+    await alice.acceptIdentity('u_bob', p1, p2);
+    expect(await read(bob, await send('r1', alice, 'accepted p2'))).toBe('accepted p2');
+  });
+});
+
+describe('Round 6: retry paths', () => {
+  it('still restores and backs up when listing reports a rollback', async () => {
+    const server = new FakeKeyServer();
+    const [bob, rk] = await firstDevice(server, 'u_bob');
+    const laptop = await open(server, 'u_bob', 'bob_laptop');
+    await laptop.restoreIdentity(rk);
+    await bob.identityStatus();
+    const m = server.masters.get('u_bob')!;
+    const newest = structuredClone(m.device_list!);
+    const older = { epoch: newest.epoch - 1, device_ids: [bob.deviceId], signature: pqc.signDeviceList(masterSeed(server, 'u_bob', rk), TENANT, 'u_bob', m.version, newest.epoch - 1, [bob.deviceId]) };
+    m.device_list = older;
+    server.backups.delete('u_bob');
+    server.join('r1', 'u_bob');
+    // The session's own flush is refused (the cap), so only the drain can store it.
+    server.backupCap = 0;
+    await send('r1', bob, 'own session');
+    const local = await openCryptoStore('u_bob');
+    await vi.waitFor(async () => expect(await local.list('bqf:')).toHaveLength(1));
+    local.close();
+    server.backupCap = 10;
+    await expect(bob.resumeWork()).rejects.toThrow(/older device list/);
+    expect(server.backups.get('u_bob')?.size).toBe(1);
+  });
+
+  it('retries the cross-signature of a replacement device that could not be stored', async () => {
+    const server = new FakeKeyServer();
+    const [bob] = await firstDevice(server, 'u_bob');
+    const storeName = 'u_bob';
+    const old = bob.deviceId;
+    for (const e of opened.splice(0)) e.close();
+    await CryptoEngine.resetDevice('u_bob', old, await openCryptoStore(storeName));
+    const api = server.as('u_bob');
+    const sign = api.signDevice;
+    let fail = true;
+    api.signDevice = async (...a) => {
+      if (fail) {
+        fail = false;
+        throw new Transient('the network');
+      }
+      return sign(...a);
+    };
+    const fresh = await open(server, 'u_bob', storeName, api);
+    expect(fresh.deviceId).not.toBe(old);
+    // The failure was reported before anyone listened; the first listener gets it.
+    const retry = vi.fn();
+    await vi.waitFor(() => {
+      fresh.onTransient(retry)();
+      expect(retry).toHaveBeenCalled();
+    });
+    expect(server.devices.get('u_bob')!.get(fresh.deviceId)!.master_signature).toBeUndefined();
+    await fresh.resumeWork();
+    expect(server.devices.get('u_bob')!.get(fresh.deviceId)!.master_signature).toBeTruthy();
+  });
+
+  it('says the backup is full as soon as a refused batch is stored, while a later batch stalls', async () => {
+    const server = new FakeKeyServer();
+    const api = server.as('u_alice');
+    const alice = await open(server, 'u_alice', 'u_alice', api);
+    await (await alice.prepareIdentity()).commit();
+    server.join('r1', 'u_alice');
+    await send('r1', alice, 'own session');
+    await vi.waitFor(() => expect(server.backups.get('u_alice')?.size).toBe(1));
+    server.backups.delete('u_alice');
+    server.backupCap = 0;
+    const store = await openCryptoStore('u_alice');
+    const [[ik]] = await store.list('in:');
+    await store.write(Array.from({ length: 150 }, (_, i): [string, unknown] => [`bq:x${String(i).padStart(3, '0')}`, ik]));
+    store.close();
+    const put = api.putBackup;
+    let n = 0;
+    let unstall = () => {};
+    vi.spyOn(api, 'putBackup').mockImplementation(async (...a) => (++n === 2 ? new Promise<never>((_, reject) => { unstall = () => reject(new TypeError('network')); }) : put(...a)));
+    const full = vi.fn();
+    alice.onBackupState(full);
+    const work = alice.resumeWork().catch(() => undefined);
+    await vi.waitFor(() => expect(full).toHaveBeenCalledWith(true));
+    expect(n).toBe(2); // the second batch is still in flight
+    unstall(); // frees the per-user lock for later tests
+    await work;
+  });
+});
+
+describe('Round 6: the new device\'s wait ends at its deadline', () => {
+  it('aborts a consume request in flight when the pairing wait runs out', async () => {
+    const server = new FakeKeyServer();
+    const [alice] = await firstDevice(server, 'u_alice');
+    let seen: AbortSignal | undefined;
+    const api = server.as('u_alice');
+    const laptop = await open(server, 'u_alice', 'alice_laptop', { ...api, pairingConsume: (_id, _d, signal) => {
+      seen = signal;
+      return new Promise((_, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true }));
+    } });
+    const offer = await alice.offerVerification();
+    const join = await laptop.joinVerification(offer.text);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const done = join.finish().catch((e: unknown) => e);
+      await vi.advanceTimersByTimeAsync(4 * 60_000 + 10);
+      expect(String(await done)).toMatch(/did not approve in time/);
+      expect(seen?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('Round 6: taking on an identity', () => {
+  it('adopts the identity as published when a delayed approval lands, and refuses one that changed', async () => {
+    const server = new FakeKeyServer();
+    const [alice] = await firstDevice(server, 'u_alice');
+    const api = server.as('u_alice');
+    const writes = vi.spyOn(api, 'putBackup');
+    const laptop = await open(server, 'u_alice', 'alice_laptop', api);
+    const offer = await alice.offerVerification();
+    const join = await laptop.joinVerification(offer.text);
+    await offer.poll();
+    // While the user compares codes, the backup is deleted elsewhere: a new generation.
+    server.deleteBackup('u_alice');
+    await offer.approve();
+    await join.finish();
+    server.join('r1', 'u_alice');
+    await send('r1', laptop, 'backed up at the new generation');
+    await vi.waitFor(() => expect(writes).toHaveBeenCalled());
+    expect(writes.mock.calls[0][1]).toBe(1); // signed for it at once, no stale first attempt
+
+    // An identity reset while waiting: the seeds sent are the old identity's, and are refused.
+    const tablet = await open(server, 'u_alice', 'alice_tablet');
+    const offer2 = await alice.offerVerification();
+    const join2 = await tablet.joinVerification(offer2.text);
+    await offer2.poll();
+    await offer2.approve();
+    await (await laptop.prepareIdentity(true)).commit();
+    await expect(join2.finish()).rejects.toThrow(/changed while waiting/);
+    expect(await tablet.identityStatus()).toMatchObject({ state: 'unverified' });
+  });
+
+  it('keeps the seeds when enrollment fails for availability, finishes it on retry, and only then announces it', async () => {
+    const server = new FakeKeyServer();
+    const [, rk] = await firstDevice(server, 'u_alice');
+    const api = server.as('u_alice');
+    const sign = api.signDevice;
+    let fail = true;
+    api.signDevice = async (...a) => {
+      if (fail) {
+        fail = false;
+        throw new Transient('the network');
+      }
+      return sign(...a);
+    };
+    const laptop = await open(server, 'u_alice', 'alice_laptop', api);
+    const adopted = vi.fn();
+    laptop.onAdopted(adopted);
+    const retry = vi.fn();
+    laptop.onTransient(retry);
+    await laptop.restoreIdentity(rk); // the seeds are kept: no error, no recovery key again
+    expect(retry).toHaveBeenCalled();
+    expect(adopted).not.toHaveBeenCalled();
+    expect(server.devices.get('u_alice')!.get(laptop.deviceId)!.master_signature).toBeUndefined();
+    await laptop.resumeWork();
+    expect(server.devices.get('u_alice')!.get(laptop.deviceId)!.master_signature).toBeTruthy();
+    expect(server.masters.get('u_alice')!.device_list!.device_ids).toContain(laptop.deviceId);
+    expect(adopted).toHaveBeenCalledTimes(1);
+    await laptop.resumeWork();
+    expect(adopted).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('Round 6: enrollment announced only once listed', () => {
+  it('waits for the listing too, when only that failed', async () => {
+    const server = new FakeKeyServer();
+    const [, rk] = await firstDevice(server, 'u_alice');
+    const api = server.as('u_alice');
+    const reserve = api.reserveDeviceList;
+    let fail = true;
+    api.reserveDeviceList = async (...a) => {
+      if (fail) {
+        fail = false;
+        throw new Transient('the network');
+      }
+      return reserve(...a);
+    };
+    const laptop = await open(server, 'u_alice', 'alice_laptop', api);
+    const adopted = vi.fn();
+    laptop.onAdopted(adopted);
+    await laptop.restoreIdentity(rk);
+    expect(server.devices.get('u_alice')!.get(laptop.deviceId)!.master_signature).toBeTruthy();
+    expect(server.masters.get('u_alice')!.device_list!.device_ids).not.toContain(laptop.deviceId);
+    expect(adopted).not.toHaveBeenCalled();
+    await laptop.resumeWork();
+    expect(server.masters.get('u_alice')!.device_list!.device_ids).toContain(laptop.deviceId);
+    expect(adopted).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('Round 6: restore and unvouched coverage', () => {
+  it('lets a valid backup copy reach over an unvouched one, never as authenticated', async () => {
+    const server = new FakeKeyServer();
+    const [alice, rk] = await firstDevice(server, 'u_alice');
+    const [bob] = await firstDevice(server, 'u_bob');
+    server.join('r1', 'u_alice', 'u_bob');
+    const m = await send('r1', bob, 'from bob');
+    expect(await read(alice, m)).toBe('from bob');
+    await vi.waitFor(() => expect(server.backups.get('u_alice')?.size).toBe(1));
+    // Alice's copy now reads as an unvouched one reaching less far than the backup's.
+    const store = await openCryptoStore('u_alice');
+    const [[k, v]] = (await store.list<{ first_index: number }>('in:')).filter(([, r]) => (r as unknown as { sender_user: string }).sender_user === 'u_bob');
+    await store.write([[k, { ...v, verified: false, first_index: 5 }]]);
+    await alice.restoreIdentity(rk);
+    const now = (await store.get<{ first_index: number; from_backup?: boolean }>(k))!;
+    store.close();
+    expect(now).toMatchObject({ first_index: 0, from_backup: true });
+    const r = await alice.decrypt(m);
+    expect(r).toMatchObject({ state: 'decrypted', authenticated: false, restored: true });
+  });
+});
+
+describe('Round 6: one upload per session', () => {
+  it('sends a session queued afresh while its refused entry waits only once', async () => {
+    const server = new FakeKeyServer();
+    const api = server.as('u_alice');
+    const alice = await open(server, 'u_alice', 'u_alice', api);
+    await (await alice.prepareIdentity()).commit();
+    server.join('r1', 'u_alice');
+    server.backupCap = 0;
+    await send('r1', alice, 'own session');
+    const store = await openCryptoStore('u_alice');
+    await vi.waitFor(async () => expect(await store.list('bqf:')).toHaveLength(1));
+    const [[, ik]] = await store.list<string>('bqf:');
+    await store.write([[`bq:${ik}`, ik]]); // the same session queued again
+    server.backupCap = 10;
+    const writes = vi.spyOn(api, 'putBackup');
+    await alice.resumeWork();
+    expect(writes).toHaveBeenCalledTimes(1);
+    expect(writes.mock.calls[0][2]).toHaveLength(1);
+    expect(await store.list('bq:')).toEqual([]);
+    expect(await store.list('bqf:')).toEqual([]);
+    store.close();
   });
 });

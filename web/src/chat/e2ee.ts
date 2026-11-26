@@ -175,8 +175,8 @@ const keyServer = (signal: AbortSignal): KeyServer => ({
   async signDevice(deviceId, version, signature) {
     await call(`/api/v1/keys/devices/${encodeURIComponent(deviceId)}/signature`, 'POST', { version, signature }, signal);
   },
-  async reserveDeviceList(version, expectedEpoch, digest) {
-    const o = obj(await call('/api/v1/keys/devices/list/reserve', 'POST', { version, expected_epoch: expectedEpoch, digest }, signal));
+  async reserveDeviceList(version, expectedEpoch, digest, signature) {
+    const o = obj(await call('/api/v1/keys/devices/list/reserve', 'POST', { version, expected_epoch: expectedEpoch, digest, signature }, signal));
     if (typeof o.epoch !== 'number' || o.epoch <= expectedEpoch) throw new Error('Invalid device list reservation');
     return { epoch: o.epoch, expires_in_ms: typeof o.expires_in_ms === 'number' ? o.expires_in_ms : 0 };
   },
@@ -407,6 +407,10 @@ async function withEngine<T>(fn: (e: CryptoEngine) => Promise<T>): Promise<T> {
   }
 }
 
+/** Whether userId's device is running here now (started, or restarted by a retry or a
+ * replacement). It changes with onRoomKeys, which every start-up announces. */
+export const encryptionReadyFor = (userId: string): boolean => current?.userId === userId && !current.failed && current.ready !== undefined;
+
 /** Calls fn whenever room keys arrive, so messages waiting for them can be opened again. */
 export function onRoomKeys(fn: () => void): () => void {
   keyListeners.add(fn);
@@ -463,8 +467,17 @@ export const offerVerification = (): Promise<PairingOffer> => identityEngine().t
 
 /** Whether the device a pairing handed keys to has verified itself (signed and listed). signal
  * (the screen closed, or its deadline passed) aborts the wait for the lock and the request. */
-export const ownDeviceVerified = (deviceId: string, signal?: AbortSignal): Promise<boolean> =>
-  identityEngine().then((e) => e.ownDeviceVerified(deviceId, signal));
+export async function ownDeviceVerified(deviceId: string, signal?: AbortSignal): Promise<boolean> {
+  // The device may still be starting: an abort stops waiting for it, never the start-up itself.
+  const started = identityEngine();
+  const e = signal ? await new Promise<CryptoEngine>((resolve, reject) => {
+    const stop = () => reject(signal.reason);
+    if (signal.aborted) return stop();
+    signal.addEventListener('abort', stop, { once: true });
+    started.then(resolve, reject).finally(() => signal.removeEventListener('abort', stop));
+  }) : await started;
+  return e.ownDeviceVerified(deviceId, signal);
+}
 
 export async function joinVerification(text: string): Promise<PairingJoin> {
   const j = await (await identityEngine()).joinVerification(text);
@@ -583,8 +596,9 @@ function runRetry(s: RetrySession): Promise<void> {
       }
       keysArrived(false);
     } catch (e) {
-      // A verdict (a rollback, bad data) is not retried; the identity status reports it.
-      again = isTransient(e);
+      // A verdict (a rollback, bad data) is not retried; the identity status reports it. A
+      // failure reported while this ran still earns its pass.
+      again = isTransient(e) || s.again;
       if (!again) setRetry(s, false, false);
     } finally {
       s.run = undefined;
@@ -682,7 +696,9 @@ export function retireDevice() {
   let fenced = false;
   const attempt = (async () => {
     const e = await entry?.engine.catch(() => undefined);
-    if (!e || fenced) return false;
+    // Checked right before touching: a refused logout fenced this attempt, or the entry it
+    // captured is no longer the device in use.
+    if (!e || fenced || !entry || current !== entry || entry.cancelled || entry.failed) return false;
     touched = e.deviceId;
     // Pending from the start, per device: a refused or interrupted sign-out leaves it to retire.
     saveAbandoned({ user_id: e.userId, device_id: e.deviceId });
@@ -708,12 +724,14 @@ export function retireDevice() {
   return {
     wait: Promise.race([attempt, new Promise<boolean>((r) => setTimeout(r, RETIRE_MS, false))]),
     async replaceIfRetired(): Promise<void> {
-      // Bounded like wait: a DELETE that never answers must not leave the touched device in use.
-      await Promise.race([attempt, new Promise((r) => setTimeout(r, RETIRE_MS))]);
+      // An attempt that has not touched a device by now never will: fenced at once, before any
+      // wait, so a start-up finishing meanwhile keeps its device.
       if (!touched) {
-        fenced = true; // nothing was changed, and nothing will be
+        fenced = true;
         return;
       }
+      // Bounded like wait: a DELETE that never answers must not leave the touched device in use.
+      await Promise.race([attempt, new Promise((r) => setTimeout(r, RETIRE_MS))]);
       // The outcome may be unknown (a delist or DELETE still in flight): the touched device is
       // replaced, never a different one after another sign-out, sign-in or revocation.
       if (entry && current === entry) await replaceDevice(touched);

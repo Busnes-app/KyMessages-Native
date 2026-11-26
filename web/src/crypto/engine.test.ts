@@ -656,3 +656,74 @@ describe('Round 5: a mailbox drain fails at the first item it could not store', 
     expect(box()).toEqual([]);
   });
 });
+
+describe('Round 6: which copy of a room key is in charge', () => {
+  it('lets a vouched copy supersede an unvouched one (also at an equal index), and never the reverse', async () => {
+    const server = new FakeKeyServer();
+    const alice = await device(server, 'u_alice');
+    const bob = await device(server, 'u_bob');
+    server.join('r1', 'u_alice', 'u_bob');
+    type Rec = { first_index: number; verified?: boolean; from_backup?: boolean };
+    const bobRecords = async () => {
+      const s = await openCryptoStore('u_bob');
+      try {
+        return { primary: (await s.list<Rec>('in:'))[0][1], covers: (await s.list<Rec>('inb:')).map(([, v]) => v), queued: (await s.list('bq:')).length };
+      } finally {
+        s.close();
+      }
+    };
+    const patchPrimary = async (patch: Partial<Rec>) => {
+      const s = await openCryptoStore('u_bob');
+      const [[k, v]] = await s.list<Rec>('in:');
+      await s.write([[k, { ...v, ...patch }]]);
+      s.close();
+    };
+    // The next send shares the session with bob again, from alice's current index.
+    const reshare = async () => {
+      const s = await openCryptoStore('u_alice');
+      const out = (await s.get<{ shared: Record<string, string> }>('out:r1'))!;
+      delete out.shared[`u_bob\n${bob.deviceId}`];
+      await s.write([['out:r1', out]]);
+      s.close();
+    };
+    const opened = async (m: SealedMessage) => {
+      const r = await bob.decrypt(m);
+      return r.state === 'decrypted' ? { body: r.inner.body, authenticated: r.authenticated } : r.state;
+    };
+    const m0 = await send('r1', alice, 'zero');
+    await bob.receive();
+    await send('r1', alice, 'one');
+
+    // An unvouched primary from index 0; a vouched copy from index 2 takes over from there.
+    await patchPrimary({ verified: false });
+    await reshare();
+    const m2 = await send('r1', alice, 'two');
+    await bob.receive();
+    let r = await bobRecords();
+    expect(r.primary).toMatchObject({ first_index: 2, verified: true });
+    expect(r.covers).toEqual([expect.objectContaining({ first_index: 0, verified: false })]);
+    expect(await opened(m2)).toEqual({ body: 'two', authenticated: true });
+    expect(await opened(m0)).toEqual({ body: 'zero', authenticated: false });
+
+    // At an equal index, too.
+    await patchPrimary({ verified: false, first_index: 3 });
+    await reshare();
+    const m3 = await send('r1', alice, 'three');
+    await bob.receive();
+    r = await bobRecords();
+    expect(r.primary).toMatchObject({ first_index: 3, verified: true });
+    expect(await opened(m3)).toEqual({ body: 'three', authenticated: true });
+
+    // A copy from a device no longer vouched for, reaching earlier than the primary, never
+    // replaces it, and is no better a cover than the one kept.
+    delete server.devices.get('u_alice')!.get(alice.deviceId)!.master_signature;
+    await patchPrimary({ first_index: 9 });
+    await reshare();
+    const m4 = await send('r1', alice, 'four');
+    await bob.receive();
+    r = await bobRecords();
+    expect(r.primary).toMatchObject({ first_index: 9, verified: true });
+    expect(r.covers).toEqual([expect.objectContaining({ first_index: 0 })]);
+    expect(await opened(m4)).toEqual({ body: 'four', authenticated: true });
+  });
+});

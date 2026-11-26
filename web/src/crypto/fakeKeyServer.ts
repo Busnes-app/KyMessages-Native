@@ -130,8 +130,9 @@ export class FakeKeyServer {
         if (!pqc.verifyPinsWrite(m.master_key, TENANT, userId, version, expected + 1, sealed, signature)) throw new Error('The pin set is not signed by the current master key');
         m.pins = { counter: expected + 1, sealed };
       },
-      reserveDeviceList: async (version, expected, digest) => {
+      reserveDeviceList: async (version, expected, digest, signature) => {
         const m = this.masters.get(userId);
+        if (m && !pqc.verifyDeviceListReserve(m.master_key, TENANT, userId, version, expected, digest, signature)) throw new Error('The device list reservation is not signed by the current master key');
         if (!m || m.version !== version || (m.device_list?.epoch ?? 0) !== expected) throw new Conflict('409');
         const r = this.reservations.get(userId);
         const now = Date.now();

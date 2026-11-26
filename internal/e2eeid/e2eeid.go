@@ -27,23 +27,26 @@ import (
 
 // Labels. Each is a domain (signatures), an HKDF info or an HPKE info, never two of these.
 const (
-	DomainMaster      = "kymessages.master.v1"
-	DomainDevice      = "kymessages.device.v2"
-	DomainBackupKey   = "kymessages.backup-key.v1"
-	DomainDeviceList  = "kymessages.device-list.v1"
-	DomainPinsWrite   = "kymessages.pins-write.v1"
-	DomainBackupWrite = "kymessages.backup-write.v1"
-	labelFingerprint  = "kymessages.master-fingerprint.v1"
-	labelRecovery     = "kymessages.recovery.v1"
-	LabelRecoveryMKey = "kymessages.recovery.v1/master-key"
-	LabelRecoveryBKey = "kymessages.recovery.v1/backup-key"
-	labelRecoveryCode = "kymessages.recovery-key.v1"
-	InfoBackup        = "kymessages.backup.v1"
-	InfoQRTransfer    = "kymessages.qr-transfer.v1"
-	infoQRInner       = "kymessages.qr-transfer.v1/inner"
-	labelQRCode       = "kymessages.qr-transfer.v1/code"
-	labelPins         = "kymessages.pins.v1"
-	labelBackupMAC    = "kymessages.backup.v1/mac"
+	DomainMaster     = "kymessages.master.v1"
+	DomainDevice     = "kymessages.device.v2"
+	DomainBackupKey  = "kymessages.backup-key.v1"
+	DomainDeviceList = "kymessages.device-list.v1"
+	// DomainDeviceListReserve signs a reservation of the next list epoch: its own domain, so a
+	// reservation is never a published list and a list never a reservation.
+	DomainDeviceListReserve = "kymessages.device-list-reserve.v1"
+	DomainPinsWrite         = "kymessages.pins-write.v1"
+	DomainBackupWrite       = "kymessages.backup-write.v1"
+	labelFingerprint        = "kymessages.master-fingerprint.v1"
+	labelRecovery           = "kymessages.recovery.v1"
+	LabelRecoveryMKey       = "kymessages.recovery.v1/master-key"
+	LabelRecoveryBKey       = "kymessages.recovery.v1/backup-key"
+	labelRecoveryCode       = "kymessages.recovery-key.v1"
+	InfoBackup              = "kymessages.backup.v1"
+	InfoQRTransfer          = "kymessages.qr-transfer.v1"
+	infoQRInner             = "kymessages.qr-transfer.v1/inner"
+	labelQRCode             = "kymessages.qr-transfer.v1/code"
+	labelPins               = "kymessages.pins.v1"
+	labelBackupMAC          = "kymessages.backup.v1/mac"
 )
 
 const (
@@ -134,6 +137,13 @@ func DeviceListMessage(tenantID, userID string, version, epoch int64, deviceIDs 
 		fields = append(fields, s(id))
 	}
 	return Fields(fields...), nil
+}
+
+// DeviceListReserveMessage is what the master key signs to reserve the next device list epoch,
+// while the list is at expectedEpoch, for the proposed list with this digest (DeviceListDigest,
+// lowercase hex): only a device holding the master seed can hold the list.
+func DeviceListReserveMessage(tenantID, userID string, version, expectedEpoch int64, digest string) []byte {
+	return Fields(s(hybridsig.Alg), s(tenantID), s(userID), s(strconv.FormatInt(version, 10)), s(strconv.FormatInt(expectedEpoch, 10)), s(digest))
 }
 
 // DeviceListDigest names one proposed device list: lowercase hex SHA-256 of

@@ -7,7 +7,8 @@ import { FakeKeyServer } from '../crypto/fakeKeyServer';
 const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { 'Content-Type': 'application/json' } });
 
 /** Answers a request instead of the fake server; undefined lets it through. */
-export type Block = (method: string, path: string) => Response | undefined | Promise<Response | undefined>;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type Block = (method: string, path: string, body: any) => Response | undefined | Promise<Response | undefined>;
 
 export function httpFake(server: FakeKeyServer, userId: string, block: { fn?: Block } = {}) {
   const api = server.as(userId);
@@ -33,7 +34,7 @@ function route(server: FakeKeyServer, api: ReturnType<FakeKeyServer['as']>, user
     // The routes take the shapes chat/e2ee.ts sends; the fake server checks what matters.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const body = (init?.body ? JSON.parse(String(init.body)) : {}) as any;
-    const held = await block.fn?.(method, path);
+    const held = await block.fn?.(method, path, body);
     if (held) return held;
     try {
       const m = /^\/api\/v1\/keys\/devices\/([^/]+)(\/signature)?$/.exec(path);
@@ -62,7 +63,7 @@ function route(server: FakeKeyServer, api: ReturnType<FakeKeyServer['as']>, user
           await api.putPins(body.version, body.expected_counter, body.sealed, body.signature);
           return json({ counter: (body.expected_counter as number) + 1 });
         case 'POST /api/v1/keys/devices/list/reserve':
-          return json(await api.reserveDeviceList(body.version, body.expected_epoch, body.digest));
+          return json(await api.reserveDeviceList(body.version, body.expected_epoch, body.digest, body.signature));
         case 'PUT /api/v1/keys/devices/list':
           await api.putDeviceList(body.version, body.expected_epoch, body.epoch, body.device_ids, body.signature);
           return json({ epoch: body.epoch });

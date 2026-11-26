@@ -73,7 +73,8 @@ export interface IdentityServer {
   /** Reserves the next epoch for the list with this digest while the list is at expectedEpoch,
    * answering the epoch to sign and how long the reservation holds; Conflict (with retryInMs
    * while another device's reservation holds it) otherwise. */
-  reserveDeviceList(version: number, expectedEpoch: number, digest: string): Promise<{ epoch: number; expires_in_ms: number }>;
+  /** signature: the master key's kymessages.device-list-reserve.v1 signature over the reservation. */
+  reserveDeviceList(version: number, expectedEpoch: number, digest: string, signature: Hybrid): Promise<{ epoch: number; expires_in_ms: number }>;
   putDeviceList(version: number, expectedEpoch: number, epoch: number, deviceIds: string[], signature: Hybrid): Promise<void>;
   signDevice(deviceId: string, version: number, signature: Hybrid): Promise<void>;
   getBackup(version: number, after: BackupCursor): Promise<{ sessions: BackupEntry[]; more: boolean }>;
@@ -167,6 +168,8 @@ const SIGNED = 'identity:signed';
 /** The newest pin set counter seen for one identity: scoped to org, fingerprint and version. */
 const pinsMark = (l: { tenant_id: string; fingerprint: string; version: number }) => `pins:hwm:${l.tenant_id}:${l.fingerprint}:${l.version}`;
 const RESTORE = 'backup:restore';
+/** Set while this device took on an identity but is not yet both signed and listed. */
+const ENROLLING = 'identity:enrolling';
 const previousKey = (fp: string, version: number) => `identity:previous:${fp}:${version}`;
 const pinKey = (userId: string) => `mpin:${userId}`;
 const changeKey = (userId: string) => `mchg:${userId}`;
@@ -519,7 +522,11 @@ export class Identity {
       }
       if (l && current(l)) {
         this.backupGen = { version: master.version, generation: master.backup_generation };
-        await this.signOwnDevice(l);
+        // A cross-signature that cannot be stored now (the network) is retried, not fatal.
+        await this.signOwnDevice(l).catch((e: unknown) => {
+          if (!isTransient(e)) throw e;
+          this.later(e);
+        });
         // A rolled-back or forked list or pin set is reported, never signed over: re-signing an
         // old roster, or an empty pin set, to get past the mark would bring back what the newer
         // state removed. Resetting the identity is the way out (the UI offers it).
@@ -528,6 +535,7 @@ export class Identity {
           if (master.pins.counter < ((await this.ctx.store.get<number>(pinsMark(l))) ?? 0)) throw new Rollback('rollback', 'pin set rolled back');
           // Under the lock: a list another device holds is not waited for here, but retried.
           await this.ensureListed(l, false);
+          await this.enrolled();
         } catch (e) {
           if (e instanceof Transient) this.later(e);
           else if (!(e instanceof Rollback)) throw e;
@@ -556,10 +564,21 @@ export class Identity {
   async drain(): Promise<void> {
     const l = await this.local();
     if (!l) return;
-    // Unlocked: a listing given up under the lock (another device held the list) waits here.
-    await this.ensureListed(l);
+    // A cross-signature that failed (a replacement device signing itself) is retried here.
+    await this.ctx.locked(() => this.signOwnDevice(l));
+    // Unlocked: a listing given up under the lock (another device held the list) waits here. A
+    // rollback or fork is a verdict the status reports; the restore and the backup still run.
+    let verdict: Rollback | undefined;
+    try {
+      await this.ensureListed(l);
+      await this.enrolled();
+    } catch (e) {
+      if (!(e instanceof Rollback)) throw e;
+      verdict = e;
+    }
     await this.resumeRestore();
     await this.ctx.locked(() => this.flushBackup(true));
+    if (verdict) throw verdict;
   }
 
   /** Tells the UI when whether refused sessions wait changes; nothing is redone. */
@@ -568,6 +587,26 @@ export class Identity {
     if (full === this.backupFull) return;
     this.backupFull = full;
     this.ctx.onBackupState?.(full);
+  }
+
+  /** A failure for availability asks for a retry and is swallowed; anything else is thrown. */
+  private unlessTransient(e: unknown): void {
+    if (!isTransient(e)) throw e;
+    this.later(e);
+  }
+
+  /**
+   * Once this device is signed and listed after taking on the identity, the enrollment is
+   * durable: pending retirements can be signed now (before any backup page is read).
+   */
+  private async enrolled(): Promise<void> {
+    const l = await this.local();
+    const signed = await this.ctx.store.get<{ version: number; device_id: string }>(SIGNED);
+    if (!l || !(await this.ctx.store.get(ENROLLING)) || signed?.version !== l.version || signed.device_id !== this.ctx.deviceId) return;
+    const { master } = await this.ctx.server.getMaster();
+    if (!master?.device_list?.device_ids.includes(this.ctx.deviceId)) return;
+    await this.ctx.store.write([], [ENROLLING]);
+    this.ctx.onAdopted?.();
   }
 
   /** Background work that failed for availability asks for a retry. */
@@ -626,8 +665,11 @@ export class Identity {
       try {
         // The lease is counted from before the request, on the monotonic clock: a grant that
         // arrives late has less left than it says, and one already spent is not signed under.
+        // Reserving takes the master key too, so a session without the seed cannot hold the list.
+        const digest = pqc.hash('kymessages.device-list', ...next);
+        const proof = pqc.signDeviceListReserve(seeds.master, l.tenant_id, user, l.version, expected, digest);
         const asked = performance.now();
-        const r = await this.ctx.server.reserveDeviceList(l.version, expected, pqc.hash('kymessages.device-list', ...next));
+        const r = await this.ctx.server.reserveDeviceList(l.version, expected, digest, proof);
         const until = asked + r.expires_in_ms;
         // Signed only once reserved, for the epoch reserved, and never under a reservation known
         // to have lapsed; a lost reservation discards this signature unsent.
@@ -774,16 +816,17 @@ export class Identity {
       const refused = (await this.ctx.store.list('bqf:')).map(([k]) => k);
       const restore: RestoreCursor = { version: local.version, after: { room_id: '', sender_key: '', session_id: '' }, count: 0 };
       this.backupGen = { version: master.version, generation: master.backup_generation };
-      await this.ctx.store.write([[IDENTITY, local], [RESTORE, restore], ...queue], [SIGNED, ...refused]);
-      await this.signOwnDevice(local);
+      // The seeds are durable from here: enrollment (signing and listing this device) that then
+      // fails for availability is finished by the bounded retry, not undone.
+      await this.ctx.store.write([[IDENTITY, local], [RESTORE, restore], [ENROLLING, true], ...queue], [SIGNED, ...refused]);
+      await this.signOwnDevice(local).catch((e: unknown) => this.unlessTransient(e));
       await this.syncPins().catch(() => undefined);
     });
     // Outside the lock: waiting out another device's reservation must not hold every tab.
-    await this.ensureListed(local);
+    await this.ensureListed(local).catch((e: unknown) => this.unlessTransient(e));
     this.notify();
     await this.backupStateChanged();
-    // Durable now: pending retirements can be signed before any backup page is read.
-    this.ctx.onAdopted?.();
+    await this.enrolled();
     const restored = await this.resumeRestore();
     await this.ctx.locked(() => this.flushBackup()).catch((e: unknown) => this.later(e));
     return restored;
@@ -897,13 +940,21 @@ export class Identity {
       // still writes the synced set, so the user retries against a confirmed baseline.
       let accepted: PinRecord | undefined;
       let adopted: PinRecord | undefined;
+      let rebased: IdentityChange | undefined;
       let refused = false;
       if (accept) {
         const pin = await this.ctx.store.get<PinRecord>(pinKey(accept.user));
         const c = await this.ctx.store.get<IdentityChange>(changeKey(accept.user));
         const shared = remote[accept.user];
         if (shared?.fingerprint === accept.fingerprint) {
+          // Settled already (another device accepted this key): the verified shared record is
+          // adopted as it is. A pending change here for yet another key is not what the user
+          // clicked: it stays, rebased onto the adopted pin, and the click is refused.
           adopted = shared;
+          if (c && c.fingerprint !== accept.fingerprint) {
+            rebased = { ...c, previous: shared.fingerprint };
+            refused = true;
+          }
         } else if (!shared || shared.fingerprint !== accept.previous || pin?.fingerprint !== accept.previous ||
           c?.previous !== accept.previous || c.fingerprint !== accept.fingerprint) {
           refused = true;
@@ -926,7 +977,9 @@ export class Identity {
       // putIfAbsent: a pin another tab stored meanwhile is never overwritten.
       for (const [k, v] of tentative) await this.ctx.store.putIfAbsent(k, v);
       const took = accepted ?? adopted;
-      if (accept && took) await this.ctx.store.write([[pinKey(accept.user), took]], [changeKey(accept.user)]);
+      if (accept && took) {
+        await this.ctx.store.write([[pinKey(accept.user), took], ...(rebased ? [[changeKey(accept.user), rebased] as [string, unknown]] : [])], rebased ? [] : [changeKey(accept.user)]);
+      }
       if (refused) throw new Error('This identity changed again. Check the new fingerprint before accepting.');
       return;
     }
@@ -958,7 +1011,16 @@ export class Identity {
   async flushBackup(refused = false): Promise<void> {
     const l = await this.local();
     if (!l) return;
-    const queue = [...await this.ctx.store.list<string>('bq:'), ...(refused ? await this.ctx.store.list<string>('bqf:') : [])];
+    let queue = await this.ctx.store.list<string>('bq:');
+    if (refused) {
+      // A session queued afresh while its refused entry waits is sent once: the refused entry
+      // stays queued (it is kept until it lands), so its fresh twin goes now.
+      const waiting = await this.ctx.store.list<string>('bqf:');
+      const held = new Set(waiting.map(([, ik]) => ik));
+      const twins = queue.filter(([, ik]) => held.has(ik));
+      if (twins.length > 0) await this.ctx.store.write([], twins.map(([k]) => k));
+      queue = [...queue.filter(([, ik]) => !held.has(ik)), ...waiting];
+    }
     if (queue.length === 0) return;
     const seeds = await this.seeds(l);
     try {
@@ -1011,6 +1073,8 @@ export class Identity {
       // A refused entry moves to bqf: (or stays there); everything else in the batch is done.
       const kept = new Set(keep.map(([k]) => k));
       await this.ctx.store.write(keep, done.filter((k) => !kept.has(k)));
+      // Durable now: the notice follows, even if a later batch stalls.
+      await this.backupStateChanged();
     }
   }
 
@@ -1149,24 +1213,32 @@ export class Identity {
     return {
       code: pqc.comparisonCode(q.secret, q.pairing_id, this.ctx.deviceId, eph.public),
       finish: async (signal) => {
-        // Bounded: stops at the pairing's lifetime, and after a few failures in a row; a
-        // pairing the server no longer has (404) ends it at once.
-        const deadline = Date.now() + PAIRING_WAIT_MS;
+        // Bounded: stops at the pairing's lifetime (the deadline aborts a request in flight too),
+        // and after a few failures in a row; a pairing the server no longer has (404) ends it.
+        const deadline = new AbortController();
+        const timer = setTimeout(() => deadline.abort(new DOMException('The pairing wait ran out', 'TimeoutError')), PAIRING_WAIT_MS);
+        const stop = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
+        const late = () => new Error('The other device did not approve in time. Start again.');
         let failures = 0;
         let got: { initiator_device: string; sealed: string } | undefined;
-        while (!got) {
-          signal?.throwIfAborted();
-          if (Date.now() >= deadline) throw new Error('The other device did not approve in time. Start again.');
-          try {
-            got = await this.ctx.server.pairingConsume(q.pairing_id, this.ctx.deviceId, signal);
-            break;
-          } catch (e) {
+        try {
+          while (!got) {
             signal?.throwIfAborted();
-            if ((e as { status?: number }).status === 404) throw new Error('This verification was cancelled or expired. Start again.');
-            if (!(e instanceof Conflict) && ++failures > PAIRING_RETRIES) throw e;
-            if (e instanceof Conflict) failures = 0;
+            if (deadline.signal.aborted) throw late();
+            try {
+              got = await this.ctx.server.pairingConsume(q.pairing_id, this.ctx.deviceId, stop);
+              break;
+            } catch (e) {
+              signal?.throwIfAborted();
+              if (deadline.signal.aborted) throw late();
+              if ((e as { status?: number }).status === 404) throw new Error('This verification was cancelled or expired. Start again.');
+              if (!(e instanceof Conflict) && ++failures > PAIRING_RETRIES) throw e;
+              if (e instanceof Conflict) failures = 0;
+            }
+            await sleep(PAIRING_POLL_MS, stop).catch(() => undefined);
           }
-          await sleep(PAIRING_POLL_MS, signal);
+        } finally {
+          clearTimeout(timer);
         }
         let keys: { master_seed: string; backup_seed: string };
         try {
@@ -1174,8 +1246,15 @@ export class Identity {
         } catch {
           throw new Error('The keys from the other device did not open. Start again.');
         }
-        this.checkOwn(tenant_id, master, keys.master_seed, keys.backup_seed, q.fingerprint);
-        return this.adopt(tenant_id, master, keys.master_seed, keys.backup_seed);
+        // The approval may have taken minutes: the identity is read again (its version, backup
+        // key and generation as published now) and the seeds checked against that, so nothing
+        // stale is adopted. A consumed transfer cannot be replayed, so the seeds are kept.
+        const { tenant_id: tenantNow, master: now } = await this.ctx.server.getMaster();
+        if (!now || pqc.fingerprint(now.master_key) !== q.fingerprint) {
+          throw new Error('This account’s encryption identity changed while waiting for approval. Start again.');
+        }
+        this.checkOwn(tenantNow, now, keys.master_seed, keys.backup_seed, q.fingerprint);
+        return this.adopt(tenantNow, now, keys.master_seed, keys.backup_seed);
       },
       cancel: () => this.ctx.server.pairingCancel(q.pairing_id),
     };

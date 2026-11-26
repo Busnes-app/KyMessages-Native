@@ -192,6 +192,15 @@ func backupWriteMsg(_ *hybridsig.PublicKey, a []string) ([]byte, error) {
 	return BackupWrite(a[0], a[1], v, g, entries)
 }
 
+func deviceListReserveMsg(_ *hybridsig.PublicKey, a []string) ([]byte, error) {
+	v, err1 := strconv.ParseInt(a[2], 10, 64)
+	e, err2 := strconv.ParseInt(a[3], 10, 64)
+	if err1 != nil || err2 != nil || v < 1 || e < 0 || len(a[4]) != 64 {
+		return nil, errArg
+	}
+	return DeviceListReserveMessage(a[0], a[1], v, e, a[4]), nil
+}
+
 func deviceListMsg(_ *hybridsig.PublicKey, a []string) ([]byte, error) {
 	v, err1 := strconv.ParseInt(a[2], 10, 64)
 	e, err2 := strconv.ParseInt(a[3], 10, 64)
@@ -325,6 +334,10 @@ var calls = map[string]call{
 	"signDeviceList": {6, signWith(DomainDeviceList, deviceListMsg)},
 	// verifyDeviceList(public_key, tenant, user, version, epoch, device_ids_json, signature)
 	"verifyDeviceList": {7, verifyWith(DomainDeviceList, deviceListMsg)},
+	// signDeviceListReserve(seed, tenant, user, version, expected_epoch, digest) and
+	// verifyDeviceListReserve(public_key, tenant, user, version, expected_epoch, digest, signature).
+	"signDeviceListReserve":   {6, signWith(DomainDeviceListReserve, deviceListReserveMsg)},
+	"verifyDeviceListReserve": {7, verifyWith(DomainDeviceListReserve, deviceListReserveMsg)},
 
 	// signPinsWrite(seed, tenant, user, version, counter, sealed) and
 	// verifyPinsWrite(public_key, tenant, user, version, counter, sealed, signature).

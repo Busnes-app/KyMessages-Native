@@ -222,14 +222,25 @@ export function VerifyAnotherDevice({ onClose }: { onClose: () => void }) {
         // The copyable code works without the picture.
         setQr(await QRCode.toDataURL(o.text, { margin: 1, width: 220 }).catch(() => ''));
         let failures = 0;
+        // The code's lifetime ends a poll in flight too, not only the waits between polls.
+        const expiry = new AbortController();
+        const expire = setTimeout(() => expiry.abort(new DOMException('The code expired', 'TimeoutError')), o.expiresInMs);
+        controller.signal.addEventListener('abort', () => clearTimeout(expire), { once: true });
+        const watch = AbortSignal.any([signal, expiry.signal]);
+        const expired = () => setErr('The code expired. Close this and start again.');
         const poll = async () => {
           if (!live) return;
-          if (Date.now() >= deadline) return setErr('The code expired. Close this and start again.');
+          if (expiry.signal.aborted || Date.now() >= deadline) return expired();
           try {
-            const j = await o.poll(signal);
+            const j = await o.poll(watch);
             failures = 0;
-            if (j) return live && setJoined(j);
+            if (j) {
+              clearTimeout(expire);
+              return live && setJoined(j);
+            }
           } catch (e) {
+            if (!live || signal.aborted) return;
+            if (expiry.signal.aborted) return expired();
             if ((e as { status?: number }).status === 404 || ++failures > POLL_RETRIES) {
               return live && setErr('The code expired or was used. Close this and start again.');
             }

@@ -156,6 +156,9 @@ type (
 		ExpectedEpoch int64 `json:"expected_epoch"`
 		// e2eeid.DeviceListDigest of the proposed list.
 		Digest string `json:"digest"`
+		// The master key's kymessages.device-list-reserve.v1 signature over this reservation:
+		// a session without the master seed cannot hold the list.
+		Signature string `json:"signature"`
 	}
 	e2eeBackupPut struct {
 		Version    int64             `json:"version"`
@@ -357,7 +360,9 @@ func (s *Server) handleE2EESignDevice(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /api/v1/keys/devices/list/reserve reserves the next device list epoch for one proposed
-// list, named by its digest, for E2EEDeviceListReservation, and answers {epoch, expires_in_ms}:
+// list, named by its digest and signed by the master key (kymessages.device-list-reserve.v1,
+// checked against the master row locked in the reservation's transaction), for
+// E2EEDeviceListReservation, and answers {epoch, expires_in_ms}:
 // the epoch the list is signed for. A device signs a list only after reserving it, so of two
 // devices editing the list at once only one ever signs; the other gets 409, with retry_in_ms
 // while a live reservation holds the list, and reads the winner. Reserving the same digest again
@@ -369,12 +374,16 @@ func (s *Server) handleE2EEReserveDeviceList(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	var req e2eeDeviceListReserve
-	if !decodeIdentity(w, r, 4<<10, &req) || req.Version < 1 || req.ExpectedEpoch < 0 || !e2eeDigest.MatchString(req.Digest) {
+	// The body carries a hybrid signature (about 4.5 KB in base64).
+	if !decodeIdentity(w, r, e2eeIdentityBody, &req) || req.Version < 1 || req.ExpectedEpoch < 0 || !e2eeDigest.MatchString(req.Digest) {
 		s.writeError(w, http.StatusBadRequest, "Invalid device list reservation")
 		return
 	}
 	now := time.Now()
-	switch res, err := s.store.E2EE().ReserveDeviceList(r.Context(), tenantID, user.ID, req.Version, req.ExpectedEpoch, req.Digest, now, E2EEDeviceListReservation); {
+	proof := proofOf(e2eeid.DomainDeviceListReserve, e2eeid.DeviceListReserveMessage(tenantID, user.ID, req.Version, req.ExpectedEpoch, req.Digest), req.Signature)
+	switch res, err := s.store.E2EE().ReserveDeviceList(r.Context(), tenantID, user.ID, req.Version, req.ExpectedEpoch, req.Digest, now, E2EEDeviceListReservation, proof); {
+	case errors.Is(err, errProof):
+		s.writeError(w, http.StatusBadRequest, "The device list reservation is not signed by the current master key")
 	case errors.Is(err, store.ErrE2EEVersion):
 		out := map[string]any{"error": "The device list changed or is being changed; reload it"}
 		if !res.Until.IsZero() {

@@ -53,15 +53,20 @@ Owns user interface components, service worker caching, PWA installation manifes
   write; a fork stays one (`fork` on the mark) until a higher signed epoch. Edits verify the
   predecessor against the local master key, check the `guard` (an enrollment stops once
   `identity:retiring` names this device) right before reserving, reserve the list's digest and
-  sign for the epoch the server grants (never under a reservation known to have lapsed), poll a
+  sign for the epoch the server grants (the reservation itself carries the master key's
+  `signDeviceListReserve` signature; never under a reservation known to have lapsed), poll a
   held reservation every second up to `LIST_WAIT_MAX_MS` (past the server's lease), back off
   four times on other conflicts, and record only a list the server took. `delist` publishes even
   an unchanged list (`publishUnchanged`), so it is ordered after an enrollment holding the list. A rolled-back or
   forked own list or pin set (`Rollback`) is reported as `status().problem`, never signed over;
   the gate offers a reset. `acceptIdentity(user, previous, fingerprint)` runs through `syncPins`'
   shared compare-and-swap, checking the pending change, the local pin and the shared pin (which
-  must exist) on every attempt, adopts a shared pin that already is the new key as it is, and
-  changes the local pin only after the signed write. `engine.ownDeviceVerified(id, signal)`
+  must exist) on every attempt, adopts a shared pin that already is the new key as it is (and
+  then refuses the click, keeping a newer pending candidate rebased onto it, when the prompt
+  clicked was stale), and changes the local pin only after the signed write. `engine.encrypt`
+  throws `NotVerified` on a device without the identity, before any session is made; `roomKey`
+  keeps a vouched Olm copy in charge of what it covers (an unvouched or earlier one only
+  becomes the `inb:` cover), and a vouched copy supersedes an unvouched or restored primary. `engine.ownDeviceVerified(id, signal)`
   reads only the user's own entry, with the signal on the lock wait and the request. Pin sync adopts a differing pin only as an accepted change
   from exactly this device's pin (rewriting a prompt for another key to change from the new pin),
   otherwise keeps the synced pin and a local pending change,
@@ -102,8 +107,13 @@ Owns user interface components, service worker caching, PWA installation manifes
   `RetrySession` (kept across that user's start-ups, ended at sign-out or a user switch) that
   awaits `engine.resumeWork()` (mailbox, then `identity.drain()`: unlocked listing, the restore
   and the backup queue), one run at a time, with one more pass when a failure arrives during a
-  run; `encryptionRetry()` `{pending, exhausted}` drives the gate's notice (also while loading)
-  and `retryEncryptionNow`. `ensureListed` under the lock (status) never waits on another
+  run (kept through a later verdict); `encryptionRetry()` `{pending, exhausted}` drives the
+  gate's notice (also while loading) and `retryEncryptionNow`. `encryptionReadyFor(user)`, re-read
+  on `onRoomKeys`/`onEncryptionPending`, is `Chat.tsx`'s readiness, so a recovered start-up
+  makes the page usable and clears its own start-up error. `identity.drain()` also signs the
+  device (a replacement whose signing failed), and runs the restore and backup after a listing
+  rollback. Enrollment that fails for availability after the seed write (`identity:enrolling`)
+  is finished there, and `onAdopted` fires once the device is signed and listed. `ensureListed` under the lock (status) never waits on another
   device's reservation; lease deadlines use `performance.now()` from before the request. `onBackupStateChanged`
   updates the gate's full notice without a status check.
   `EARLY` (a message from before this device's session) is retryable, so backup pages reopen it.

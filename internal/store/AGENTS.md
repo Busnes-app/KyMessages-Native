@@ -76,7 +76,7 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   `file:` directory. This permits read/write-only restoration of paths with reserved
   characters without accidentally opening a different database.
 - `UpdateProfile` writes only username, email, display name, role and status. SCIM and the KyIdentity webhook use it so a stale read cannot revert a concurrent password change or recovery-code redemption. `ListUsers` filters by one exact `UserFilter` field, and by `sso_provider` when `UserFilter.Provider` is set.
-- `DeleteUserSessions` deletes the user's sessions, MFA challenges and device pairings in one transaction (`deleteGrants`, shared with the password paths): a pending challenge or pairing would otherwise mint a session after a SCIM or directory revocation.
+- `DeleteUserSessions` deletes the user's sessions, MFA challenges, device pairings and E3 QR pairings (`e2ee_pairings`, pending or sealed) in one transaction (`deleteGrants`, shared with the password paths): a pending challenge or pairing would otherwise mint a session, or hand out the account's encryption keys, after a SCIM or directory revocation.
 - TOTP enrolment: `SetPendingTOTP` writes the encrypted secret only on a local account with TOTP off; `EnableTOTP` turns it on only if the stored secret is still the one confirmed, stores the recovery-code digests and deletes every grant in the same transaction; `DisableTOTP` clears secret and codes. Each is `ErrNotFound` from any other state. No migration: the columns exist since v1.
 - `CreateUser`, `CreateDirectoryUser` and `ApplyDirectoryProfile` check the username against every other row first (inside the directory transaction) and return `ErrUsernameTaken` (wraps `ErrAlreadyExists`) on both engines; a refused directory write rolls back with its event ID. A write that loses a race to a concurrent insert meets the UNIQUE constraint instead; `uniqueError` maps that engine error (SQLite `users.username`, Postgres `users_username_key`) to `ErrUsernameTaken` too, any other unique violation to `ErrAlreadyExists` (`unique_internal_test.go`).
 - `GetLocalUserByUsername` returns only `sso_provider = 'local'` rows, preferring an exact-case match. Usernames are unique only case-sensitively, so password login and `init-admin` must never resolve an SSO row.
@@ -109,7 +109,8 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   in another org; a replacement deletes the backup, pairings, pins and device list and clears
   every cross-signature in the same transaction. Pin, device-list and backup writes and
   `SignDevice` run `fenced`: they lock the master row at (tenant, user, version) and call the
-  caller's `Proof` with its key before writing, all in one transaction. `ReserveDeviceList` holds
+  caller's `Proof` with its key before writing, all in one transaction. `ReserveDeviceList` (fenced
+  on its `Proof` too) holds
   the next epoch for one digest until it lapses and returns it (`E2EEReservation`; the same
   digest keeps its epoch, another gets one above every epoch granted, and a refusal names the
   holder's lapse); `PutDeviceList` publishes at exactly that epoch under a reservation of its
