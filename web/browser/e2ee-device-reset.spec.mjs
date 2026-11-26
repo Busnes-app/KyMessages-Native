@@ -35,6 +35,8 @@ async function verifyWithRecoveryKey(page, key) {
   await page.getByRole('radio', { name: /recovery key/ }).check();
   await page.getByLabel('Recovery key', { exact: true }).fill(key);
   await page.getByRole('button', { name: 'Verify', exact: true }).click();
+  // The open dialog hides the banner from the accessibility tree: wait for it to close first.
+  await expect(page.getByRole('dialog')).toHaveCount(0, { timeout: 15_000 });
   await expect(banner).toHaveCount(0);
 }
 

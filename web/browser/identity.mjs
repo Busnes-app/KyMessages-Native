@@ -32,6 +32,8 @@ export async function newIdentity(page) {
   }
   await page.getByRole('checkbox', { name: /I saved my recovery key/ }).check();
   await page.getByRole('button', { name: 'Continue' }).click();
+  // The open dialog hides the banner from the accessibility tree: wait for it to close first.
+  await expect(page.getByRole('dialog')).toHaveCount(0, { timeout: 15_000 });
   await expect(banner(page)).toHaveCount(0);
   return key;
 }
