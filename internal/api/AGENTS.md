@@ -149,6 +149,7 @@ Owns HTTP routing, request parsing, session cookie validation, CORS headers, and
   HMAC credential before owned, revision-fenced authority updates.
 - Installer ownership settings (`installer.*`) are omitted from `extra_settings`.
 - `POST /api/v1/messages/state {ids}` (1–50) answers which messages the caller can still read (a member of the room, in their org), with `deleted` and `edited_at` and never the text; on-device search checks its hits with it. It reads the primary.
+- Attachment uploads (`attachment_handlers.go`, E5): `?encrypted=1` is client ciphertext. It must be the only multipart part and the only query parameter (anything else is 400, so no key or name rides along); it is stored as `encrypted.bin`, `application/octet-stream`, never sniffed (`blobs.Opaque`), and serves only as an attachment download. Without it the bytes are sniffed as before, for `kybot_` tokens only; other sessions get 400 `e2ee_required`. Quotas count ciphertext. A message takes up to 20 attachment IDs (10 files and their thumbnails); bootstrap still reports `max_per_message` 10 (`TestChatAttachmentsEncryptedUploadsAreOpaque`).
 - End-to-end encryption key server (`e2ee_handlers.go`): `POST /api/v1/keys/upload` (strict body:
   self-signed device keys plus signed one-time and fallback keys; `409` when a device ID's keys
   change; answers `one_time_key_count` and `has_fallback_key`, false when none was uploaded yet or

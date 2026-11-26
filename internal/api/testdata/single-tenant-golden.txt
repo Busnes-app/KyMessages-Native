@@ -77,7 +77,7 @@ Content-Type: application/json
 == upload a
 status 201
 Content-Type: application/json
-{"attachment":{"id":"att_<uuid>","tenant_id":"default","room_id":"rm_<uuid>","uploader_id":"u_g_alice","filename":"a.txt","mime_type":"text/plain; charset=utf-8","size_bytes":1700,"sha256_hex":"<token>","created_at":<num>}}
+{"attachment":{"id":"att_<uuid>","tenant_id":"default","room_id":"rm_<uuid>","uploader_id":"u_g_alice","filename":"encrypted.bin","mime_type":"application/octet-stream","size_bytes":1700,"sha256_hex":"<token>","created_at":<num>}}
 == upload over user staging cap
 status 413
 Content-Type: application/json
@@ -89,27 +89,27 @@ Content-Type: application/json
 == list staged
 status 200
 Content-Type: application/json
-{"attachments":[{"id":"att_<uuid>","tenant_id":"default","room_id":"rm_<uuid>","uploader_id":"u_g_alice","filename":"a.txt","mime_type":"text/plain; charset=utf-8","size_bytes":1700,"sha256_hex":"<token>","created_at":<num>}]}
+{"attachments":[{"id":"att_<uuid>","tenant_id":"default","room_id":"rm_<uuid>","uploader_id":"u_g_alice","filename":"encrypted.bin","mime_type":"application/octet-stream","size_bytes":1700,"sha256_hex":"<token>","created_at":<num>}]}
 == post message
 status 201
 Content-Type: application/json
-{"message":{"id":"msg_<uuid>","tenant_id":"default","room_id":"rm_<uuid>","seq":1,"sender_id":"u_g_alice","sender_name":"Galice","encoding":"e2ee_room_v1","body":"{\"alg\":\"megolm.v1\",\"ciphertext\":\"bWVnb2xtOmZpbGU\",\"device_id\":\"TESTDEVICE01\",\"sender_key\":\"<token>\",\"session_id\":\"<token>\"}","created_at":<num>,"attachments":[{"id":"att_<uuid>","tenant_id":"default","room_id":"rm_<uuid>","message_id":"msg_<uuid>","uploader_id":"u_g_alice","filename":"a.txt","mime_type":"text/plain; charset=utf-8","size_bytes":1700,"sha256_hex":"<token>","created_at":<num>}]}}
+{"message":{"id":"msg_<uuid>","tenant_id":"default","room_id":"rm_<uuid>","seq":1,"sender_id":"u_g_alice","sender_name":"Galice","encoding":"e2ee_room_v1","body":"{\"alg\":\"megolm.v1\",\"ciphertext\":\"bWVnb2xtOmZpbGU\",\"device_id\":\"TESTDEVICE01\",\"sender_key\":\"<token>\",\"session_id\":\"<token>\"}","created_at":<num>,"attachments":[{"id":"att_<uuid>","tenant_id":"default","room_id":"rm_<uuid>","message_id":"msg_<uuid>","uploader_id":"u_g_alice","filename":"encrypted.bin","mime_type":"application/octet-stream","size_bytes":1700,"sha256_hex":"<token>","created_at":<num>}]}}
 == bob upload
 status 201
 Content-Type: application/json
-{"attachment":{"id":"att_<uuid>","tenant_id":"default","room_id":"rm_<uuid>","uploader_id":"u_g_bob","filename":"d.txt","mime_type":"text/plain; charset=utf-8","size_bytes":1700,"sha256_hex":"<token>","created_at":<num>}}
+{"attachment":{"id":"att_<uuid>","tenant_id":"default","room_id":"rm_<uuid>","uploader_id":"u_g_bob","filename":"encrypted.bin","mime_type":"application/octet-stream","size_bytes":1700,"sha256_hex":"<token>","created_at":<num>}}
 == bob upload over install cap
 status 413
 Content-Type: application/json
 {"error":"Workspace attachment storage quota exceeded"}
 == download
 status 200
-Content-Type: text/plain; charset=utf-8
+Content-Type: application/octet-stream
 Content-Length: 1700
 sha256 098230e31a14b0105c570ee8e4de14f841da1aff1d84f3e92bbbd1a1660557de
 == download range
 status 206
-Content-Type: text/plain; charset=utf-8
+Content-Type: application/octet-stream
 Content-Range: bytes 10-19/1700
 Content-Length: 10
 sha256 848b3d144b177e262a328fb477798cc39cedf8ce617043d231665fdf67516771
@@ -134,10 +134,10 @@ Content-Type: application/json
 == upload after delete
 status 201
 Content-Type: application/json
-{"attachment":{"id":"att_<uuid>","tenant_id":"default","room_id":"rm_<uuid>","uploader_id":"u_g_bob","filename":"f.txt","mime_type":"text/plain; charset=utf-8","size_bytes":1700,"sha256_hex":"<token>","created_at":<num>}}
+{"attachment":{"id":"att_<uuid>","tenant_id":"default","room_id":"rm_<uuid>","uploader_id":"u_g_bob","filename":"encrypted.bin","mime_type":"application/octet-stream","size_bytes":1700,"sha256_hex":"<token>","created_at":<num>}}
 == download posted
 status 200
-Content-Type: text/plain; charset=utf-8
+Content-Type: application/octet-stream
 Content-Length: 1700
 sha256 098230e31a14b0105c570ee8e4de14f841da1aff1d84f3e92bbbd1a1660557de
 == meeting create

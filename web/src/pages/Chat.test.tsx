@@ -47,6 +47,7 @@ afterEach(() => {
   resetFakeE2EE();
   cleanup();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
   window.history.replaceState(null, '', '/');
 });
 
@@ -464,7 +465,7 @@ describe('Native Chat page', () => {
         if (url.startsWith('/api/v1/rooms/rm_gen/messages')) {
           return Promise.resolve(json({ messages: [], has_more: false }));
         }
-        if (url === '/api/v1/rooms/rm_gen/attachments' && method === 'POST') {
+        if (url === '/api/v1/rooms/rm_gen/attachments?encrypted=1' && method === 'POST') {
           uploadSignal = init?.signal ?? undefined;
           return new Promise<Response>((resolve) => {
             resolveUpload = resolve;
@@ -487,7 +488,8 @@ describe('Native Chat page', () => {
     fireEvent.change(fileInput, { target: { files: [file] } });
 
     const removeBtn = await screen.findByRole('button', { name: 'Remove report.txt' });
-    expect(uploadSignal?.aborted).toBe(false);
+    // The ciphertext upload starts once encryption finishes.
+    await waitFor(() => expect(uploadSignal?.aborted).toBe(false));
 
     // User removes chip while upload is still in flight.
     fireEvent.click(removeBtn);
@@ -588,6 +590,88 @@ describe('Native Chat page', () => {
     await waitFor(() => {
       expect(deletedUrls).toEqual(['/api/v1/attachments/att_left_staged']);
     });
+  });
+
+  it('encrypts files before upload, sends their keys only sealed, and decrypts them on download', async () => {
+    const uploads: { url: string; name: string; type: string; bytes: Uint8Array }[] = [];
+    const posted: Record<string, unknown>[] = [];
+    const saved: Blob[] = [];
+    vi.spyOn(URL, 'createObjectURL').mockImplementation((b) => {
+      saved.push(b as Blob);
+      return `blob:test/${saved.length}`;
+    });
+    // jsdom cannot navigate to a download.
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+    let failUploads = false;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? 'GET';
+        if (url === '/api/v1/bootstrap') {
+          return json({
+            user: { id: 'u_alice', username: 'alice', display_name: 'Alice', role: 'user' },
+            tenant: { id: 'default', slug: 'default', display_name: 'Busnes HQ', plan: 'self_hosted' },
+            rooms: [{ id: 'rm_gen', tenant_id: 'default', kind: 'channel', name: 'general', topic: '', is_private: false, last_seq: 0, created_by: 'u_alice', created_at: Date.now(), role: 'owner', last_read_seq: 0, unread_count: 0, notify_mode: 'all' }],
+            attachments: { max_upload_bytes: 10 * 1024 * 1024, max_per_message: 10 },
+          });
+        }
+        if (url.startsWith('/api/v1/rooms/rm_gen/attachments') && method === 'POST') {
+          const file = (init?.body as FormData).get('file') as File;
+          uploads.push({ url, name: file.name, type: file.type, bytes: new Uint8Array(await file.arrayBuffer()) });
+          if (failUploads) return json({ error: 'storage full' }, 500);
+          return json({ attachment: { id: `att_enc${uploads.length}`, room_id: 'rm_gen', uploader_id: 'u_alice', filename: 'encrypted.bin', mime_type: 'application/octet-stream', size_bytes: file.size, sha256_hex: '', created_at: 1 } }, 201);
+        }
+        if (url === '/api/v1/rooms/rm_gen/messages' && method === 'POST') {
+          const req = JSON.parse(String(init?.body)) as Record<string, unknown>;
+          posted.push(req);
+          return json({ message: { id: 'm_file', room_id: 'rm_gen', seq: 1, sender_id: 'u_alice', sender_name: 'Alice', encoding: 'e2ee_room_v1', body: req.body, created_at: Date.now(), reactions: [], attachments: [{ id: 'att_enc1', room_id: 'rm_gen', uploader_id: 'u_alice', filename: 'encrypted.bin', mime_type: 'application/octet-stream', size_bytes: uploads[0].bytes.length, sha256_hex: '', created_at: 1 }] } }, 201);
+        }
+        if (url.startsWith('/api/v1/rooms/rm_gen/messages')) return json({ messages: [], has_more: false });
+        if (url === '/api/v1/attachments/att_enc1' && method === 'GET') return new Response(uploads[0].bytes);
+        return json({ error: 'not found' }, 404);
+      }),
+    );
+
+    const { container } = render(<Chat />);
+    await screen.findByRole('heading', { name: 'Welcome to #general' });
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(fileInput, { target: { files: [new File(['hello world'], 'report.txt', { type: 'text/plain' })] } });
+    await screen.findByText('11 B');
+
+    // The server receives opaque ciphertext under a generic name, never the file's name or type.
+    expect(uploads).toHaveLength(1);
+    expect(uploads[0]).toMatchObject({ url: '/api/v1/rooms/rm_gen/attachments?encrypted=1', name: 'encrypted.bin', type: 'application/octet-stream' });
+    expect(uploads[0].bytes.length).toBe(11 + 16);
+    expect(new TextDecoder().decode(uploads[0].bytes)).not.toContain('hello');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    await screen.findByRole('button', { name: 'Download report.txt' });
+    expect(posted).toHaveLength(1);
+    expect(posted[0].attachment_ids).toEqual(['att_enc1']);
+    // The key, name and type travel only inside the sealed envelope.
+    const outside = JSON.stringify({ ...posted[0], body: undefined });
+    expect(outside).not.toContain('report.txt');
+    expect(outside).not.toContain('"key"');
+    const env = JSON.parse(String(posted[0].body)) as { ciphertext: string };
+    const inner = JSON.parse(atob(env.ciphertext)) as { type: string; files: { name: string; mime_type: string; key: string }[] };
+    expect(inner.type).toBe('attachment');
+    expect(inner.files[0]).toMatchObject({ name: 'report.txt', mime_type: 'text/plain' });
+    expect(inner.files[0].key).toMatch(/^[A-Za-z0-9+/]{43}$/);
+    expect(screen.queryByText('File not encrypted')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Download report.txt' }));
+    await waitFor(() => expect(saved).toHaveLength(1));
+    // Saved untyped, so the decrypted copy can never render as this origin.
+    expect(saved[0].type).toBe('application/octet-stream');
+    expect(new TextDecoder().decode(await saved[0].arrayBuffer())).toBe('hello world');
+
+    // A refused upload is an error on its chip; there is no plaintext retry.
+    failUploads = true;
+    fireEvent.change(fileInput, { target: { files: [new File(['again'], 'second.txt', { type: 'text/plain' })] } });
+    await screen.findByText('storage full');
+    expect(uploads).toHaveLength(2);
+    expect(uploads.every((u) => u.url.endsWith('?encrypted=1') && u.name === 'encrypted.bin')).toBe(true);
   });
 
   it('hides the attachment button when bootstrap reports attachments.available=false', async () => {

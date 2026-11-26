@@ -1,3 +1,4 @@
+import type { FileDescriptor } from '../crypto/attachments';
 import { arr, bool, count, obj, oneOf, opt, str } from '../dto';
 
 export type RoomKind = 'dm' | 'channel' | 'meeting';
@@ -149,6 +150,8 @@ export interface ChatMessage {
   /** For e2ee_room_v1: the envelope as stored. `body` holds only decrypted text, never this. */
   envelope?: string;
   e2ee?: E2EEState;
+  /** From the decrypted message: its encrypted files (keys included). Never from the server. */
+  files?: FileDescriptor[];
 }
 
 export type CallMode = 'p2p_mesh' | 'sfu_livekit';

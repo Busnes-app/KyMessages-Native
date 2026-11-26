@@ -177,6 +177,21 @@ describe('encrypted rooms between two client engines', () => {
     expect(await read(bob, m1)).toBe('pay 10');
   });
 
+  it('carries attachment descriptors inside the sealed message, and refuses a non-list', async () => {
+    const server = new FakeKeyServer();
+    const alice = await device(server, 'u_alice');
+    const bob = await device(server, 'u_bob');
+    server.join('r1', 'u_alice', 'u_bob');
+    const files = [{ attachment_id: 'att_1', key: 'secret' }];
+    const m1 = post('r1', alice, await alice.encrypt('r1', { type: 'attachment', body: '', files }));
+    const bad = post('r1', alice, await alice.encrypt('r1', { type: 'attachment', body: '', files: 'x' as unknown as unknown[] }));
+    expect(m1.body).not.toContain('secret');
+    await bob.receive();
+    const opened = await bob.decrypt(m1);
+    expect(opened.state === 'decrypted' && opened.inner.files).toEqual(files);
+    expect(await read(bob, bad)).toBe('failed: This message is damaged.');
+  });
+
   it('binds an edit to the message it edits', async () => {
     const server = new FakeKeyServer();
     const alice = await device(server, 'u_alice');

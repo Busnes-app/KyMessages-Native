@@ -21,7 +21,9 @@ import (
 	"time"
 
 	"github.com/Busnes-app/ky_server_base/internal/api"
+	"github.com/Busnes-app/ky_server_base/internal/auth"
 	"github.com/Busnes-app/ky_server_base/internal/config"
+	kycrypto "github.com/Busnes-app/ky_server_base/internal/crypto"
 	"github.com/Busnes-app/ky_server_base/internal/store"
 	"github.com/Busnes-app/ky_server_base/internal/testdb"
 )
@@ -42,7 +44,17 @@ func makeTestPNG(t *testing.T, width, height int) []byte {
 	return buf.Bytes()
 }
 
+// doMultipartUpload uploads as the web client does: end-to-end encrypted bytes (encrypted=1).
 func doMultipartUpload(t *testing.T, handler http.Handler, path, bearer, fieldName, filename string, data []byte) *httptest.ResponseRecorder {
+	t.Helper()
+	if !strings.Contains(path, "?") {
+		path += "?encrypted=1"
+	}
+	return doPlainUpload(t, handler, path, bearer, fieldName, filename, data)
+}
+
+// doPlainUpload uploads bytes the server may sniff: only bot tokens may do this.
+func doPlainUpload(t *testing.T, handler http.Handler, path, bearer, fieldName, filename string, data []byte) *httptest.ResponseRecorder {
 	t.Helper()
 	var body bytes.Buffer
 	mw := multipart.NewWriter(&body)
@@ -66,6 +78,22 @@ func doMultipartUpload(t *testing.T, handler http.Handler, path, bearer, fieldNa
 	return rec
 }
 
+// createChatTestBot makes a native bot account owned by ownerID and returns its kybot_ token.
+func createChatTestBot(t *testing.T, st store.Store, id, username, ownerID string) string {
+	t.Helper()
+	ctx := context.Background()
+	if err := st.Users().CreateUser(ctx, &store.User{ID: id, Username: username, Role: "bot", Status: "active", SSOProvider: "bot"}); err != nil {
+		t.Fatal(err)
+	}
+	tok := auth.AgentTokenPrefix + kycrypto.RandomHex(32)
+	if err := st.Agents().CreateAgent(ctx, &store.Agent{ID: "agt_" + id, UserID: id, Username: username, OwnerUserID: ownerID, TokenHash: kycrypto.SHA256Hex([]byte(tok)), TokenState: store.AgentTokenActive, CreatedBy: ownerID, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	return tok
+}
+
+// Plaintext files (a bot's, or any uploaded before E5) keep their sniffed type, inline images and
+// sanitized names.
 func TestChatAttachmentsUploadLinkDownloadAndCleanup(t *testing.T) {
 	srv, st, cfg := setupTestServer(t)
 	startChatBus(t, srv)
@@ -74,12 +102,13 @@ func TestChatAttachmentsUploadLinkDownloadAndCleanup(t *testing.T) {
 	_, aliceTok := createChatTestUser(t, st, "u_att_alice", "attalice", "user")
 	_, bobTok := createChatTestUser(t, st, "u_att_bob", "attbob", "user")
 	_, charlieTok := createChatTestUser(t, st, "u_att_charlie", "attcharlie", "user")
+	botTok := createChatTestBot(t, st, "u_att_bot", "attbot", "u_att_alice")
 
-	// Alice creates a channel with Bob; Charlie is not a member.
+	// Alice creates a channel with Bob and her bot; Charlie is not a member.
 	rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", aliceTok, map[string]any{
 		"kind":       store.RoomKindChannel,
 		"name":       "files-room",
-		"member_ids": []string{"u_att_bob"},
+		"member_ids": []string{"u_att_bob", "u_att_bot"},
 	}, nil)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create room = %d: %s", rec.Code, rec.Body.String())
@@ -126,7 +155,7 @@ func TestChatAttachmentsUploadLinkDownloadAndCleanup(t *testing.T) {
 	if len(largePNG) <= 1<<20 {
 		t.Fatalf("expected largePNG > 1 MiB, got %d bytes", len(largePNG))
 	}
-	upRec := doMultipartUpload(t, srv, "/api/v1/rooms/"+roomID+"/attachments", aliceTok, "file", "../../evil/design.png", largePNG)
+	upRec := doPlainUpload(t, srv, "/api/v1/rooms/"+roomID+"/attachments", botTok, "file", "../../evil/design.png", largePNG)
 	if upRec.Code != http.StatusCreated {
 		t.Fatalf("upload large PNG = %d: %s", upRec.Code, upRec.Body.String())
 	}
@@ -141,9 +170,9 @@ func TestChatAttachmentsUploadLinkDownloadAndCleanup(t *testing.T) {
 		t.Fatalf("unexpected uploaded attachment metadata: %+v", att)
 	}
 
-	// Before linking to a message, uploader Alice can fetch it, but Bob gets 404.
+	// Before linking to a message, the uploading bot can fetch it, but Bob gets 404.
 	reqAliceStaged := httptest.NewRequest(http.MethodGet, "/api/v1/attachments/"+att.ID+"?inline=1", nil)
-	reqAliceStaged.Header.Set("Authorization", "Bearer "+aliceTok)
+	reqAliceStaged.Header.Set("Authorization", "Bearer "+botTok)
 	recAliceStaged := httptest.NewRecorder()
 	srv.ServeHTTP(recAliceStaged, reqAliceStaged)
 	if recAliceStaged.Code != http.StatusOK {
@@ -168,10 +197,10 @@ func TestChatAttachmentsUploadLinkDownloadAndCleanup(t *testing.T) {
 		t.Fatalf("hijack attachment send = %d, want 400", hijackRec.Code)
 	}
 
-	// Alice sends an attachment-only message (empty body allowed when attachment_ids is non-empty).
-	sendRec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+roomID+"/messages", aliceTok, map[string]any{
-		"body":           testEnvelope(""),
-		"encoding":       "e2ee_room_v1",
+	// The bot sends an attachment-only message (empty body allowed when attachment_ids is non-empty).
+	sendRec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+roomID+"/messages", botTok, map[string]any{
+		"body":           "",
+		"encoding":       "plain_v1",
 		"attachment_ids": []string{att.ID},
 	}, nil)
 	if sendRec.Code != http.StatusCreated {
@@ -248,10 +277,12 @@ func TestChatAttachmentsXSSDowngradeAndMaxUploadCap(t *testing.T) {
 	defer srv.CloseChat()
 
 	_, aliceTok := createChatTestUser(t, st, "u_sec_alice", "secalice", "user")
+	botTok := createChatTestBot(t, st, "u_sec_bot", "secbot", "u_sec_alice")
 
 	rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", aliceTok, map[string]any{
-		"kind": store.RoomKindChannel,
-		"name": "sec-room",
+		"kind":       store.RoomKindChannel,
+		"name":       "sec-room",
+		"member_ids": []string{"u_sec_bot"},
 	}, nil)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create room = %d", rec.Code)
@@ -270,7 +301,7 @@ func TestChatAttachmentsXSSDowngradeAndMaxUploadCap(t *testing.T) {
 
 	// SVG XSS payload must downgrade to application/octet-stream and NEVER serve inline even with ?inline=1.
 	svg := []byte(`<svg xmlns="http://www.w3.org/2000/svg" onload="alert(document.cookie)"></svg>`)
-	upSVG := doMultipartUpload(t, srv, "/api/v1/rooms/"+roomID+"/attachments", aliceTok, "file", "xss.svg", svg)
+	upSVG := doPlainUpload(t, srv, "/api/v1/rooms/"+roomID+"/attachments", botTok, "file", "xss.svg", svg)
 	if upSVG.Code != http.StatusCreated {
 		t.Fatalf("upload svg = %d: %s", upSVG.Code, upSVG.Body.String())
 	}
@@ -283,7 +314,7 @@ func TestChatAttachmentsXSSDowngradeAndMaxUploadCap(t *testing.T) {
 	}
 
 	reqInlineSVG := httptest.NewRequest(http.MethodGet, "/api/v1/attachments/"+svgResp.Attachment.ID+"?inline=1", nil)
-	reqInlineSVG.Header.Set("Authorization", "Bearer "+aliceTok)
+	reqInlineSVG.Header.Set("Authorization", "Bearer "+botTok)
 	recInlineSVG := httptest.NewRecorder()
 	srv.ServeHTTP(recInlineSVG, reqInlineSVG)
 	if recInlineSVG.Code != http.StatusOK {
@@ -698,5 +729,153 @@ func TestChatAttachmentStorageInitErrorExposedAndReflectedInBootstrap(t *testing
 	}
 	if body.Attachments.Available {
 		t.Fatal("expected bootstrap attachments.available=false when blob store failed to initialize")
+	}
+}
+
+// multipartParts builds a multipart body from parts in order; a part with a filename is a file.
+func multipartParts(t *testing.T, parts ...[3]string) (*bytes.Buffer, string) {
+	t.Helper()
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	for _, p := range parts {
+		var w io.Writer
+		var err error
+		if p[1] != "" {
+			w, err = mw.CreateFormFile(p[0], p[1])
+		} else {
+			w, err = mw.CreateFormField(p[0])
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.WriteString(w, p[2])
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return &body, mw.FormDataContentType()
+}
+
+func TestChatAttachmentsEncryptedUploadsAreOpaque(t *testing.T) {
+	srv, st, _ := setupTestServer(t)
+	startChatBus(t, srv)
+	defer srv.CloseChat()
+
+	_, aliceTok := createChatTestUser(t, st, "u_enc_alice", "encalice", "user")
+	_, bobTok := createChatTestUser(t, st, "u_enc_bob", "encbob", "user")
+	_, carolTok := createChatTestUser(t, st, "u_enc_carol", "enccarol", "user")
+	room := roomOf(t, doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", aliceTok, map[string]any{
+		"kind": store.RoomKindChannel, "name": "sealed-files", "member_ids": []string{"u_enc_bob"},
+	}, nil))
+	up := "/api/v1/rooms/" + room + "/attachments"
+	post := func(path, tok string, parts ...[3]string) *httptest.ResponseRecorder {
+		body, ct := multipartParts(t, parts...)
+		req := httptest.NewRequest(http.MethodPost, path, body)
+		req.Header.Set("Content-Type", ct)
+		req.Header.Set("Authorization", "Bearer "+tok)
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Ciphertext that happens to look like a PNG is still never sniffed or served as one, and the
+	// name the client sent is never stored.
+	ciphertext := makeTestPNG(t, 4, 4)
+	rec := doMultipartUpload(t, srv, up, aliceTok, "file", "secret-plan.png", ciphertext)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("encrypted upload = %d: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "secret-plan") {
+		t.Fatalf("upload answer leaks the client's file name: %s", rec.Body.String())
+	}
+	var file struct {
+		Attachment store.Attachment `json:"attachment"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &file)
+	if file.Attachment.Filename != "encrypted.bin" || file.Attachment.MimeType != "application/octet-stream" || file.Attachment.SizeBytes != int64(len(ciphertext)) {
+		t.Fatalf("encrypted attachment metadata = %+v", file.Attachment)
+	}
+	// Quotas count the ciphertext.
+	if staged := listStaged(t, srv, room, aliceTok); len(staged) != 1 || staged[0].SizeBytes != int64(len(ciphertext)) {
+		t.Fatalf("staged = %+v", staged)
+	}
+
+	// A person may not upload plaintext, and an encrypted upload carries nothing but its file.
+	for name, r := range map[string]*httptest.ResponseRecorder{
+		"plaintext from a person":    doPlainUpload(t, srv, up, aliceTok, "file", "plan.pdf", []byte("plain")),
+		"encrypted=0":                doPlainUpload(t, srv, up+"?encrypted=0", aliceTok, "file", "a", []byte("x")),
+		"another query parameter":    doPlainUpload(t, srv, up+"?encrypted=1&key=c2VjcmV0", aliceTok, "file", "a", []byte("x")),
+		"a field before the file":    post(up+"?encrypted=1", aliceTok, [3]string{"file_key", "", "c2VjcmV0"}, [3]string{"file", "a", "x"}),
+		"a field after the file":     post(up+"?encrypted=1", aliceTok, [3]string{"file", "a", "x"}, [3]string{"private_key", "", "c2VjcmV0"}),
+		"a second file after a file": post(up+"?encrypted=1", aliceTok, [3]string{"file", "a", "x"}, [3]string{"file", "b", "y"}),
+	} {
+		if r.Code != http.StatusBadRequest {
+			t.Errorf("%s = %d, want 400: %s", name, r.Code, r.Body.String())
+		}
+	}
+	if r := doPlainUpload(t, srv, up, aliceTok, "file", "plan.pdf", []byte("plain")); !strings.Contains(r.Body.String(), `"code":"e2ee_required"`) {
+		t.Errorf("plaintext refusal = %s", r.Body.String())
+	}
+	// Refused uploads leave nothing staged and hold no quota.
+	if staged := listStaged(t, srv, room, aliceTok); len(staged) != 1 {
+		t.Fatalf("refused uploads left staged files: %+v", staged)
+	}
+
+	// A file and its thumbnail are both attachments: ten files with thumbnails fit one message.
+	ids := []string{file.Attachment.ID}
+	for i := 1; i < 2*10; i++ {
+		r := doMultipartUpload(t, srv, up, aliceTok, "file", "f", []byte(fmt.Sprintf("ciphertext %d", i)))
+		var a struct {
+			Attachment store.Attachment `json:"attachment"`
+		}
+		_ = json.Unmarshal(r.Body.Bytes(), &a)
+		ids = append(ids, a.Attachment.ID)
+	}
+	extra := doMultipartUpload(t, srv, up, aliceTok, "file", "f", []byte("one too many"))
+	var extraAtt struct {
+		Attachment store.Attachment `json:"attachment"`
+	}
+	_ = json.Unmarshal(extra.Body.Bytes(), &extraAtt)
+	if r := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room+"/messages", aliceTok, map[string]any{
+		"body": testEnvelope(""), "encoding": "e2ee_room_v1", "attachment_ids": append(append([]string{}, ids...), extraAtt.Attachment.ID),
+	}, nil); r.Code != http.StatusBadRequest {
+		t.Fatalf("21 attachments = %d, want 400", r.Code)
+	}
+
+	// Staged ciphertext is the uploader's alone.
+	get := func(tok, query string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/attachments/"+file.Attachment.ID+query, nil)
+		req.Header.Set("Authorization", "Bearer "+tok)
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+	if r := get(bobTok, ""); r.Code != http.StatusNotFound {
+		t.Fatalf("bob fetching staged ciphertext = %d, want 404", r.Code)
+	}
+	if r := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room+"/messages", aliceTok, map[string]any{
+		"body": testEnvelope(""), "encoding": "e2ee_room_v1", "attachment_ids": ids,
+	}, nil); r.Code != http.StatusCreated {
+		t.Fatalf("post 20 attachments = %d: %s", r.Code, r.Body.String())
+	}
+
+	// Members get the exact ciphertext as an opaque download, never inline; others get 404.
+	r := get(bobTok, "?inline=1")
+	if r.Code != http.StatusOK || !bytes.Equal(r.Body.Bytes(), ciphertext) {
+		t.Fatalf("bob download = %d (%d bytes)", r.Code, r.Body.Len())
+	}
+	for header, want := range map[string]string{
+		"Content-Type":            "application/octet-stream",
+		"Content-Disposition":     "attachment; filename=encrypted.bin",
+		"X-Content-Type-Options":  "nosniff",
+		"Content-Security-Policy": "default-src 'none'; sandbox",
+		"Cache-Control":           "private, no-store",
+	} {
+		if got := r.Header().Get(header); got != want {
+			t.Errorf("%s = %q, want %q", header, got, want)
+		}
+	}
+	if r := get(carolTok, ""); r.Code != http.StatusNotFound {
+		t.Fatalf("non-member download = %d, want 404", r.Code)
 	}
 }

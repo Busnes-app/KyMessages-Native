@@ -20,6 +20,10 @@ import (
 
 const (
 	maxAttachmentsPerMessage = 10
+	// A message may also carry each file's encrypted thumbnail, itself an attachment.
+	maxAttachmentIDsPerMessage = 2 * maxAttachmentsPerMessage
+	// encryptedFilename is the only name an end-to-end encrypted upload has on the server.
+	encryptedFilename = "encrypted.bin"
 	// multipartEnvelopeOverhead leaves headroom for multipart boundaries and headers
 	// without allowing arbitrary request inflation beyond MaxUploadBytes.
 	multipartEnvelopeOverhead = 64 << 10
@@ -74,22 +78,37 @@ func isAttachmentUploadPath(path string) bool {
 	return roomID != "" && !strings.Contains(roomID, "/")
 }
 
-// POST /api/v1/rooms/{id}/attachments
-// Accepts multipart/form-data with a single "file" part, validates size, storage quotas,
-// and magic bytes, writes the blob under a server-generated flat key, and creates an
-// unattached attachment record owned by the uploader that can then be linked via
-// POST /api/v1/rooms/{id}/messages.
+// POST /api/v1/rooms/{id}/attachments[?encrypted=1]
+// Accepts multipart/form-data with a single "file" part, validates size and storage quotas,
+// writes the blob under a server-generated flat key, and creates an unattached attachment record
+// owned by the uploader that can then be linked via POST /api/v1/rooms/{id}/messages.
+// With encrypted=1 the file is client ciphertext (E5): it must be the only part, and it is stored
+// as application/octet-stream named encrypted.bin, never sniffed, whatever name the client sent.
+// Without it the bytes are sniffed as before; that plaintext path is for bot tokens only.
 func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Request) {
 	if s.blobs == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "Attachment storage unavailable")
 		return
 	}
-	user, _, ok := s.currentUser(r)
+	user, sess, ok := s.currentUser(r)
 	if !ok {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
 	if !s.allowChatAction(w, user.ID, chatLimitUploads) {
+		return
+	}
+	query := r.URL.Query()
+	encrypted := query.Get("encrypted") == "1"
+	if len(query) > 1 || (len(query) == 1 && !encrypted) {
+		s.writeError(w, http.StatusBadRequest, "The only upload parameter is encrypted=1")
+		return
+	}
+	if !encrypted && !isBotToken(user, sess) {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "Files are end-to-end encrypted: upload ciphertext with encrypted=1",
+			"code":  CodeE2EERequired,
+		})
 		return
 	}
 
@@ -159,6 +178,10 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 			break
 		}
 		_ = part.Close()
+		if encrypted {
+			s.writeError(w, http.StatusBadRequest, "An encrypted upload carries only its file")
+			return
+		}
 	}
 	if filePart == nil {
 		s.writeError(w, http.StatusBadRequest, "Missing file field in multipart upload")
@@ -225,7 +248,12 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 	}
 
 	attID := "att_" + uuid.Must(uuid.NewV7()).String()
-	putRes, err := s.blobs.Put(tenantID, attID, filePart, res.ReservedBytes)
+	var body io.Reader = filePart
+	if encrypted {
+		body = blobs.Opaque(filePart)
+		rawFilename = encryptedFilename
+	}
+	putRes, err := s.blobs.Put(tenantID, attID, body, res.ReservedBytes)
 	if err != nil {
 		var maxErr *http.MaxBytesError
 		switch {
@@ -239,6 +267,14 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 			s.writeError(w, http.StatusInternalServerError, "Failed to store uploaded file")
 		}
 		return
+	}
+	// Nothing may follow the ciphertext either: an encrypted upload has no metadata.
+	if encrypted {
+		if _, err := mr.NextPart(); !errors.Is(err, io.EOF) {
+			_ = s.blobs.Erase(tenantID, putRes.Key)
+			s.writeError(w, http.StatusBadRequest, "An encrypted upload carries only its file")
+			return
+		}
 	}
 
 	att := &store.Attachment{

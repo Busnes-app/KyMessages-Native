@@ -465,6 +465,34 @@ describe('the signed-in device', () => {
     expect(seen[0]).toBe('waiting');
   });
 
+  it('keeps only the encrypted files the server attached, and calls malformed ones damaged', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === '/api/v1/keys/upload') {
+        const req = JSON.parse(String(init?.body)) as { one_time_keys: unknown[] };
+        return json({ one_time_key_count: req.one_time_keys.length });
+      }
+      return json({ messages: [] });
+    }));
+    const e = await startE2EE('u_alice');
+    await vi.waitFor(async () => expect((await openMessage(parseMessage({ id: 'x', room_id: 'r1', sender_id: 'u_bob', encoding: 'plain_v1', body: 'p' }))).body).toBe('p'));
+    const desc = (id: string) => ({
+      attachment_id: id, v: 1, alg: 'A256GCM-STREAM', key: 'A'.repeat(43), nonce_prefix: 'A'.repeat(10),
+      chunk_size: 65536, sha256: 'a'.repeat(64), ciphertext_size: 26, size: 10, name: `${id}.txt`, mime_type: 'text/plain',
+    });
+    const att = (id: string) => ({ id, room_id: 'r1', filename: 'encrypted.bin' });
+    const m = parseMessage({
+      id: 'm1', room_id: 'r1', sender_id: 'u_bob', encoding: 'e2ee_room_v1', attachments: [att('att_a'), att('att_plain')],
+      body: '{"alg":"megolm.v1","sender_key":"k","device_id":"DEVICE0001","session_id":"s","ciphertext":"AAAA"}',
+    });
+    const decrypt = vi.spyOn(e, 'decrypt');
+    decrypt.mockResolvedValue({ state: 'decrypted', inner: { room_id: 'r1', type: 'attachment', body: '', files: [desc('att_a'), desc('att_elsewhere')] } });
+    const opened = await openMessage(m);
+    expect(opened.files?.map((f) => f.attachment_id)).toEqual(['att_a']);
+    expect(opened.files?.[0].name).toBe('att_a.txt');
+    decrypt.mockResolvedValue({ state: 'decrypted', inner: { room_id: 'r1', type: 'attachment', body: '', files: [{ ...desc('att_a'), chunk_size: 1 }] } });
+    expect((await openMessage(m)).e2ee).toEqual({ kind: 'failed', reason: 'This message is damaged.' });
+  });
+
   it('refuses text whose sealed form would exceed the server envelope limit, before sealing', async () => {
     // 10 KiB of control characters is under the 16 KiB text limit but escapes to 60 KiB of JSON.
     await expect(sealRoomMessage('r1', { type: 'text', body: '\u0001'.repeat(10 << 10) })).rejects.toThrow('Message is too long');

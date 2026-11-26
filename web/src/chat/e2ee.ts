@@ -6,6 +6,7 @@ import { arr, bool, obj, str } from '../dto';
 import { keepStorage } from '../persist';
 import { CryptoEngine, DeviceChanged, type ClaimedKey, type DeviceKeys, type KeyServer, type Mail, type RoomInner } from '../crypto/engine';
 import { loadCrypto } from '../crypto/index';
+import { openFiles } from '../crypto/attachments';
 import { type CryptoStore, deleteCryptoStores, openCryptoStore, storedDevices } from '../crypto/store';
 import { parseRoomDetail, type ChatMessage, type E2EEState } from './types';
 
@@ -310,8 +311,10 @@ export async function openMessage(m: ChatMessage): Promise<ChatMessage> {
     const r = await e.decrypt({ id: m.id, room_id: m.room_id, sender_id: m.sender_id, body: m.envelope });
     if (r.state === 'waiting') return shut({ kind: 'waiting', gen });
     if (r.state === 'failed') return shut({ kind: 'failed', reason: r.reason });
+    const files = openFiles(r.inner.files, m.attachments);
+    if (!files) return shut({ kind: 'failed', reason: 'This message is damaged.' });
     // The encrypted reply target is the true one; the server's copy is only a hint.
-    return { ...m, body: r.inner.body, reply_to_id: r.inner.reply_to_id, e2ee: { kind: 'decrypted' } };
+    return { ...m, body: r.inner.body, reply_to_id: r.inner.reply_to_id, e2ee: { kind: 'decrypted' }, ...(files.length ? { files } : {}) };
   } catch {
     // Not a verdict on the message: the engine's own checks return 'failed' without throwing.
     return shut({ kind: 'failed', reason: NOT_YET, gen });

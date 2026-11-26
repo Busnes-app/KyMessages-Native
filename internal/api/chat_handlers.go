@@ -743,8 +743,8 @@ func (s *Server) handleChatSendMessage(w http.ResponseWriter, r *http.Request) {
 		seenAtt[id] = struct{}{}
 		attIDs = append(attIDs, id)
 	}
-	if len(attIDs) > maxAttachmentsPerMessage {
-		s.writeError(w, http.StatusBadRequest, "At most 10 attachments per message")
+	if len(attIDs) > maxAttachmentIDsPerMessage {
+		s.writeError(w, http.StatusBadRequest, "At most 10 files (and their thumbnails) per message")
 		return
 	}
 	body := strings.TrimSpace(req.Body)

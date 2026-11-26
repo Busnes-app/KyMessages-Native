@@ -140,13 +140,21 @@ func (s *Store) Dir() string {
 	return s.dir
 }
 
+// opaque marks an upload as end-to-end encrypted bytes (Opaque).
+type opaque struct{ io.Reader }
+
+// Opaque wraps the body of a client-encrypted upload: Put stores it as application/octet-stream
+// and never inspects its bytes.
+func Opaque(r io.Reader) io.Reader { return opaque{r} }
+
 // ValidKey reports whether key is a safe flat blob identifier.
 func ValidKey(key string) bool {
 	return validKey.MatchString(key)
 }
 
 // Put streams r into the store under key, enforcing 1 <= size <= maxBytes, computing SHA-256,
-// sniffing and validating a safe MIME type, and atomically moving the file into place (mode 0600).
+// sniffing and validating a safe MIME type (unless r is Opaque), and atomically moving the file
+// into place (mode 0600).
 func (s *Store) Put(tenantID, key string, r io.Reader, maxBytes int64) (PutResult, error) {
 	rel, err := s.rel(tenantID, key)
 	if err != nil {
@@ -189,7 +197,10 @@ func (s *Store) Put(tenantID, key string, r io.Reader, maxBytes int64) (PutResul
 		return PutResult{}, ErrTooLarge
 	}
 
-	mimeType := detectSafeMIME(tmp, n)
+	mimeType := "application/octet-stream"
+	if _, sealed := r.(opaque); !sealed {
+		mimeType = detectSafeMIME(tmp, n)
+	}
 
 	if err := tmp.Sync(); err != nil {
 		return PutResult{}, fmt.Errorf("blobs: sync temp file: %w", err)

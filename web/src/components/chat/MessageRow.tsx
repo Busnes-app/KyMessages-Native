@@ -8,6 +8,8 @@ import {
   type ChatMessage,
 } from '../../chat/types';
 import { formatTime, initialsFor, isBotSender, isGuestSender, isWebhookSender } from '../../chat/state';
+import { sealedIds, type FileDescriptor } from '../../crypto/attachments';
+import { SealedFiles } from './Attachments';
 
 const WAITING_TEXT = "Waiting for this message's key";
 
@@ -20,13 +22,28 @@ export function plaintextLabel(msg: ChatMessage): string | null {
   return 'Sent before encryption';
 }
 
+/** "Attachment: <name>" or "<n> attachments", naming encrypted files by their decrypted names. */
+export function attachmentSummary(msg: ChatMessage): string {
+  const names = [...(msg.files ?? []).map((f) => f.name), ...plainAttachments(msg).map((a) => a.filename)];
+  if (names.length === 1) return `Attachment: ${names[0]}`;
+  return names.length > 1 ? `${names.length} attachments` : '';
+}
+
+/**
+ * The server's attachments that no encrypted descriptor names: files uploaded in the clear (before
+ * E5, or by a bot). An encrypted message not opened yet has none: its uploads are not known to be
+ * plaintext.
+ */
+export function plainAttachments(msg: ChatMessage): ChatAttachment[] {
+  if (msg.encoding === 'e2ee_room_v1' && msg.e2ee?.kind !== 'decrypted') return [];
+  const sealed = new Set(sealedIds(msg.files ?? []));
+  return msg.attachments.filter((a) => !sealed.has(a.id));
+}
+
 function messagePreviewText(msg: ChatMessage): string {
   if (msg.e2ee?.kind === 'waiting') return WAITING_TEXT;
   if (msg.e2ee?.kind === 'failed') return 'Message could not be decrypted';
-  if (msg.body) return msg.body;
-  if (msg.attachments.length === 1) return `Attachment: ${msg.attachments[0].filename}`;
-  if (msg.attachments.length > 1) return `${msg.attachments.length} attachments`;
-  return '';
+  return msg.body || attachmentSummary(msg);
 }
 
 const QUICK_REACTIONS = ['👍', '❤️', '🎉', '👀'] as const;
@@ -98,6 +115,7 @@ interface MessageRowProps {
   onReply: (message: ChatMessage) => void;
   onJumpToMessage?: (seq: number) => void;
   onPreviewImage?: (attachment: ChatAttachment) => void;
+  onPreviewFile?: (file: FileDescriptor) => void;
   onToggleReaction: (messageId: string, emoji: string, currentlyReacted: boolean) => void;
   onEdit: (messageId: string, newBody: string) => Promise<void>;
   onDelete: (messageId: string) => Promise<void>;
@@ -118,6 +136,7 @@ export const MessageRow: React.FC<MessageRowProps> = ({
   onReply,
   onJumpToMessage,
   onPreviewImage,
+  onPreviewFile,
   onToggleReaction,
   onEdit,
   onDelete,
@@ -141,6 +160,8 @@ export const MessageRow: React.FC<MessageRowProps> = ({
   const sealedShut = message.e2ee !== undefined && message.e2ee.kind !== 'decrypted';
   const canEdit = isSynced && !isDeleted && isOwn && !sealedShut;
   const plainNote = plaintextLabel(message);
+  const sealedFiles = message.files ?? [];
+  const plainFiles = plainAttachments(message);
   const canDelete = isSynced && !isDeleted && (isOwn || canModerate);
   const authorLabel = message.sender_name || 'Unknown';
 
@@ -299,7 +320,7 @@ export const MessageRow: React.FC<MessageRowProps> = ({
             ) : message.e2ee?.kind === 'failed' ? (
               <p className="chat-msg-locked is-error">Can't decrypt this message. {message.e2ee.reason}</p>
             ) : (
-              (message.body || message.attachments.length === 0) && (
+              (message.body || (sealedFiles.length === 0 && plainFiles.length === 0)) && (
                 <div className="chat-msg-body">
                   {renderFormattedBody(message.body)}
                   {grouped && message.edited_at && <span className="chat-msg-edited"> (edited)</span>}
@@ -308,12 +329,13 @@ export const MessageRow: React.FC<MessageRowProps> = ({
             )}
             {plainNote && <p className="chat-msg-e2ee-note">{plainNote}</p>}
 
-            {message.attachments.length > 0 && (
-              <p className="chat-msg-e2ee-note">{message.attachments.length === 1 ? 'File not encrypted' : 'Files not encrypted'}</p>
+            {sealedFiles.length > 0 && <SealedFiles files={sealedFiles} onPreview={onPreviewFile} />}
+            {plainFiles.length > 0 && (
+              <p className="chat-msg-e2ee-note">{plainFiles.length === 1 ? 'File not encrypted' : 'Files not encrypted'}</p>
             )}
-            {message.attachments.length > 0 && (
-              <div className="chat-attachments" aria-label="Attachments">
-                {message.attachments.map((att) =>
+            {plainFiles.length > 0 && (
+              <div className="chat-attachments" aria-label="Unencrypted attachments">
+                {plainFiles.map((att) =>
                   isInlineImageAttachment(att) ? (
                     <div key={att.id} className="chat-att-image-card">
                       <button

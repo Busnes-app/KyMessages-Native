@@ -1,9 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MessageRow } from './MessageRow';
-import type { ChatMessage } from '../../chat/types';
+import type { ChatAttachment, ChatMessage } from '../../chat/types';
+import { encryptBlob, type FileDescriptor } from '../../crypto/attachments';
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
 
 const baseMsg: ChatMessage = {
   id: 'm1',
@@ -285,6 +290,81 @@ describe('MessageRow', () => {
       cleanup();
       row({ ...sealed, body: '', e2ee: { kind: 'failed', reason: 'This message was encrypted for another room.' } });
       expect(screen.getByText("Can't decrypt this message. This message was encrypted for another room.")).toBeTruthy();
+    });
+
+    const att = (id: string): ChatAttachment => ({ id, tenant_id: 't1', room_id: 'r1', uploader_id: 'u1', filename: 'encrypted.bin', mime_type: 'application/octet-stream', size_bytes: 10, sha256_hex: '', created_at: 1 });
+
+    it('names encrypted files by their decrypted names and labels only the plaintext ones', () => {
+      const file = { attachment_id: 'att_sealed', name: 'budget.xlsx', size: 2048 } as FileDescriptor;
+      row({ ...sealed, body: '', files: [file], attachments: [att('att_sealed'), { ...att('att_old'), filename: 'old.pdf' }] });
+      expect(screen.getByRole('button', { name: 'Download budget.xlsx' })).toBeTruthy();
+      expect(screen.queryByText('encrypted.bin')).toBeNull();
+      // Only the upload no descriptor names is plaintext.
+      expect(screen.getByText('File not encrypted')).toBeTruthy();
+      expect(screen.getByRole('link', { name: /old\.pdf/ }).getAttribute('href')).toBe('/api/v1/attachments/att_old');
+    });
+
+    it('never calls the uploads of an unopened encrypted message plaintext', () => {
+      row({ ...sealed, body: '', e2ee: { kind: 'waiting' }, attachments: [att('att_x')] });
+      expect(screen.queryByText('File not encrypted')).toBeNull();
+      expect(screen.queryByRole('link')).toBeNull();
+    });
+
+    it('decrypts a thumbnail into a blob: URL and revokes it on unmount', async () => {
+      const png = new Uint8Array([137, 80, 78, 71, 1, 2, 3]);
+      const { ciphertext, sealed: t } = await encryptBlob(new Blob([png]), 'thumb');
+      const thumb = { ...t, attachment_id: 'att_thumb', mime_type: 'image/png', width: 4, height: 3 };
+      const file = { attachment_id: 'att_img', name: 'photo.png', mime_type: 'image/png', size: 9000, thumb } as FileDescriptor;
+      const fetched: string[] = [];
+      vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+        fetched.push(url);
+        return new Response(ciphertext);
+      }));
+      const made: Blob[] = [];
+      vi.spyOn(URL, 'createObjectURL').mockImplementation((b) => {
+        made.push(b as Blob);
+        return 'blob:thumb';
+      });
+      const revoke = vi.spyOn(URL, 'revokeObjectURL');
+      const onPreviewFile = vi.fn();
+      const { unmount } = render(
+        <MessageRow
+          message={{ ...sealed, body: '', files: [file], attachments: [att('att_img'), att('att_thumb')] }}
+          grouped={false}
+          currentUserId="u_bob"
+          canModerate={false}
+          onReply={vi.fn()}
+          onPreviewFile={onPreviewFile}
+          onToggleReaction={vi.fn()}
+          onEdit={vi.fn().mockResolvedValue(undefined)}
+          onDelete={vi.fn().mockResolvedValue(undefined)}
+          onRetryFailed={vi.fn()}
+          onDismissFailed={vi.fn()}
+        />,
+      );
+      const img = await screen.findByRole('img', { name: 'photo.png' });
+      expect(img.getAttribute('src')).toBe('blob:thumb');
+      // Only the thumbnail is fetched; the full image waits for a preview or download.
+      expect(fetched).toEqual(['/api/v1/attachments/att_thumb']);
+      expect(made[0].type).toBe('image/png');
+      expect(new Uint8Array(await made[0].arrayBuffer())).toEqual(png);
+      expect(screen.queryByText('File not encrypted')).toBeNull();
+      fireEvent.click(screen.getByRole('button', { name: 'Preview photo.png' }));
+      expect(onPreviewFile).toHaveBeenCalledWith(file);
+      unmount();
+      expect(revoke).toHaveBeenCalledWith('blob:thumb');
+    });
+
+    it('shows a tampered thumbnail as an error, never as an image', async () => {
+      const { ciphertext, sealed: t } = await encryptBlob(new Blob([new Uint8Array(5)]), 'thumb');
+      ciphertext[0] ^= 1;
+      const thumb = { ...t, attachment_id: 'att_thumb', mime_type: 'image/png', width: 4, height: 3 };
+      vi.stubGlobal('fetch', vi.fn(async () => new Response(ciphertext)));
+      const made = vi.spyOn(URL, 'createObjectURL');
+      row({ ...sealed, body: '', files: [{ attachment_id: 'att_img', name: 'photo.png', mime_type: 'image/png', size: 9, thumb } as FileDescriptor], attachments: [att('att_img'), att('att_thumb')] });
+      expect(await screen.findByText(/damaged or was changed/)).toBeTruthy();
+      expect(screen.queryByRole('img')).toBeNull();
+      expect(made).not.toHaveBeenCalled();
     });
   });
 });

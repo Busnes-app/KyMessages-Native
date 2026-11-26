@@ -95,6 +95,8 @@ export interface RoomInner {
   reply_to_id?: string;
   /** For an edit: the message it replaces, so the edit cannot be moved onto another one. */
   message_id?: string;
+  /** Encrypted attachment descriptors, checked by crypto/attachments.ts openFiles. */
+  files?: unknown[];
 }
 
 export interface RoomEnvelope {
@@ -212,12 +214,14 @@ function parseInner(s: string): RoomInner | undefined {
   if (!INNER_TYPES.includes(i.type as RoomMessageType)) return undefined;
   if (i.reply_to_id !== undefined && !isStr(i.reply_to_id, 128)) return undefined;
   if (i.message_id !== undefined && !isStr(i.message_id, 128)) return undefined;
+  if (i.files !== undefined && !Array.isArray(i.files)) return undefined;
   return {
     room_id: i.room_id,
     type: i.type as RoomMessageType,
     body: i.body,
     ...(i.reply_to_id ? { reply_to_id: i.reply_to_id as string } : {}),
     ...(i.message_id ? { message_id: i.message_id as string } : {}),
+    ...(i.files ? { files: i.files as unknown[] } : {}),
   };
 }
 

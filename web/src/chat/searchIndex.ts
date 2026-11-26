@@ -24,8 +24,9 @@ interface Entry {
   ct: ArrayBuffer;
 }
 
-// The fields kept for a hit: enough to show it and jump to it.
-export type SearchHit = Pick<ChatMessage, 'id' | 'room_id' | 'seq' | 'sender_id' | 'sender_name' | 'body' | 'created_at' | 'edited_at'>;
+// The fields kept for a hit: enough to show it and jump to it. `files` holds decrypted file
+// names only, never their keys.
+export type SearchHit = Pick<ChatMessage, 'id' | 'room_id' | 'seq' | 'sender_id' | 'sender_name' | 'body' | 'created_at' | 'edited_at'> & { files?: string[] };
 
 const dbName = (userId: string) => PREFIX + userId;
 
@@ -134,11 +135,12 @@ export class SearchIndex {
       // now (deleted, emptied, unreadable, not yet stored) also loses an earlier copy, so the
       // device never keeps old text it would not index now.
       const unread = m.encoding === 'e2ee_room_v1' && m.e2ee?.kind !== 'decrypted';
-      if (m.deleted_at || unread || !m.body.trim() || m.encoding === 'system_v1' || m.delivery.kind !== 'synced') {
+      const files = m.files?.map((f) => f.name) ?? [];
+      if (m.deleted_at || unread || (!m.body.trim() && files.length === 0) || m.encoding === 'system_v1' || m.delivery.kind !== 'synced') {
         drop.push(m.deleted_at ? { id: m.id } : { id: m.id, edited_at: m.edited_at ?? 0 });
         continue;
       }
-      const plain: SearchHit = { id: m.id, room_id: m.room_id, seq: m.seq, sender_id: m.sender_id, sender_name: m.sender_name, body: m.body, created_at: m.created_at, edited_at: m.edited_at };
+      const plain: SearchHit = { id: m.id, room_id: m.room_id, seq: m.seq, sender_id: m.sender_id, sender_name: m.sender_name, body: m.body, created_at: m.created_at, edited_at: m.edited_at, ...(files.length ? { files } : {}) };
       const iv = crypto.getRandomValues(new Uint8Array(12));
       const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, this.key, new TextEncoder().encode(JSON.stringify(plain)));
       keep.push({ id: m.id, room_id: m.room_id, created_at: m.created_at, edited_at: m.edited_at ?? 0, iv, ct });
@@ -282,7 +284,7 @@ export class SearchIndex {
         }),
       );
       for (const m of plain) {
-        const text = `${m.body}\n${m.sender_name}`.toLowerCase();
+        const text = [m.body, m.sender_name, ...(m.files ?? [])].join('\n').toLowerCase();
         if (!words.every((w) => text.includes(w))) continue;
         pending.push(m);
         if (pending.length >= limit - hits.length && (await flush())) return hits;

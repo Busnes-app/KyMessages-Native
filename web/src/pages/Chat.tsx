@@ -47,8 +47,10 @@ import {
   openDirectMessage,
   sendMessage,
   setReaction,
-  uploadAttachment,
 } from '../chat/client';
+import { discardUploads, uploadEncryptedFile } from '../chat/files';
+import { ciphertextSize, sealedIds, type FileDescriptor } from '../crypto/attachments';
+import { Lightbox, SealedLightbox } from '../components/chat/Attachments';
 import {
   applyReactionDelta,
   formatDayDivider,
@@ -83,7 +85,7 @@ import {
   type WsStatus,
 } from '../chat/types';
 import { ChatSidebar } from '../components/chat/ChatSidebar';
-import { MessageRow } from '../components/chat/MessageRow';
+import { MessageRow, attachmentSummary } from '../components/chat/MessageRow';
 import { RoomDetailsDrawer, type DrawerTab } from '../components/chat/RoomDetailsDrawer';
 import { CreateChannelModal, SearchModal, StartDMModal } from '../components/chat/ChatModals';
 import { searchIndexFor } from '../chat/searchIndex';
@@ -123,10 +125,14 @@ interface RoomMessageBucket {
   hasGapAfter?: boolean;
 }
 
+// `ready` holds the encrypted file's descriptor, key included; an `error` with an attachmentId is a
+// staged upload whose key this tab never had (a reload, another tab), which can only be removed.
 type StagedAttachment =
   | { kind: 'uploading'; localId: string; filename: string; sizeBytes: number; previewUrl?: string }
-  | { kind: 'ready'; localId: string; attachment: ChatAttachment; previewUrl?: string }
-  | { kind: 'error'; localId: string; filename: string; error: string };
+  | { kind: 'ready'; localId: string; file: FileDescriptor; previewUrl?: string }
+  | { kind: 'error'; localId: string; filename: string; error: string; attachmentId?: string };
+
+type LightboxTarget = { kind: 'plain'; attachment: ChatAttachment } | { kind: 'sealed'; file: FileDescriptor };
 
 const isMac =
   typeof navigator !== 'undefined' && /mac|iphone|ipad|ipod/i.test(navigator.platform || navigator.userAgent);
@@ -157,7 +163,7 @@ export const Chat: React.FC<ChatProps> = ({
   const [replyByRoom, setReplyByRoom] = useState<Record<string, ChatMessage | null>>({});
   const [stagedByRoom, setStagedByRoom] = useState<Record<string, StagedAttachment[]>>({});
   const [attachmentLimits, setAttachmentLimits] = useState<ChatAttachmentLimits>(DEFAULT_ATTACHMENT_LIMITS);
-  const [lightboxAttachment, setLightboxAttachment] = useState<ChatAttachment | null>(null);
+  const [lightboxAttachment, setLightboxAttachment] = useState<LightboxTarget | null>(null);
   const [dragActive, setDragActive] = useState(false);
   const [modal, setModal] = useState<ActiveModal>('none');
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -339,7 +345,8 @@ export const Chat: React.FC<ChatProps> = ({
   }, []);
 
   // Rebuild the tray from the server once per room: a reload or another tab may have left
-  // staged uploads that still count against the pending quota.
+  // staged uploads that still count against the pending quota. Their keys never left the tab that
+  // encrypted them, so here they can only be removed.
   const stagedFetchedRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     if (!activeRoomId || stagedFetchedRef.current.has(activeRoomId)) return;
@@ -350,11 +357,17 @@ export const Chat: React.FC<ChatProps> = ({
         setStagedByRoom((prev) => {
           const current = prev[roomId] ?? [];
           const known = new Set(
-            current.flatMap((item) => (item.kind === 'ready' ? [item.attachment.id] : [])),
+            current.flatMap((item) => (item.kind === 'ready' ? sealedIds([item.file]) : item.kind === 'error' && item.attachmentId ? [item.attachmentId] : [])),
           );
           const restored: StagedAttachment[] = list
             .filter((a) => !known.has(a.id))
-            .map((a) => ({ kind: 'ready', localId: a.id, attachment: a }));
+            .map((a) => ({
+              kind: 'error',
+              localId: a.id,
+              filename: a.filename,
+              attachmentId: a.id,
+              error: 'Uploaded in another tab or before a reload; remove it',
+            }));
           return restored.length ? { ...prev, [roomId]: [...restored, ...current] } : prev;
         });
       })
@@ -385,7 +398,7 @@ export const Chat: React.FC<ChatProps> = ({
   const hasUploadingAttachments = activeStaged.some((item) => item.kind === 'uploading');
   const readyStagedAttachments = activeStaged
     .filter((item): item is Extract<StagedAttachment, { kind: 'ready' }> => item.kind === 'ready')
-    .map((item) => item.attachment);
+    .map((item) => item.file);
 
   const setActiveDraft = useCallback((value: string) => {
     const rid = activeRoomIdRef.current;
@@ -1187,7 +1200,9 @@ export const Chat: React.FC<ChatProps> = ({
     (roomId: string, localId: string) => {
       const existing = (stagedByRoomRef.current[roomId] ?? []).find((item) => item.localId === localId);
       if (existing && existing.kind === 'ready') {
-        void deleteAttachment(existing.attachment.id).catch(() => {
+        discardUploads([existing.file]);
+      } else if (existing?.kind === 'error' && existing.attachmentId) {
+        void deleteAttachment(existing.attachmentId).catch(() => {
           // Best-effort cleanup; orphan sweep also expires abandoned uploads.
         });
       } else {
@@ -1233,17 +1248,8 @@ export const Chat: React.FC<ChatProps> = ({
 
       for (const file of accepted) {
         const localId = newIdempotencyKey();
-        if (file.size <= 0) {
-          setStagedByRoom((prev) => ({
-            ...prev,
-            [roomId]: [
-              ...(prev[roomId] ?? []),
-              { kind: 'error', localId, filename: file.name || 'file', error: 'File is empty' },
-            ],
-          }));
-          continue;
-        }
-        if (file.size > attachmentLimits.max_upload_bytes) {
+        // The server limit applies to the ciphertext.
+        if (ciphertextSize(file.size) > attachmentLimits.max_upload_bytes) {
           setStagedByRoom((prev) => ({
             ...prev,
             [roomId]: [
@@ -1282,17 +1288,15 @@ export const Chat: React.FC<ChatProps> = ({
         const controller = new AbortController();
         uploadControllersRef.current.set(localId, controller);
 
-        void uploadAttachment(roomId, file, controller.signal)
-          .then((att) => {
+        void uploadEncryptedFile(roomId, file, controller.signal)
+          .then((sealed) => {
             uploadControllersRef.current.delete(localId);
             let cleanedOrphan = false;
             const cleanupOrphan = () => {
               if (cleanedOrphan) return;
               cleanedOrphan = true;
               releasePreviewUrl(previewUrl);
-              void deleteAttachment(att.id).catch(() => {
-                // Best-effort cleanup; orphan sweep also expires abandoned uploads.
-              });
+              discardUploads([sealed]);
             };
             if (cancelledUploadsRef.current.delete(localId)) {
               cleanupOrphan();
@@ -1305,21 +1309,10 @@ export const Chat: React.FC<ChatProps> = ({
                 cleanupOrphan();
                 return prev;
               }
-              const inlineSafe = isInlineImageAttachment(att);
-              if (!inlineSafe) {
-                releasePreviewUrl(previewUrl);
-              }
               return {
                 ...prev,
                 [roomId]: list.map((item) =>
-                  item.localId === localId
-                    ? {
-                        kind: 'ready',
-                        localId,
-                        attachment: att,
-                        previewUrl: inlineSafe ? previewUrl : undefined,
-                      }
-                    : item,
+                  item.localId === localId ? { kind: 'ready', localId, file: sealed, previewUrl } : item,
                 ),
               };
             });
@@ -1352,7 +1345,7 @@ export const Chat: React.FC<ChatProps> = ({
     body: string,
     replyToId: string | undefined,
     clientKey: string,
-    attachments: ChatAttachment[] = [],
+    files: FileDescriptor[] = [],
   ) => {
     const me = currentUserRef.current;
     if (!me) return;
@@ -1370,7 +1363,8 @@ export const Chat: React.FC<ChatProps> = ({
       body,
       created_at: Date.now(),
       reactions: [],
-      attachments,
+      attachments: [],
+      ...(files.length > 0 ? { files } : {}),
       delivery: { kind: 'sending', idempotencyKey: clientKey },
     };
 
@@ -1395,7 +1389,7 @@ export const Chat: React.FC<ChatProps> = ({
         roomId,
         body,
         replyToId,
-        attachmentIds: attachments.map((a) => a.id),
+        files,
         idempotencyKey: clientKey,
       });
       setBuckets((prev) => {
@@ -1504,7 +1498,7 @@ export const Chat: React.FC<ChatProps> = ({
   const handleEditMessage = async (messageId: string, newBody: string) => {
     if (!activeRoomId) return;
     const original = bucketsRef.current[activeRoomId]?.messages.find((m) => m.id === messageId);
-    const updated = await editMessage(activeRoomId, messageId, newBody, original?.reply_to_id);
+    const updated = await editMessage(activeRoomId, messageId, newBody, original?.reply_to_id, original?.files);
     setBuckets((prev) => {
       const current = prev[activeRoomId];
       if (!current) return prev;
@@ -2296,7 +2290,8 @@ export const Chat: React.FC<ChatProps> = ({
                           onJumpToMessage={(seq) => {
                             void jumpToMessageSeq(activeRoom.id, seq);
                           }}
-                          onPreviewImage={(att) => setLightboxAttachment(att)}
+                          onPreviewImage={(att) => setLightboxAttachment({ kind: 'plain', attachment: att })}
+                          onPreviewFile={(file) => setLightboxAttachment({ kind: 'sealed', file })}
                           onToggleReaction={handleToggleReaction}
                           onEdit={handleEditMessage}
                           onDelete={handleDeleteMessage}
@@ -2307,7 +2302,7 @@ export const Chat: React.FC<ChatProps> = ({
                                 failed.body,
                                 failed.reply_to_id,
                                 failed.delivery.idempotencyKey,
-                                failed.attachments,
+                                failed.files,
                               );
                             }
                           }}
@@ -2316,11 +2311,7 @@ export const Chat: React.FC<ChatProps> = ({
                             const dismissed = bucketsRef.current[activeRoom.id]?.messages.find(
                               (m) => m.delivery.kind === 'failed' && m.delivery.idempotencyKey === key,
                             );
-                            for (const a of dismissed?.attachments ?? []) {
-                              void deleteAttachment(a.id).catch(() => {
-                                // Best-effort; the orphan sweep expires it otherwise.
-                              });
-                            }
+                            discardUploads(dismissed?.files ?? []);
                             setBuckets((prevBuckets) => {
                               const current = prevBuckets[activeRoom.id];
                               if (!current) return prevBuckets;
@@ -2374,10 +2365,7 @@ export const Chat: React.FC<ChatProps> = ({
                 <div className="chat-reply-banner">
                   <span className="chat-reply-banner-copy">
                     Replying to <strong>{replyTo.sender_name || 'Member'}</strong>:{' '}
-                    {replyTo.body ||
-                      (replyTo.attachments.length === 1
-                        ? `Attachment: ${replyTo.attachments[0].filename}`
-                        : `${replyTo.attachments.length} attachments`)}
+                    {replyTo.body || attachmentSummary(replyTo)}
                   </span>
                   <button
                     type="button"
@@ -2420,22 +2408,22 @@ export const Chat: React.FC<ChatProps> = ({
                       <span className="chat-staged-meta">
                         <span
                           className="chat-staged-name"
-                          title={item.kind === 'ready' ? item.attachment.filename : item.filename}
+                          title={item.kind === 'ready' ? item.file.name : item.filename}
                         >
-                          {item.kind === 'ready' ? item.attachment.filename : item.filename}
+                          {item.kind === 'ready' ? item.file.name : item.filename}
                         </span>
                         <span className="chat-staged-sub">
                           {item.kind === 'uploading'
                             ? `Uploading (${formatBytes(item.sizeBytes)})…`
                             : item.kind === 'ready'
-                              ? formatBytes(item.attachment.size_bytes)
+                              ? formatBytes(item.file.size)
                               : item.error}
                         </span>
                       </span>
                       <button
                         type="button"
                         className="chat-icon-btn chat-staged-remove"
-                        aria-label={`Remove ${item.kind === 'ready' ? item.attachment.filename : item.filename}`}
+                        aria-label={`Remove ${item.kind === 'ready' ? item.file.name : item.filename}`}
                         onClick={() => removeStagedAttachment(activeRoom.id, item.localId)}
                       >
                         <X size={13} />
@@ -2658,48 +2646,26 @@ export const Chat: React.FC<ChatProps> = ({
         />
       )}
 
-      {lightboxAttachment && (
-        <div
-          className="chat-lightbox-backdrop"
-          role="dialog"
-          aria-modal="true"
-          aria-label={`Image preview: ${lightboxAttachment.filename}`}
-          onClick={() => setLightboxAttachment(null)}
-        >
-          <div className="chat-lightbox-dialog" onClick={(e) => e.stopPropagation()}>
-            <div className="chat-lightbox-header">
-              <div className="chat-lightbox-title">
-                <strong>{lightboxAttachment.filename}</strong>
-                <span>{formatBytes(lightboxAttachment.size_bytes)}</span>
-              </div>
-              <div className="chat-lightbox-actions">
-                <a
-                  href={attachmentUrl(lightboxAttachment.id)}
-                  download={lightboxAttachment.filename}
-                  className="btn-secondary chat-lightbox-dl"
-                >
-                  <Download size={14} aria-hidden="true" />
-                  <span>Download</span>
-                </a>
-                <button
-                  type="button"
-                  className="chat-icon-btn"
-                  aria-label="Close image preview"
-                  onClick={() => setLightboxAttachment(null)}
-                >
-                  <X size={16} />
-                </button>
-              </div>
-            </div>
-            <div className="chat-lightbox-body">
-              <img
-                src={attachmentUrl(lightboxAttachment.id, true)}
-                alt={lightboxAttachment.filename}
-                className="chat-lightbox-img"
-              />
-            </div>
-          </div>
-        </div>
+      {lightboxAttachment?.kind === 'sealed' && (
+        <SealedLightbox file={lightboxAttachment.file} onClose={() => setLightboxAttachment(null)} />
+      )}
+      {lightboxAttachment?.kind === 'plain' && (
+        <Lightbox
+          name={lightboxAttachment.attachment.filename}
+          size={lightboxAttachment.attachment.size_bytes}
+          src={attachmentUrl(lightboxAttachment.attachment.id, true)}
+          onClose={() => setLightboxAttachment(null)}
+          download={
+            <a
+              href={attachmentUrl(lightboxAttachment.attachment.id)}
+              download={lightboxAttachment.attachment.filename}
+              className="btn-secondary chat-lightbox-dl"
+            >
+              <Download size={14} aria-hidden="true" />
+              <span>Download</span>
+            </a>
+          }
+        />
       )}
     </div>
   );

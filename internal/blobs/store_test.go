@@ -170,6 +170,24 @@ func TestStoreMIMESniffingAndXSSDowngrade(t *testing.T) {
 	}
 }
 
+func TestStoreOpaqueUploadIsNeverSniffed(t *testing.T) {
+	st, err := blobs.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	png := makePNG(t)
+	res, err := st.Put("default", "att_opaque_00001", blobs.Opaque(bytes.NewReader(png)), 1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.MimeType != "application/octet-stream" || res.SizeBytes != int64(len(png)) {
+		t.Fatalf("opaque Put = %+v, want application/octet-stream of %d bytes", res, len(png))
+	}
+	if _, err := st.Put("default", "att_opaque_00002", blobs.Opaque(bytes.NewReader(nil)), 1024); !errors.Is(err, blobs.ErrEmpty) {
+		t.Fatalf("empty opaque Put = %v, want ErrEmpty", err)
+	}
+}
+
 func TestSanitizeFilename(t *testing.T) {
 	cases := []struct {
 		in   string
