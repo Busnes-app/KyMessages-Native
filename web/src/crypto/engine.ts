@@ -260,6 +260,7 @@ export class CryptoEngine {
   private missedTransient = false;
   private readonly backupState = new Set<(full: boolean) => void>();
   private readonly adopted = new Set<() => void>();
+  private readonly verdicts = new Set<(e: Rollback | NotVerified) => void>();
   private readonly identity: Identity;
 
   private constructor(
@@ -357,13 +358,30 @@ export class CryptoEngine {
     return () => this.adopted.delete(fn);
   }
 
+  /** Calls fn when a live operation (mailbox read, room check, send, retry) hits Rollback or NotVerified. */
+  onVerdict(fn: (e: Rollback | NotVerified) => void): () => void {
+    this.verdicts.add(fn);
+    return () => this.verdicts.delete(fn);
+  }
+
+  private reportVerdict(e: unknown): void {
+    if (e instanceof Rollback || e instanceof NotVerified) {
+      for (const fn of this.verdicts) fn(e);
+    }
+  }
+
   /**
    * The work a retry resumes, awaited to the end: the mailbox, then the key backup restore in
    * progress and the backup queue (refused entries too). Throws what stopped it.
    */
   async resumeWork(): Promise<void> {
     await this.receive();
-    await this.identity.drain();
+    try {
+      await this.identity.drain();
+    } catch (e) {
+      this.reportVerdict(e);
+      throw e;
+    }
   }
 
   /** Calls fn with the IDs of room sessions whose keys just arrived; returns an unsubscribe. */
@@ -517,8 +535,9 @@ export class CryptoEngine {
       this.identity.afterWrites();
       throw new NotVerified();
     }
-    await this.store.write([...pins, ...devicePins]);
-    // All first sights in one shared compare-and-swap, before any of them gets a key.
+    await this.store.write(pins);
+    // All first sights in one shared compare-and-swap, before any of them gets a key or any new
+    // peer device pin is persisted: if the own identity moved, nothing new is pinned.
     let committed: Set<string>;
     try {
       committed = await this.identity.commitFirstSights(sights);
@@ -526,7 +545,7 @@ export class CryptoEngine {
       this.identity.afterWrites();
       pinSyncFailed(e);
     }
-    const later: [string, unknown][] = [];
+    const later: [string, unknown][] = [...devicePins];
     for (const [userId, ok] of proposed) {
       if (!committed.has(userId)) continue;
       for (const c of ok) {
@@ -636,7 +655,12 @@ export class CryptoEngine {
   /** Checks a room's members' identities when it opens, so a reader sees a change before sending. */
   checkRoom(roomId: string): Promise<void> {
     return this.locked(async () => {
-      await this.devicesInRoom(roomId);
+      try {
+        await this.devicesInRoom(roomId);
+      } catch (e) {
+        this.reportVerdict(e);
+        throw e;
+      }
     });
   }
 
@@ -800,57 +824,62 @@ export class CryptoEngine {
    */
   encrypt(roomId: string, inner: Omit<RoomInner, 'room_id'>): Promise<string> {
     return this.locked(async () => {
-      // An unverified device trusts no one, so its message would reach no one, silently: it is
-      // refused before any session is made or ratcheted, and sends once the device is verified.
-      // Holding the seeds is not enough: this device must be cross-signed by the identity the
-      // server publishes now and on its newest device list (not a stale or reset identity, not
-      // a replacement still enrolling, not a retired device), judged from the send's own query.
-      if (!(await this.identity.isVerified())) throw new NotVerified();
-      // devicesInRoom refuses (NotVerified) unless this device is trusted by the send's own query.
-      const { members, devices } = await this.devicesInRoom(roomId, { trusted: false });
-      const outKey = `out:${roomId}`;
-      let out = await this.store.get<OutboundRecord>(outKey);
-      let session = out ? GroupSession.fromPickle(out.pickle, this.key) : undefined;
       try {
-        if (!out || !session || this.mustRotate(out, session, members, devices)) {
-          session?.free();
-          session = new GroupSession();
-          out = { pickle: '', created_at: Date.now(), shared: {} };
-          // This device reads its own messages through an inbound copy, like everyone else.
-          const own = new InboundGroupSession(session.sessionKey());
-          try {
-            const k = inboundKey(this.curve25519, session.sessionId);
-            await this.store.write([[k, {
-              pickle: own.pickle(this.key),
-              room_id: roomId,
-              sender_user: this.userId,
-              sender_device: this.deviceId,
-              sender_key: this.curve25519,
-              first_index: own.firstKnownIndex,
-              verified: true,
-            } satisfies InboundRecord], [backupQueueKey(k), k]]);
-            this.backupSoon();
-          } finally {
-            own.free();
+        // An unverified device trusts no one, so its message would reach no one, silently: it is
+        // refused before any session is made or ratcheted, and sends once the device is verified.
+        // Holding the seeds is not enough: this device must be cross-signed by the identity the
+        // server publishes now and on its newest device list (not a stale or reset identity, not
+        // a replacement still enrolling, not a retired device), judged from the send's own query.
+        if (!(await this.identity.isVerified())) throw new NotVerified();
+        // devicesInRoom refuses (NotVerified) unless this device is trusted by the send's own query.
+        const { members, devices } = await this.devicesInRoom(roomId, { trusted: false });
+        const outKey = `out:${roomId}`;
+        let out = await this.store.get<OutboundRecord>(outKey);
+        let session = out ? GroupSession.fromPickle(out.pickle, this.key) : undefined;
+        try {
+          if (!out || !session || this.mustRotate(out, session, members, devices)) {
+            session?.free();
+            session = new GroupSession();
+            out = { pickle: '', created_at: Date.now(), shared: {} };
+            // This device reads its own messages through an inbound copy, like everyone else.
+            const own = new InboundGroupSession(session.sessionKey());
+            try {
+              const k = inboundKey(this.curve25519, session.sessionId);
+              await this.store.write([[k, {
+                pickle: own.pickle(this.key),
+                room_id: roomId,
+                sender_user: this.userId,
+                sender_device: this.deviceId,
+                sender_key: this.curve25519,
+                first_index: own.firstKnownIndex,
+                verified: true,
+              } satisfies InboundRecord], [backupQueueKey(k), k]]);
+              this.backupSoon();
+            } finally {
+              own.free();
+            }
           }
+          const need = devices.filter((d) => out!.shared[devKey(d)] !== d.curve25519);
+          if (need.length > 0) {
+            for (const t of await this.shareRoomKey(roomId, session, need)) out.shared[devKey(t)] = t.curve25519;
+          }
+          const full: RoomInner = { ...inner, room_id: roomId };
+          const ciphertext = session.encrypt(JSON.stringify(full));
+          await this.store.write([[outKey, { ...out, pickle: session.pickle(this.key) } satisfies OutboundRecord]]);
+          const envelope: RoomEnvelope = {
+            alg: 'megolm.v1',
+            sender_key: this.curve25519,
+            device_id: this.deviceId,
+            session_id: session.sessionId,
+            ciphertext,
+          };
+          return JSON.stringify(envelope);
+        } finally {
+          session?.free();
         }
-        const need = devices.filter((d) => out!.shared[devKey(d)] !== d.curve25519);
-        if (need.length > 0) {
-          for (const t of await this.shareRoomKey(roomId, session, need)) out.shared[devKey(t)] = t.curve25519;
-        }
-        const full: RoomInner = { ...inner, room_id: roomId };
-        const ciphertext = session.encrypt(JSON.stringify(full));
-        await this.store.write([[outKey, { ...out, pickle: session.pickle(this.key) } satisfies OutboundRecord]]);
-        const envelope: RoomEnvelope = {
-          alg: 'megolm.v1',
-          sender_key: this.curve25519,
-          device_id: this.deviceId,
-          session_id: session.sessionId,
-          ciphertext,
-        };
-        return JSON.stringify(envelope);
-      } finally {
-        session?.free();
+      } catch (e) {
+        this.reportVerdict(e);
+        throw e;
       }
     });
   }
@@ -918,6 +947,9 @@ export class CryptoEngine {
     let usedOneTimeKey = false;
     try {
       await this.receiveLocked(fresh, () => (usedOneTimeKey = true));
+    } catch (e) {
+      this.reportVerdict(e);
+      throw e;
     } finally {
       // Keys already stored are announced even if a later ack or mailbox read fails: a retry
       // would find them known and announce nothing, leaving waiting messages stuck.
@@ -975,8 +1007,9 @@ export class CryptoEngine {
     try {
       return new Set((await this.verifiedDevices(users)).map((t) => `${devKey(t)}\n${t.curve25519}`));
     } catch (e) {
-      // A rolled-back pin set is a verdict: the mail stays queued and the gate shows it.
-      if (isTransient(e) || e instanceof Rollback) throw e;
+      // A rolled-back pin/device list or moved/unverified identity is a permanent verdict: the
+      // mail stays queued without burning the transient retry budget, and the gate refreshes.
+      if (isTransient(e) || e instanceof Rollback || e instanceof NotVerified) throw e;
       throw new Transient(e instanceof Error ? e.message : 'Could not check the senders');
     }
   }

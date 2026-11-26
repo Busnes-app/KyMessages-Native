@@ -1646,7 +1646,7 @@ describe('Round 7: from a consumed transfer to adoption', () => {
     await expect(laptop.restoreIdentity(rk)).rejects.toThrow(/two device lists/);
     expect(adopted).not.toHaveBeenCalled();
     const s = await openCryptoStore('alice_laptop');
-    expect(await s.get('identity:enrolling')).toBe(true);
+    expect(await s.get('identity:enrolling')).toMatchObject({ version: 1 });
     s.close();
     expect(await laptop.identityStatus()).toMatchObject({ state: 'verified', problem: 'fork' });
   });
@@ -1791,7 +1791,7 @@ describe('Round 8: seeds stored are announced', () => {
     expect(changed).toHaveBeenCalled();
     const s = await openCryptoStore('alice_laptop');
     expect(await s.get('identity')).toBeDefined();
-    expect(await s.get('identity:enrolling')).toBe(true);
+    expect(await s.get('identity:enrolling')).toMatchObject({ version: 1 });
     s.close();
   });
 });
@@ -1844,7 +1844,7 @@ describe('Round 8: confirming enrollment against every authenticated list', () =
     // The server's list (older, naming the laptop) is a rollback now.
     await expect(c.laptop.resumeWork()).rejects.toThrow(/older device list/);
     expect(c.adopted).not.toHaveBeenCalled();
-    expect(await enrolling()).toBe(true);
+    expect(await enrolling()).toMatchObject({ version: 1 });
   });
 
   it('marks a fork on another list at the same epoch leaving the device out', async () => {
@@ -1857,7 +1857,7 @@ describe('Round 8: confirming enrollment against every authenticated list', () =
     await expect(c.laptop.restoreIdentity(c.rk)).rejects.toThrow(/two device lists/);
     await expect(c.laptop.resumeWork()).rejects.toThrow(/two device lists/);
     expect(c.adopted).not.toHaveBeenCalled();
-    expect(await enrolling()).toBe(true);
+    expect(await enrolling()).toMatchObject({ version: 1 });
     expect(await c.laptop.identityStatus()).toMatchObject({ state: 'verified', problem: 'fork' });
   });
 
@@ -1941,5 +1941,206 @@ describe('Round 8: trust verdicts and this device\'s own keys', () => {
     const s = await openCryptoStore('u_alice');
     expect((await s.list('pin:')).filter(([k]) => k.includes('u_bob'))).toHaveLength(0);
     s.close();
+  });
+});
+
+describe('Round 9: transfer PQC retry, post-commit availability, atomic enrollment & deferred device pins', () => {
+  it('retries transferOpen on PQCUnavailable without re-consuming the pairing transfer', async () => {
+    const server = new FakeKeyServer();
+    const [phone] = await firstDevice(server, 'u_alice', 'alice_phone');
+    const api = server.as('u_alice');
+    let consumes = 0;
+    const consume = api.pairingConsume;
+    api.pairingConsume = async (...a) => { consumes++; return consume(...a); };
+    const laptop = await open(server, 'u_alice', 'alice_laptop', api);
+
+    const offer = await phone.offerVerification();
+    const join = await laptop.joinVerification(offer.text);
+    expect(await offer.poll()).toEqual({ code: join.code, device: laptop.deviceId });
+    await offer.approve();
+
+    const realOpen = pqc.transferOpen;
+    let calls = 0;
+    vi.spyOn(pqc, 'transferOpen').mockImplementation((...args) => {
+      if (++calls === 1) throw new PQCUnavailable('wasm restarted');
+      return realOpen(...args);
+    });
+
+    await join.finish();
+    expect(consumes).toBe(1);
+    expect(calls).toBe(2);
+    expect(await laptop.identityStatus()).toMatchObject({ state: 'verified' });
+  });
+
+  it('fails definitively without retrying when transferOpen rejects bad transfer data', async () => {
+    const server = new FakeKeyServer();
+    const [phone] = await firstDevice(server, 'u_alice', 'alice_phone');
+    const laptop = await open(server, 'u_alice', 'alice_laptop');
+    const offer = await phone.offerVerification();
+    const join = await laptop.joinVerification(offer.text);
+    expect(await offer.poll()).toEqual({ code: join.code, device: laptop.deviceId });
+    await offer.approve();
+
+    const spy = vi.spyOn(pqc, 'transferOpen').mockImplementation(() => { throw new Error('bad transfer'); });
+    await expect(join.finish()).rejects.toThrow(/did not open/);
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats a transient post-commit storage failure in adopt as retryable while announcing durable seeds', async () => {
+    const server = new FakeKeyServer();
+    const [, rk] = await firstDevice(server, 'u_alice', 'alice_phone');
+    const store = await openCryptoStore('alice_laptop');
+    const realList = store.list.bind(store);
+    let failPostCommit = true;
+    store.list = (async (prefix: string) => {
+      if (prefix === 'bqf:' && failPostCommit && (await store.get('identity')) !== undefined) {
+        failPostCommit = false;
+        throw new DOMException('database temporarily busy', 'UnknownError');
+      }
+      return realList(prefix);
+    }) as typeof store.list;
+    const laptop = await CryptoEngine.open('u_alice', server.as('u_alice'), store);
+    opened.push(laptop);
+    const changed = vi.fn();
+    const retry = vi.fn();
+    laptop.onIdentityChange(changed);
+    laptop.onTransient(retry);
+
+    await expect(laptop.restoreIdentity(rk)).resolves.toBe(0);
+    expect(changed).toHaveBeenCalled();
+    expect(retry).toHaveBeenCalled();
+    expect(await store.get('identity')).toBeDefined();
+  });
+
+  it('observes a missing device_list on the authenticated current master as Rollback, keeps ENROLLING, and does not deadlock status()', async () => {
+    const server = new FakeKeyServer();
+    const [, rk] = await firstDevice(server, 'u_alice', 'alice_phone');
+    const api = server.as('u_alice');
+    const putList = api.putDeviceList;
+    const getMaster = api.getMaster;
+    let stripList = false;
+    api.putDeviceList = async (...a) => { await putList(...a); stripList = true; };
+    api.getMaster = async (sig) => {
+      const r = await getMaster(sig);
+      if (stripList && r.master) {
+        return { ...r, master: { ...r.master, device_list: undefined } };
+      }
+      return r;
+    };
+    const laptop = await open(server, 'u_alice', 'alice_laptop', api);
+    const adopted = vi.fn();
+    laptop.onAdopted(adopted);
+
+    await expect(laptop.restoreIdentity(rk)).rejects.toBeInstanceOf(Rollback);
+    expect(adopted).not.toHaveBeenCalled();
+    const s = await openCryptoStore('alice_laptop');
+    expect(await s.get('identity:enrolling')).toMatchObject({ version: 1 });
+    s.close();
+    // status() already holds the per-user lock; enrolled(true, l) must not re-lock/deadlock
+    // and must report the missing-list rollback verdict.
+    expect(await laptop.identityStatus()).toMatchObject({ state: 'verified', problem: 'rollback' });
+  });
+
+  it('does not let an older enrollment confirmation remove a newer enrollment marker', async () => {
+    const server = new FakeKeyServer();
+    const [, rk1] = await firstDevice(server, 'u_alice', 'alice_phone');
+    const api = server.as('u_alice');
+    const putList = api.putDeviceList;
+    let injectedNewer = false;
+    api.putDeviceList = async (...a) => {
+      await putList(...a);
+      if (!injectedNewer) {
+        injectedNewer = true;
+        // Between unlocked ensureListed(v1) and locked enrolled(false, v1), a newer enrollment (v2)
+        // takes over local state under the per-user lock.
+        const s = await openCryptoStore('alice_laptop');
+        const id = await s.get<Record<string, unknown>>('identity');
+        await s.write([
+          ['identity', { ...id, version: 2, fingerprint: 'ff'.repeat(32) }],
+          ['identity:enrolling', { tenant_id: TENANT, version: 2, fingerprint: 'ff'.repeat(32) }],
+        ]);
+        s.close();
+      }
+    };
+    const laptop = await open(server, 'u_alice', 'alice_laptop', api);
+    const adopted = vi.fn();
+    laptop.onAdopted(adopted);
+
+    await laptop.restoreIdentity(rk1);
+    expect(adopted).not.toHaveBeenCalled();
+    const s = await openCryptoStore('alice_laptop');
+    expect(await s.get('identity:enrolling')).toEqual({ tenant_id: TENANT, version: 2, fingerprint: 'ff'.repeat(32) });
+    s.close();
+  });
+
+  it('defers new device pins of already-pinned peers as well as fresh peers until commitFirstSights succeeds', async () => {
+    const server = new FakeKeyServer();
+    const api = server.as('u_alice');
+    const query = api.query;
+    let resetDuringSend = false;
+    api.query = async (...a) => {
+      const r = await query(...a);
+      if (resetDuringSend) {
+        resetDuringSend = false;
+        await resetOnServer(server, 'u_alice');
+      }
+      return r;
+    };
+    const alice = await open(server, 'u_alice', 'u_alice', api);
+    await (await alice.prepareIdentity()).commit();
+    const [bob1, bobRk] = await firstDevice(server, 'u_bob', 'bob_1');
+    server.join('r1', 'u_alice', 'u_bob');
+    // Alice sends once so Bob (and bob1) is already pinned and r1 has an outbound session.
+    await alice.encrypt('r1', { type: 'text', body: 'first' });
+
+    const sBefore = await openCryptoStore('u_alice');
+    const outBefore = await sBefore.get('out:r1');
+    expect(await sBefore.get(`pin:u_bob\n${bob1.deviceId}`)).toBeDefined();
+    sBefore.close();
+
+    // Now Bob enrolls a second device (new device on an already-pinned peer) and Carol joins (fresh peer).
+    const bob2 = await open(server, 'u_bob', 'bob_2');
+    await bob2.restoreIdentity(bobRk);
+    const [carol1] = await firstDevice(server, 'u_carol', 'carol_1');
+    server.join('r1', 'u_carol');
+
+    // During Alice's send, her identity moves before commitFirstSights runs.
+    resetDuringSend = true;
+    await expect(alice.encrypt('r1', { type: 'text', body: 'must fail' })).rejects.toBeInstanceOf(NotVerified);
+
+    const sAfter = await openCryptoStore('u_alice');
+    // Previously pinned bob1 stays, but neither bob2 (new device of already-pinned peer)
+    // nor carol1 (fresh peer) nor any outbound ratchet update was persisted.
+    expect(await sAfter.get(`pin:u_bob\n${bob1.deviceId}`)).toBeDefined();
+    expect(await sAfter.get(`pin:u_bob\n${bob2.deviceId}`)).toBeUndefined();
+    expect(await sAfter.get(`pin:u_carol\n${carol1.deviceId}`)).toBeUndefined();
+    expect(await sAfter.get('mpin:u_carol')).toBeUndefined();
+    expect(await sAfter.get('out:r1')).toEqual(outBefore);
+    sAfter.close();
+  });
+
+  it('preserves NotVerified as a permanent verdict through receive(), keeps mail queued, and fires onVerdict', async () => {
+    const server = new FakeKeyServer();
+    const [alice] = await firstDevice(server, 'u_alice', 'alice_1');
+    const [bob] = await firstDevice(server, 'u_bob', 'bob_1');
+    server.join('r1', 'u_alice', 'u_bob');
+    await send('r1', bob, 'hello before reset');
+    const waiting = () => server.mail.get(`u_alice\n${alice.deviceId}`)?.length ?? 0;
+    expect(waiting()).toBeGreaterThan(0);
+
+    // Move Alice's identity on the server so her commitFirstSights fails with IdentityMoved -> NotVerified.
+    await resetOnServer(server, 'u_alice');
+    const verdicts: unknown[] = [];
+    alice.onVerdict((e) => verdicts.push(e));
+    let caught: unknown;
+    try {
+      await alice.receive();
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(NotVerified);
+    expect(isTransient(caught)).toBe(false);
+    expect(verdicts).toEqual([caught]);
+    expect(waiting()).toBeGreaterThan(0);
   });
 });

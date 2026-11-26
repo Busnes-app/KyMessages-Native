@@ -1,8 +1,8 @@
 import 'fake-indexeddb/auto';
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { abandonDevice, encryptionReadyFor, encryptionRetry, identityStatus, onIdentityChanged, StaleStatus, ownDeviceVerified, prepareIdentity, restoreIdentity, forgetCryptoStore, keyGeneration, NOT_YET, onRoomKeys, openMessage, receiveRoomKeys, replaceDevice, RETIRE_MS, retireDevice, retryable, retryEncryptionNow, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
-import { CryptoEngine, EARLY } from '../crypto/engine';
+import { abandonDevice, acceptIdentity, checkRoomIdentities, encryptionReadyFor, encryptionRetry, identityStatus, onIdentityChanged, StaleStatus, ownDeviceVerified, prepareIdentity, restoreIdentity, forgetCryptoStore, keyGeneration, NOT_YET, onRoomKeys, openMessage, receiveRoomKeys, replaceDevice, RETIRE_MS, retireDevice, retryable, retryEncryptionNow, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
+import { CryptoEngine, EARLY, NotVerified } from '../crypto/engine';
 import { FakeKeyServer, TENANT } from '../crypto/fakeKeyServer';
 import { pqc } from '../pqc/index';
 import { isTransient } from '../crypto/records';
@@ -1204,7 +1204,7 @@ describe('Round 8: status and start-ups around a device reset', () => {
     const announced = vi.fn();
     const off = onIdentityChanged(announced);
     const otherTab = new BroadcastChannel('kymessages-room-keys');
-    otherTab.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId });
+    otherTab.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId, op: 'op-1' });
     await vi.waitFor(() => expect(encryptionReadyFor('u_alice')).toBe(false));
     const uploads = s.uploads;
     const fresh = identityStatus();
@@ -1215,7 +1215,7 @@ describe('Round 8: status and start-ups around a device reset', () => {
     const store = await openCryptoStore('u_alice');
     await CryptoEngine.resetDevice('u_alice', first.deviceId, store);
     store.close();
-    otherTab.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: first.deviceId });
+    otherTab.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: first.deviceId, op: 'op-1' });
     await vi.waitFor(() => expect(announced).toHaveBeenCalled());
     expect(await fresh).toMatchObject({ state: 'verified' });
     expect((await startE2EE('u_alice')).deviceId).not.toBe(first.deviceId);
@@ -1230,20 +1230,424 @@ describe('Round 8: status and start-ups around a device reset', () => {
     await (await prepareIdentity()).commit();
     await new Promise((r) => setTimeout(r, 100));
     const otherTab = new BroadcastChannel('kymessages-room-keys');
-    otherTab.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId });
+    otherTab.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId, op: 'op-dup' });
     await vi.waitFor(() => expect(encryptionReadyFor('u_alice')).toBe(false));
     const uploads = s.uploads;
-    // Start a status check waiting on the first hold, then send a duplicate device-reset.
+    // Start a status check waiting on the first hold, then send a duplicate device-reset for the same op.
     const fresh = identityStatus();
-    otherTab.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId });
+    otherTab.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId, op: 'op-dup' });
     await tick();
     expect(s.uploads).toBe(uploads);
     const store = await openCryptoStore('u_alice');
     await CryptoEngine.resetDevice('u_alice', first.deviceId, store);
     store.close();
-    otherTab.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: first.deviceId });
+    otherTab.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: first.deviceId, op: 'op-dup' });
     expect(await fresh).toMatchObject({ state: 'verified' });
     expect((await startE2EE('u_alice')).deviceId).not.toBe(first.deviceId);
     otherTab.close();
+  });
+});
+
+describe('Round 9: correlated reset holds, direct restart, live verdicts & hygiene', () => {
+  function serveUser(server: FakeKeyServer, userRef: { current: string }, hooks?: {
+    onUpload?: () => void;
+    holdUpload?: () => Promise<undefined> | undefined;
+    holdMaster?: () => Promise<undefined> | undefined;
+  }) {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      const method = (init?.method ?? 'GET').toUpperCase();
+      const path = new URL(url, 'http://localhost').pathname;
+      const fn = httpFake(server, userRef.current, {
+        fn: () => {
+          if (method === 'POST' && path === '/api/v1/keys/upload') {
+            hooks?.onUpload?.();
+            return hooks?.holdUpload?.();
+          }
+          if (method === 'GET' && path === '/api/v1/keys/master') {
+            return hooks?.holdMaster?.();
+          }
+          return undefined;
+        },
+      });
+      return fn(input, init);
+    }));
+  }
+  const tick = () => new Promise((r) => setTimeout(r, 50));
+
+  it('correlates two peers\' overlapping holds, ignores mismatched/duplicate notices, and resolves fresh status only after both settle', async () => {
+    const server = new FakeKeyServer();
+    let uploads = 0;
+    serveUser(server, { current: 'u_alice' }, { onUpload: () => { uploads++; } });
+    const first = await startE2EE('u_alice');
+    await (await prepareIdentity()).commit();
+    await tick();
+
+    const ch = new BroadcastChannel('kymessages-room-keys');
+    ch.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId, op: 'op-a' });
+    await vi.waitFor(() => expect(encryptionReadyFor('u_alice')).toBe(false));
+    // Duplicate of op-a plus an independent second peer op-b.
+    ch.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId, op: 'op-a' });
+    ch.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId, op: 'op-b' });
+    const uploadsBefore = uploads;
+    const fresh = identityStatus();
+    await tick();
+    expect(uploads).toBe(uploadsBefore);
+
+    // Mismatched completion does nothing.
+    ch.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: first.deviceId, op: 'op-unknown' });
+    await tick();
+    expect(uploads).toBe(uploadsBefore);
+
+    // Completing op-a does not release while op-b is still pending.
+    ch.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: first.deviceId, op: 'op-a' });
+    await tick();
+    expect(uploads).toBe(uploadsBefore);
+
+    // Completing op-b releases the hold and restarts with the replacement device.
+    const store = await openCryptoStore('u_alice');
+    await CryptoEngine.resetDevice('u_alice', first.deviceId, store);
+    store.close();
+    ch.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: first.deviceId, op: 'op-b' });
+    expect(await fresh).toMatchObject({ state: 'verified' });
+    expect((await startE2EE('u_alice')).deviceId).not.toBe(first.deviceId);
+    ch.close();
+  });
+
+  it('tracks timeouts per peer attempt so a timed-out first op does not clear a later active hold', async () => {
+    const server = new FakeKeyServer();
+    let uploads = 0;
+    serveUser(server, { current: 'u_alice' }, { onUpload: () => { uploads++; } });
+    const first = await startE2EE('u_alice');
+    await (await prepareIdentity()).commit();
+    await tick();
+
+    const ch = new BroadcastChannel('kymessages-room-keys');
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      ch.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId, op: 'op-1' });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(encryptionReadyFor('u_alice')).toBe(false);
+      const uploadsBefore = uploads;
+
+      // Halfway through op-1's fallback window, op-2 arrives.
+      await vi.advanceTimersByTimeAsync(6_000);
+      ch.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId, op: 'op-2' });
+      await vi.advanceTimersByTimeAsync(10);
+
+      // op-1's 10s fallback expires at t=10s, but op-2 is still pending so nothing restarts yet.
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(uploads).toBe(uploadsBefore);
+
+      // A late completion for the already-timed-out op-1 is ignored.
+      ch.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: first.deviceId, op: 'op-1' });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(uploads).toBe(uploadsBefore);
+
+      // op-2's completion releases the hold and triggers the direct restart.
+      vi.useRealTimers();
+      const store = await openCryptoStore('u_alice');
+      await CryptoEngine.resetDevice('u_alice', first.deviceId, store);
+      store.close();
+      ch.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: first.deviceId, op: 'op-2' });
+      await vi.waitFor(() => expect(encryptionReadyFor('u_alice')).toBe(true));
+      expect((await startE2EE('u_alice')).deviceId).not.toBe(first.deviceId);
+    } finally {
+      vi.useRealTimers();
+      ch.close();
+    }
+  });
+
+  it('restarts the still-current entry directly when the final peer hold resolves, even with no gate listener', async () => {
+    const server = new FakeKeyServer();
+    let uploads = 0;
+    serveUser(server, { current: 'u_alice' }, { onUpload: () => { uploads++; } });
+    const first = await startE2EE('u_alice');
+    await (await prepareIdentity()).commit();
+    await tick();
+
+    // No onIdentityChanged listener subscribed at all.
+    const ch = new BroadcastChannel('kymessages-room-keys');
+    ch.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId, op: 'op-direct' });
+    await vi.waitFor(() => expect(encryptionReadyFor('u_alice')).toBe(false));
+    const uploadsBefore = uploads;
+    const store = await openCryptoStore('u_alice');
+    await CryptoEngine.resetDevice('u_alice', first.deviceId, store);
+    store.close();
+    ch.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: first.deviceId, op: 'op-direct' });
+
+    await vi.waitFor(() => expect(encryptionReadyFor('u_alice')).toBe(true));
+    expect(uploads).toBeGreaterThan(uploadsBefore);
+    expect((await startE2EE('u_alice')).deviceId).not.toBe(first.deviceId);
+    ch.close();
+  });
+
+  it('carries no peer-reset restart across sign-out or account switch', async () => {
+    const server = new FakeKeyServer();
+    const userRef = { current: 'u_alice' };
+    let uploads = 0;
+    serveUser(server, userRef, { onUpload: () => { uploads++; } });
+    const alice = await startE2EE('u_alice');
+    await tick();
+
+    const ch = new BroadcastChannel('kymessages-room-keys');
+    ch.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: alice.deviceId, op: 'op-signout' });
+    await vi.waitFor(() => expect(encryptionReadyFor('u_alice')).toBe(false));
+
+    // Sign out and switch to u_bob before op-signout finishes.
+    await forgetCryptoStore();
+    userRef.current = 'u_bob';
+    const bob = await startE2EE('u_bob');
+    await tick();
+    const uploadsBob = uploads;
+
+    ch.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: alice.deviceId, op: 'op-signout' });
+    await tick();
+    expect(uploads).toBe(uploadsBob);
+    expect(encryptionReadyFor('u_bob')).toBe(true);
+    expect(encryptionReadyFor('u_alice')).toBe(false);
+    expect((await startE2EE('u_bob')).deviceId).toBe(bob.deviceId);
+    ch.close();
+  });
+
+  it('does not let a peer completion bypass an overlapping local replaceDevice or a second replaceDevice overwrite the local fence', async () => {
+    const server = new FakeKeyServer();
+    let uploads = 0;
+    serveUser(server, { current: 'u_alice' }, { onUpload: () => { uploads++; } });
+    const first = await startE2EE('u_alice');
+    await (await prepareIdentity()).commit();
+    await tick();
+
+    let releaseLocalReset!: () => void;
+    const localBlocked = new Promise<void>((r) => { releaseLocalReset = r; });
+    const realReset = CryptoEngine.resetDevice.bind(CryptoEngine);
+    let resetCalls = 0;
+    vi.spyOn(CryptoEngine, 'resetDevice').mockImplementation(async (...args) => {
+      resetCalls++;
+      await localBlocked;
+      return realReset(...args);
+    });
+
+    const uploadsBefore = uploads;
+    const r1 = replaceDevice(first.deviceId);
+    await vi.waitFor(() => expect(resetCalls).toBe(1));
+    // Second replaceDevice call after invalidation joins the active local fence instead of overwriting it.
+    const r2 = replaceDevice(first.deviceId);
+    expect(resetCalls).toBe(1);
+
+    // Overlapping peer reset starts and finishes while the local reset is still blocked.
+    const ch = new BroadcastChannel('kymessages-room-keys');
+    ch.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId, op: 'op-overlap' });
+    await tick();
+    ch.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: first.deviceId, op: 'op-overlap' });
+    await tick();
+    // Peer completion must NOT bypass the still-running local reset hold.
+    expect(uploads).toBe(uploadsBefore);
+
+    // A second peer op starts while local is still running; releasing local alone still waits for op-after.
+    ch.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId, op: 'op-after' });
+    await tick();
+    releaseLocalReset();
+    await tick();
+    expect(uploads).toBe(uploadsBefore);
+
+    // Once op-after finishes, both r1 and r2 complete and start the replacement device.
+    ch.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: first.deviceId, op: 'op-after' });
+    await Promise.all([r1, r2]);
+    expect(resetCalls).toBe(1);
+    expect(uploads).toBeGreaterThan(uploadsBefore);
+    expect((await startE2EE('u_alice')).deviceId).not.toBe(first.deviceId);
+    ch.close();
+  });
+
+  it('maps a fresh status check awaiting restart to StaleStatus when signed out or invalidated mid-restart', async () => {
+    const server = new FakeKeyServer();
+    let releaseUpload!: () => void;
+    let holdNextUpload = false;
+    serveUser(server, { current: 'u_alice' }, {
+      holdUpload: () => {
+        if (!holdNextUpload) return undefined;
+        holdNextUpload = false;
+        return new Promise<undefined>((r) => { releaseUpload = () => r(undefined); });
+      },
+    });
+    const first = await startE2EE('u_alice');
+    await tick();
+
+    const ch = new BroadcastChannel('kymessages-room-keys');
+    ch.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId, op: 'op-stale' });
+    await vi.waitFor(() => expect(encryptionReadyFor('u_alice')).toBe(false));
+
+    // Fresh status check awaits the peer hold, then sign-out cancels it -> StaleStatus.
+    const freshSignOut = identityStatus().catch((e: unknown) => e);
+    await forgetCryptoStore();
+    ch.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: first.deviceId, op: 'op-stale' });
+    expect(await freshSignOut).toBeInstanceOf(StaleStatus);
+
+    // Now test mid-restart invalidation: start again, invalidate via peer reset, let restart block on upload,
+    // then sign out before upload finishes -> StaleStatus.
+    const second = await startE2EE('u_alice');
+    await tick();
+    ch.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: second.deviceId, op: 'op-mid' });
+    await vi.waitFor(() => expect(encryptionReadyFor('u_alice')).toBe(false));
+    holdNextUpload = true;
+    const freshMid = identityStatus().catch((e: unknown) => e);
+    const store = await openCryptoStore('u_alice');
+    await CryptoEngine.resetDevice('u_alice', second.deviceId, store);
+    store.close();
+    ch.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: second.deviceId, op: 'op-mid' });
+    await tick();
+    await forgetCryptoStore();
+    releaseUpload?.();
+    expect(await freshMid).toBeInstanceOf(StaleStatus);
+    ch.close();
+  });
+
+  async function resetMasterOnServer(server: FakeKeyServer, userId: string): Promise<string> {
+    const m = pqc.masterGenerate();
+    const b = pqc.xwingGenerate();
+    const rk = pqc.recoveryGenerate();
+    const cur = server.masters.get(userId)!;
+    const version = cur.version + 1;
+    await server.as(userId).putMaster({
+      expected_version: cur.version,
+      master_key: m.public_key,
+      self_signature: pqc.signMaster(m.seed, TENANT, userId),
+      backup_key: { public_key: b.public, signature: pqc.signBackupKey(m.seed, TENANT, userId, version, b.public) },
+      recovery: {
+        wrapped_master_key: pqc.recoveryWrap(rk.key, 'master-key', TENANT, userId, m.seed),
+        wrapped_backup_key: pqc.recoveryWrap(rk.key, 'backup-key', TENANT, userId, b.seed),
+      },
+    });
+    return pqc.fingerprint(m.public_key);
+  }
+
+  it('delivers live Rollback and NotVerified verdicts from receiveRoomKeys, checkRoomIdentities, and sealRoomMessage without acking mail or burning retry budget', async () => {
+    const server = new FakeKeyServer();
+    serveUser(server, { current: 'u_alice' });
+    const alice = await startE2EE('u_alice');
+    await (await prepareIdentity()).commit();
+    // Create verified Bob on the same FakeKeyServer and send Alice a room key in r1.
+    const bobStore = await openCryptoStore('u_bob_peer');
+    const bob = await CryptoEngine.open('u_bob', server.as('u_bob'), bobStore);
+    await (await bob.prepareIdentity()).commit();
+    server.join('r1', 'u_alice', 'u_bob');
+    await bob.encrypt('r1', { type: 'text', body: 'hi alice' });
+    bob.close();
+    const pendingMail = () => server.mail.get(`u_alice\n${alice.deviceId}`)?.length ?? 0;
+    expect(pendingMail()).toBeGreaterThan(0);
+
+    // 1. First test Rollback on ordinary receiveRoomKeys wake: snapshot pins at counter 0,
+    // advance Alice's pin counter by sending in r2 to Carol, then roll back server pins to 0.
+    const carolStore = await openCryptoStore('u_carol_peer');
+    const carol = await CryptoEngine.open('u_carol', server.as('u_carol'), carolStore);
+    await (await carol.prepareIdentity()).commit();
+    server.join('r2', 'u_alice', 'u_carol');
+    const oldPins = structuredClone(server.masters.get('u_alice')!.pins);
+    await sealRoomMessage('r2', { type: 'text', body: 'advance pin counter' });
+    carol.close();
+    expect(server.masters.get('u_alice')!.pins.counter).toBeGreaterThan(oldPins.counter);
+    server.masters.get('u_alice')!.pins = oldPins;
+
+    const announced = vi.fn();
+    const off = onIdentityChanged(announced);
+
+    receiveRoomKeys();
+    await vi.waitFor(() => expect(announced).toHaveBeenCalledTimes(1));
+    expect(pendingMail()).toBeGreaterThan(0);
+    expect(encryptionRetry().pending).toBe(false);
+
+    // 2. Now reset Alice's identity on the server so receive/check/send hit NotVerified.
+    await resetMasterOnServer(server, 'u_alice');
+
+    announced.mockClear();
+    receiveRoomKeys();
+    await vi.waitFor(() => expect(announced).toHaveBeenCalledTimes(1));
+    expect(pendingMail()).toBeGreaterThan(0);
+    expect(encryptionRetry().pending).toBe(false);
+
+    // 3. Room-open checkRoomIdentities delivers the verdict to the gate.
+    announced.mockClear();
+    checkRoomIdentities('r1');
+    await vi.waitFor(() => expect(announced).toHaveBeenCalledTimes(1));
+
+    // 4. sealRoomMessage delivers the verdict to the gate AND retains the original NotVerified error.
+    announced.mockClear();
+    await expect(sealRoomMessage('r1', { type: 'text', body: 'blocked' })).rejects.toBeInstanceOf(NotVerified);
+    expect(announced).toHaveBeenCalledTimes(1);
+
+    off();
+  });
+
+  it('never lets a stale account or entry verdict refresh a newer account', async () => {
+    const server = new FakeKeyServer();
+    const userRef = { current: 'u_alice' };
+    let releaseMaster!: () => void;
+    let holdNextMaster = false;
+    serveUser(server, userRef, {
+      holdMaster: () => {
+        if (!holdNextMaster) return undefined;
+        holdNextMaster = false;
+        return new Promise<undefined>((r) => { releaseMaster = () => r(undefined); });
+      },
+    });
+    const alice = await startE2EE('u_alice');
+    await (await prepareIdentity()).commit();
+    const bobStore = await openCryptoStore('u_bob_stale');
+    const bob = await CryptoEngine.open('u_bob', server.as('u_bob'), bobStore);
+    await (await bob.prepareIdentity()).commit();
+    server.join('r1', 'u_alice', 'u_bob');
+    await bob.encrypt('r1', { type: 'text', body: 'mail for alice' });
+    bob.close();
+    await resetMasterOnServer(server, 'u_alice');
+
+    // Trigger receiveRoomKeys on Alice while her getMaster check is held in flight.
+    holdNextMaster = true;
+    receiveRoomKeys();
+    await tick();
+
+    // Sign out Alice and switch to Bob BEFORE Alice's in-flight verdict completes.
+    await forgetCryptoStore();
+    userRef.current = 'u_bob';
+    await startE2EE('u_bob');
+    const announced = vi.fn();
+    const off = onIdentityChanged(announced);
+
+    // Release Alice's stale verdict: it must NOT refresh Bob's gate.
+    releaseMaster?.();
+    await tick();
+    expect(announced).not.toHaveBeenCalled();
+    expect(alice.deviceId).toBeDefined();
+    off();
+  });
+
+  it('does not start the engine or leak rejections when ownDeviceVerified is pre-aborted, and announces acceptIdentity once via engine', async () => {
+    const server = new FakeKeyServer();
+    let uploads = 0;
+    serveUser(server, { current: 'u_alice' }, { onUpload: () => { uploads++; } });
+
+    // Pre-aborted ownDeviceVerified before any startE2EE must reject immediately without starting.
+    const ac = new AbortController();
+    ac.abort(new DOMException('already closed', 'AbortError'));
+    await expect(ownDeviceVerified('dev_other', ac.signal)).rejects.toThrow(/already closed/);
+    expect(uploads).toBe(0);
+
+    // acceptIdentity announces once (from engine's fenced onIdentityChange), not twice.
+    const alice = await startE2EE('u_alice');
+    await (await prepareIdentity()).commit();
+    const bobStore = await openCryptoStore('u_bob_accept');
+    const bob = await CryptoEngine.open('u_bob', server.as('u_bob'), bobStore);
+    await (await bob.prepareIdentity()).commit();
+    server.join('r1', 'u_alice', 'u_bob');
+    await alice.encrypt('r1', { type: 'text', body: 'pin bob' });
+    const prevFp = pqc.fingerprint(server.masters.get('u_bob')!.master_key);
+    const nextFp = await resetMasterOnServer(server, 'u_bob');
+    bob.close();
+    await alice.checkRoom('r1');
+    const announced = vi.fn();
+    const off = onIdentityChanged(announced);
+    await acceptIdentity('u_bob', prevFp, nextFp);
+    expect(announced).toHaveBeenCalledTimes(1);
+    off();
   });
 });

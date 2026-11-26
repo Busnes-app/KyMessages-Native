@@ -11,7 +11,7 @@
 // entries must carry the master key's MAC. A device that is not verified trusts nobody.
 // Nothing the server says can delete this device's copy of the master and backup seeds.
 import { InboundGroupSession } from './index';
-import { b64, pqc, unb64, type BackupRef, type Hybrid } from '../pqc/index';
+import { b64, ensurePQC, pqc, PQCUnavailable, unb64, type BackupRef, type Hybrid } from '../pqc/index';
 import type { CryptoStore } from './store';
 import { backupCoverKey, backupQueueKey, backupRefusedKey, Conflict, IdentityMoved, inboundKey, isObj, isStr, isTransient, parseJSON, sleep, Transient, type InboundRecord } from './records';
 
@@ -169,8 +169,26 @@ const SIGNED = 'identity:signed';
 /** The newest pin set counter seen for one identity: scoped to org, fingerprint and version. */
 const pinsMark = (l: { tenant_id: string; fingerprint: string; version: number }) => `pins:hwm:${l.tenant_id}:${l.fingerprint}:${l.version}`;
 const RESTORE = 'backup:restore';
+interface EnrollingRecord {
+  tenant_id: string;
+  version: number;
+  fingerprint: string;
+}
+
 /** Set while this device took on an identity but is not yet both signed and listed. */
 const ENROLLING = 'identity:enrolling';
+
+function abortable<T>(p: Promise<T>, signal?: AbortSignal, late?: () => Error | undefined): Promise<T> {
+  if (!signal) return p;
+  const timedOut = late?.();
+  if (timedOut) return Promise.reject(timedOut);
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(late?.() ?? signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    p.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+  });
+}
 const previousKey = (fp: string, version: number) => `identity:previous:${fp}:${version}`;
 const pinKey = (userId: string) => `mpin:${userId}`;
 const changeKey = (userId: string) => `mchg:${userId}`;
@@ -410,8 +428,17 @@ export class Identity {
     const dl = rec.device_list;
     if (dl !== undefined && !this.signedList(rec.master_key, tenantId, userId, rec.version, dl)) return none;
     // A rolled-back list (one that may still name a removed device), a fork at one epoch, or a
-    // missing list after one was seen: no device of this user is trusted.
-    if (await this.observeList(tenantId, userId, fp, rec.version, dl) !== 'ok' || !dl) return none;
+    // missing list after one was seen: no device of this user is trusted; for this device's own
+    // current identity it is a rollback/fork verdict the gate must show.
+    const seen = await this.observeList(tenantId, userId, fp, rec.version, dl);
+    if (seen !== 'ok') {
+      if (userId === this.ctx.userId) {
+        const own = await this.local();
+        if (own && own.tenant_id === tenantId && own.version === rec.version && own.fingerprint === fp) throw listVerdict(seen);
+      }
+      return none;
+    }
+    if (!dl) return none;
     return { key: rec.master_key, devices: new Set(dl.device_ids) };
   }
 
@@ -539,7 +566,7 @@ export class Identity {
           if (master.pins.counter < ((await this.ctx.store.get<number>(pinsMark(l))) ?? 0)) throw new Rollback('rollback', 'pin set rolled back');
           // Under the lock: a list another device holds is not waited for here, but retried.
           await this.ensureListed(l, false);
-          await this.enrolled();
+          await this.enrolled(true, l);
         } catch (e) {
           if (isTransient(e)) this.later(e);
           else if (!(e instanceof Rollback)) throw e;
@@ -575,7 +602,7 @@ export class Identity {
     let verdict: Rollback | undefined;
     try {
       await this.ensureListed(l);
-      await this.enrolled();
+      await this.enrolled(false, l);
     } catch (e) {
       if (!(e instanceof Rollback)) throw e;
       verdict = e;
@@ -602,26 +629,36 @@ export class Identity {
   /**
    * Once this device is signed and listed after taking on the identity, the enrollment is
    * durable: pending retirements can be signed now (before any backup page is read).
+   * Confirmation and removal of ENROLLING run in one per-user lock transaction (reusing the
+   * caller's lock when locked is true), bound to the identity/marker that is being confirmed.
    */
-  private async enrolled(): Promise<void> {
+  private async enrolled(locked: boolean, expected?: { tenant_id: string; version: number; fingerprint: string }): Promise<void> {
+    const run = <T>(fn: () => Promise<T>) => (locked ? fn() : this.ctx.locked(fn));
     try {
-      const l = await this.local();
-      const signed = await this.ctx.store.get<{ version: number; device_id: string }>(SIGNED);
-      if (!l || !(await this.ctx.store.get(ENROLLING)) || signed?.version !== l.version || signed.device_id !== this.ctx.deviceId) return;
-      // Confirmed only against the identity this device holds, as published now, and a list
-      // that identity signed naming this device; otherwise the marker stays for the next try.
-      const { tenant_id, master } = await this.ctx.server.getMaster();
-      const dl = master?.device_list;
-      if (!master || tenant_id !== l.tenant_id || master.version !== l.version || pqc.fingerprint(master.master_key) !== l.fingerprint ||
-        !dl || !this.signedList(l.master_key, l.tenant_id, this.ctx.userId, l.version, dl)) return;
-      // Every authenticated list is observed before membership counts: a newer one, or another
-      // at the same epoch, that leaves this device out still moves the mark (or marks the fork).
-      // A rolled-back or forked list is the verdict; the marker stays.
-      const seen = await this.observeList(l.tenant_id, this.ctx.userId, l.fingerprint, l.version, dl);
-      if (seen !== 'ok') throw listVerdict(seen);
-      if (!dl.device_ids.includes(this.ctx.deviceId)) return;
-      await this.ctx.store.write([], [ENROLLING]);
-      this.ctx.onAdopted?.();
+      const confirmed = await run(async () => {
+        const l = await this.local();
+        const marker = await this.ctx.store.get<EnrollingRecord | boolean>(ENROLLING);
+        const signed = await this.ctx.store.get<{ version: number; device_id: string }>(SIGNED);
+        if (!l || !marker || signed?.version !== l.version || signed.device_id !== this.ctx.deviceId) return false;
+        if (expected && (l.tenant_id !== expected.tenant_id || l.version !== expected.version || l.fingerprint !== expected.fingerprint)) return false;
+        if (typeof marker === 'object' && (marker.tenant_id !== l.tenant_id || marker.version !== l.version || marker.fingerprint !== l.fingerprint)) return false;
+        // Confirmed only against the authenticated current master this device holds.
+        const { tenant_id, master } = await this.ctx.server.getMaster();
+        if (!master || !validMaster(master) || tenant_id !== l.tenant_id || master.version !== l.version ||
+          pqc.fingerprint(master.master_key) !== l.fingerprint ||
+          !pqc.verifyMaster(master.master_key, tenant_id, this.ctx.userId, master.self_signature)) return false;
+        const dl = master.device_list;
+        // An unauthenticated list neither confirms nor counts as absence. Once the current master
+        // is authenticated, a missing list after an authenticated list was seen IS rollback and
+        // keeps the marker; any authenticated list is observed before membership counts.
+        if (dl !== undefined && !this.signedList(l.master_key, l.tenant_id, this.ctx.userId, l.version, dl)) return false;
+        const seen = await this.observeList(l.tenant_id, this.ctx.userId, l.fingerprint, l.version, dl);
+        if (seen !== 'ok') throw listVerdict(seen);
+        if (!dl || !dl.device_ids.includes(this.ctx.deviceId)) return false;
+        await this.ctx.store.write([], [ENROLLING]);
+        return true;
+      });
+      if (confirmed) this.ctx.onAdopted?.();
     } catch (e) {
       // Enrollment already happened; failing to confirm it for availability is retried.
       if (e instanceof Rollback) throw e;
@@ -870,7 +907,8 @@ export class Identity {
           stop();
           // The seeds are durable from here: enrollment (signing and listing this device) and
           // the backup read that then fail for availability are finished by the bounded retry.
-          if (!same) await this.ctx.store.write([[IDENTITY, next], [RESTORE, restore], [ENROLLING, true], ...queue], [SIGNED, ...refused]);
+          const enrolling: EnrollingRecord = { tenant_id: next.tenant_id, version: next.version, fingerprint: next.fingerprint };
+          if (!same) await this.ctx.store.write([[IDENTITY, next], [RESTORE, restore], [ENROLLING, enrolling], ...queue], [SIGNED, ...refused]);
           this.backupGen = { version: now.version, generation: now.backup_generation };
           return next;
         }, abort?.signal);
@@ -879,22 +917,32 @@ export class Identity {
         const timedOut = abort?.late();
         if (timedOut) throw timedOut;
         if (abort?.signal.aborted || !isTransient(e) || attempt >= PAIRING_RETRIES) throw e;
+        if (e instanceof PQCUnavailable) {
+          await abortable(ensurePQC(), abort?.signal, abort?.late).catch((err: unknown) => {
+            if (!(err instanceof PQCUnavailable)) throw err;
+          });
+        }
         await sleep(PAIRING_POLL_MS, abort?.signal).catch(() => undefined);
       }
     }
-    // The seeds are stored: that is announced even when signing or listing then refuses.
+    // The seeds are durable from here: availability errors in post-write lock acquisition,
+    // signing, listing, backup-state or confirmation use pending/retry handling, while permanent
+    // verdicts still propagate and the closing notification always runs.
     try {
       await this.ctx.locked(async () => {
         await this.signOwnDevice(local).catch((e: unknown) => this.unlessTransient(e));
-        await this.syncPins().catch(() => undefined);
-      });
+        await this.syncPins().catch((e: unknown) => {
+          if (e instanceof Rollback) throw e;
+          this.later(e);
+        });
+      }).catch((e: unknown) => this.unlessTransient(e));
       // Outside the lock: waiting out another device's reservation must not hold every tab.
       await this.ensureListed(local).catch((e: unknown) => this.unlessTransient(e));
+      await this.backupStateChanged().catch((e: unknown) => this.unlessTransient(e));
+      await this.enrolled(false, local);
     } finally {
       this.notify();
     }
-    await this.backupStateChanged();
-    await this.enrolled();
     // The identity is taken on: a backup read that fails for availability now leaves its cursor
     // pending for the retry; it is not a failed verification.
     const restored = await this.resumeRestore().catch((e: unknown) => {
@@ -925,11 +973,18 @@ export class Identity {
     const mark = pinsMark(l);
     for (let attempt = 0; attempt < 3; attempt++) {
       const { tenant_id, master } = await this.ctx.server.getMaster();
-      if (!master || tenant_id !== l.tenant_id || master.version !== l.version || pqc.fingerprint(master.master_key) !== l.fingerprint) {
+      if (!master || !validMaster(master) || tenant_id !== l.tenant_id || master.version !== l.version ||
+        pqc.fingerprint(master.master_key) !== l.fingerprint ||
+        !pqc.verifyMaster(master.master_key, tenant_id, this.ctx.userId, master.self_signature)) {
         throw new IdentityMoved('The encryption identity changed; check this device again.');
       }
       const counter = master.pins.counter;
       if (counter < ((await this.ctx.store.get<number>(mark)) ?? 0)) throw new Rollback('rollback', 'The server returned an older pin set than this device has seen.');
+      const dl = master.device_list;
+      if (dl === undefined || this.signedList(l.master_key, l.tenant_id, this.ctx.userId, l.version, dl)) {
+        const seen = await this.observeList(l.tenant_id, this.ctx.userId, l.fingerprint, l.version, dl);
+        if (seen !== 'ok') throw listVerdict(seen);
+      }
       const remote: Record<string, PinRecord> = {};
       if (counter > 0) {
         // A set that does not open is an error, never an empty set: local pins stay as they are.
@@ -1312,16 +1367,35 @@ export class Identity {
             }
             await sleep(PAIRING_POLL_MS, stop).catch(() => undefined);
           }
+          const timedOut = () => (deadline.signal.aborted ? late() : undefined);
           let keys: { master_seed: string; backup_seed: string };
-          try {
-            keys = pqc.transferOpen(eph.seed, q.secret, q.pairing_id, got.initiator_device, this.ctx.deviceId, got.sealed);
-          } catch {
-            throw new Error('The keys from the other device did not open. Start again.');
+          for (let attempt = 0; ; attempt++) {
+            signal?.throwIfAborted();
+            if (deadline.signal.aborted) throw late();
+            try {
+              keys = pqc.transferOpen(eph.seed, q.secret, q.pairing_id, got.initiator_device, this.ctx.deviceId, got.sealed);
+              break;
+            } catch (e) {
+              // Only module unavailability is retried (holding the consumed transfer response);
+              // bad transfer data fails definitively at once.
+              if (!(e instanceof PQCUnavailable)) {
+                throw new Error('The keys from the other device did not open. Start again.');
+              }
+              signal?.throwIfAborted();
+              if (deadline.signal.aborted) throw late();
+              if (attempt >= PAIRING_RETRIES) throw e;
+              try {
+                await abortable(ensurePQC(), stop, timedOut);
+              } catch (reloadErr) {
+                if (!(reloadErr instanceof PQCUnavailable)) throw reloadErr;
+                await sleep(PAIRING_POLL_MS, stop).catch(() => undefined);
+              }
+            }
           }
           // The approval may have taken minutes: adoption reads the identity again right before
           // it writes (its version, backup key and generation as published then) and checks the
           // seeds against that, so nothing stale is adopted.
-          return await this.adopt(tenant_id, q.fingerprint, keys.master_seed, keys.backup_seed, { signal: stop, late: () => (deadline.signal.aborted ? late() : undefined) });
+          return await this.adopt(tenant_id, q.fingerprint, keys.master_seed, keys.backup_seed, { signal: stop, late: timedOut });
         } finally {
           clearTimeout(timer);
         }

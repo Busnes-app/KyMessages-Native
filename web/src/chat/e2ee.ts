@@ -227,6 +227,14 @@ const keyServer = (signal: AbortSignal): KeyServer => ({
 // One device start-up. Stopping it (sign-out, revocation, another user) aborts its requests,
 // releasing any per-user lock held over the network, closes the store and cancels start-up.
 // A pending start-up can never keep keys alive or reopen a deleted store.
+interface EntryHolds {
+  active: Set<string>;
+  timers: Map<string, ReturnType<typeof setTimeout>>;
+  promise: Promise<void>;
+  release: () => void;
+  hadPeer: boolean;
+}
+
 interface Entry {
   userId: string;
   engine: Promise<CryptoEngine>;
@@ -238,6 +246,10 @@ interface Entry {
   invalidated?: boolean;
   /** Set while this user's device is being reset (here or in another tab): no start-up begins. */
   replacing?: Promise<void>;
+  /** Active local replaceDevice promise for this entry: a second call joins it instead of overwriting the fence. */
+  replacingLocal?: Promise<void>;
+  /** Per-entry hold table (correlated peer op tokens and local reset token). */
+  holds?: EntryHolds;
   controller: AbortController;
   /** The user's retry session, shared by their later start-ups until sign-out. */
   retry: RetrySession;
@@ -261,29 +273,26 @@ function keysArrived(share: boolean): void {
   if (share) keyChannel?.postMessage(null);
   for (const fn of keyListeners) fn();
 }
-// A tab resetting a device says so before it waits on the lock (device-reset), and again once
-// the reset is stored or gave up (device-reset-done). A tab running that device stops it at once,
-// starts nothing until the second notice (or PEER_RESET_MS), then has the gate ask again.
+// A tab resetting a device says so with a per-operation ID before it waits on the lock
+// (device-reset), and again once the reset is stored or gave up (device-reset-done). A tab running
+// that device stops it at once, holds start-up per entry until every applicable reset op (and any
+// overlapping local reset) settles or times out (PEER_RESET_MS per op), then restarts directly.
 const PEER_RESET_MS = 10_000;
-const peerResets = new Map<string, () => void>();
 if (keyChannel) keyChannel.onmessage = ({ data }: MessageEvent<unknown>) => {
   if (data === null) keysArrived(false);
   else if (typeof data === 'object' && data !== null && 'type' in data && (data.type === 'device-reset' || data.type === 'device-reset-done')
-    && 'user_id' in data && typeof data.user_id === 'string' && 'device_id' in data && typeof data.device_id === 'string') {
-    const key = `${data.user_id}\n${data.device_id}`;
-    if (data.type === 'device-reset-done') return peerResets.get(key)?.();
+    && 'user_id' in data && typeof data.user_id === 'string'
+    && 'device_id' in data && typeof data.device_id === 'string'
+    && 'op' in data && typeof data.op === 'string' && data.op.length > 0) {
     const entry = current;
-    if (entry?.userId !== data.user_id || entry.deviceId !== data.device_id || peerResets.has(key)) return;
+    if (!entry || entry.cancelled || entry.userId !== data.user_id || entry.deviceId !== data.device_id) return;
+    const token = `peer:${data.op}`;
+    if (data.type === 'device-reset-done') {
+      releaseHold(entry, token);
+      return;
+    }
     invalidateEntry(entry);
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    void holdStarts(entry, new Promise<void>((done) => {
-      const finish = () => { clearTimeout(timer); done(); };
-      peerResets.set(key, finish);
-      timer = setTimeout(finish, PEER_RESET_MS);
-    })).then(() => {
-      peerResets.delete(key);
-      if (current === entry) announceIdentity();
-    });
+    addHold(entry, token, PEER_RESET_MS);
   }
 };
 
@@ -295,13 +304,59 @@ function invalidateEntry(entry: Entry): void {
   entry.store?.close();
 }
 
-/** Holds every start-up of entry's user until reset settles; cleared before anyone waiting resumes. */
-function holdStarts(entry: Entry, reset: Promise<unknown>): Promise<void> {
-  let held: Promise<void>;
-  const clear = () => { if (entry.replacing === held) entry.replacing = undefined; };
-  held = reset.then(clear, clear);
-  entry.replacing = held;
-  return held;
+/** Adds token to entry's hold set (idempotent for duplicate delivery of the same op). */
+function addHold(entry: Entry, token: string, peerTimeoutMs?: number): Promise<void> {
+  let h = entry.holds;
+  if (!h) {
+    let release!: () => void;
+    const promise = new Promise<void>((r) => { release = r; });
+    h = { active: new Set(), timers: new Map(), promise, release, hadPeer: false };
+    entry.holds = h;
+    entry.replacing = promise;
+  }
+  if (h.active.has(token)) return h.promise;
+  h.active.add(token);
+  if (peerTimeoutMs !== undefined) {
+    h.hadPeer = true;
+    h.timers.set(token, setTimeout(() => releaseHold(entry, token), peerTimeoutMs));
+  }
+  return h.promise;
+}
+
+/** Releases token from entry's hold set; only resolves the hold once every applicable op settles. */
+function releaseHold(entry: Entry, token: string): void {
+  const h = entry.holds;
+  if (!h || !h.active.delete(token)) return;
+  const timer = h.timers.get(token);
+  if (timer !== undefined) {
+    clearTimeout(timer);
+    h.timers.delete(token);
+  }
+  if (h.active.size > 0) return;
+  entry.holds = undefined;
+  entry.replacing = undefined;
+  h.release();
+  if (h.hadPeer) {
+    // Let any waiter already queued on entry.replacing (e.g. an overlapping local replaceDevice or
+    // fresh identityStatus) resume first; if entry is still current (even with no gate listener
+    // subscribed), restart it directly. Never carry a restart across sign-out or account switch.
+    queueMicrotask(() => {
+      if (current !== entry || entry.cancelled || entry.retry.ended) return;
+      void startE2EE(entry.userId).catch(() => undefined);
+    });
+  }
+}
+
+/** Clears and releases every active hold and timer on entry when it is stopped. */
+function clearHolds(entry: Entry): void {
+  const h = entry.holds;
+  if (!h) return;
+  for (const timer of h.timers.values()) clearTimeout(timer);
+  h.timers.clear();
+  h.active.clear();
+  entry.holds = undefined;
+  entry.replacing = undefined;
+  h.release();
 }
 // Set when another tab deleted this tab's store (a sign-out). This tab may
 // have missed that sign-out, so it must not create a new device and new private keys on its own:
@@ -312,9 +367,14 @@ class Cancelled extends Error {}
 
 /** Opens (once) the device for userId: loads the crypto core, restores or creates keys, then reads waiting mail. */
 export function startE2EE(userId: string): Promise<CryptoEngine> {
-  // A reset under way finishes first; a sign-out meanwhile never starts this user again.
-  if (current?.userId === userId && current.replacing) {
-    return current.replacing.then(() => (current?.userId === userId ? startE2EE(userId) : Promise.reject(new DeviceChanged())));
+  // A reset under way finishes first; a sign-out or account switch meanwhile never starts this user again.
+  const held = current;
+  if (held?.userId === userId && held.replacing) {
+    return held.replacing.then(() => (
+      !held.retry.ended && current?.retry === held.retry && !current.cancelled
+        ? startE2EE(userId)
+        : Promise.reject(new DeviceChanged())
+    ));
   }
   if (current?.userId === userId && !current.failed) {
     const entry = current;
@@ -392,8 +452,10 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
     e.onKeys(() => keysArrived(true));
     e.onTransient(() => retryLater(retry));
     e.onBackupState((full) => { if (isLive(entry)) for (const fn of backupListeners) fn(full); });
-    // Identity notices are wired at start-up, and only the entry in use reaches the UI.
+    // Identity notices and live verdicts (Rollback / NotVerified) are wired at start-up, and
+    // only the entry in use reaches the UI.
     e.onIdentityChange(() => { if (isLive(entry)) announceIdentity(); });
+    e.onVerdict(() => { if (isLive(entry)) announceIdentity(); });
     // Verified now (QR or recovery key): retire pending devices, without waiting for the
     // backup restore that follows.
     e.onAdopted(() => void retireAbandoned(userId, entry.controller.signal, e).catch(() => undefined));
@@ -428,6 +490,7 @@ function stopE2EE(): void {
   current = undefined;
   if (!old) return;
   old.cancelled = true;
+  clearHolds(old);
   old.controller.abort();
   old.store?.close();
   void old.engine.then((e) => e.close(), () => undefined);
@@ -544,8 +607,24 @@ export function identityStatus(): Promise<IdentityStatus> {
   const entry = current;
   if (!entry) return Promise.reject(new Error('Encryption is not set up in this browser'));
   // A fresh check of a failed or replaced start-up starts this user's device again (once a reset
-  // under way is stored: startE2EE waits for it).
-  if (entry.failed) return startE2EE(entry.userId).then(() => identityStatus());
+  // under way is stored: startE2EE waits for it). The restart outcome stays bound to this session
+  // and its resulting live engine; stale reset/cancel outcomes map to StaleStatus.
+  if (entry.failed) {
+    const owner = entry.retry;
+    return startE2EE(entry.userId).then((restarted) => {
+      const next = current;
+      if (owner.ended || !next || next.retry !== owner || !isLive(next) || (next.ready !== undefined && next.ready !== restarted)) {
+        throw new StaleStatus();
+      }
+      return statusFor(next);
+    }, (err: unknown) => {
+      if (err instanceof DeviceChanged || err instanceof Cancelled || owner.ended || current?.retry !== owner
+        || (current !== entry && (current?.invalidated || current?.cancelled))) {
+        throw new StaleStatus();
+      }
+      throw err;
+    });
+  }
   return statusFor(entry);
 }
 
@@ -568,11 +647,14 @@ export const offerVerification = (): Promise<PairingOffer> => identityEngine().t
 /** Whether the device a pairing handed keys to has verified itself (signed and listed). signal
  * (the screen closed, or its deadline passed) aborts the wait for the lock and the request. */
 export async function ownDeviceVerified(deviceId: string, signal?: AbortSignal): Promise<boolean> {
+  signal?.throwIfAborted();
   // The device may still be starting: an abort stops waiting for it, never the start-up itself.
   const started = engine();
   const e = signal ? await new Promise<CryptoEngine>((resolve, reject) => {
-    const stop = () => reject(signal.reason);
-    if (signal.aborted) return stop();
+    const stop = () => {
+      void started.catch(() => undefined);
+      reject(signal.reason);
+    };
     signal.addEventListener('abort', stop, { once: true });
     started.then(resolve, reject).finally(() => signal.removeEventListener('abort', stop));
   }) : await started;
@@ -591,7 +673,6 @@ export const identityChanges = (): Promise<IdentityChange[]> => identityEngine()
 export async function acceptIdentity(userId: string, previous: string, fingerprint: string): Promise<void> {
   const { e } = await identityEngine();
   await e.acceptIdentity(userId, previous, fingerprint);
-  announceIdentity();
 }
 
 /** Checks a room's members' identities as it opens, so a change shows before anyone sends. */
@@ -702,8 +783,9 @@ function runRetry(s: RetrySession): Promise<void> {
       // failure reported while this ran still earns its pass.
       again = isTransient(e) || s.again;
       if (!again) setRetry(s, false, false);
-      // A verdict (a rollback or fork) is the identity status's to show, with its reset action.
-      if (!isTransient(e) && !s.ended) announceIdentity();
+      // A verdict (a rollback or fork) is the identity status's to show, with its reset action;
+      // never let a stale session refresh a newer account or entry.
+      if (!isTransient(e) && !s.ended && current?.retry === s && isLive(current)) announceIdentity();
     } finally {
       s.run = undefined;
     }
@@ -967,30 +1049,38 @@ export async function replaceDevice(expected?: string): Promise<void> {
   const entry = current;
   if (!entry) return;
   const old = await entry.engine;
-  if (current !== entry || (expected !== undefined && old.deviceId !== expected)) return;
+  if (current !== entry || entry.cancelled || (expected !== undefined && old.deviceId !== expected)) return;
+  if (entry.replacingLocal) return entry.replacingLocal;
   invalidateEntry(entry);
-  entry.deviceId = undefined;
-  // No start-up (a gate check, a retry) begins until the old device's keys are gone.
-  const reset = (async () => {
-    const store = await openCryptoStore(entry.userId);
+  // Keep entry.deviceId intact while holds run so overlapping peer resets for this device join
+  // the same hold, and keep entry.replacingLocal so a second replaceDevice call joins instead of
+  // overwriting the active local fence.
+  const token = `local:${crypto.randomUUID()}`;
+  const held = addHold(entry, token);
+  const run = (async () => {
+    let store: CryptoStore | undefined;
     try {
+      store = await openCryptoStore(entry.userId);
       await resetDevice(entry.userId, old.deviceId, store);
     } finally {
-      store.close();
+      store?.close();
+      releaseHold(entry, token);
     }
+    await held;
+    if (current === entry && !entry.cancelled && !entry.retry.ended) await startE2EE(entry.userId);
   })();
-  await holdStarts(entry, reset);
-  await reset;
-  if (current === entry) await startE2EE(entry.userId);
+  entry.replacingLocal = run;
+  await run;
 }
 
 /** Wake stale peers before waiting on their lock, then reset only the expected identity; peers
  * hear again once it is stored (or failed), and only then start. */
 async function resetDevice(userId: string, deviceId: string, store: CryptoStore): Promise<void> {
-  keyChannel?.postMessage({ type: 'device-reset', user_id: userId, device_id: deviceId });
+  const op = crypto.randomUUID();
+  keyChannel?.postMessage({ type: 'device-reset', user_id: userId, device_id: deviceId, op });
   try {
     await CryptoEngine.resetDevice(userId, deviceId, store);
   } finally {
-    keyChannel?.postMessage({ type: 'device-reset-done', user_id: userId, device_id: deviceId });
+    keyChannel?.postMessage({ type: 'device-reset-done', user_id: userId, device_id: deviceId, op });
   }
 }
