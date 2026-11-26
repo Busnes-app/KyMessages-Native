@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"github.com/Busnes-app/ky_server_base/internal/blobs"
 	"image"
 	"image/color"
 	"image/png"
@@ -12,6 +14,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1051,5 +1054,153 @@ func TestChatLegacyAttachmentEditsKeepNoOriginal(t *testing.T) {
 		if rec.Code != http.StatusOK || got.Message.OriginalBody != "" || len(got.Message.Attachments) != 1 {
 			t.Fatalf("edit %d = %d, original_body %q, %d attachments", i+1, rec.Code, got.Message.OriginalBody, len(got.Message.Attachments))
 		}
+	}
+}
+
+// The exact row a slim bus frame names is served to members only.
+func TestChatGetMessageServesMembersOnly(t *testing.T) {
+	srv, st, _ := setupTestServer(t)
+	startChatBus(t, srv)
+	defer srv.CloseChat()
+	_, aliceTok := createChatTestUser(t, st, "u_get_alice", "getalice", "user")
+	_, eveTok := createChatTestUser(t, st, "u_get_eve", "geteve", "user")
+	room := roomOf(t, doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", aliceTok, map[string]any{"kind": store.RoomKindChannel, "name": "get"}, nil))
+	var posted struct {
+		Message store.Message `json:"message"`
+	}
+	_ = json.Unmarshal(doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room+"/messages", aliceTok, map[string]any{"body": testEnvelope("first"), "encoding": "e2ee_room_v1"}, nil).Body.Bytes(), &posted)
+	if rec := doBearerJSON(t, srv, http.MethodPatch, "/api/v1/rooms/"+room+"/messages/"+posted.Message.ID, aliceTok, map[string]any{"body": testEnvelope("second"), "encoding": "e2ee_room_v1"}, nil); rec.Code != http.StatusOK {
+		t.Fatalf("edit = %d", rec.Code)
+	}
+	path := "/api/v1/rooms/" + room + "/messages/" + posted.Message.ID
+	rec := doBearerJSON(t, srv, http.MethodGet, path, aliceTok, nil, nil)
+	var got struct {
+		Message store.Message `json:"message"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &got)
+	if rec.Code != http.StatusOK || got.Message.Body != testEnvelope("second") || got.Message.EditedAt == nil {
+		t.Fatalf("member get = %d %+v", rec.Code, got.Message)
+	}
+	if rec := doBearerJSON(t, srv, http.MethodGet, path, eveTok, nil, nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("non-member get = %d, want 404", rec.Code)
+	}
+	if rec := doBearerJSON(t, srv, http.MethodGet, "/api/v1/rooms/"+room+"/messages/msg_missing", aliceTok, nil, nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("missing get = %d, want 404", rec.Code)
+	}
+}
+
+// flakyBlobs fails every Erase while fail is set, as an unreachable store would.
+type flakyBlobs struct {
+	blobs.Backend
+	fail atomic.Bool
+}
+
+func (b *flakyBlobs) Erase(tenantID, key string) error {
+	if b.fail.Load() {
+		return errors.New("storage unavailable")
+	}
+	return b.Backend.Erase(tenantID, key)
+}
+
+// A staged upload's removal is queued with its row, so a failed blob delete is retried by the
+// sweep (single mode too), and a request that died between writing a blob and committing its row
+// leaves an intent the sweep erases once the upload's deadline has passed.
+func TestChatAttachmentBlobRemovalsAreDurable(t *testing.T) {
+	srv, st, cfg := setupTestServer(t)
+	startChatBus(t, srv)
+	defer srv.CloseChat()
+	fb := &flakyBlobs{Backend: api.BlobsForTest(srv)}
+	api.SetBlobsForTest(srv, fb)
+	_, aliceTok := createChatTestUser(t, st, "u_dur_alice", "duralice", "user")
+	room := roomOf(t, doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", aliceTok, map[string]any{"kind": store.RoomKindChannel, "name": "durable"}, nil))
+	dir := filepath.Join(cfg.Database.DataDir, "attachments")
+	onDisk := func(key string) bool {
+		_, err := os.Stat(filepath.Join(dir, key))
+		return err == nil
+	}
+	queued := func() int {
+		refs, err := st.Chat().PendingBlobDeletes(context.Background(), 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(refs)
+	}
+
+	var up struct {
+		Attachment store.Attachment `json:"attachment"`
+	}
+	_ = json.Unmarshal(doMultipartUpload(t, srv, "/api/v1/rooms/"+room+"/attachments", aliceTok, "file", "f", []byte("ciphertext")).Body.Bytes(), &up)
+	if queued() != 0 {
+		t.Fatal("a committed upload left its intent queued")
+	}
+	fb.fail.Store(true)
+	if rec := doBearerJSON(t, srv, http.MethodDelete, "/api/v1/attachments/"+up.Attachment.ID, aliceTok, nil, nil); rec.Code != http.StatusNoContent {
+		t.Fatalf("delete staged = %d", rec.Code)
+	}
+	if !onDisk(up.Attachment.ID) || queued() != 1 {
+		t.Fatalf("failed erase: on disk %v, queued %d; want the blob kept and queued", onDisk(up.Attachment.ID), queued())
+	}
+	if _, err := srv.SweepOrphanAttachments(context.Background(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if queued() != 1 {
+		t.Fatal("a sweep against unavailable storage dropped the queued delete")
+	}
+	fb.fail.Store(false)
+	// The lease a failed attempt took must pass before the retry.
+	if _, err := srv.SweepOrphanAttachments(context.Background(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if !onDisk(up.Attachment.ID) {
+		t.Fatal("a leased delete was retried before its lease ended")
+	}
+	if _, err := srv.SweepOrphanAttachments(context.Background(), time.Now().Add(11*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if onDisk(up.Attachment.ID) || queued() != 0 {
+		t.Fatalf("after the lease: on disk %v, queued %d; want erased and cleared", onDisk(up.Attachment.ID), queued())
+	}
+
+	// The crash boundary: a blob written, its intent queued, no row (the request died). Once due,
+	// the sweep erases it and clears the queue.
+	const crashed = "att_00000000-0000-7000-8000-00000000c4a5"
+	if err := st.Chat().QueueUploadIntent(context.Background(), "", crashed, time.Now().Add(-time.Second).UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fb.Put(store.DefaultTenantID, crashed, strings.NewReader("half an upload"), 1<<20, blobs.PutOptions{Opaque: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.SweepOrphanAttachments(context.Background(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if onDisk(crashed) {
+		t.Fatal("the sweep left a blob whose upload never committed")
+	}
+}
+
+// A body that overflows while the handler looks for another part is reported as too large, not
+// as an extra part.
+func TestChatEncryptedUploadOverflowIsTooLarge(t *testing.T) {
+	_, st, cfg := setupTestServer(t)
+	cfg.Attachments.MaxUploadBytes = 2048
+	srv := api.NewServer(cfg, st)
+	startChatBus(t, srv)
+	defer srv.CloseChat()
+	_, aliceTok := createChatTestUser(t, st, "u_ovf_alice", "ovfalice", "user")
+	room := roomOf(t, doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", aliceTok, map[string]any{"kind": store.RoomKindChannel, "name": "ovf"}, nil))
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	fw, _ := mw.CreateFormFile("file", "encrypted.bin")
+	_, _ = fw.Write([]byte("ciphertext"))
+	// The next part's header alone exceeds the request limit (upload limit plus 64 KiB).
+	_, _ = mw.CreatePart(textproto.MIMEHeader{"X-Padding": {strings.Repeat("p", 80<<10)}})
+	_ = mw.Close()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rooms/"+room+"/attachments?encrypted=1", &body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+aliceTok)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("overflowing body = %d, want 413: %s", rec.Code, rec.Body.String())
 	}
 }

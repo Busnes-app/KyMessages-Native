@@ -51,3 +51,46 @@ func TestChatRoomListIgnoresLaggingReplica(t *testing.T) {
 	}
 
 }
+
+// The exact-row read reads the primary: it sees an edit a lagging replica has not.
+func TestChatGetMessageIgnoresLaggingReplica(t *testing.T) {
+	ctx := context.Background()
+	primaryCfg := testdb.Config(t)
+	if primaryCfg.Driver != "postgres" {
+		t.Skip("read replicas exist only on Postgres; set KY_TEST_POSTGRES_DSN")
+	}
+	replicaCfg := testdb.Config(t)
+	seed := func(s store.Store) {
+		t.Helper()
+		room := &store.Room{ID: "rm_lag_get", Kind: store.RoomKindChannel, Name: "ops", CreatedBy: "u_alice"}
+		if err := s.Chat().CreateRoom(ctx, room, nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := s.Chat().CreateMessage(ctx, store.CreateMessageParams{ID: "msg_lag_get", RoomID: room.ID, SenderID: "u_alice", Body: "first"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	replica, err := store.Open(ctx, replicaCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replica.Close()
+	seed(replica)
+	withReplica := primaryCfg
+	withReplica.ReadReplicaDSN = replicaCfg.DSN
+	st, err := store.Open(ctx, withReplica)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	seed(st)
+	if _, err := st.Chat().EditMessage(ctx, store.DefaultTenantID, "rm_lag_get", "msg_lag_get", "u_alice", "edited", store.MessageEncodingPlainV1); err != nil {
+		t.Fatal(err)
+	}
+	if page, _, err := st.Chat().ListMessages(ctx, store.MessagePageQuery{RoomID: "rm_lag_get", Limit: 10}); err != nil || len(page) != 1 || page[0].Body != "first" {
+		t.Fatalf("replica read = %v %v, want the lagging copy (the test's premise)", page, err)
+	}
+	if m, err := st.Chat().GetMessage(ctx, store.DefaultTenantID, "rm_lag_get", "msg_lag_get"); err != nil || m.Body != "edited" {
+		t.Fatalf("GetMessage = %v %v, want the edited row from the primary", m, err)
+	}
+}

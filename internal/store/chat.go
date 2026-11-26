@@ -961,15 +961,19 @@ func (c *chatStore) EditMessage(ctx context.Context, tenantID, roomID, messageID
 	// The first envelope of an encrypted message with files keeps their keys (an edit replaces only
 	// the text, so they are never sealed again for later room members). Only a genuine first
 	// envelope is kept: never one of a message edited before, whose body is already an edit.
-	editedAt := nowMilli()
-	err = tx.QueryRowContext(ctx, c.store.rebind(`UPDATE messages SET body = ?, encoding = ?, edited_at = ?,
+	// edited_at only moves forward, even for two edits in one millisecond, so clients can order
+	// every version; the sender is checked in the same statement.
+	now := nowMilli()
+	var editedAt int64
+	err = tx.QueryRowContext(ctx, c.store.rebind(`UPDATE messages SET body = ?, encoding = ?,
+		edited_at = CASE WHEN edited_at IS NOT NULL AND edited_at >= ? THEN edited_at + 1 ELSE ? END,
 		original_body = CASE WHEN original_body = '' AND edited_at IS NULL AND encoding = ?
 			AND EXISTS (SELECT 1 FROM attachments a WHERE a.tenant_id = messages.tenant_id AND a.room_id = messages.room_id AND a.message_id = messages.id)
 			THEN body ELSE original_body END
-		WHERE tenant_id = ? AND room_id = ? AND id = ? AND deleted_at IS NULL
-		RETURNING original_body`),
-		newBody, encoding, editedAt, MessageEncodingE2EERoomV1, tenantID, roomID, messageID,
-	).Scan(&m.OriginalBody)
+		WHERE tenant_id = ? AND room_id = ? AND id = ? AND sender_id = ? AND deleted_at IS NULL
+		RETURNING original_body, edited_at`),
+		newBody, encoding, now, now, MessageEncodingE2EERoomV1, tenantID, roomID, messageID, actorID,
+	).Scan(&m.OriginalBody, &editedAt)
 	if errorsIs(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -1281,10 +1285,20 @@ func (c *chatStore) DeleteStagedAttachment(ctx context.Context, tenantID, attach
 	if n == 0 {
 		return "", ErrAttachmentInvalid
 	}
+	// Queued with the row's removal, so a failed blob delete is retried by the sweep.
+	if err := queueBlobDeleteTx(ctx, c, tx, tenantID, blobKey); err != nil {
+		return "", err
+	}
 	if err := tx.Commit(); err != nil {
 		return "", err
 	}
 	return blobKey, nil
+}
+
+// queueBlobDeleteTx queues an unposted upload's blob for deletion with its row's removal.
+func queueBlobDeleteTx(ctx context.Context, c *chatStore, tx *sql.Tx, tenantID, key string) error {
+	_, err := tx.ExecContext(ctx, c.store.rebind(`INSERT INTO pending_blob_deletes (tenant_id, blob_key, user_id, not_before) VALUES (?, ?, '', 0) ON CONFLICT (tenant_id, blob_key) DO NOTHING`), tenantID, key)
+	return err
 }
 
 func (c *chatStore) lockAttachmentQuotaTx(ctx context.Context, tx *sql.Tx, tenantID string) error {
@@ -1501,6 +1515,18 @@ func (c *chatStore) CommitAttachmentWithQuota(ctx context.Context, reservationID
 		}
 	}
 
+	// The upload's intent goes with its commit; one a sweep already leased means the upload came
+	// too late, its blob being erased, so it commits nothing.
+	var claimed int
+	if err := tx.QueryRowContext(ctx, c.store.rebind(`SELECT COUNT(*) FROM pending_blob_deletes WHERE tenant_id = ? AND blob_key = ? AND user_id = ?`), a.TenantID, a.BlobKey, blobDeleteClaimed).Scan(&claimed); err != nil {
+		return err
+	}
+	if claimed > 0 {
+		return ErrAttachmentInvalid
+	}
+	if _, err := tx.ExecContext(ctx, c.store.rebind(`DELETE FROM pending_blob_deletes WHERE tenant_id = ? AND blob_key = ? AND user_id = ''`), a.TenantID, a.BlobKey); err != nil {
+		return err
+	}
 	insQ := c.store.rebind(`
 		INSERT INTO attachments (id, tenant_id, room_id, message_id, uploader_id, blob_key, filename, mime_type, size_bytes, sha256_hex, created_at, version_id)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
@@ -1589,6 +1615,9 @@ func (c *chatStore) PurgeOrphanAttachments(ctx context.Context, olderThanMilli i
 			return nil, err
 		}
 		if n, err := res.RowsAffected(); err == nil && n == 1 {
+			if err := queueBlobDeleteTx(ctx, c, tx, item.TenantID, item.Key); err != nil {
+				return nil, err
+			}
 			deletedKeys = append(deletedKeys, item.BlobRef)
 		}
 	}

@@ -1,14 +1,34 @@
 import type { ChatMessage, ChatReactionSummary, ChatRoomSummary } from './types';
 
-/**
- * Which of two copies of one message to keep: a deletion always wins, and a copy older than the
- * one held (an earlier edit, a stale page or response) never replaces it.
- */
-function keep(held: ChatMessage, incoming: ChatMessage): ChatMessage {
-  if (held.deleted_at && !incoming.deleted_at) return held;
-  if (!incoming.deleted_at && (held.edited_at ?? 0) > (incoming.edited_at ?? 0)) return held;
-  return incoming;
+// Messages known deleted, newest few thousand: a deletion that arrives before its message, or
+// before a history page or response still on its way, still wins when they land.
+const deleted = new Map<string, number>();
+const MAX_DELETED = 10_000;
+
+/** Remembers that a message was deleted, so no later copy of it shows its content again. */
+export function rememberDeleted(id: string, at: number): void {
+  deleted.delete(id);
+  deleted.set(id, at);
+  for (const old of deleted.keys()) {
+    if (deleted.size <= MAX_DELETED) break;
+    deleted.delete(old);
+  }
 }
+
+/** Forgets every remembered deletion (sign-out). */
+export function forgetDeleted(): void {
+  deleted.clear();
+}
+
+/** A message as a tombstone: no text, files or keys of any kind. */
+export function tombstone(m: ChatMessage, at: number): ChatMessage {
+  return { ...m, body: '', attachments: [], files: undefined, filesState: undefined, plainIds: undefined, original: undefined, envelope: undefined, deleted_at: at };
+}
+
+const settle = (m: ChatMessage): ChatMessage => {
+  const at = deleted.get(m.id);
+  return at !== undefined && !m.deleted_at ? tombstone(m, at) : m;
+};
 
 /** What the on-device search index holds of a message: a change means it is indexed again. */
 export function searchSignature(m: ChatMessage): string {
@@ -16,41 +36,42 @@ export function searchSignature(m: ChatMessage): string {
   return [m.body, m.edited_at ?? '', m.deleted_at ?? '', m.delivery.kind, m.e2ee?.kind ?? '', names].join('\u0000');
 }
 
-/** Insert or replace a server-confirmed message, reconciling any optimistic pending copy. */
-export function upsertMessage(
-  list: ChatMessage[],
-  incoming: ChatMessage,
-  reconcileClientKey?: string,
-): ChatMessage[] {
-  const withoutOptimistic = reconcileClientKey
-    ? list.filter((m) => !(m.delivery.kind !== 'synced' && m.delivery.idempotencyKey === reconcileClientKey))
-    : list;
+/**
+ * Which of two copies of one message to keep: a deletion always wins, and a copy older than the
+ * one held (an earlier edit, a stale page or response) never replaces it. The server orders a
+ * message's edits strictly (edited_at), so equal times are the same version.
+ */
+function keep(held: ChatMessage, incoming: ChatMessage): ChatMessage {
+  if (held.deleted_at && !incoming.deleted_at) return held;
+  if (!incoming.deleted_at && (held.edited_at ?? 0) > (incoming.edited_at ?? 0)) return held;
+  return incoming;
+}
 
-  const idx = withoutOptimistic.findIndex((m) => m.id === incoming.id);
+/**
+ * The one rule for confirming a send, whichever path its message arrives by (socket, REST, a page,
+ * a late key): an unsent copy (sending or failed) is resolved only by a synced message from the
+ * same sender that seals that send's idempotency key as its `ref`. A reply without it resolves nothing.
+ */
+export function resolvePending(list: ChatMessage[]): ChatMessage[] {
+  const confirmed = new Set(list.flatMap((m) => (m.delivery.kind === 'synced' && m.ref ? [`${m.sender_id}\u0000${m.ref}`] : [])));
+  if (confirmed.size === 0) return list;
+  const next = list.filter((m) => m.delivery.kind === 'synced' || !confirmed.has(`${m.sender_id}\u0000${m.delivery.idempotencyKey}`));
+  return next.length === list.length ? list : next;
+}
+
+/** Insert or replace a message, keeping deletions and newer edits, and confirming its send. */
+export function upsertMessage(list: ChatMessage[], incoming: ChatMessage): ChatMessage[] {
+  const arrived = settle(incoming);
+  const idx = list.findIndex((m) => m.id === arrived.id);
   let next: ChatMessage[];
   if (idx >= 0) {
-    const held = withoutOptimistic[idx];
-    next = [...withoutOptimistic];
-    next[idx] = keep(held, incoming) === held ? held : { ...incoming, reactions: incoming.reactions.length > 0 ? incoming.reactions : held.reactions };
+    const held = list[idx];
+    next = [...list];
+    next[idx] = keep(held, arrived) === held ? held : { ...arrived, reactions: arrived.reactions.length > 0 ? arrived.reactions : held.reactions };
   } else {
-    // The socket can confirm a send before (or instead of) its REST answer: the unsent copy with the
-    // idempotency key the message seals as its `ref` is that message, sending or already failed.
-    const dupIdx = withoutOptimistic.findIndex(
-      (m) =>
-        m.delivery.kind !== 'synced' &&
-        m.sender_id === incoming.sender_id &&
-        incoming.ref !== undefined &&
-        m.delivery.idempotencyKey === incoming.ref,
-    );
-    if (dupIdx >= 0) {
-      next = [...withoutOptimistic];
-      next[dupIdx] = incoming;
-    } else {
-      next = [...withoutOptimistic, incoming];
-    }
+    next = [...list, arrived];
   }
-
-  return sortMessages(next);
+  return resolvePending(sortMessages(next));
 }
 
 /** Merge a batch of historical or catch-up messages without duplicates. */
@@ -60,11 +81,12 @@ export function mergeMessageBatch(existing: ChatMessage[], incoming: ChatMessage
   for (const m of existing) {
     byId.set(m.id, m);
   }
-  for (const m of incoming) {
+  for (const raw of incoming) {
+    const m = settle(raw);
     const held = byId.get(m.id);
     byId.set(m.id, held ? keep(held, m) : m);
   }
-  return sortMessages(Array.from(byId.values()));
+  return resolvePending(sortMessages(Array.from(byId.values())));
 }
 
 function sortMessages(list: ChatMessage[]): ChatMessage[] {

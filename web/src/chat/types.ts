@@ -155,6 +155,7 @@ export interface ChatMessage {
   /** From the decrypted message only, never the server: its encrypted files (keys included). */
   files?: MessageFiles['files'];
   filesState?: MessageFiles['filesState'];
+  plainIds?: MessageFiles['plainIds'];
   /** What an edit of this message must carry (from its own envelope or latest edit). */
   provenance?: MessageFiles['provenance'];
   /** The sender's ID for this message, its idempotency key, sealed in the message. */

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -578,5 +579,102 @@ func TestChatStoreEditNeverRevivesATombstone(t *testing.T) {
 		if m.DeletedAt == nil || m.Body != "" || m.OriginalBody != "" {
 			t.Fatalf("message %s after delete/edit race: deleted=%v body=%q original=%q", m.ID, m.DeletedAt != nil, m.Body, m.OriginalBody)
 		}
+	}
+}
+
+// Every edit moves edited_at forward, even within one millisecond, so clients order versions.
+func TestChatStoreEditsAreStrictlyOrdered(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	chat := st.Chat()
+	room := &store.Room{Kind: store.RoomKindChannel, Name: "order", CreatedBy: "u_alice"}
+	if err := chat.CreateRoom(ctx, room, []string{"u_bob"}); err != nil {
+		t.Fatal(err)
+	}
+	m, _, err := chat.CreateMessage(ctx, store.CreateMessageParams{RoomID: room.ID, SenderID: "u_alice", Encoding: store.MessageEncodingE2EERoomV1, Body: "v0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var last int64
+	for i := 1; i <= 5; i++ {
+		e, err := chat.EditMessage(ctx, "", room.ID, m.ID, "u_alice", fmt.Sprintf("v%d", i), store.MessageEncodingE2EERoomV1)
+		if err != nil || e.EditedAt == nil || *e.EditedAt <= last {
+			t.Fatalf("edit %d: %v, edited_at %v after %d", i, err, e, last)
+		}
+		last = *e.EditedAt
+	}
+	if _, err := chat.EditMessage(ctx, "", room.ID, m.ID, "u_bob", "not mine", store.MessageEncodingE2EERoomV1); !errors.Is(err, store.ErrForbidden) {
+		t.Fatalf("edit by another member = %v, want ErrForbidden", err)
+	}
+}
+
+// An upload's intent goes with its commit; a sweep that leased it first makes the late commit
+// refuse, so no row ever names a blob being erased. Staged removals are queued with the row.
+func TestChatStoreUploadIntentsAndQueuedRemovals(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	chat := st.Chat()
+	room := &store.Room{Kind: store.RoomKindChannel, Name: "intents", CreatedBy: "u_alice"}
+	if err := chat.CreateRoom(ctx, room, nil); err != nil {
+		t.Fatal(err)
+	}
+	att := func(key string) *store.Attachment {
+		return &store.Attachment{ID: key, BlobKey: key, RoomID: room.ID, UploaderID: "u_alice", Filename: "encrypted.bin", MimeType: "application/octet-stream", SizeBytes: 10, SHA256Hex: strings.Repeat("a", 64)}
+	}
+	future := time.Now().Add(time.Hour).UnixMilli()
+	past := time.Now().Add(-time.Second).UnixMilli()
+	due := func() []string {
+		t.Helper()
+		refs, err := chat.DuePendingBlobDeletes(ctx, 100, time.Now(), time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var keys []string
+		for _, r := range refs {
+			keys = append(keys, r.Key)
+		}
+		return keys
+	}
+
+	// In flight: not due, and its commit removes it.
+	if err := chat.QueueUploadIntent(ctx, "", "att_intent_ok", future); err != nil {
+		t.Fatal(err)
+	}
+	if keys := due(); len(keys) != 0 {
+		t.Fatalf("an in-flight intent is due: %v", keys)
+	}
+	if err := chat.CommitAttachmentWithQuota(ctx, "", att("att_intent_ok"), store.AttachmentQuotaLimits{}); err != nil {
+		t.Fatal(err)
+	}
+	if queued, _ := chat.PendingBlobDeletes(ctx, 100); len(queued) != 0 {
+		t.Fatalf("a committed upload is still queued: %v", queued)
+	}
+
+	// Crashed past its deadline: due, leased by the sweep, and a late commit refuses.
+	if err := chat.QueueUploadIntent(ctx, "", "att_intent_late", past); err != nil {
+		t.Fatal(err)
+	}
+	if keys := due(); len(keys) != 1 || keys[0] != "att_intent_late" {
+		t.Fatalf("due = %v, want the late intent", keys)
+	}
+	if keys := due(); len(keys) != 0 {
+		t.Fatalf("a leased intent was handed out twice: %v", keys)
+	}
+	if err := chat.CommitAttachmentWithQuota(ctx, "", att("att_intent_late"), store.AttachmentQuotaLimits{}); !errors.Is(err, store.ErrAttachmentInvalid) {
+		t.Fatalf("late commit = %v, want ErrAttachmentInvalid", err)
+	}
+
+	// A staged removal is queued with the row, due at once.
+	if err := chat.CommitAttachmentWithQuota(ctx, "", att("att_staged"), store.AttachmentQuotaLimits{}); err != nil {
+		t.Fatal(err)
+	}
+	if key, err := chat.DeleteStagedAttachment(ctx, "", "att_staged", "u_alice"); err != nil || key != "att_staged" {
+		t.Fatalf("delete staged = %q %v", key, err)
+	}
+	if keys := due(); len(keys) != 1 || keys[0] != "att_staged" {
+		t.Fatalf("due = %v, want the staged removal", keys)
+	}
+	if err := chat.ClearPendingBlobDeletes(ctx, []store.BlobRef{{TenantID: store.DefaultTenantID, Key: "att_staged"}}); err != nil {
+		t.Fatal(err)
 	}
 }

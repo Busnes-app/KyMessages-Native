@@ -53,9 +53,15 @@ export function limiter(n: number) {
     } else {
       await new Promise<void>((resolve, reject) => {
         const waiter = {
+          // A caller that left while its slot was being handed over passes the slot straight on.
           start: () => {
             signal?.removeEventListener('abort', leave);
-            resolve();
+            if (signal?.aborted) {
+              release();
+              reject(signal.reason);
+            } else {
+              resolve();
+            }
           },
         };
         const leave = () => {
@@ -179,6 +185,10 @@ export function discardUploads(files: readonly FileDescriptor[]): void {
 // Reads exactly `size` bytes into one buffer of that size: a declared length that differs, or any
 // byte past `size`, ends the download, so a reply is never buffered beyond what the descriptor allows.
 async function readExactly(res: Response, size: number, progress: () => void, signal: AbortSignal): Promise<Uint8Array<ArrayBuffer>> {
+  if (signal.aborted) {
+    void res.body?.cancel();
+    signal.throwIfAborted();
+  }
   const declared = res.headers.get('Content-Length');
   if (declared !== null && !res.headers.get('Content-Encoding') && Number(declared) !== size) {
     void res.body?.cancel();
@@ -189,23 +199,26 @@ async function readExactly(res: Response, size: number, progress: () => void, si
   // Giving up (a stall, the deadline, the caller leaving) ends the read too, not just the request.
   const stop = () => void reader.cancel(signal.reason).catch(() => undefined);
   signal.addEventListener('abort', stop, { once: true });
-  const out = new Uint8Array(size);
-  let got = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (got + value.length > size) {
-      void reader.cancel();
-      throw new Error(DAMAGED);
+  try {
+    const out = new Uint8Array(size);
+    let got = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (got + value.length > size) {
+        void reader.cancel();
+        throw new Error(DAMAGED);
+      }
+      out.set(value, got);
+      got += value.length;
+      progress();
     }
-    out.set(value, got);
-    got += value.length;
-    progress();
+    signal.throwIfAborted();
+    if (got !== size) throw new Error(DAMAGED);
+    return out;
+  } finally {
+    signal.removeEventListener('abort', stop);
   }
-  signal.removeEventListener('abort', stop);
-  signal.throwIfAborted();
-  if (got !== size) throw new Error(DAMAGED);
-  return out;
 }
 
 /** What an image must declare before it may be decoded: its type, and an exact size or a pixel budget. */
@@ -250,8 +263,10 @@ export async function openSealed(
     progress();
     const res = await fetch(attachmentUrl(blob.attachment_id), { credentials: 'same-origin', cache: 'no-store', signal: done });
     if (!res.ok) throw new Error(res.status === 404 ? 'This file is no longer available.' : 'Could not download this file.');
-    const plain = new Blob(await decryptBlob(await readExactly(res, ciphertext_size, progress, done), blob, kind), { type });
+    // The deadline and the caller bound decryption too: nothing decrypted is returned after either.
+    const plain = new Blob(await decryptBlob(await readExactly(res, ciphertext_size, progress, done), blob, kind, done), { type });
     if (image) await checkImage(plain, image);
+    done.throwIfAborted();
     return plain;
   } finally {
     clearTimeout(timer);

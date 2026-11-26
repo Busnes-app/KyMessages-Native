@@ -231,6 +231,19 @@ describe('limits', () => {
     expect(await next).toBe('next');
   });
 
+  it('returns no plaintext when the caller leaves while it decrypts', async () => {
+    const { ciphertext, file } = await sealedFile('x'.repeat(70_000)); // two chunks
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(ciphertext)));
+    const ctrl = new AbortController();
+    const real = crypto.subtle.decrypt.bind(crypto.subtle);
+    vi.spyOn(crypto.subtle, 'decrypt').mockImplementation(async (...args) => {
+      const out = await real(...args);
+      ctrl.abort(new Error('left'));
+      return out;
+    });
+    await expect(openSealed(file, 'file', 'text/plain', ctrl.signal)).rejects.toThrow('left');
+  });
+
   it('gives up on a download that keeps trickling past its deadline', async () => {
     const { ciphertext, file } = await sealedFile();
     vi.useFakeTimers();

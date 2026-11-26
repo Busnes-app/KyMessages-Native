@@ -8,7 +8,7 @@ import {
   type ChatMessage,
 } from '../../chat/types';
 import { formatTime, initialsFor, isBotSender, isGuestSender, isWebhookSender } from '../../chat/state';
-import { sealedIds, type FileDescriptor, type SealedFile } from '../../crypto/attachments';
+import { sealedIds, type FileDescriptor, type Provenance, type SealedFile } from '../../crypto/attachments';
 import { SealedFiles } from './Attachments';
 
 const WAITING_TEXT = "Waiting for this message's key";
@@ -43,6 +43,16 @@ interface AttachmentView {
 }
 
 /**
+ * What an edit of this message must seal, or undefined when no safe edit exists. Taken from the
+ * message's own (or latest edit's) envelope. A message the relay calls plaintext names no uploads
+ * on its own say: with uploads it is not offered for editing, without it edits as legacy.
+ */
+export function editProvenance(msg: ChatMessage): Provenance | undefined {
+  if (msg.encoding === 'plain_v1') return msg.attachments.length > 0 ? undefined : { kind: 'legacy', rows: [] };
+  return msg.provenance;
+}
+
+/**
  * How a message's uploads may be shown. Only a message without a sealed file list (sent before E5,
  * or plaintext) has plaintext uploads; an encrypted message not opened yet shows none, and one that
  * names its files never shows an upload it does not name.
@@ -58,6 +68,13 @@ export function attachmentView(msg: ChatMessage): AttachmentView {
   } else if (msg.filesState) {
     // Shown even when the server lists no rows: their absence is no evidence there are none.
     view.unreadable = { reason: msg.filesState.reason, expected: msg.filesState.expected };
+  } else if (msg.plainIds) {
+    // A legacy edit vouches for these plaintext rows only: others are hidden, missing ones said.
+    const vouched = new Set(msg.plainIds);
+    view.plain = msg.attachments.filter((a) => vouched.has(a.id));
+    view.unnamed = msg.attachments.length - view.plain.length;
+    const missing = msg.plainIds.length - view.plain.length;
+    if (missing > 0) view.unreadable = { reason: "This message's files are not available.", expected: missing };
   } else {
     view.plain = msg.attachments;
   }
@@ -182,7 +199,8 @@ export const MessageRow: React.FC<MessageRowProps> = ({
   const isOwn = message.sender_id === currentUserId;
   // A message this device cannot read cannot be edited from it.
   const sealedShut = message.e2ee !== undefined && message.e2ee.kind !== 'decrypted';
-  const canEdit = isSynced && !isDeleted && isOwn && !sealedShut;
+  // No edit is offered where none could say what the message's files are.
+  const canEdit = isSynced && !isDeleted && isOwn && !sealedShut && editProvenance(message) !== undefined;
   const plainNote = plaintextLabel(message);
   const files = attachmentView(message);
   const sealedFiles = files.sealed;

@@ -11,7 +11,7 @@ import {
   FILES_WAITING,
   expectOriginal,
   messageFiles,
-  withTries,
+  needsOriginal,
   openFiles,
   parseFileDescriptor,
   rasterSize,
@@ -295,7 +295,10 @@ describe('descriptors', () => {
       expect(one?.files?.[0].attachment_id).toBe('att_a');
       expect(one?.provenance).toEqual({ kind: 'e5', ref: REF, files: 1 });
       expect(messageFiles({ type: 'text', ref: REF, files: [] }, undefined, at(), 0)).toEqual({ files: [], ref: REF, provenance: { kind: 'e5', ref: REF, files: 0 } });
-      expect(messageFiles({ type: 'text' }, undefined, at('att_old'), 0)).toEqual({ provenance: { kind: 'legacy' } });
+      // From before E5: its rows are shown as the server lists them; a first edit may name them
+      // only when the envelope itself says it carried attachments.
+      expect(messageFiles({ type: 'attachment' }, undefined, at('att_old'), 0)).toEqual({ provenance: { kind: 'legacy', rows: ['att_old'] } });
+      expect(messageFiles({ type: 'text' }, undefined, at('att_old'), 0)).toEqual({ provenance: { kind: 'legacy', rows: [] } });
       // An E5 message without its ID, or with bad descriptors, is damaged.
       expect(messageFiles({ type: 'text', files: [] }, undefined, at(), 0)).toBeUndefined();
       expect(messageFiles({ type: 'text', ref: REF, files: [{ bogus: 1 }] }, undefined, at(), 0)).toBeUndefined();
@@ -326,36 +329,34 @@ describe('descriptors', () => {
       expect(messageFiles(edit({ kind: 'e5', ref: 'x', files: 1 }), undefined, at(), 0)).toBeUndefined();
     });
 
-    it('of a message from before E5 stay plaintext across any number of edits, whatever original the server keeps', () => {
-      const legacyEdit = edit({ kind: 'legacy' });
-      expect(messageFiles(legacyEdit, undefined, at('att_old'), 0)).toEqual({ provenance: { kind: 'legacy' } });
-      expect(messageFiles(legacyEdit, sent([file('att_a')]), at('att_old'), 0)).toEqual({ provenance: { kind: 'legacy' } });
+    it('of a message from before E5 are only the rows its edit names, across repeat edits', () => {
+      const legacyEdit = edit({ kind: 'legacy', rows: ['att_old'] });
+      // Repeat edits carry the same rows, whatever the server lists or keeps.
+      expect(messageFiles(legacyEdit, undefined, at('att_old', 'att_injected'), 0)).toEqual({ provenance: { kind: 'legacy', rows: ['att_old'] }, plainIds: ['att_old'] });
+      expect(needsOriginal(legacyEdit)).toBe(false);
+      expect(messageFiles(edit({ kind: 'legacy', rows: ['../x'] }), undefined, at(), 0)).toBeUndefined();
     });
 
-    it('of mixed versions: a pre-E5 edit keeps plaintext, unless the kept original had E5 files', () => {
-      const preE5Edit = { type: 'edit' };
-      expect(messageFiles(preE5Edit, undefined, at('att_old'), 0)).toEqual({ provenance: { kind: 'legacy' } });
-      expect(messageFiles(preE5Edit, sent(undefined, undefined), at('att_old'), 0)).toEqual({ provenance: { kind: 'legacy' } });
-      expect(messageFiles(preE5Edit, sent([file('att_a')]), at('att_a'), 0)?.filesState).toBeDefined();
-      // An edit sealed between formats (files: [] without `original`) cannot vouch for anything.
-      expect(messageFiles({ type: 'edit', files: [] }, sent([file('att_a')]), at('att_a'), 0)?.filesState).toBeDefined();
+    it('never need an original for a legacy, file-less or older edit, so none is opened', () => {
+      expect(needsOriginal(e5(1))).toBe(true);
+      expect(needsOriginal(e5(0))).toBe(false);
+      expect(needsOriginal(edit({ kind: 'legacy', rows: [] }))).toBe(false);
+      expect(needsOriginal({ type: 'edit' })).toBe(false);
+      expect(needsOriginal({ type: 'attachment', ref: REF, files: [] })).toBe(false);
     });
 
-    it('stop being waited for after a few tries', () => {
-      let out = messageFiles(e5(1), { state: 'waiting' }, at('att_a'), 1)!;
-      let tries: number | undefined;
-      for (let i = 0; i < 4; i++) {
-        out = withTries(out, tries);
-        tries = out.filesState?.tries;
-        expect(out.filesState?.gen).toBeDefined();
-        out = messageFiles(e5(1), { state: 'waiting' }, at('att_a'), 1)!;
+    it('of an older tab\'s edit, which names nothing, are unavailable whenever there are rows', () => {
+      for (const older of [{ type: 'edit' }, { type: 'edit', files: [] }, edit({ kind: 'legacy' })]) {
+        expect(messageFiles(older, undefined, at('att_a'), 0)?.filesState).toBeDefined();
+        expect(messageFiles(older, undefined, at('att_a'), 0)?.provenance).toBeUndefined();
+        expect(messageFiles(older, undefined, at(), 0)).toEqual({ files: [] });
       }
-      const last = withTries(out, tries);
-      expect(last.filesState?.gen).toBeUndefined();
-      expect(last.filesState).toMatchObject({ expected: 1, reason: expect.stringMatching(/has not reached this device/) });
+    });
+
+    it('name the session whose key a waiting original needs', () => {
+      expect(messageFiles(e5(1), { state: 'waiting', sessionId: 'sess_1' }, at('att_a'), 3)?.filesState).toEqual({ reason: FILES_WAITING, gen: 3, session: 'sess_1', expected: 1 });
     });
   });
-
 });
 
 describe('raster headers', () => {

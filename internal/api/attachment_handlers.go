@@ -259,8 +259,16 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 		// put in place, so a refused upload never leaves one behind.
 		body = &soleFile{part: filePart, rest: mr}
 	}
+	// Durable before any byte is written: if this request dies between the blob and its row, the
+	// sweep erases the blob once the upload's deadline has passed (its commit removes the intent).
+	intentDue := time.Now().Add(attachmentUploadDeadline(maxBytes) + time.Minute).UnixMilli()
+	if err := s.store.Chat().QueueUploadIntent(r.Context(), tenantID, attID, intentDue); err != nil {
+		s.writeError(w, http.StatusInternalServerError, "Failed to store uploaded file")
+		return
+	}
 	putRes, err := s.blobs.Put(tenantID, attID, body, res.ReservedBytes, blobs.PutOptions{Opaque: encrypted})
 	if err != nil {
+		s.abandonUpload(r.Context(), tenantID, attID)
 		var maxErr *http.MaxBytesError
 		switch {
 		case errors.Is(err, errTrailingPart):
@@ -290,11 +298,13 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 		VersionID:  putRes.VersionID,
 	}
 	if err := s.store.Chat().CommitAttachmentWithQuota(r.Context(), res.ID, att, limits); err != nil {
-		s.eraseUncommitted(tenantID, putRes.Key)
+		s.abandonUpload(r.Context(), tenantID, putRes.Key)
 		if s.writePoolError(w, err) {
 			return
 		}
 		switch {
+		case errors.Is(err, store.ErrAttachmentInvalid):
+			s.writeError(w, http.StatusRequestTimeout, "The upload took too long; send the file again")
 		case errors.Is(err, store.ErrAttachmentUploadQuotaExceeded):
 			s.writeError(w, http.StatusRequestEntityTooLarge, "File exceeds organization upload limit")
 		case errors.Is(err, store.ErrAttachmentTenantQuotaExceeded):
@@ -326,18 +336,40 @@ type soleFile struct {
 func (f *soleFile) Read(p []byte) (int, error) {
 	n, err := f.part.Read(p)
 	if errors.Is(err, io.EOF) {
-		if _, next := f.rest.NextPart(); !errors.Is(next, io.EOF) {
+		// Another part is a refusal of its own; a failed read (the body over its size) stays that error.
+		switch _, next := f.rest.NextPart(); {
+		case next == nil:
 			return n, errTrailingPart
+		case !errors.Is(next, io.EOF):
+			return n, next
 		}
 	}
 	return n, err
 }
 
-// eraseUncommitted removes a blob whose upload was refused before its row was written. A failure
-// is logged: with no row, nothing charges or lists the blob, and the stale-temp sweep cannot see it.
-func (s *Server) eraseUncommitted(tenantID, key string) {
-	if err := s.blobs.Erase(tenantID, key); err != nil {
-		log.Printf("[ATTACHMENTS] refused upload %s left an unlisted blob: %v", key, err)
+// abandonUpload erases the blob of an upload that will not commit and drops its intent. If the
+// erase fails the intent stays queued, so the sweep erases the blob after the upload's deadline.
+func (s *Server) abandonUpload(ctx context.Context, tenantID, key string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	s.eraseQueued(ctx, []store.BlobRef{{TenantID: tenantID, Key: key}})
+}
+
+// eraseQueued erases blobs whose deletes are queued and clears the ones that went; a failure stays
+// queued for the next sweep.
+func (s *Server) eraseQueued(ctx context.Context, refs []store.BlobRef) {
+	var done []store.BlobRef
+	for _, ref := range refs {
+		if err := s.blobs.Erase(ref.TenantID, ref.Key); err != nil && !errors.Is(err, blobs.ErrInvalidKey) {
+			log.Printf("[ATTACHMENTS] blob %s not erased yet (queued for the sweep): %v", ref.Key, err)
+			continue
+		}
+		done = append(done, ref)
+	}
+	if len(done) > 0 {
+		if err := s.store.Chat().ClearPendingBlobDeletes(ctx, done); err != nil {
+			log.Printf("[ATTACHMENTS] erased blobs stay queued (the sweep clears them): %v", err)
+		}
 	}
 }
 
@@ -499,8 +531,9 @@ func (s *Server) handleChatDeleteAttachment(w http.ResponseWriter, r *http.Reque
 		}
 		return
 	}
-	// Never sent: no retained copy is kept (§9.4 retains posted files).
-	_ = s.blobs.Erase(tenantID, blobKey)
+	// Never sent: no retained copy is kept (§9.4 retains posted files). Queued with the row's
+	// removal, so a failed erase is retried by the sweep.
+	s.eraseQueued(r.Context(), []store.BlobRef{{TenantID: tenantID, Key: blobKey}})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -513,11 +546,6 @@ func (s *Server) SweepOrphanAttachments(ctx context.Context, now time.Time) (int
 	if err := s.relocateFlatBlobs(ctx); err != nil && ctx.Err() == nil {
 		log.Printf("[ATTACHMENTS] flat blob relocation incomplete (retrying next sweep): %v", err)
 	}
-	if s.config.Tenancy.IsMultiTenant() {
-		if err := s.drainPendingBlobDeletes(ctx); err != nil && ctx.Err() == nil {
-			log.Printf("[ATTACHMENTS] queued blob deletes incomplete (retrying next sweep): %v", err)
-		}
-	}
 	cutoff := now.Add(-s.pendingAttachmentTTL()).UnixMilli()
 	deleted := 0
 	for {
@@ -525,13 +553,15 @@ func (s *Server) SweepOrphanAttachments(ctx context.Context, now time.Time) (int
 		if err != nil {
 			return deleted, err
 		}
-		for _, key := range keys {
-			_ = s.blobs.Erase(key.TenantID, key.Key) // never sent
-			deleted++
-		}
+		s.eraseQueued(ctx, keys) // never sent; queued with their rows' removal
+		deleted += len(keys)
 		if len(keys) < 200 {
 			break
 		}
+	}
+	// Every mode: staged removals and abandoned uploads that failed to erase, and (multi) erasures.
+	if err := s.drainPendingBlobDeletes(ctx, now); err != nil && ctx.Err() == nil {
+		log.Printf("[ATTACHMENTS] queued blob deletes incomplete (retrying next sweep): %v", err)
 	}
 	s.blobs.SweepStaleTemps(time.Hour)
 	return deleted, nil
@@ -617,8 +647,8 @@ func (s *Server) eraseUser(ctx context.Context, user *store.User, revoke func(co
 // drainPendingBlobDeletes finishes blob deletes an erasure committed but could not complete.
 // Each entry is tried on its own: successes are cleared, failures stay queued, and the batch is
 // a random sample, so a blob that keeps failing cannot hold back the others.
-func (s *Server) drainPendingBlobDeletes(ctx context.Context) error {
-	refs, err := s.store.Chat().PendingBlobDeletes(ctx, 500)
+func (s *Server) drainPendingBlobDeletes(ctx context.Context, now time.Time) error {
+	refs, err := s.store.Chat().DuePendingBlobDeletes(ctx, 500, now, 10*time.Minute)
 	if err != nil || len(refs) == 0 || s.blobs == nil {
 		return err
 	}

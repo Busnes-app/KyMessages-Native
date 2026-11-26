@@ -201,6 +201,16 @@ export async function fetchMessages(
   return { ...page, messages: await openMessages(page.messages) };
 }
 
+/** One message, read from the primary: the exact row a slim edit frame names. */
+export async function fetchMessage(roomId: string, messageId: string): Promise<ChatMessage> {
+  const data = obj(
+    await apiJSON(`/api/v1/rooms/${encodeURIComponent(roomId)}/messages/${encodeURIComponent(messageId)}`, {}, 'Could not load message'),
+  );
+  const m = parseMessage(data.message);
+  if (m.id !== messageId || m.room_id !== roomId) throw new Error('Unexpected message');
+  return openMessage(m);
+}
+
 // The caller's staged (unposted) uploads in a room, which still count against their quota.
 export async function listStagedAttachments(roomId: string): Promise<ChatAttachment[]> {
   const data = obj(

@@ -6,7 +6,7 @@ import { arr, bool, obj, str } from '../dto';
 import { keepStorage } from '../persist';
 import { CryptoEngine, DeviceChanged, type ClaimedKey, type DeviceKeys, type KeyServer, type Mail, type RoomInner } from '../crypto/engine';
 import { loadCrypto } from '../crypto/index';
-import { expectOriginal, messageFiles, withTries, type OpenedEnvelope } from '../crypto/attachments';
+import { expectOriginal, messageFiles, needsOriginal, type OpenedEnvelope } from '../crypto/attachments';
 import { type CryptoStore, deleteCryptoStores, openCryptoStore, storedDevices } from '../crypto/store';
 import { parseRoomDetail, type ChatMessage, type E2EEState } from './types';
 
@@ -112,13 +112,39 @@ const keyListeners = new Set<() => void>();
 let keyGen = 0;
 export const keyGeneration = () => keyGen;
 const keyChannel = typeof BroadcastChannel === 'undefined' ? undefined : new BroadcastChannel('kymessages-room-keys');
-function keysArrived(share: boolean): void {
+// The generation at which each session's key last arrived (the newest few thousand), and the last
+// arrival whose sessions are unknown (device start-up, an older tab): files waiting on one
+// session's key are opened again only when that key may have come.
+const sessionGen = new Map<string, number>();
+const MAX_SESSIONS = 5000;
+let unknownGen = 0;
+function keysArrived(share: boolean, sessions?: string[]): void {
   keyGen++;
-  if (share) keyChannel?.postMessage(null);
+  if (sessions) {
+    for (const id of sessions) {
+      sessionGen.delete(id);
+      sessionGen.set(id, keyGen);
+    }
+    for (const id of sessionGen.keys()) {
+      if (sessionGen.size <= MAX_SESSIONS) break;
+      sessionGen.delete(id);
+    }
+  } else {
+    unknownGen = keyGen;
+  }
+  if (share) keyChannel?.postMessage(sessions ? { type: 'keys', sessions } : null);
   for (const fn of keyListeners) fn();
 }
+/** Whether the key to `session` (any key, when unknown) may have arrived after generation `since`. */
+export function keysArrivedFor(session: string | undefined, since: number): boolean {
+  return session === undefined || unknownGen > since || (sessionGen.get(session) ?? 0) > since;
+}
+const isKeys = (d: unknown): d is { sessions: string[] } =>
+  typeof d === 'object' && d !== null && 'type' in d && d.type === 'keys' && 'sessions' in d
+  && Array.isArray(d.sessions) && d.sessions.every((s) => typeof s === 'string');
 if (keyChannel) keyChannel.onmessage = ({ data }: MessageEvent<unknown>) => {
   if (data === null) keysArrived(false);
+  else if (isKeys(data)) keysArrived(false, data.sessions.slice(0, MAX_SESSIONS));
   else if (typeof data === 'object' && data !== null && 'type' in data && data.type === 'device-reset'
     && 'user_id' in data && typeof data.user_id === 'string' && 'device_id' in data && typeof data.device_id === 'string') {
     if (current?.userId === data.user_id && current.deviceId === data.device_id) invalidateEntry(current);
@@ -204,7 +230,7 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
       live();
     }
     void retireAbandoned(userId, entry.controller.signal).catch(() => undefined);
-    e.onKeys(() => keysArrived(true));
+    e.onKeys((sessions) => keysArrived(true, sessions));
     return e;
   })();
   current = entry;
@@ -314,11 +340,11 @@ export async function openMessage(m: ChatMessage): Promise<ChatMessage> {
     const r = await e.decrypt({ id: m.id, room_id: m.room_id, sender_id: m.sender_id, body: m.envelope });
     if (r.state === 'waiting') return shut({ kind: 'waiting', gen });
     if (r.state === 'failed') return shut({ kind: 'failed', reason: r.reason });
-    const original = r.inner.type === 'edit' && m.original ? await openOriginal(e, m, m.original, expectOriginal(r.inner)) : undefined;
+    const original = needsOriginal(r.inner) && m.original ? await openOriginal(e, m, m.original, expectOriginal(r.inner)) : undefined;
     const files = messageFiles(r.inner, original, m.attachments, gen);
     if (!files) return shut({ kind: 'failed', reason: 'This message is damaged.' });
     // The encrypted reply target is the true one; the server's copy is only a hint.
-    return { ...m, body: r.inner.body, reply_to_id: r.inner.reply_to_id, e2ee: { kind: 'decrypted' }, ...withTries(files, m.filesState?.tries) };
+    return { ...m, body: r.inner.body, reply_to_id: r.inner.reply_to_id, e2ee: { kind: 'decrypted' }, files: undefined, filesState: undefined, plainIds: undefined, provenance: undefined, ref: undefined, ...files };
   } catch {
     // Not a verdict on the message: the engine's own checks return 'failed' without throwing.
     return shut({ kind: 'failed', reason: NOT_YET, gen });
@@ -327,7 +353,7 @@ export async function openMessage(m: ChatMessage): Promise<ChatMessage> {
 
 // The envelope an edited message was first sent in, which describes its files; `expect` refuses a
 // substitute before it can claim the index. An open that throws (local storage) is not a verdict:
-// it reads as waiting, and is tried again as keys arrive, a bounded number of times.
+// it reads as waiting, and is tried again when keys arrive.
 async function openOriginal(e: CryptoEngine, m: ChatMessage, body: string, expect: ReturnType<typeof expectOriginal>): Promise<OpenedEnvelope> {
   try {
     return await e.decrypt({ id: m.id, room_id: m.room_id, sender_id: m.sender_id, body }, expect);

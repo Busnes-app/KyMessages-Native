@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { applyReactionDelta, isGroupedWithPrevious, mergeMessageBatch, searchSignature, sortRooms, upsertMessage } from './state';
+import { applyReactionDelta, forgetDeleted, isGroupedWithPrevious, mergeMessageBatch, rememberDeleted, resolvePending, searchSignature, sortRooms, upsertMessage } from './state';
 import { parseWsEvent, type ChatMessage, type ChatRoomSummary } from './types';
 
 function makeMsg(overrides: Partial<ChatMessage> = {}): ChatMessage {
@@ -28,9 +28,9 @@ describe('chat state helpers', () => {
       body: 'ship it',
       delivery: { kind: 'sending', idempotencyKey: 'k1' },
     });
-    const confirmed = makeMsg({ id: 'msg_42', seq: 42, body: 'ship it' });
+    const confirmed = makeMsg({ id: 'msg_42', seq: 42, body: 'ship it', ref: 'k1' });
 
-    const next = upsertMessage([pending], confirmed, 'k1');
+    const next = upsertMessage([pending], confirmed);
     expect(next).toHaveLength(1);
     expect(next[0].id).toBe('msg_42');
     expect(next[0].delivery.kind).toBe('synced');
@@ -49,7 +49,7 @@ describe('chat state helpers', () => {
     expect(afterWs).toHaveLength(1);
     expect(afterWs[0].id).toBe('msg_99');
 
-    const afterRest = upsertMessage(afterWs, wsCopy, 'k2');
+    const afterRest = upsertMessage(afterWs, wsCopy);
     expect(afterRest).toHaveLength(1);
     expect(afterRest[0].id).toBe('msg_99');
   });
@@ -192,5 +192,32 @@ describe('encrypted files', () => {
     expect(mergeMessageBatch([live], [{ ...live, body: 'v1', edited_at: 10 }])[0].body).toBe('v2');
     // A deletion always lands.
     expect(upsertMessage([live], tomb)[0].deleted_at).toBe(30);
+  });
+});
+
+describe('deletions and confirmations', () => {
+  const base = { id: 'm1', tenant_id: 't', room_id: 'r', seq: 1, sender_id: 'u', sender_name: 'U', encoding: 'e2ee_room_v1' as const, body: 'hello', created_at: 1, reactions: [], attachments: [], delivery: { kind: 'synced' as const }, e2ee: { kind: 'decrypted' as const } };
+
+  it('keeps a deletion that arrived before the message, through pages and responses', () => {
+    rememberDeleted('m1', 40);
+    try {
+      expect(mergeMessageBatch([], [{ ...base, files: [] }])[0]).toMatchObject({ deleted_at: 40, body: '' });
+      expect(upsertMessage([], base)[0]).toMatchObject({ deleted_at: 40, body: '' });
+      expect(upsertMessage([], base)[0].files).toBeUndefined();
+    } finally {
+      forgetDeleted();
+    }
+    expect(upsertMessage([], base)[0].deleted_at).toBeUndefined();
+  });
+
+  it('resolves an unsent copy only with the sealed ref of its own send', () => {
+    const pending: ChatMessage = { ...base, id: 'pending_k', seq: Number.MAX_SAFE_INTEGER, delivery: { kind: 'failed', idempotencyKey: 'k', error: 'x' } };
+    // No ref (an unopened or untrusted answer), another sender, another ref: nothing resolved.
+    expect(resolvePending([pending, { ...base }])).toHaveLength(2);
+    expect(resolvePending([pending, { ...base, ref: 'k', sender_id: 'mallory' }])).toHaveLength(2);
+    expect(resolvePending([pending, { ...base, ref: 'other' }])).toHaveLength(2);
+    expect(resolvePending([pending, { ...base, ref: 'k' }]).map((m) => m.id)).toEqual(['m1']);
+    // The same rule on a page of history.
+    expect(mergeMessageBatch([pending], [{ ...base, ref: 'k' }]).map((m) => m.id)).toEqual(['m1']);
   });
 });

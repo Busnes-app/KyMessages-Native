@@ -509,6 +509,40 @@ describe('the signed-in device', () => {
     expect((await openMessage(m)).e2ee).toEqual({ kind: 'failed', reason: 'This message is damaged.' });
   });
 
+  it('never opens (or claims) a kept original for a legacy, file-less or older edit', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === '/api/v1/keys/upload') {
+        const req = JSON.parse(String(init?.body)) as { one_time_keys: unknown[] };
+        return json({ one_time_key_count: req.one_time_keys.length });
+      }
+      return json({ messages: [] });
+    }));
+    const e = await startE2EE('u_alice');
+    await vi.waitFor(async () => expect((await openMessage(parseMessage({ id: 'x', room_id: 'r1', sender_id: 'u_bob', encoding: 'plain_v1', body: 'p' }))).body).toBe('p'));
+    // The server pairs each edit with another message's envelope as its "original".
+    const elsewhere = '{"alg":"megolm.v1","sender_key":"k","device_id":"DEVICE0001","session_id":"s_other","ciphertext":"CCCC"}';
+    const m = parseMessage({
+      id: 'm1', room_id: 'r1', sender_id: 'u_bob', encoding: 'e2ee_room_v1', original_body: elsewhere,
+      attachments: [{ id: 'att_old', room_id: 'r1', filename: 'old.pdf' }, { id: 'att_x', room_id: 'r1', filename: 'x.pdf' }],
+      body: '{"alg":"megolm.v1","sender_key":"k","device_id":"DEVICE0001","session_id":"s","ciphertext":"AAAA"}',
+    });
+    const decrypt = vi.spyOn(e, 'decrypt');
+    for (const original of [{ kind: 'legacy', rows: ['att_old'] }, { kind: 'e5', ref: 'ref-m1-000001', files: 0 }, undefined]) {
+      decrypt.mockReset();
+      decrypt.mockResolvedValue({ state: 'decrypted', inner: { room_id: 'r1', type: 'edit', body: 'caption', message_id: 'm1', ...(original ? { original } : {}) } });
+      const opened = await openMessage(m);
+      expect(opened.body).toBe('caption');
+      expect(decrypt).toHaveBeenCalledTimes(1);
+      expect(decrypt.mock.calls.some(([sealed]) => sealed.body === elsewhere)).toBe(false);
+    }
+    // Legacy: only its named row is plaintext; older edit: its rows are unavailable.
+    decrypt.mockResolvedValue({ state: 'decrypted', inner: { room_id: 'r1', type: 'edit', body: 'caption', message_id: 'm1', original: { kind: 'legacy', rows: ['att_old'] } } });
+    expect((await openMessage(m)).plainIds).toEqual(['att_old']);
+    decrypt.mockResolvedValue({ state: 'decrypted', inner: { room_id: 'r1', type: 'edit', body: 'caption', message_id: 'm1' } });
+    expect((await openMessage(m)).filesState).toBeDefined();
+    decrypt.mockReset();
+  });
+
   it('refuses text whose sealed form would exceed the server envelope limit, before sealing', async () => {
     // 10 KiB of control characters is under the 16 KiB text limit but escapes to 60 KiB of JSON.
     await expect(sealRoomMessage('r1', { type: 'text', body: '\u0001'.repeat(10 << 10) })).rejects.toThrow('Message is too long');

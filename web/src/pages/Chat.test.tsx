@@ -711,9 +711,9 @@ describe('Native Chat page', () => {
     expect(uploads.every((u) => u.url.endsWith('?encrypted=1') && u.name === 'encrypted.bin')).toBe(true);
   });
 
-  it('fetches again exactly the row an edit too large for the bus names, when it is already loaded', async () => {
+  it('fetches again exactly the row an edit too large for the bus names, even seq 1, retrying a failure', async () => {
     const fetched: string[] = [];
-    const row = (body: string, edited?: number) => ({ id: 'm_old', room_id: 'rm_gen', seq: 3, sender_id: 'bot_1', sender_name: 'Bot', encoding: 'plain_v1', body, created_at: 1, reactions: [], attachments: [], ...(edited ? { edited_at: edited } : {}) });
+    const row = (body: string, edited?: number) => ({ id: 'm_old', room_id: 'rm_gen', seq: 1, sender_id: 'bot_1', sender_name: 'Bot', encoding: 'plain_v1', body, created_at: 1, reactions: [], attachments: [], ...(edited ? { edited_at: edited } : {}) });
     vi.stubGlobal(
       'fetch',
       vi.fn(async (input: RequestInfo | URL) => {
@@ -725,18 +725,51 @@ describe('Native Chat page', () => {
             rooms: [{ id: 'rm_gen', tenant_id: 'default', kind: 'channel', name: 'general', topic: '', is_private: false, last_seq: 9, created_by: 'u_alice', created_at: Date.now(), role: 'owner', last_read_seq: 9, unread_count: 0, notify_mode: 'all' }],
           });
         }
-        if (url.startsWith('/api/v1/rooms/rm_gen/messages')) {
+        if (url === '/api/v1/rooms/rm_gen/messages/m_old') {
           fetched.push(url);
-          return json({ messages: [url.includes('before=4') ? row('caption, edited', 50) : row('first caption')], has_more: false });
+          // The first read fails (a transient error); the retry gets the edited row.
+          return fetched.length === 1 ? json({ error: 'busy' }, 503) : json({ message: row('caption, edited', 50) });
+        }
+        if (url.startsWith('/api/v1/rooms/rm_gen/messages')) {
+          return json({ messages: [row('first caption')], has_more: false });
         }
         return json({ error: 'not found' }, 404);
       }),
     );
     render(<Chat />);
     await screen.findByText('first caption');
-    act(() => FakeWebSocket.instances[0].emit({ t: 'message.edit', room: 'rm_gen', seq: 3, d: { refetch: true, id: 'm_old' } }));
-    expect(await screen.findByText('caption, edited')).toBeTruthy();
-    expect(fetched.at(-1)).toBe('/api/v1/rooms/rm_gen/messages?before=4&limit=1');
+    act(() => FakeWebSocket.instances[0].emit({ t: 'message.edit', room: 'rm_gen', seq: 1, d: { refetch: true, id: 'm_old' } }));
+    expect(await screen.findByText('caption, edited', {}, { timeout: 3000 })).toBeTruthy();
+    expect(fetched).toEqual(['/api/v1/rooms/rm_gen/messages/m_old', '/api/v1/rooms/rm_gen/messages/m_old']);
+  });
+
+  it('does not take a send as confirmed by an answer that does not seal its key', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url === '/api/v1/bootstrap') {
+          return json({
+            user: { id: 'u_alice', username: 'alice', display_name: 'Alice', role: 'user' },
+            tenant: { id: 'default', slug: 'default', display_name: 'Busnes HQ', plan: 'self_hosted' },
+            rooms: [{ id: 'rm_gen', tenant_id: 'default', kind: 'channel', name: 'general', topic: '', is_private: false, last_seq: 0, created_by: 'u_alice', created_at: Date.now(), role: 'owner', last_read_seq: 0, unread_count: 0, notify_mode: 'all' }],
+          });
+        }
+        if (url === '/api/v1/rooms/rm_gen/messages' && init?.method === 'POST') {
+          // Some other message of Alice's, not the one just sent.
+          return json({ message: { id: 'm_other', room_id: 'rm_gen', seq: 7, sender_id: 'u_alice', sender_name: 'Alice', encoding: 'e2ee_room_v1', created_at: 1, reactions: [], attachments: [],
+            body: fakeEnvelope({ room_id: 'rm_gen', type: 'text', body: 'an older message', ref: 'not-this-send', files: [] }) } }, 201);
+        }
+        if (url.startsWith('/api/v1/rooms/rm_gen/messages')) return json({ messages: [], has_more: false });
+        return json({ error: 'not found' }, 404);
+      }),
+    );
+    render(<Chat />);
+    await screen.findByRole('heading', { name: 'Welcome to #general' });
+    fireEvent.change(screen.getByLabelText('Message input'), { target: { value: 'hello there' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    expect(await screen.findByText(/The server did not confirm this message/)).toBeTruthy();
+    expect(screen.getByText('hello there')).toBeTruthy();
   });
 
   it('closes an image preview when its message is deleted', async () => {

@@ -21,7 +21,11 @@ export function useSealedUrl(
   const openRef = useRef(open);
   openRef.current = open;
   useEffect(() => {
-    if (!id) return;
+    // Unset (scrolled away unfinished, closed): hold no decrypted bytes or URL.
+    if (!id) {
+      setState({});
+      return;
+    }
     const ctrl = new AbortController();
     let url: string | undefined;
     setState({});

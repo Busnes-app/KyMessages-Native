@@ -1,7 +1,7 @@
 // A stand-in for chat/e2ee.ts in page tests, which run without the WebAssembly core: "sealing"
 // base64-encodes the inner JSON under a session name, and a message opens once its session's key
 // has "arrived". Use with vi.mock('../chat/e2ee', () => import('../chat/e2eeFake')).
-import { expectOriginal, messageFiles, withTries, type OpenedEnvelope } from '../crypto/attachments';
+import { expectOriginal, messageFiles, needsOriginal, type OpenedEnvelope } from '../crypto/attachments';
 import type { RoomInner } from '../crypto/engine';
 import type { ChatMessage } from './types';
 
@@ -23,9 +23,13 @@ export function fakeEnvelope(inner: RoomInner, session = 's_own'): string {
 let keyGen = 0;
 export const keyGeneration = () => keyGen;
 
+const sessionGen = new Map<string, number>();
+export const keysArrivedFor = (session: string | undefined, since: number) => session === undefined || (sessionGen.get(session) ?? 0) > since;
+
 export function deliverKey(session: string): void {
   keys.add(session);
   keyGen++;
+  sessionGen.set(session, keyGen);
   for (const fn of listeners) fn();
 }
 
@@ -33,6 +37,7 @@ export function deliverKey(session: string): void {
 export function storeKeySilently(session: string): void {
   keys.add(session);
   keyGen++;
+  sessionGen.set(session, keyGen);
 }
 
 let unavailable = false;
@@ -44,6 +49,7 @@ export function setFakeUnavailable(v: boolean): void {
 
 export function resetFakeE2EE(): void {
   keys.clear();
+  sessionGen.clear();
   keys.add('s_own');
   unavailable = false;
 }
@@ -86,15 +92,15 @@ function openNow(m: ChatMessage): ChatMessage {
   const inner = JSON.parse(atob(env.ciphertext)) as RoomInner;
   if (inner.room_id !== m.room_id) return { ...m, body: '', e2ee: { kind: 'failed', reason: 'This message was encrypted for another room.' } };
   let original: OpenedEnvelope | undefined;
-  if (inner.type === 'edit' && m.original) {
+  if (needsOriginal(inner) && m.original) {
     const o = JSON.parse(m.original) as { session_id: string; ciphertext: string };
     const opened = keys.has(o.session_id) ? (JSON.parse(atob(o.ciphertext)) as RoomInner) : undefined;
     const refused = opened && expectOriginal(inner)(opened);
-    original = !opened ? { state: 'waiting' } : refused ? { state: 'failed', reason: refused } : { state: 'decrypted', inner: opened };
+    original = !opened ? { state: 'waiting', sessionId: o.session_id } : refused ? { state: 'failed', reason: refused } : { state: 'decrypted', inner: opened };
   }
   const files = messageFiles(inner, original, m.attachments, keyGen);
   if (!files) return { ...m, body: '', e2ee: { kind: 'failed', reason: 'This message is damaged.' } };
-  return { ...m, body: inner.body, reply_to_id: inner.reply_to_id, e2ee: { kind: 'decrypted' }, ...withTries(files, m.filesState?.tries) };
+  return { ...m, body: inner.body, reply_to_id: inner.reply_to_id, e2ee: { kind: 'decrypted' }, files: undefined, filesState: undefined, plainIds: undefined, provenance: undefined, ref: undefined, ...files };
 }
 
 let held: Promise<void> | undefined;

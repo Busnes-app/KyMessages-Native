@@ -248,6 +248,66 @@ func (c *chatStore) eraseActorTx(ctx context.Context, tx *sql.Tx, tenantID, user
 	return late, nil
 }
 
+// blobDeleteClaimed marks a queued delete of no person's (an upload intent, a staged removal) that
+// a sweep has leased: a late commit of that upload then refuses, so no row names an erased blob.
+const blobDeleteClaimed = "~sweep"
+
+// QueueUploadIntent records, before an upload writes its blob, that the blob must be erased
+// unless the upload commits: CommitAttachmentWithQuota removes the intent in its transaction, and
+// a sweep erases what is left once notBefore (past the upload's deadline) passes.
+func (c *chatStore) QueueUploadIntent(ctx context.Context, tenantID, key string, notBefore int64) error {
+	_, err := c.store.db.ExecContext(ctx, c.store.rebind(`INSERT INTO pending_blob_deletes (tenant_id, blob_key, user_id, not_before) VALUES (?, ?, '', ?)`), normalizeTenant(tenantID), key, notBefore)
+	return err
+}
+
+// DuePendingBlobDeletes returns up to limit queued deletes that are due, a random sample. Deletes
+// of no person's are leased first (for lease), so a late commit refuses them and a sweep that dies
+// before it erases leaves them due again once the lease ends.
+func (c *chatStore) DuePendingBlobDeletes(ctx context.Context, limit int, at time.Time, lease time.Duration) ([]BlobRef, error) {
+	tx, err := c.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	now := at.UnixMilli()
+	rows, err := tx.QueryContext(ctx, c.store.rebind(`SELECT tenant_id, blob_key, user_id FROM pending_blob_deletes WHERE not_before <= ? ORDER BY random() LIMIT ?`), now, limit)
+	if err != nil {
+		return nil, err
+	}
+	type due struct {
+		BlobRef
+		user string
+	}
+	var found []due
+	for rows.Next() {
+		var d due
+		if err := rows.Scan(&d.TenantID, &d.Key, &d.user); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		found = append(found, d)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return nil, err
+	}
+	out := make([]BlobRef, 0, len(found))
+	for _, d := range found {
+		if d.user != "" && d.user != blobDeleteClaimed {
+			out = append(out, d.BlobRef) // an erasure's: no upload can commit it
+			continue
+		}
+		res, err := tx.ExecContext(ctx, c.store.rebind(`UPDATE pending_blob_deletes SET user_id = ?, not_before = ? WHERE tenant_id = ? AND blob_key = ? AND user_id IN ('', ?) AND not_before <= ?`),
+			blobDeleteClaimed, now+lease.Milliseconds(), d.TenantID, d.Key, blobDeleteClaimed, now)
+		if err != nil {
+			return nil, err
+		}
+		if n, err := res.RowsAffected(); err == nil && n == 1 {
+			out = append(out, d.BlobRef)
+		}
+	}
+	return out, tx.Commit()
+}
+
 // PendingBlobDeletes lists up to limit queued blob deletes, a random sample of them.
 func (c *chatStore) PendingBlobDeletes(ctx context.Context, limit int) ([]BlobRef, error) {
 	rows, err := c.store.db.QueryContext(ctx, c.store.rebind(`SELECT tenant_id, blob_key FROM pending_blob_deletes ORDER BY random() LIMIT ?`), limit)

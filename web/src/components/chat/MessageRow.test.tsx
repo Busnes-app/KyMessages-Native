@@ -331,6 +331,31 @@ describe('MessageRow', () => {
       expect(screen.getByRole('link', { name: /old\.pdf/ }).getAttribute('href')).toBe('/api/v1/attachments/att_old');
     });
 
+    it('shows only the plaintext rows a legacy edit vouches for', () => {
+      row({ ...sealed, body: 'old, edited', plainIds: ['att_old', 'att_gone'], attachments: [{ ...att('att_old'), filename: 'old.pdf' }, { ...att('att_new'), filename: 'planted.pdf' }] });
+      expect(screen.getByText('File not encrypted')).toBeTruthy();
+      expect(screen.getByRole('link', { name: /old\.pdf/ })).toBeTruthy();
+      expect(screen.queryByRole('link', { name: /planted/ })).toBeNull();
+      expect(screen.getByRole('note').textContent).toMatch(/hidden/);
+      expect(screen.getByText(/^Attachment unavailable\./)).toBeTruthy();
+    });
+
+    it('offers no edit where none could say what the message\'s files are', () => {
+      // The relay calls it plaintext and lists uploads: nothing authenticates them.
+      row({ ...baseMsg, attachments: [att('att_1')] }, 'u1');
+      expect(screen.queryByRole('button', { name: 'Edit message' })).toBeNull();
+      cleanup();
+      row(baseMsg, 'u1');
+      expect(screen.getByRole('button', { name: 'Edit message' })).toBeTruthy();
+      cleanup();
+      // An encrypted message whose edit history names nothing (an older tab's edit).
+      row({ ...sealed, filesState: { reason: 'x' } }, 'u1');
+      expect(screen.queryByRole('button', { name: 'Edit message' })).toBeNull();
+      cleanup();
+      row({ ...sealed, provenance: { kind: 'e5', ref: 'ref-12345678', files: 0 } }, 'u1');
+      expect(screen.getByRole('button', { name: 'Edit message' })).toBeTruthy();
+    });
+
     it('never calls the uploads of an unopened encrypted message plaintext', () => {
       row({ ...sealed, body: '', e2ee: { kind: 'waiting' }, attachments: [att('att_x')] });
       expect(screen.queryByText('File not encrypted')).toBeNull();

@@ -157,7 +157,7 @@ export function checkBlob(d: SealedBlob, kind: BlobKind): SealedBlob {
  * Checks the ciphertext's length and SHA-256 against the descriptor, then opens every chunk.
  * Nothing is returned unless the whole blob is authentic.
  */
-export async function decryptBlob(ciphertext: Uint8Array, d: SealedBlob, kind: BlobKind): Promise<Uint8Array<ArrayBuffer>[]> {
+export async function decryptBlob(ciphertext: Uint8Array, d: SealedBlob, kind: BlobKind, signal?: AbortSignal): Promise<Uint8Array<ArrayBuffer>[]> {
   const blob = checkBlob(d, kind);
   if (ciphertext.length !== blob.ciphertext_size || (await sha256Hex(ciphertext)) !== blob.sha256) throw new Error(DAMAGED);
   const n = layout(blob.ciphertext_size, blob.chunk_size, blob.size)!;
@@ -166,6 +166,7 @@ export async function decryptBlob(ciphertext: Uint8Array, d: SealedBlob, kind: B
   const parts: Uint8Array<ArrayBuffer>[] = [];
   const full = blob.chunk_size + TAG;
   for (let i = 0; i < n; i++) {
+    signal?.throwIfAborted();
     const chunk = ciphertext.subarray(i * full, Math.min((i + 1) * full, ciphertext.length));
     try {
       parts.push(new Uint8Array(await crypto.subtle.decrypt(chunkParams(prefix, kind, i, i === n - 1), key, chunk)));
@@ -268,25 +269,37 @@ export function openFiles(raw: unknown, attached: readonly { id: string }[]): Se
 
 /**
  * What an edit says the message it edits holds: E5 files (the sender's message ID and how many),
- * or a message from before E5 whose uploads are plaintext. Read only from an envelope bound to
- * the message (the message itself, or its latest edit), never from the server's kept original.
+ * or a message from before E5 and the plaintext uploads it had when first edited (`rows`, carried
+ * unchanged by later edits). Read only from an envelope bound to the message (the message itself,
+ * or its latest edit), never from the server's kept original.
  */
-export type Provenance = { kind: 'e5'; ref: string; files: number } | { kind: 'legacy' };
-const LEGACY: Provenance = { kind: 'legacy' };
+export type Provenance = { kind: 'e5'; ref: string; files: number } | { kind: 'legacy'; rows: string[] };
 const REF_RE = /^[A-Za-z0-9_-]{8,128}$/;
 
-function parseProvenance(v: unknown): Provenance | undefined {
+// Undefined: malformed. `rows` absent: a legacy edit sealed before rows were named.
+function parseProvenance(v: unknown): Provenance | { kind: 'legacy'; rows?: undefined } | undefined {
   if (!isObj(v)) return undefined;
-  if (v.kind === 'legacy') return LEGACY;
+  if (v.kind === 'legacy') {
+    if (v.rows === undefined) return { kind: 'legacy' };
+    const rows = v.rows;
+    return Array.isArray(rows) && rows.length <= MAX_FILES && rows.every((r): r is string => typeof r === 'string' && ID_RE.test(r))
+      ? { kind: 'legacy', rows }
+      : undefined;
+  }
   if (v.kind !== 'e5' || typeof v.ref !== 'string' || !REF_RE.test(v.ref) || !isInt(v.files, 0, MAX_FILES)) return undefined;
   return { kind: 'e5', ref: v.ref, files: v.files };
 }
 
-/** What a message's files are once opened. No `files` and no `filesState`: from before E5 (plaintext uploads). */
+/** What a message's files are once opened. Only `plainIds` (or neither field) means plaintext uploads. */
 export interface MessageFiles {
   files?: SealedFile[];
-  /** Files exist but cannot be read here. `gen` set while worth trying again as keys arrive. */
-  filesState?: { reason: string; gen?: number; tries?: number; expected?: number };
+  /** Files exist but cannot be read here. `session`: the key that, when it arrives, may open them. */
+  filesState?: { reason: string; gen?: number; session?: string; expected?: number };
+  /**
+   * The plaintext uploads (from before E5) an edit vouches for. Absent on an unedited message from
+   * before E5, whose rows the server alone lists.
+   */
+  plainIds?: string[];
   /** What an edit of this message must carry; absent when it cannot be edited safely. */
   provenance?: Provenance;
   /** The sender's ID for the message (its idempotency key). */
@@ -296,35 +309,45 @@ export interface MessageFiles {
 /** An envelope opened as far as files care (crypto/engine.ts `Opened`). */
 export type OpenedEnvelope =
   | { state: 'decrypted'; inner: Inner }
-  | { state: 'waiting' }
+  | { state: 'waiting'; sessionId?: string }
   | { state: 'failed'; reason: string };
 type Inner = { type: string; files?: unknown[]; ref?: string; original?: unknown };
 
 export const FILES_WAITING = "Waiting for the key to this message's files.";
 const FILES_GONE = "This message's files are not available.";
 export const FILES_REPLACED = "This message's files were replaced or damaged, so they are not shown.";
-const FILES_UNVERIFIED = "This message's files cannot be verified.";
+const FILES_UNVERIFIED = "This message was edited by an older version, so its files cannot be verified.";
 
 /**
- * What the server's kept original of an edited message must be: for E5, the sender's first
- * envelope of this very message (same ID, same number of files). Checked before the original's
- * ratchet index is claimed, so a substitute never takes another message's place.
+ * Whether reading this message's files needs the server's kept original: only an E5 edit that
+ * says there are files. A legacy or file-less edit never opens one, so an unrelated envelope the
+ * server offers is never decrypted, nor its ratchet index claimed for this message.
+ */
+export function needsOriginal(inner: Inner): boolean {
+  if (inner.type !== 'edit') return false;
+  const prov = parseProvenance(inner.original);
+  return prov?.kind === 'e5' && prov.files > 0;
+}
+
+/**
+ * What the kept original of an edited message must be: the sender's first envelope of this very
+ * message (same ID, same number of files). Checked before the original's ratchet index is claimed,
+ * so a substitute never takes another message's place.
  */
 export function expectOriginal(edit: Inner): (inner: Inner) => string | undefined {
   const prov = parseProvenance(edit.original);
-  return (inner) => {
-    if (inner.type === 'edit') return FILES_REPLACED;
-    if (prov?.kind !== 'e5') return undefined;
-    return inner.ref === prov.ref && Array.isArray(inner.files) && inner.files.length === prov.files ? undefined : FILES_REPLACED;
-  };
+  return (inner) =>
+    prov?.kind === 'e5' && inner.type !== 'edit' && inner.ref === prov.ref && Array.isArray(inner.files) && inner.files.length === prov.files
+      ? undefined
+      : FILES_REPLACED;
 }
 
 /**
  * A message's files, or undefined when the message is damaged. A message sent since E5 carries
- * its files and its sender's ID (`ref`); an edit carries only text and `original`, which names
- * that ID and how many files there are, never their keys. The server keeps the first envelope
- * (`original`) and it must match. Anything missing, withheld or substituted reads as unavailable,
- * never as fewer files; only a message from before E5 has plaintext uploads.
+ * its files and its sender's ID (`ref`); an edit carries only text and `original`, never file keys.
+ * An E5 edit's files come only from the server's kept first envelope, which must match. A legacy
+ * edit names the plaintext uploads it vouches for. Anything missing, withheld, substituted or not
+ * established reads as unavailable, never as fewer files.
  */
 export function messageFiles(
   inner: Inner,
@@ -333,45 +356,34 @@ export function messageFiles(
   gen: number,
 ): MessageFiles | undefined {
   if (inner.type !== 'edit') {
-    if (inner.files === undefined) return { provenance: LEGACY };
+    // From before E5: its rows are the server's word alone (docs §5). Only an envelope that says it
+    // carried attachments lets a first edit name those rows; a text message's edit names none.
+    if (inner.files === undefined) {
+      const rows = inner.type === 'attachment' ? attached.map((a) => a.id).slice(0, MAX_FILES) : [];
+      return { provenance: { kind: 'legacy', rows } };
+    }
     if (typeof inner.ref !== 'string' || !REF_RE.test(inner.ref)) return undefined;
     const files = openFiles(inner.files, attached);
     return files && { files, ref: inner.ref, provenance: { kind: 'e5', ref: inner.ref, files: files.length } };
   }
   if (inner.original === undefined) {
-    // Sealed before this format. A pre-E5 edit keeps plaintext uploads, unless the kept original
-    // shows the message had E5 files, which such an edit cannot vouch for.
-    if (inner.files !== undefined) return { filesState: { reason: FILES_UNVERIFIED } };
-    if (!original) return { provenance: LEGACY };
-    return original.state === 'decrypted' && original.inner.type !== 'edit' && original.inner.files === undefined
-      ? { provenance: LEGACY }
-      : { filesState: { reason: FILES_UNVERIFIED } };
+    // Sealed before this format (a pre-E5 or older tab's edit): nothing vouches for its uploads.
+    return attached.length > 0 ? { filesState: { reason: FILES_UNVERIFIED } } : { files: [] };
   }
   const prov = parseProvenance(inner.original);
   if (!prov) return undefined;
-  if (prov.kind === 'legacy') return { provenance: prov };
+  if (prov.kind === 'legacy') {
+    if (!prov.rows) return attached.length > 0 ? { filesState: { reason: FILES_UNVERIFIED } } : { files: [] };
+    return { provenance: { kind: 'legacy', rows: prov.rows }, plainIds: prov.rows };
+  }
   const base = { provenance: prov, ref: prov.ref };
   if (prov.files === 0) return { ...base, files: [] };
   const expected = prov.files;
   if (!original) return { ...base, filesState: { reason: FILES_GONE, expected } };
-  if (original.state === 'waiting') return { ...base, filesState: { reason: FILES_WAITING, gen, expected } };
+  if (original.state === 'waiting') return { ...base, filesState: { reason: FILES_WAITING, gen, session: original.sessionId, expected } };
   if (original.state === 'failed') return { ...base, filesState: { reason: original.reason, expected } };
   const files = expectOriginal(inner)(original.inner) ? undefined : openFiles(original.inner.files, attached);
   return files ? { ...base, files } : { ...base, filesState: { reason: FILES_REPLACED, expected } };
-}
-
-const MAX_FILE_TRIES = 5;
-
-/**
- * Counts how often a message's files waited for their key, after `tries` earlier waits. A key that
- * never comes (a member who joined after the files were sent) stops being waited for, so retries
- * stay bounded; a reload tries again.
- */
-export function withTries(out: MessageFiles, tries = 0): MessageFiles {
-  const s = out.filesState;
-  if (s?.gen === undefined) return out;
-  if (tries + 1 >= MAX_FILE_TRIES) return { ...out, filesState: { reason: "The key to this message's files has not reached this device.", expected: s.expected } };
-  return { ...out, filesState: { ...s, tries: tries + 1 } };
 }
 
 /** Every server attachment ID a descriptor list names (files and their thumbnails). */

@@ -34,6 +34,7 @@ import {
   editMessage,
   fetchBootstrap,
   fetchDirectoryUsers,
+  fetchMessage,
   fetchMessages,
   fetchRoomDetail,
   fetchRoomLobby,
@@ -56,8 +57,12 @@ import {
   formatDayDivider,
   isGroupedWithPrevious,
   mergeMessageBatch,
+  forgetDeleted,
+  rememberDeleted,
+  resolvePending,
   sameCalendarDay,
   searchSignature,
+  tombstone,
   upsertMessage,
 } from '../chat/state';
 import {
@@ -84,11 +89,11 @@ import {
   type WsStatus,
 } from '../chat/types';
 import { ChatSidebar } from '../components/chat/ChatSidebar';
-import { MessageRow, attachmentSummary, attachmentView } from '../components/chat/MessageRow';
+import { MessageRow, attachmentSummary, attachmentView, editProvenance } from '../components/chat/MessageRow';
 import { RoomDetailsDrawer, type DrawerTab } from '../components/chat/RoomDetailsDrawer';
 import { CreateChannelModal, SearchModal, StartDMModal } from '../components/chat/ChatModals';
 import { searchIndexFor } from '../chat/searchIndex';
-import { keyGeneration, onRoomKeys, openMessages, receiveRoomKeys, retryable, roomMemberLeft, startE2EE } from '../chat/e2ee';
+import { keyGeneration, keysArrivedFor, onRoomKeys, openMessages, receiveRoomKeys, retryable, roomMemberLeft, startE2EE } from '../chat/e2ee';
 import { CallAudioLayer, CallStage } from '../components/chat/CallStage';
 import { HybridCallController, type HybridCallSnapshot } from '../rtc/hybridCall';
 
@@ -117,7 +122,9 @@ type ActiveModal = 'none' | 'new-channel' | 'new-dm' | 'search';
 // What a row says about its encryption state; a retry replaces the row only when this changes.
 const e2eeLabel = (m: ChatMessage) => (m.e2ee?.kind === 'failed' ? `failed:${m.e2ee.reason}` : m.e2ee?.kind ?? '');
 // A read message whose files' key had not arrived: opened again as keys arrive.
-const filesRetry = (m: ChatMessage) => m.e2ee?.kind === 'decrypted' && m.filesState?.gen !== undefined;
+// Opened again only once the key to that files' session may have arrived since it was opened.
+const filesRetry = (m: ChatMessage) =>
+  m.e2ee?.kind === 'decrypted' && m.filesState?.gen !== undefined && keysArrivedFor(m.filesState.session, m.filesState.gen);
 
 interface RoomMessageBucket {
   messages: ChatMessage[];
@@ -283,15 +290,16 @@ export const Chat: React.FC<ChatProps> = ({
             // Only fill in what is still unopened and not deleted: an edit or a deletion may
             // have landed meanwhile. Merge just what opening sets, so the row keeps its later
             // state (deletion, reactions, pins). A row still waiting takes the newer generation.
-            messages: b.messages.map((m) => {
+            // A late key can reveal a send's sealed ref: the one confirmation rule applies here too.
+            messages: resolvePending(b.messages.map((m) => {
               const o = opened.get(m.id);
               if (!o || m.deleted_at || m.envelope !== o.envelope || (m.e2ee?.kind === 'decrypted' && !filesRetry(m))) return m;
               const gen = (e: ChatMessage['e2ee']) => (e && e.kind !== 'decrypted' ? e.gen : undefined);
               const filesSig = (x: ChatMessage) => (x.files ? 'files' : `${x.filesState?.reason ?? ''}\u0000${x.filesState?.gen ?? ''}`);
               if (e2eeLabel(m) === e2eeLabel(o) && gen(m.e2ee) === gen(o.e2ee) && filesSig(m) === filesSig(o)) return m;
               changed = true;
-              return { ...m, body: o.body, reply_to_id: o.reply_to_id, e2ee: o.e2ee, files: o.files, filesState: o.filesState, provenance: o.provenance, ref: o.ref };
-            }),
+              return { ...m, body: o.body, reply_to_id: o.reply_to_id, e2ee: o.e2ee, files: o.files, filesState: o.filesState, plainIds: o.plainIds, provenance: o.provenance, ref: o.ref };
+            })),
           };
         }
         return changed ? next : prev;
@@ -316,7 +324,7 @@ export const Chat: React.FC<ChatProps> = ({
       b.messages.filter((m) => {
         const e = m.e2ee;
         const again = e?.kind === 'waiting' || (e?.kind === 'failed' && retryable(e.reason));
-        if (filesRetry(m)) return m.filesState!.gen! < now;
+        if (filesRetry(m)) return true;
         return again && e.gen !== undefined && e.gen < now;
       }),
     );
@@ -342,6 +350,7 @@ export const Chat: React.FC<ChatProps> = ({
         ctrl.abort();
       }
       controllers.clear();
+      forgetDeleted();
       for (const u of urls) {
         URL.revokeObjectURL(u);
       }
@@ -361,9 +370,12 @@ export const Chat: React.FC<ChatProps> = ({
       .then((list) => {
         setStagedByRoom((prev) => {
           const current = prev[roomId] ?? [];
-          const known = new Set(
-            current.flatMap((item) => (item.kind === 'ready' ? sealedIds([item.file]) : item.kind === 'error' && item.attachmentId ? [item.attachmentId] : [])),
-          );
+          // Uploads this tab holds: its chips, and those named by its own sends still unconfirmed.
+          const unsent = (bucketsRef.current[roomId]?.messages ?? []).flatMap((m) => (m.delivery.kind !== 'synced' ? sealedIds(m.files ?? []) : []));
+          const known = new Set([
+            ...unsent,
+            ...current.flatMap((item) => (item.kind === 'ready' ? sealedIds([item.file]) : item.kind === 'error' && item.attachmentId ? [item.attachmentId] : [])),
+          ]);
           const restored: StagedAttachment[] = list
             .filter((a) => !known.has(a.id))
             .map((a) => ({
@@ -517,7 +529,7 @@ export const Chat: React.FC<ChatProps> = ({
                   hasGapAfter: prev[roomId]?.hasGapAfter ?? false,
                 }
               : {
-                  messages: page.messages,
+                  messages: mergeMessageBatch([], page.messages),
                   hasMore: page.has_more,
                   loaded: true,
                   hasGapAfter: true,
@@ -573,7 +585,7 @@ export const Chat: React.FC<ChatProps> = ({
         setBuckets((prev) => {
           const prevBucket = prev[roomId];
           const messages = prevBucket?.hasGapAfter
-            ? page.messages
+            ? mergeMessageBatch([], page.messages)
             : mergeMessageBatch(prevBucket?.messages ?? [], page.messages);
           return {
             ...prev,
@@ -659,7 +671,7 @@ export const Chat: React.FC<ChatProps> = ({
   // copy held here (catching up by sequence would never see an older row change). A row not held
   // here only loses its stale search entry.
   const refetchRow = useCallback(
-    async (roomId: string, seq: number, id?: string) => {
+    async (roomId: string, id?: string) => {
       if (!id) {
         void catchUpRoom(roomId);
         return;
@@ -668,17 +680,19 @@ export const Chat: React.FC<ChatProps> = ({
         forgetIndexed(id);
         return;
       }
-      try {
-        const page = await fetchMessages(roomId, { before: seq + 1, limit: 1 });
-        const row = page.messages.find((m) => m.id === id);
-        if (!row) return;
-        setBuckets((prev) => {
-          const current = prev[roomId];
-          if (!current?.messages.some((m) => m.id === id)) return prev;
-          return { ...prev, [roomId]: { ...current, messages: upsertMessage(current.messages, row) } };
-        });
-      } catch {
-        // Transient: the next event or a room switch reloads it.
+      // A failed read is tried again a few times; a room switch or reload fetches it anyway.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const row = await fetchMessage(roomId, id);
+          setBuckets((prev) => {
+            const current = prev[roomId];
+            if (!current?.messages.some((m) => m.id === id)) return prev;
+            return { ...prev, [roomId]: { ...current, messages: upsertMessage(current.messages, row) } };
+          });
+          return;
+        } catch {
+          await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
+        }
       }
     },
     [catchUpRoom, forgetIndexed],
@@ -776,7 +790,7 @@ export const Chat: React.FC<ChatProps> = ({
           // Not loaded here: the indexed copy is out of date, so drop it (re-indexed when viewed).
           if (!bucketsRef.current[event.roomId]) forgetIndexed(event.message?.id ?? event.messageId);
           if (event.refetch || !event.message) {
-            void refetchRow(event.roomId, event.seq, event.messageId);
+            void refetchRow(event.roomId, event.messageId);
             return;
           }
           const edited = event.message;
@@ -795,6 +809,10 @@ export const Chat: React.FC<ChatProps> = ({
         }
         case 'message.delete': {
           forgetIndexed(event.messageId);
+          // Remembered even when the message is not loaded here, so a page or response still on
+          // its way never shows it again.
+          const at = event.deletedAt ?? Date.now();
+          rememberDeleted(event.messageId, at);
           setBuckets((prev) => {
             const current = prev[event.roomId];
             if (!current) return prev;
@@ -802,11 +820,7 @@ export const Chat: React.FC<ChatProps> = ({
               ...prev,
               [event.roomId]: {
                 ...current,
-                messages: current.messages.map((m) =>
-                  m.id === event.messageId
-                    ? { ...m, body: '', attachments: [], files: undefined, filesState: undefined, original: undefined, deleted_at: event.deletedAt ?? Date.now() }
-                    : m,
-                ),
+                messages: current.messages.map((m) => (m.id === event.messageId ? tombstone(m, at) : m)),
               },
             };
           });
@@ -1451,17 +1465,27 @@ export const Chat: React.FC<ChatProps> = ({
         files,
         idempotencyKey: clientKey,
       });
+      // Only the message sealing this send's key confirms it; any other answer leaves it failed.
+      const ours = confirmed.ref === clientKey;
       setBuckets((prev) => {
         const current = prev[roomId] ?? { messages: [], hasMore: false, loaded: true };
+        const next = upsertMessage(current.messages, confirmed);
         return {
           ...prev,
           [roomId]: {
             ...current,
-            messages: upsertMessage(current.messages, confirmed, clientKey),
+            messages: ours
+              ? next
+              : next.map((m) =>
+                  m.delivery.kind !== 'synced' && m.delivery.idempotencyKey === clientKey
+                    ? { ...m, delivery: { kind: 'failed', idempotencyKey: clientKey, error: 'The server did not confirm this message.' } }
+                    : m,
+                ),
             loaded: true,
           },
         };
       });
+      if (!ours) return;
       setRooms((prev) =>
         prev.map((r) =>
           r.id === roomId
@@ -1559,7 +1583,7 @@ export const Chat: React.FC<ChatProps> = ({
     const original = bucketsRef.current[activeRoomId]?.messages.find((m) => m.id === messageId);
     // What the message's files are comes from its own (or latest edit's) envelope, never from the
     // server's kept original; a message sent before encryption is from before E5.
-    const provenance = original?.provenance ?? (original?.encoding === 'plain_v1' ? { kind: 'legacy' as const } : undefined);
+    const provenance = original && editProvenance(original);
     const updated = await editMessage({ roomId: activeRoomId, messageId, body: newBody, replyToId: original?.reply_to_id, provenance });
     setBuckets((prev) => {
       const current = prev[activeRoomId];
@@ -1577,6 +1601,8 @@ export const Chat: React.FC<ChatProps> = ({
   const handleDeleteMessage = async (messageId: string) => {
     if (!activeRoomId) return;
     const deleted = await deleteMessage(activeRoomId, messageId);
+    const at = deleted.deleted_at ?? Date.now();
+    rememberDeleted(messageId, at);
     setBuckets((prev) => {
       const current = prev[activeRoomId];
       if (!current) return prev;
@@ -1584,11 +1610,7 @@ export const Chat: React.FC<ChatProps> = ({
         ...prev,
         [activeRoomId]: {
           ...current,
-          messages: current.messages.map((m) =>
-            m.id === messageId
-              ? { ...m, body: '', attachments: [], files: undefined, filesState: undefined, original: undefined, deleted_at: deleted.deleted_at ?? Date.now() }
-              : m,
-          ),
+          messages: current.messages.map((m) => (m.id === messageId ? tombstone(m, at) : m)),
         },
       };
     });
@@ -2568,7 +2590,9 @@ export const Chat: React.FC<ChatProps> = ({
                     } else if (e.key === 'ArrowUp' && !draft && currentUser) {
                       for (let i = activeMessages.length - 1; i >= 0; i--) {
                         const m = activeMessages[i];
-                        if (m.delivery.kind === 'synced' && !m.deleted_at && m.sender_id === currentUser.id) {
+                        // The last of this person's messages that can be edited here, as the row decides.
+                        const opened = m.encoding !== 'e2ee_room_v1' || m.e2ee?.kind === 'decrypted';
+                        if (m.delivery.kind === 'synced' && !m.deleted_at && m.sender_id === currentUser.id && opened && editProvenance(m)) {
                           e.preventDefault();
                           setEditTrigger({ messageId: m.id, seq: Date.now() });
                           break;
