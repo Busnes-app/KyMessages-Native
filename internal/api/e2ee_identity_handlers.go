@@ -192,8 +192,8 @@ func (s *Server) handleE2EEGetMaster(w http.ResponseWriter, r *http.Request) {
 }
 
 // PUT /api/v1/keys/master sets the caller's identity (expected_version 0) or replaces it
-// (expected_version the current one), which also drops the old key backup, pin set and device
-// cross-signatures. Colleagues then see the identity change.
+// (expected_version the current one, from a sign-in in the last 10 minutes), which also drops
+// the old key backup, pin set and device cross-signatures. Colleagues then see the change.
 func (s *Server) handleE2EEPutMaster(w http.ResponseWriter, r *http.Request) {
 	user, tenantID, ok := s.e2eeCaller(w, r)
 	if !ok {
@@ -202,6 +202,12 @@ func (s *Server) handleE2EEPutMaster(w http.ResponseWriter, r *http.Request) {
 	var req e2eeMasterPut
 	if !decodeIdentity(w, r, e2eeIdentityBody, &req) || req.ExpectedVersion < 0 {
 		s.writeError(w, http.StatusBadRequest, "Invalid encryption identity")
+		return
+	}
+	// A reset replaces what every colleague pinned and what the user's other devices hold, so
+	// it needs a recent sign-in, as console changes do; a stolen older session cannot do it.
+	if _, sess, _ := s.currentUser(r); req.ExpectedVersion > 0 && (sess == nil || time.Since(sess.CreatedAt) > stepUpWindow) {
+		s.writeStepUp(w, user)
 		return
 	}
 	version := req.ExpectedVersion + 1

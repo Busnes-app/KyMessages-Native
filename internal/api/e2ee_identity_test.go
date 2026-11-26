@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Busnes-app/ky_server_base/internal/api"
+	"github.com/Busnes-app/ky_server_base/internal/crypto"
 	"github.com/Busnes-app/ky_server_base/internal/e2eeid"
 	"github.com/Busnes-app/ky_server_base/internal/pqc/hybridsig"
 	"github.com/Busnes-app/ky_server_base/internal/pqc/xwing"
@@ -195,8 +196,17 @@ func TestE2EEMasterKeyIsValidatedAndVersioned(t *testing.T) {
 		t.Fatalf("recovery wrap does not round-trip: %v", err)
 	}
 
-	// A reset needs the current version and starts version 2.
+	// A reset needs a recent sign-in: a session from 11 minutes ago is asked to step up.
 	reset := newIdentity(t, orgA, alice.ID)
+	oldTok := "tok_e3_old_" + alice.ID
+	if err := st.Sessions().CreateSession(t.Context(), &store.Session{UserID: alice.ID, TokenHash: crypto.SHA256Hex([]byte(oldTok)),
+		CreatedAt: time.Now().Add(-11 * time.Minute), ExpiresAt: time.Now().Add(time.Hour)}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if rec := doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/master", oldTok, reset.put(t, 1), nil); rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "reauthentication_required") {
+		t.Fatalf("reset from a stale session = %d %s", rec.Code, rec.Body.String())
+	}
+	// A reset needs the current version and starts version 2.
 	if c := put(reset.put(t, 0)); c != http.StatusConflict {
 		t.Fatalf("reset without the current version = %d", c)
 	}
