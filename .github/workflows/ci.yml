@@ -46,6 +46,9 @@ jobs:
       - name: kye2e tag stays out of release builds
         run: bash scripts/check-build-tags.sh
 
+      - name: Post-quantum hybrid TLS guard
+        run: bash scripts/check-pqc-tls.sh
+
       - name: kye2e build opens the gate only for a .test issuer
         run: |
           go vet -tags kye2e ./internal/config/

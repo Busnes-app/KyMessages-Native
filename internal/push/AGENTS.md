@@ -13,7 +13,7 @@ Owns VAPID key handling (`vapid.go`), payload encryption (`crypto.go`, aes128gcm
 - Payloads carry the room, sender and a short preview; encrypted messages are never previewed. Calls use urgency `high` and a 60s TTL.
 
 ## Verification
-- `go test ./internal/push/ ./internal/api/ -run 'Push|VAPID|Dispatcher|Mention|Logout'`
+- `go test ./internal/push/ ./internal/api/ -run 'Push|VAPID|Dispatcher|Mention|Logout|PQTLS'`
 
 ## Child DOX Index
 None.
