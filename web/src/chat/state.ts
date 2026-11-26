@@ -105,6 +105,11 @@ export function mergeMessageBatch(existing: ChatMessage[], incoming: ChatMessage
   return resolvePending(sortMessages(Array.from(byId.values())));
 }
 
+/** Replaces a history slice while preserving the local copies needed to retry or dismiss sends. */
+export function replaceMessageHistory(existing: ChatMessage[], incoming: ChatMessage[]): ChatMessage[] {
+  return mergeMessageBatch(existing.filter((m) => m.delivery.kind !== 'synced'), incoming);
+}
+
 function sortMessages(list: ChatMessage[]): ChatMessage[] {
   return [...list].sort((a, b) => {
     const aPending = a.delivery.kind !== 'synced';

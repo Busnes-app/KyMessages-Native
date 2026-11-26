@@ -312,6 +312,16 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 		}
 		switch {
 		case errors.Is(err, store.ErrAttachmentInvalid):
+			// This refusal happened before the insert. Publication may have finished
+			// after an earlier sweep erased the key or found it absent.
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+			defer cancel()
+			if err := s.store.Chat().QueueLateUploadCleanup(ctx, tenantID, putRes.Key); err != nil {
+				log.Printf("[ATTACHMENTS] could not queue late upload %s: %v", putRes.Key, err)
+				if eraseErr := s.blobs.Erase(tenantID, putRes.Key); eraseErr != nil {
+					log.Printf("[ATTACHMENTS] late upload %s remains: %v", putRes.Key, eraseErr)
+				}
+			}
 			s.writeError(w, http.StatusRequestTimeout, "The upload took too long; send the file again")
 		case errors.Is(err, store.ErrAttachmentUploadQuotaExceeded):
 			s.writeError(w, http.StatusRequestEntityTooLarge, "File exceeds organization upload limit")

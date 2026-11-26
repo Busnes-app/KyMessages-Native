@@ -5,7 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"sort"
+	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // Erasure (KyIdentity user.erased, multi mode): delete one person's data. Their messages in
@@ -251,12 +254,24 @@ func (c *chatStore) eraseActorTx(ctx context.Context, tx *sql.Tx, tenantID, user
 // blobDeleteClaimed marks a queued delete of no person's (an upload intent, a staged removal) that
 // a sweep has leased: a late commit of that upload then refuses, so no row names an erased blob.
 const blobDeleteClaimed = "~sweep"
+const blobDeleteClaimPrefix = blobDeleteClaimed + ":"
 
 // QueueUploadIntent records, before an upload writes its blob, that the blob must be erased
 // unless the upload commits: CommitAttachmentWithQuota removes the intent in its transaction, and
 // a sweep erases what is left once notBefore (past the upload's deadline) passes.
 func (c *chatStore) QueueUploadIntent(ctx context.Context, tenantID, key string, notBefore int64) error {
 	_, err := c.store.db.ExecContext(ctx, c.store.rebind(`INSERT INTO pending_blob_deletes (tenant_id, blob_key, user_id, not_before) VALUES (?, ?, '', ?)`), normalizeTenant(tenantID), key, notBefore)
+	return err
+}
+
+// QueueLateUploadCleanup records a blob published after its upload lost the intent. Replacing
+// an old sweep claim prevents its completion from clearing this new cleanup.
+func (c *chatStore) QueueLateUploadCleanup(ctx context.Context, tenantID, key string) error {
+	_, err := c.store.db.ExecContext(ctx, c.store.rebind(`INSERT INTO pending_blob_deletes (tenant_id, blob_key, user_id, not_before)
+		VALUES (?, ?, '', 0)
+		ON CONFLICT (tenant_id, blob_key) DO UPDATE SET user_id = '', not_before = 0
+		WHERE pending_blob_deletes.user_id IN ('', ?) OR pending_blob_deletes.user_id LIKE ?`),
+		normalizeTenant(tenantID), key, blobDeleteClaimed, blobDeleteClaimPrefix+"%")
 	return err
 }
 
@@ -291,17 +306,19 @@ func (c *chatStore) DuePendingBlobDeletes(ctx context.Context, limit int, at tim
 		return nil, err
 	}
 	out := make([]BlobRef, 0, len(found))
+	claim := blobDeleteClaimPrefix + uuid.NewString()
 	for _, d := range found {
-		if d.user != "" && d.user != blobDeleteClaimed {
+		if d.user != "" && d.user != blobDeleteClaimed && !strings.HasPrefix(d.user, blobDeleteClaimPrefix) {
 			out = append(out, d.BlobRef) // an erasure's: no upload can commit it
 			continue
 		}
-		res, err := tx.ExecContext(ctx, c.store.rebind(`UPDATE pending_blob_deletes SET user_id = ?, not_before = ? WHERE tenant_id = ? AND blob_key = ? AND user_id IN ('', ?) AND not_before <= ?`),
-			blobDeleteClaimed, now+lease.Milliseconds(), d.TenantID, d.Key, blobDeleteClaimed, now)
+		res, err := tx.ExecContext(ctx, c.store.rebind(`UPDATE pending_blob_deletes SET user_id = ?, not_before = ? WHERE tenant_id = ? AND blob_key = ? AND user_id = ? AND not_before <= ?`),
+			claim, now+lease.Milliseconds(), d.TenantID, d.Key, d.user, now)
 		if err != nil {
 			return nil, err
 		}
 		if n, err := res.RowsAffected(); err == nil && n == 1 {
+			d.sweepClaim = claim
 			out = append(out, d.BlobRef)
 		}
 	}
@@ -352,6 +369,13 @@ func (c *chatStore) ClearPendingBlobDeletes(ctx context.Context, refs []BlobRef)
 		}
 	}
 	for _, r := range refs {
+		if r.sweepClaim != "" {
+			// Staged blobs have no retained version. Clear only the lease that erased them.
+			if _, err := tx.ExecContext(ctx, c.store.rebind(`DELETE FROM pending_blob_deletes WHERE tenant_id = ? AND blob_key = ? AND user_id = ?`), r.TenantID, r.Key, r.sweepClaim); err != nil {
+				return err
+			}
+			continue
+		}
 		// The caller erased every version of r, so its retained charge goes too.
 		if _, err := tx.ExecContext(ctx, c.store.rebind(`DELETE FROM retained_attachment_versions WHERE tenant_id = ? AND blob_key = ?`), r.TenantID, r.Key); err != nil {
 			return err

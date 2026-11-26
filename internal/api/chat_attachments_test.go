@@ -1178,6 +1178,51 @@ func TestChatAttachmentBlobRemovalsAreDurable(t *testing.T) {
 	}
 }
 
+type lateUploadBlobs struct {
+	blobs.Backend
+	beforePublish func()
+	key           string
+}
+
+func (b *lateUploadBlobs) Put(tenantID, key string, r io.Reader, maxBytes int64, opts blobs.PutOptions) (blobs.PutResult, error) {
+	b.key = key
+	b.beforePublish()
+	return b.Backend.Put(tenantID, key, r, maxBytes, opts)
+}
+
+func TestChatLatePublicationQueuesCleanupAfterIntentWasSwept(t *testing.T) {
+	srv, st, cfg := setupTestServer(t)
+	startChatBus(t, srv)
+	defer srv.CloseChat()
+	_, token := createChatTestUser(t, st, "u_late_upload", "lateupload", "user")
+	room := roomOf(t, doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", token, map[string]any{"kind": store.RoomKindChannel, "name": "uploads"}, nil))
+	ctx := context.Background()
+	backend := &lateUploadBlobs{Backend: api.BlobsForTest(srv)}
+	backend.beforePublish = func() {
+		if _, err := srv.SweepOrphanAttachments(ctx, time.Now().Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		if refs, err := st.Chat().PendingBlobDeletes(ctx, 100); err != nil || len(refs) != 0 {
+			t.Fatalf("intent after first sweep = %+v, %v", refs, err)
+		}
+	}
+	api.SetBlobsForTest(srv, backend)
+
+	rec := doMultipartUpload(t, srv, "/api/v1/rooms/"+room+"/attachments", token, "file", "file.bin", []byte("opaque file"))
+	if rec.Code != http.StatusRequestTimeout {
+		t.Fatalf("late upload = %d, want 408: %s", rec.Code, rec.Body.String())
+	}
+	if refs, err := st.Chat().PendingBlobDeletes(ctx, 100); err != nil || len(refs) != 1 || refs[0].Key != backend.key {
+		t.Fatalf("late publication cleanup = %+v, %v", refs, err)
+	}
+	if _, err := srv.SweepOrphanAttachments(ctx, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.Database.DataDir, "attachments", backend.key)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("blob after second sweep: %v, want not found", err)
+	}
+}
+
 type uncertainUploadCommitStore struct {
 	store.Store
 	chat *uncertainUploadCommitChat

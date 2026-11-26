@@ -61,6 +61,7 @@ import {
   mergeMessageBatch,
   forgetDeleted,
   rememberDeleted,
+  replaceMessageHistory,
   resolvePending,
   sameCalendarDay,
   searchSignature,
@@ -538,7 +539,7 @@ export const Chat: React.FC<ChatProps> = ({
                   hasGapAfter: prev[roomId]?.hasGapAfter ?? false,
                 }
               : {
-                  messages: mergeMessageBatch([], page.messages),
+                  messages: replaceMessageHistory(existing, page.messages),
                   hasMore: page.has_more,
                   loaded: true,
                   hasGapAfter: true,
@@ -594,7 +595,7 @@ export const Chat: React.FC<ChatProps> = ({
         setBuckets((prev) => {
           const prevBucket = prev[roomId];
           const messages = prevBucket?.hasGapAfter
-            ? mergeMessageBatch([], page.messages)
+            ? replaceMessageHistory(prevBucket.messages, page.messages)
             : mergeMessageBatch(prevBucket?.messages ?? [], page.messages);
           return {
             ...prev,

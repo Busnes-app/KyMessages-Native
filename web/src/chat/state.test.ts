@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { applyReactionDelta, forgetDeleted, isGroupedWithPrevious, mergeMessageBatch, rememberDeleted, resolvePending, searchSignature, sortRooms, upsertMessage } from './state';
+import { applyReactionDelta, forgetDeleted, isGroupedWithPrevious, mergeMessageBatch, rememberDeleted, replaceMessageHistory, resolvePending, searchSignature, sortRooms, upsertMessage } from './state';
 import { parseWsEvent, type ChatMessage, type ChatRoomSummary } from './types';
 
 function makeMsg(overrides: Partial<ChatMessage> = {}): ChatMessage {
@@ -179,6 +179,15 @@ describe('encrypted files', () => {
     expect(upsertMessage([failed], confirmed).map((m) => m.id)).toEqual(['m_real']);
     // Another message with the same text and rows is not that send.
     expect(upsertMessage([optimistic], { ...confirmed, ref: 'other' }).map((m) => m.id)).toEqual(['m_real', 'pending_k']);
+  });
+
+  it('carries a failed file send through a history jump and back to the latest slice', () => {
+    const failed: ChatMessage = { ...base, id: 'pending_k', seq: Number.MAX_SAFE_INTEGER, body: 'caption', files: [file],
+      delivery: { kind: 'failed', idempotencyKey: 'k', error: 'network' } };
+    const history = replaceMessageHistory([{ ...base, id: 'm_latest' }, failed], [{ ...base, id: 'm_older' }]);
+    expect(history).toEqual([{ ...base, id: 'm_older' }, failed]);
+    expect(replaceMessageHistory(history, [{ ...base, id: 'm_latest' }])).toEqual([{ ...base, id: 'm_latest' }, failed]);
+    expect(replaceMessageHistory(history, [{ ...base, id: 'm_sent', ref: 'k' }])).toEqual([{ ...base, id: 'm_sent', ref: 'k' }]);
   });
 
   it('keeps a deletion and the newest edit over late copies', () => {

@@ -442,6 +442,7 @@ type ChatStore interface {
 	EraseUser(ctx context.Context, tenantID string, user *User) ([]BlobRef, error)
 	PendingBlobDeletes(ctx context.Context, limit int) ([]BlobRef, error)
 	QueueUploadIntent(ctx context.Context, tenantID, key string, notBefore int64) error
+	QueueLateUploadCleanup(ctx context.Context, tenantID, key string) error
 	DuePendingBlobDeletes(ctx context.Context, limit int, now time.Time, lease time.Duration) ([]BlobRef, error)
 	ClearPendingBlobDeletes(ctx context.Context, refs []BlobRef) error
 	// AttachmentTenant returns the org of the attachment stored under blobKey.

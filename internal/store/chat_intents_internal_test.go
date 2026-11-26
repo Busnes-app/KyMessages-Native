@@ -84,3 +84,43 @@ func TestChatUploadCommitWaitsForSweepClaim(t *testing.T) {
 		t.Fatalf("attachment after sweep claim = %v, want ErrNotFound", err)
 	}
 }
+
+func TestLateUploadCleanupSurvivesOldSweepCompletion(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, testdb.Config(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	chat := st.Chat()
+	const key = "att_late_publication"
+	if err := chat.QueueUploadIntent(ctx, DefaultTenantID, key, 0); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	claim := func() []BlobRef {
+		t.Helper()
+		refs, err := chat.DuePendingBlobDeletes(ctx, 100, now, time.Minute)
+		if err != nil || len(refs) != 1 || refs[0].Key != key {
+			t.Fatalf("claim = %+v, %v", refs, err)
+		}
+		return refs
+	}
+	old := claim()
+	if err := chat.QueueLateUploadCleanup(ctx, DefaultTenantID, key); err != nil {
+		t.Fatal(err)
+	}
+	newer := claim()
+	if err := chat.ClearPendingBlobDeletes(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	if refs, err := chat.PendingBlobDeletes(ctx, 100); err != nil || len(refs) != 1 {
+		t.Fatalf("new cleanup after stale clear = %+v, %v", refs, err)
+	}
+	if err := chat.ClearPendingBlobDeletes(ctx, newer); err != nil {
+		t.Fatal(err)
+	}
+	if refs, err := chat.PendingBlobDeletes(ctx, 100); err != nil || len(refs) != 0 {
+		t.Fatalf("cleanup after matching clear = %+v, %v", refs, err)
+	}
+}

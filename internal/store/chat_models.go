@@ -297,9 +297,10 @@ type UpsertMeetingResult struct {
 
 // BlobRef names one attachment blob: its org and its key.
 type BlobRef struct {
-	ID       string // the attachment row, where known
-	TenantID string
-	Key      string
+	ID         string // the attachment row, where known
+	TenantID   string
+	Key        string
+	sweepClaim string
 }
 
 // CallLease is the fenced owner of one room, on the database clock.
