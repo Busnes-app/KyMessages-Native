@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Download, FileText, Loader2, X } from 'lucide-react';
 import type { BlobKind, FileDescriptor, SealedBlob } from '../../crypto/attachments';
 import { openSealed, saveSealed } from '../../chat/files';
@@ -42,6 +42,9 @@ export const previewable = (f: FileDescriptor) => isInlineImageAttachment(f);
 function SaveButton({ file, className, children }: { file: FileDescriptor; className: string; children: React.ReactNode }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  // The save in flight belongs to this button: leaving aborts it and releases its plaintext.
+  const save = useRef<AbortController | null>(null);
+  useEffect(() => () => save.current?.abort(), []);
   return (
     <button
       type="button"
@@ -50,11 +53,17 @@ function SaveButton({ file, className, children }: { file: FileDescriptor; class
       title={error || `Download ${file.name}`}
       aria-label={`Download ${file.name}`}
       onClick={() => {
+        const ctrl = new AbortController();
+        save.current = ctrl;
         setBusy(true);
         setError('');
-        saveSealed(file)
-          .catch((e: unknown) => setError(e instanceof Error ? e.message : 'Could not download this file.'))
-          .finally(() => setBusy(false));
+        saveSealed(file, ctrl.signal)
+          .catch((e: unknown) => {
+            if (!ctrl.signal.aborted) setError(e instanceof Error ? e.message : 'Could not download this file.');
+          })
+          .finally(() => {
+            if (!ctrl.signal.aborted) setBusy(false);
+          });
       }}
     >
       {children}

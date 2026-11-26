@@ -4,8 +4,10 @@
 import { errorMessage, secureFetch } from '../api';
 import { obj } from '../dto';
 import {
+  DAMAGED,
   MAX_THUMB_CIPHERTEXT,
   THUMB_MIMES,
+  checkBlob,
   ciphertextSize,
   cleanMime,
   cleanName,
@@ -101,26 +103,55 @@ export function discardUploads(files: readonly FileDescriptor[]): void {
   for (const id of sealedIds(files)) if (id) void deleteAttachment(id).catch(() => undefined);
 }
 
+// Reads exactly `size` bytes, giving up as soon as the server sends more: a reply is never
+// buffered beyond what the descriptor allows.
+async function readExactly(res: Response, size: number): Promise<Uint8Array<ArrayBuffer>> {
+  const reader = res.body?.getReader();
+  if (!reader) throw new Error(DAMAGED);
+  const out = new Uint8Array(size);
+  let off = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (off + value.length > size) {
+      void reader.cancel();
+      throw new Error(DAMAGED);
+    }
+    out.set(value, off);
+    off += value.length;
+  }
+  if (off !== size) throw new Error(DAMAGED);
+  return out;
+}
+
 /** Downloads a blob and opens it; nothing is returned unless all of it is authentic. */
 export async function openSealed(blob: SealedBlob, kind: BlobKind, type: string, signal?: AbortSignal): Promise<Blob> {
+  const { ciphertext_size } = checkBlob(blob, kind);
   const res = await fetch(attachmentUrl(blob.attachment_id), { credentials: 'same-origin', cache: 'no-store', signal });
   if (!res.ok) throw new Error(res.status === 404 ? 'This file is no longer available.' : 'Could not download this file.');
-  return new Blob(await decryptBlob(new Uint8Array(await res.arrayBuffer()), blob, kind), { type });
+  return new Blob(await decryptBlob(await readExactly(res, ciphertext_size), blob, kind), { type });
 }
 
 // Long enough for the browser to start saving; the decrypted copy is then released.
 const SAVE_URL_MS = 30_000;
 
-/** Decrypts a file and saves it under its name. */
+/**
+ * Decrypts a file and saves it under its name. Aborting `signal` (the caller left: another room,
+ * sign-out) stops the download, or revokes the decrypted copy at once if it already exists.
+ */
 export async function saveSealed(file: FileDescriptor, signal?: AbortSignal): Promise<void> {
   // Always untyped: a blob: URL belongs to this origin, so a typed one (HTML, SVG) opened in a tab
   // would run as this app.
-  const url = URL.createObjectURL(await openSealed(file, 'file', 'application/octet-stream', signal));
+  const plain = await openSealed(file, 'file', 'application/octet-stream', signal);
+  signal?.throwIfAborted();
+  const url = URL.createObjectURL(plain);
+  const revoke = () => URL.revokeObjectURL(url);
+  signal?.addEventListener('abort', revoke, { once: true });
   const a = document.createElement('a');
   a.href = url;
   a.download = file.name;
   document.body.append(a);
   a.click();
   a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), SAVE_URL_MS);
+  setTimeout(revoke, SAVE_URL_MS);
 }

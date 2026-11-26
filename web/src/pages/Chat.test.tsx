@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { Chat } from './Chat';
 import { HybridCallController } from '../rtc/hybridCall';
 import { deliverKey, fakeEnvelope, heldOpenCount, holdFakeOpens, resetFakeE2EE, setFakeUnavailable, storeKeySilently } from '../chat/e2eeFake';
@@ -595,6 +595,7 @@ describe('Native Chat page', () => {
   it('encrypts files before upload, sends their keys only sealed, and decrypts them on download', async () => {
     const uploads: { url: string; name: string; type: string; bytes: Uint8Array }[] = [];
     const posted: Record<string, unknown>[] = [];
+    const patched: Record<string, unknown>[] = [];
     const saved: Blob[] = [];
     vi.spyOn(URL, 'createObjectURL').mockImplementation((b) => {
       saved.push(b as Blob);
@@ -626,6 +627,11 @@ describe('Native Chat page', () => {
           const req = JSON.parse(String(init?.body)) as Record<string, unknown>;
           posted.push(req);
           return json({ message: { id: 'm_file', room_id: 'rm_gen', seq: 1, sender_id: 'u_alice', sender_name: 'Alice', encoding: 'e2ee_room_v1', body: req.body, created_at: Date.now(), reactions: [], attachments: [{ id: 'att_enc1', room_id: 'rm_gen', uploader_id: 'u_alice', filename: 'encrypted.bin', mime_type: 'application/octet-stream', size_bytes: uploads[0].bytes.length, sha256_hex: '', created_at: 1 }] } }, 201);
+        }
+        if (url === '/api/v1/rooms/rm_gen/messages/m_late' && method === 'PATCH') {
+          const req = JSON.parse(String(init?.body)) as Record<string, unknown>;
+          patched.push(req);
+          return json({ message: { ...lateMessage(), body: req.body, edited_at: Date.now() } });
         }
         if (url.startsWith('/api/v1/rooms/rm_gen/messages')) return json({ messages: [], has_more: false });
         if (url === '/api/v1/attachments/att_enc1' && method === 'GET') return new Response(uploads[0].bytes);
@@ -665,6 +671,30 @@ describe('Native Chat page', () => {
     // Saved untyped, so the decrypted copy can never render as this origin.
     expect(saved[0].type).toBe('application/octet-stream');
     expect(new TextDecoder().decode(await saved[0].arrayBuffer())).toBe('hello world');
+
+    // A message whose key arrives late still opens with its files, and an edit afterwards keeps
+    // their keys in the new envelope.
+    const lateInner = { room_id: 'rm_gen', type: 'attachment' as const, body: 'late note', files: inner.files };
+    const lateMessage = () => ({
+      id: 'm_late', room_id: 'rm_gen', seq: 2, sender_id: 'u_alice', sender_name: 'Alice', encoding: 'e2ee_room_v1',
+      body: fakeEnvelope(lateInner, 's_late'), created_at: Date.now(), reactions: [],
+      attachments: [{ id: 'att_enc1', room_id: 'rm_gen', uploader_id: 'u_alice', filename: 'encrypted.bin', mime_type: 'application/octet-stream', size_bytes: 27, sha256_hex: '', created_at: 1 }],
+    });
+    act(() => FakeWebSocket.instances[0].emit({ t: 'message.new', room: 'rm_gen', seq: 2, d: lateMessage() }));
+    expect(await screen.findByText("Waiting for this message's key")).toBeTruthy();
+    act(() => deliverKey('s_late'));
+    expect(await screen.findByText('late note')).toBeTruthy();
+    expect(screen.getAllByRole('button', { name: 'Download report.txt' })).toHaveLength(2);
+    expect(screen.queryByText('File not encrypted')).toBeNull();
+    const lateRow = screen.getByText('late note').closest('article') as HTMLElement;
+    fireEvent.click(within(lateRow).getByRole('button', { name: 'Edit message' }));
+    const editBox = within(lateRow).getByRole('textbox', { name: 'Edit message' });
+    fireEvent.change(editBox, { target: { value: 'late note, edited' } });
+    fireEvent.keyDown(editBox, { key: 'Enter' });
+    await waitFor(() => expect(patched).toHaveLength(1));
+    const editInner = JSON.parse(atob((JSON.parse(String(patched[0].body)) as { ciphertext: string }).ciphertext)) as { type: string; files: unknown[] };
+    expect(editInner.type).toBe('edit');
+    expect(editInner.files).toEqual(inner.files);
 
     // A refused upload is an error on its chip; there is no plaintext retry.
     failUploads = true;

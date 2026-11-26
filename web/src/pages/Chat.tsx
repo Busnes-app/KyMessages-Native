@@ -286,7 +286,7 @@ export const Chat: React.FC<ChatProps> = ({
               const gen = (e: ChatMessage['e2ee']) => (e && e.kind !== 'decrypted' ? e.gen : undefined);
               if (e2eeLabel(m) === e2eeLabel(o) && gen(m.e2ee) === gen(o.e2ee)) return m;
               changed = true;
-              return { ...m, body: o.body, reply_to_id: o.reply_to_id, e2ee: o.e2ee };
+              return { ...m, body: o.body, reply_to_id: o.reply_to_id, e2ee: o.e2ee, files: o.files };
             }),
           };
         }

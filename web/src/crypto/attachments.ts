@@ -142,15 +142,21 @@ export async function encryptBlob(
   };
 }
 
-const DAMAGED = 'This file is damaged or was changed after it was sent.';
+export const DAMAGED = 'This file is damaged or was changed after it was sent.';
+
+/** The descriptor if it is one this format opens as `kind`, within that kind's size limit. */
+export function checkBlob(d: SealedBlob, kind: BlobKind): SealedBlob {
+  const blob = parseBlob(d, kind === 'thumb' ? MAX_THUMB_CIPHERTEXT : MAX_CIPHERTEXT);
+  if (!blob) throw new Error('This file uses an unsupported format.');
+  return blob;
+}
 
 /**
  * Checks the ciphertext's length and SHA-256 against the descriptor, then opens every chunk.
  * Nothing is returned unless the whole blob is authentic.
  */
 export async function decryptBlob(ciphertext: Uint8Array, d: SealedBlob, kind: BlobKind): Promise<Uint8Array<ArrayBuffer>[]> {
-  const blob = parseBlob(d, kind === 'thumb' ? MAX_THUMB_CIPHERTEXT : MAX_CIPHERTEXT);
-  if (!blob) throw new Error('This file uses an unsupported format.');
+  const blob = checkBlob(d, kind);
   if (ciphertext.length !== blob.ciphertext_size || (await sha256Hex(ciphertext)) !== blob.sha256) throw new Error(DAMAGED);
   const n = layout(blob.ciphertext_size, blob.chunk_size, blob.size)!;
   const key = await crypto.subtle.importKey('raw', unb64(blob.key, 32)!, 'AES-GCM', false, ['decrypt']);

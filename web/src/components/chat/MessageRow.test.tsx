@@ -355,6 +355,23 @@ describe('MessageRow', () => {
       expect(revoke).toHaveBeenCalledWith('blob:thumb');
     });
 
+    it('abandons a download and makes no decrypted copy when the row goes away', async () => {
+      let sawSignal: AbortSignal | undefined;
+      vi.stubGlobal('fetch', vi.fn((_url: string, init?: RequestInit) => {
+        sawSignal = init?.signal ?? undefined;
+        return new Promise<Response>(() => undefined);
+      }));
+      const made = vi.spyOn(URL, 'createObjectURL');
+      const file = { attachment_id: 'att_sealed', v: 1, alg: 'A256GCM-STREAM', key: 'A'.repeat(43), nonce_prefix: 'A'.repeat(10), chunk_size: 65536, sha256: 'a'.repeat(64), ciphertext_size: 26, size: 10, name: 'budget.xlsx', mime_type: 'application/vnd.ms-excel' } as FileDescriptor;
+      const { unmount } = row({ ...sealed, body: '', files: [file], attachments: [att('att_sealed')] });
+      fireEvent.click(screen.getByRole('button', { name: 'Download budget.xlsx' }));
+      await waitFor(() => expect(sawSignal).toBeDefined());
+      expect(sawSignal!.aborted).toBe(false);
+      unmount();
+      expect(sawSignal!.aborted).toBe(true);
+      expect(made).not.toHaveBeenCalled();
+    });
+
     it('shows a tampered thumbnail as an error, never as an image', async () => {
       const { ciphertext, sealed: t } = await encryptBlob(new Blob([new Uint8Array(5)]), 'thumb');
       ciphertext[0] ^= 1;
