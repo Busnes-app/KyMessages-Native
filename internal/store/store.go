@@ -19,7 +19,11 @@ var (
 	ErrE2EEKeyMismatch = errors.New("device keys do not match the registered device")
 	// ErrE2EETooManyKeys: an upload would leave a device holding more one-time keys than allowed.
 	ErrE2EETooManyKeys = errors.New("too many one-time keys for this device")
-	ErrAlreadyExists   = errors.New("record already exists")
+	// ErrE2EEVersion: a write names a master key, pin set or backup version that is not current.
+	ErrE2EEVersion = errors.New("encryption identity version is not current")
+	// ErrE2EEBackupFull: a key backup write would pass the per-user session cap.
+	ErrE2EEBackupFull = errors.New("key backup is full")
+	ErrAlreadyExists  = errors.New("record already exists")
 	// ErrUsernameTaken: another account holds the username (exact case, as the column is unique).
 	ErrUsernameTaken                  = fmt.Errorf("username is taken: %w", ErrAlreadyExists)
 	ErrSessionExpired                 = errors.New("session expired")
@@ -106,13 +110,81 @@ type E2EEStore interface {
 	// AckToDevice deletes exactly the named messages of a device, never one it was not shown.
 	AckToDevice(ctx context.Context, userID, deviceID string, ids []int64) error
 	PruneToDevice(ctx context.Context, before time.Time) error
+
+	// GetMasterKey reads a user's master key record; ErrNotFound when there is none.
+	GetMasterKey(ctx context.Context, userID string) (*E2EEMasterKey, error)
+	// ListMasterKeys returns userIDs' master keys in tenantID only.
+	ListMasterKeys(ctx context.Context, tenantID string, userIDs []string) ([]E2EEMasterKey, error)
+	// PutMasterKey stores m as version expected+1 when the stored version is expected (0: none),
+	// else ErrE2EEVersion. Replacing a master key deletes its key backup and pin set and every
+	// device cross-signature it made, in the same transaction.
+	PutMasterKey(ctx context.Context, m *E2EEMasterKey, expected int64) error
+	// SignDevice stores a device's cross-signature by master key version; ErrE2EEVersion when
+	// that is not the user's current version, ErrNotFound when there is no such device.
+	SignDevice(ctx context.Context, userID, deviceID string, version int64, signature string) error
+	// PutPins stores the user's sealed pin set as counter expected+1 under master key version.
+	PutPins(ctx context.Context, userID string, version, expected int64, pins string) error
+	// PutBackupSessions adds sealed sessions to backup version, keeping for each session the
+	// copy with the lowest first index; ErrE2EEVersion when version is not current and
+	// ErrE2EEBackupFull (storing nothing) past max sessions.
+	PutBackupSessions(ctx context.Context, userID string, version int64, sessions []E2EEBackupSession, max int) error
+	// ListBackupSessions pages backup version in (room, session) order after the given pair.
+	ListBackupSessions(ctx context.Context, userID string, version int64, afterRoom, afterSession string, limit int) ([]E2EEBackupSession, error)
+	// DeleteBackup removes every session of backup version; ErrE2EEVersion when not current.
+	DeleteBackup(ctx context.Context, userID string, version int64) error
+
+	// CreatePairing opens a QR pairing, cancelling the user's other pairings.
+	CreatePairing(ctx context.Context, p *E2EEPairing) error
+	// GetPairing reads an unexpired pairing of the user in the tenant, else ErrNotFound.
+	GetPairing(ctx context.Context, tenantID, userID, id string, now time.Time) (*E2EEPairing, error)
+	// JoinPairing records the new device and its ephemeral key, once; ErrNotFound otherwise.
+	JoinPairing(ctx context.Context, tenantID, userID, id, newDevice, ephemeralKey string, now time.Time) error
+	// SealPairing stores the sealed keys from the initiator, once, after a join.
+	SealPairing(ctx context.Context, tenantID, userID, id, initiator, sealed string, now time.Time) error
+	// ConsumePairing deletes a sealed pairing for its new device and returns it, exactly once.
+	ConsumePairing(ctx context.Context, tenantID, userID, id, newDevice string, now time.Time) (*E2EEPairing, error)
+	DeletePairing(ctx context.Context, tenantID, userID, id string) error
+	PrunePairings(ctx context.Context, now time.Time) error
 }
 
-// E2EEDevice is one device's public identity keys and its self-signature over them.
+// E2EEMasterKey is a user's encryption identity: the hybrid master public key and its
+// self-binding, the X-Wing backup public key the master key signed, the recovery-key wraps of
+// both private seeds and the sealed pin set. Signatures and keys are JSON or base64 as the API
+// validated them; the server cannot open the wraps or the pins.
+type E2EEMasterKey struct {
+	TenantID, UserID               string
+	Version                        int64
+	MasterKey, SelfSignature       string
+	BackupKey, BackupSignature     string
+	RecoveryMaster, RecoveryBackup string
+	PinsCounter                    int64
+	Pins                           string
+	UpdatedAt                      time.Time
+}
+
+// E2EEBackupSession is one Megolm session sealed to the user's X-Wing backup key.
+type E2EEBackupSession struct {
+	RoomID, SessionID string
+	FirstIndex        int64
+	Sealed            string
+}
+
+// E2EEPairing is a QR verification in progress, between two devices of one user.
+type E2EEPairing struct {
+	ID, TenantID, UserID       string
+	InitiatorDevice, NewDevice string
+	EphemeralKey, Sealed       string
+	ExpiresAt                  time.Time
+}
+
+// E2EEDevice is one device's public identity keys and its self-signature over them, and
+// the master key's cross-signature (empty until the device is verified) with its version.
 type E2EEDevice struct {
 	TenantID, UserID, DeviceID string
 	Curve25519, Ed25519        string
 	Signature                  string
+	MasterSignature            string
+	MasterVersion              int64
 	CreatedAt                  time.Time
 }
 

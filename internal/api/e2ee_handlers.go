@@ -185,10 +185,13 @@ type e2eeDeviceJSON struct {
 	Curve25519 string `json:"curve25519"`
 	Ed25519    string `json:"ed25519"`
 	Signature  string `json:"signature"`
+	// The current master key's cross-signature; absent until the device is verified.
+	MasterSignature *hybridJSON `json:"master_signature,omitempty"`
 }
 
-// POST /api/v1/keys/query lists the devices of users in the caller's organization. Anyone else
-// has no devices, exactly like a user who has never set up encryption.
+// POST /api/v1/keys/query lists the devices and master keys of users in the caller's
+// organization, which it names as tenant_id (the org every signed statement binds). Anyone
+// else has no devices and no master key, exactly like a user who has never set up encryption.
 func (s *Server) handleE2EEQuery(w http.ResponseWriter, r *http.Request) {
 	_, tenantID, ok := s.e2eeCaller(w, r)
 	if !ok {
@@ -202,18 +205,37 @@ func (s *Server) handleE2EEQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	devs, err := s.store.E2EE().ListDevices(r.Context(), tenantID, req.UserIDs)
+	var masters []store.E2EEMasterKey
+	if err == nil {
+		masters, err = s.store.E2EE().ListMasterKeys(r.Context(), tenantID, req.UserIDs)
+	}
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to load devices")
 		return
+	}
+	version := map[string]int64{}
+	masterOut := map[string]e2eeMasterJSON{}
+	for i := range masters {
+		if mj, ok := masterJSON(&masters[i]); ok {
+			masterOut[masters[i].UserID] = mj
+			version[masters[i].UserID] = mj.Version
+		}
 	}
 	out := make(map[string][]e2eeDeviceJSON, len(req.UserIDs))
 	for _, id := range req.UserIDs {
 		out[id] = []e2eeDeviceJSON{}
 	}
 	for _, d := range devs {
-		out[d.UserID] = append(out[d.UserID], e2eeDeviceJSON{d.DeviceID, d.Curve25519, d.Ed25519, d.Signature})
+		j := e2eeDeviceJSON{DeviceID: d.DeviceID, Curve25519: d.Curve25519, Ed25519: d.Ed25519, Signature: d.Signature}
+		// Only a signature by the current master key counts; a reset leaves none.
+		if v, ok := version[d.UserID]; ok && d.MasterVersion == v {
+			if sg, ok := parseHybrid(d.MasterSignature); ok {
+				j.MasterSignature = &sg
+			}
+		}
+		out[d.UserID] = append(out[d.UserID], j)
 	}
-	s.writeJSON(w, http.StatusOK, map[string]any{"devices": out})
+	s.writeJSON(w, http.StatusOK, map[string]any{"tenant_id": tenantID, "devices": out, "master_keys": masterOut})
 }
 
 // POST /api/v1/keys/claim takes one one-time key per named device, to start Olm sessions.
@@ -344,7 +366,7 @@ func (s *Server) handleE2EEToDevice(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]mail, len(msgs))
 	for i, m := range msgs {
-		out[i] = mail{m.ID, m.SenderUserID, m.SenderDeviceID, e2eeDeviceJSON{m.SenderDeviceID, m.SenderCurve25519, m.SenderEd25519, m.SenderSignature}, m.Type, m.Content, m.CreatedAt.UnixMilli()}
+		out[i] = mail{m.ID, m.SenderUserID, m.SenderDeviceID, e2eeDeviceJSON{DeviceID: m.SenderDeviceID, Curve25519: m.SenderCurve25519, Ed25519: m.SenderEd25519, Signature: m.SenderSignature}, m.Type, m.Content, m.CreatedAt.UnixMilli()}
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	s.writeJSON(w, http.StatusOK, map[string]any{"messages": out})

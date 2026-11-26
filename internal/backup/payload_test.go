@@ -155,6 +155,17 @@ func TestSnapshotSeesUncheckpointedCommit(t *testing.T) {
 	if err := st.Settings().SetSetting(ctx, "canary", "still-in-the-wal"); err != nil {
 		t.Fatal(err)
 	}
+	// E3's encryption identity and key backup are ciphertext and public keys: they ride in the
+	// capsule, so a restored user keeps their identity and history.
+	if err := st.Users().CreateUser(ctx, &store.User{ID: "u-e3", Username: "u-e3", Role: "user", Status: "active", SSOProvider: "local"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.E2EE().PutMasterKey(ctx, &store.E2EEMasterKey{TenantID: store.DefaultTenantID, UserID: "u-e3", MasterKey: "mk", SelfSignature: "ss", BackupKey: "bk", BackupSignature: "bs", RecoveryMaster: "rm", RecoveryBackup: "rb"}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.E2EE().PutBackupSessions(ctx, "u-e3", 1, []store.E2EEBackupSession{{RoomID: "r", SessionID: "s", Sealed: "sealed"}}, 10); err != nil {
+		t.Fatal(err)
+	}
 	payload, err := backup.Collect(ctx, cfg, "1.0.0")
 	if err != nil {
 		t.Fatal(err)
@@ -174,6 +185,12 @@ func TestSnapshotSeesUncheckpointedCommit(t *testing.T) {
 	defer copyStore.Close()
 	if got, err := copyStore.Settings().GetSetting(ctx, "canary"); err != nil || got != "still-in-the-wal" {
 		t.Fatalf("snapshot lacks the uncheckpointed row: %q, %v", got, err)
+	}
+	if m, err := copyStore.E2EE().GetMasterKey(ctx, "u-e3"); err != nil || m.RecoveryMaster != "rm" {
+		t.Fatalf("snapshot lacks e2ee_master_keys: %+v %v", m, err)
+	}
+	if rows, err := copyStore.E2EE().ListBackupSessions(ctx, "u-e3", 1, "", "", 10); err != nil || len(rows) != 1 || rows[0].Sealed != "sealed" {
+		t.Fatalf("snapshot lacks e2ee_key_backup: %+v %v", rows, err)
 	}
 	if check, _ := payload.VerificationRecipe["check_sqlite_integrity"].(bool); !check {
 		t.Error("recipe does not ask the drill to check the database")

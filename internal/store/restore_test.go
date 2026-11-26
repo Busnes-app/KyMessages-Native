@@ -74,6 +74,16 @@ func TestRestoreInvalidatesGrants(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
 	roomID, _, agentID := seedGrants(t, st)
+	// E3: the identity and key backup are the point of a restore; a QR pairing is a grant.
+	if err := st.E2EE().PutMasterKey(ctx, &store.E2EEMasterKey{TenantID: "t", UserID: "u", MasterKey: "mk", SelfSignature: "ss", BackupKey: "bk", BackupSignature: "bs", RecoveryMaster: "rm", RecoveryBackup: "rb"}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.E2EE().PutBackupSessions(ctx, "u", 1, []store.E2EEBackupSession{{RoomID: "r", SessionID: "s", Sealed: "x"}}, 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.E2EE().CreatePairing(ctx, &store.E2EEPairing{ID: "qr", TenantID: "t", UserID: "u", InitiatorDevice: "D1", ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
 	for range 2 { // Repeating offline preparation is harmless.
 		if err := st.InvalidateRestoredGrants(ctx); err != nil {
 			t.Fatal(err)
@@ -130,6 +140,15 @@ func TestRestoreInvalidatesGrants(t *testing.T) {
 	}
 	if _, err := st.Audit().LatestAuditRecord(ctx, "restore.grants_invalidated"); err != nil {
 		t.Fatal("no audit row", err)
+	}
+	if _, err := st.E2EE().GetPairing(ctx, "t", "u", "qr", time.Now()); !errors.Is(err, store.ErrNotFound) {
+		t.Fatal("QR pairing survived restore", err)
+	}
+	if m, err := st.E2EE().GetMasterKey(ctx, "u"); err != nil || m.MasterKey != "mk" {
+		t.Fatalf("master key lost in restore: %+v %v", m, err)
+	}
+	if rows, err := st.E2EE().ListBackupSessions(ctx, "u", 1, "", "", 10); err != nil || len(rows) != 1 {
+		t.Fatalf("key backup lost in restore: %+v %v", rows, err)
 	}
 }
 
