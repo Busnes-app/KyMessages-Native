@@ -16,7 +16,7 @@
 import { Account, GroupSession, InboundGroupSession, Session, verifyEd25519 } from './index';
 import type { Hybrid } from '../pqc/index';
 import { Identity, type IdentityChange, type IdentityServer, type IdentityStatus, type MasterKeyRecord, type PairingJoin, type PairingOffer } from './identity';
-import { backupCoverKey, backupQueueKey, inboundKey, isObj, isStr, isTransient, parseJSON, seenKey, Transient, type InboundRecord } from './records';
+import { backupCoverKey, backupQueueKey, IdentityMoved, inboundKey, isObj, isStr, isTransient, parseJSON, seenKey, Transient, type InboundRecord } from './records';
 import type { CryptoStore } from './store';
 
 export { Conflict } from './records';
@@ -219,15 +219,18 @@ function withLock<T>(name: string, fn: () => Promise<T>, signal?: AbortSignal): 
   if (typeof navigator !== 'undefined' && navigator.locks?.request) {
     return (signal ? navigator.locks.request(name, { signal }, fn) : navigator.locks.request(name, fn)) as Promise<T>;
   }
+  // As Web Locks: the signal ends only the wait for the lock; once fn runs, its result stands.
+  let started = false;
   const turn = () => {
     signal?.throwIfAborted();
+    started = true;
     return fn();
   };
   const run = (chains.get(name) ?? Promise.resolve()).then(turn, turn);
   chains.set(name, run.catch(() => undefined));
   if (!signal) return run;
   return new Promise<T>((resolve, reject) => {
-    const stop = () => reject(signal.reason);
+    const stop = () => { if (!started) reject(signal.reason); };
     if (signal.aborted) return stop();
     signal.addEventListener('abort', stop, { once: true });
     run.then(resolve, reject).finally(() => signal.removeEventListener('abort', stop));
@@ -269,7 +272,7 @@ export class CryptoEngine {
     private readonly key: Uint8Array,
   ) {
     this.identity = new Identity({
-      userId, deviceId, curve25519, ed25519, server, store, pickleKey: key, locked: (fn) => this.locked(fn),
+      userId, deviceId, curve25519, ed25519, server, store, pickleKey: key, locked: (fn, signal) => this.locked(fn, signal),
       onRestored: (ids) => { for (const fn of this.listeners) fn(ids); },
       onTransient: () => this.reportTransient(),
       onBackupState: (full) => { for (const fn of this.backupState) fn(full); },
@@ -456,11 +459,13 @@ export class CryptoEngine {
    * The devices of userIds whose self-signature verifies and whose keys match what this device
    * saw before, without this device. A device whose keys changed is dropped, never re-pinned.
    */
-  async verifiedDevices(userIds: string[]): Promise<Target[]> {
+  async verifiedDevices(userIds: string[], self?: { trusted: boolean }): Promise<Target[]> {
     // One authenticated pin sync before the whole check; a failure fails the check.
     try {
       await this.identity.beforeTrust();
     } catch (e) {
+      // Seeds of an identity the server no longer publishes: this device must verify again.
+      if (e instanceof IdentityMoved) throw new NotVerified();
       throw new Transient(e instanceof Error ? e.message : 'Could not sync pinned identities');
     }
     const out: Target[] = [];
@@ -483,7 +488,11 @@ export class CryptoEngine {
         if (!master) continue;
         const ok: { target: Target; pin?: [string, unknown] }[] = [];
         for (const d of listed.devices?.[userId] ?? []) {
-          if (userId === this.userId && isObj(d) && d.device_id === this.deviceId) continue;
+          if (userId === this.userId && isObj(d) && d.device_id === this.deviceId) {
+            // This device itself, checked like any other (self reports it), never a target.
+            if (self && (await this.checkDevice(userId, d)) && this.identity.deviceTrusted(master, listed.tenant_id, userId, d)) self.trusted = true;
+            continue;
+          }
           const checked = await this.checkDevice(userId, d);
           if (!checked || !this.identity.deviceTrusted(master, listed.tenant_id, userId, d)) continue;
           ok.push(checked);
@@ -538,9 +547,11 @@ export class CryptoEngine {
    * and could outlive a removal (whose member would keep getting keys). Two small requests per
    * send buy both.
    */
-  private async devicesInRoom(roomId: string): Promise<{ members: string[]; devices: Target[] }> {
+  private async devicesInRoom(roomId: string, self?: { trusted: boolean }): Promise<{ members: string[]; devices: Target[] }> {
     const members = [...new Set(await this.server.roomMembers(roomId))];
-    return { members, devices: await this.verifiedDevices(members) };
+    // The user's own entry is always read, so self can be answered from the same query.
+    const ids = self && !members.includes(this.userId) ? [...members, this.userId] : members;
+    return { members, devices: await this.verifiedDevices(ids, self) };
   }
 
   /**
@@ -778,8 +789,13 @@ export class CryptoEngine {
     return this.locked(async () => {
       // An unverified device trusts no one, so its message would reach no one, silently: it is
       // refused before any session is made or ratcheted, and sends once the device is verified.
+      // Holding the seeds is not enough: this device must be cross-signed by the identity the
+      // server publishes now and on its newest device list (not a stale or reset identity, not
+      // a replacement still enrolling, not a retired device), judged from the send's own query.
       if (!(await this.identity.isVerified())) throw new NotVerified();
-      const { members, devices } = await this.devicesInRoom(roomId);
+      const self = { trusted: false };
+      const { members, devices } = await this.devicesInRoom(roomId, self);
+      if (!self.trusted) throw new NotVerified();
       const outKey = `out:${roomId}`;
       let out = await this.store.get<OutboundRecord>(outKey);
       let session = out ? GroupSession.fromPickle(out.pickle, this.key) : undefined;

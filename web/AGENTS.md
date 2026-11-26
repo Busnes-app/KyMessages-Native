@@ -64,7 +64,9 @@ Owns user interface components, service worker caching, PWA installation manifes
   must exist) on every attempt, adopts a shared pin that already is the new key as it is (and
   then refuses the click, keeping a newer pending candidate rebased onto it, when the prompt
   clicked was stale), and changes the local pin only after the signed write. `engine.encrypt`
-  throws `NotVerified` on a device without the identity, before any session is made; `roomKey`
+  throws `NotVerified` before any session is made unless this device holds the identity and,
+  from the send's own query (`verifiedDevices(ids, self)`), is cross-signed and listed by the
+  identity published now (an `IdentityMoved` pin sync also reads as `NotVerified`); `roomKey`
   keeps a vouched Olm copy in charge of what it covers (an unvouched or earlier one only
   becomes the `inb:` cover), and a vouched copy supersedes an unvouched or restored primary. `engine.ownDeviceVerified(id, signal)`
   reads only the user's own entry, with the signal on the lock wait and the request. Pin sync adopts a differing pin only as an accepted change
@@ -113,7 +115,15 @@ Owns user interface components, service worker caching, PWA installation manifes
   makes the page usable and clears its own start-up error. `identity.drain()` also signs the
   device (a replacement whose signing failed), and runs the restore and backup after a listing
   rollback. Enrollment that fails for availability after the seed write (`identity:enrolling`)
-  is finished there, and `onAdopted` fires once the device is signed and listed. `ensureListed` under the lock (status) never waits on another
+  is finished there, and `onAdopted` fires once `enrolled()` confirms the current identity and a
+  signed, current list naming the device (a failed confirmation keeps the marker and is retried).
+  After a QR consume, the fresh identity read is retried a few times; `adopt` rechecks the
+  published identity and the local baseline under the lock and calls a closed screen or a
+  spent deadline off right before the seed write; a backup read failing afterwards stays
+  pending. `withLock`'s signal ends only the wait for the lock, as Web Locks do. Status checks
+  run per start-up `Entry` (`entry.status`); one asked of a replaced or ended entry rejects with
+  `StaleStatus`, which the gate ignores; engines wire `onIdentityChange` at start, and a ready
+  entry and a retry's verdict call `announceIdentity`. `ensureListed` under the lock (status) never waits on another
   device's reservation; lease deadlines use `performance.now()` from before the request. `onBackupStateChanged`
   updates the gate's full notice without a status check.
   `EARLY` (a message from before this device's session) is retryable, so backup pages reopen it.

@@ -7,7 +7,7 @@ import QRCode from 'qrcode';
 import { ShieldAlert, ShieldCheck } from 'lucide-react';
 import {
   acceptIdentity, encryptionRetry, identityChanges, identityStatus, joinVerification, offerVerification, onBackupStateChanged, onEncryptionPending, onIdentityChanged,
-  ownDeviceVerified, prepareIdentity, restoreIdentity, retryEncryptionNow,
+  ownDeviceVerified, prepareIdentity, restoreIdentity, retryEncryptionNow, StaleStatus,
 } from '../../chat/e2ee';
 
 const POLL_MS = 1500;
@@ -335,7 +335,11 @@ export type GateState = { state: 'loading' } | { state: 'error'; message: string
 export function useIdentityStatus(ready: boolean): [GateState, () => void] {
   const [gate, setGate] = useState<GateState>({ state: 'loading' });
   const refresh = useCallback(() => {
-    identityStatus().then(setGate, (e: unknown) => setGate({ state: 'error', message: errText(e, 'The encryption identity could not be checked.') }));
+    identityStatus().then(setGate, (e: unknown) => {
+      // Asked of a device since replaced: not this page's answer (the new one announces itself).
+      if (e instanceof StaleStatus) return;
+      setGate({ state: 'error', message: errText(e, 'The encryption identity could not be checked.') });
+    });
   }, []);
   useEffect(() => {
     if (!ready) return;

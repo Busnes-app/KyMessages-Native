@@ -161,8 +161,8 @@ const keyServer = (signal: AbortSignal): KeyServer => ({
   async roomMembers(roomId) {
     return parseRoomDetail(await call(`/api/v1/rooms/${encodeURIComponent(roomId)}`, 'GET', undefined, signal)).members.map((m) => m.user_id);
   },
-  async getMaster() {
-    const o = obj(await call('/api/v1/keys/master', 'GET', undefined, signal));
+  async getMaster(screen) {
+    const o = obj(await call('/api/v1/keys/master', 'GET', undefined, both(signal, screen)));
     return { tenant_id: str(o.tenant_id, 128), master: o.master === null ? null : ownMaster(o.master) };
   },
   async putMaster(req) {
@@ -237,6 +237,8 @@ interface Entry {
   controller: AbortController;
   /** The user's retry session, shared by their later start-ups until sign-out. */
   retry: RetrySession;
+  /** This start-up's identity status checks: one running, and one shared next. */
+  status: { run?: Promise<IdentityStatus>; next?: Promise<IdentityStatus> };
   store?: CryptoStore;
 }
 
@@ -291,7 +293,7 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
   if (deletedElsewhere) return Promise.reject(new Error('Encryption was reset in another tab; reload this tab to continue.'));
   stopE2EE();
   const retry = sessionFor(userId);
-  const entry = { userId, cancelled: false, failed: false, controller: new AbortController(), retry } as Entry;
+  const entry = { userId, cancelled: false, failed: false, controller: new AbortController(), retry, status: {} } as Entry;
   const server = keyServer(entry.controller.signal);
   const live = () => {
     entry.controller.signal.throwIfAborted();
@@ -350,7 +352,9 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
     void retireAbandoned(userId, entry.controller.signal, e).catch(() => undefined);
     e.onKeys(() => keysArrived(true));
     e.onTransient(() => retryLater(retry));
-    e.onBackupState((full) => { for (const fn of backupListeners) fn(full); });
+    e.onBackupState((full) => { if (current === entry) for (const fn of backupListeners) fn(full); });
+    // Identity notices are wired at start-up, and only the entry in use reaches the UI.
+    e.onIdentityChange(() => { if (current === entry) announceIdentity(); });
     // Verified now (QR or recovery key): retire pending devices, without waiting for the
     // backup restore that follows.
     e.onAdopted(() => void retireAbandoned(userId, entry.controller.signal, e).catch(() => undefined));
@@ -363,6 +367,8 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
     if (current === entry && !entry.failed && !entry.cancelled) {
       entry.ready = e;
       keysArrived(false);
+      // A replacement (or a start after a failure) is a new device state: the gate asks again.
+      announceIdentity();
     }
   }, () => undefined);
   // Keep the user on a failed entry so the next send can retry without a socket reconnect.
@@ -421,7 +427,6 @@ export function onRoomKeys(fn: () => void): () => void {
 
 const identityListeners = new Set<() => void>();
 const backupListeners = new Set<(full: boolean) => void>();
-let identityWired: CryptoEngine | undefined;
 
 /** Calls fn when whether the key backup is refusing sessions changes. */
 export function onBackupStateChanged(fn: (full: boolean) => void): () => void {
@@ -439,30 +444,55 @@ function announceIdentity(): void {
   for (const fn of identityListeners) fn();
 }
 
-async function identityEngine(): Promise<CryptoEngine> {
-  const e = await engine();
-  if (identityWired !== e) {
-    identityWired = e;
-    e.onIdentityChange(announceIdentity);
-  }
-  return e;
-}
+// Identity notices are wired when each engine starts (startE2EE).
+const identityEngine = (): Promise<CryptoEngine> => engine();
 
 // Status checks are asked for by every identity, backup and retry notice, often several at once;
 // each reads the identity from the server. One runs at a time, and requests arriving meanwhile
 // share a single next run, so none misses a change made before it asked.
-let statusRun: Promise<IdentityStatus> | undefined;
-let statusNext: Promise<IdentityStatus> | undefined;
-export function identityStatus(): Promise<IdentityStatus> {
-  if (!statusRun) {
-    statusRun = identityEngine().then((e) => e.identityStatus()).finally(() => { statusRun = undefined; });
-    return statusRun;
+// The runs belong to the device start-up they were asked of: a request made of an entry that
+// ended (a sign-out, another user) or was replaced never runs on, or waits for, the current one,
+// and its answer is never shown: it rejects with StaleStatus, which the gate ignores (the new
+// entry announces itself when it is ready, so the gate asks again).
+export class StaleStatus extends Error {
+  constructor() {
+    super('The device this status was asked of is no longer the one in use');
   }
-  statusNext ??= statusRun.catch(() => undefined).then(() => {
-    statusNext = undefined;
+}
+
+async function statusOf(entry: Entry): Promise<IdentityStatus> {
+  // Replaced or ended: invalidated (failed), stopped (cancelled) or no longer the one in use.
+  const gone = () => current !== entry || entry.failed || entry.cancelled;
+  const e = await entry.engine;
+  if (gone()) throw new StaleStatus();
+  let st: IdentityStatus;
+  try {
+    st = await e.identityStatus();
+  } catch (err) {
+    // A device replaced while this ran fails here (DeviceChanged, an aborted request).
+    if (gone()) throw new StaleStatus();
+    throw err;
+  }
+  if (gone()) throw new StaleStatus();
+  return st;
+}
+
+export function identityStatus(): Promise<IdentityStatus> {
+  const entry = current;
+  if (!entry) return Promise.reject(new Error('Encryption is not set up in this browser'));
+  // A failed start-up of this user starts again (as any use does) before its status is read.
+  if (entry.failed) return startE2EE(entry.userId).then(() => identityStatus());
+  const s = entry.status;
+  if (!s.run) {
+    s.run = statusOf(entry).finally(() => { s.run = undefined; });
+    return s.run;
+  }
+  s.next ??= s.run.catch(() => undefined).then(() => {
+    s.next = undefined;
+    if (current !== entry) throw new StaleStatus();
     return identityStatus();
   });
-  return statusNext;
+  return s.next;
 }
 
 /** A new identity for this account: show recoveryKey, then commit once the user saved it. */
@@ -615,6 +645,8 @@ function runRetry(s: RetrySession): Promise<void> {
       // failure reported while this ran still earns its pass.
       again = isTransient(e) || s.again;
       if (!again) setRetry(s, false, false);
+      // A verdict (a rollback or fork) is the identity status's to show, with its reset action.
+      if (!isTransient(e) && !s.ended) announceIdentity();
     } finally {
       s.run = undefined;
     }

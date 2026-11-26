@@ -32,6 +32,10 @@ export const backupRefusedKey = (inbound: string) => `bqf:${inbound}`;
 /** A failure worth retrying later (the network, the server), as opposed to bad data. */
 export class Transient extends Error {}
 
+/** The identity this device holds is no longer the one the server publishes (a reset or
+ * restore elsewhere): a verdict, not unavailability; the device must be verified again. */
+export class IdentityMoved extends Error {}
+
 /** Local storage (IndexedDB) failed or aborted the request: availability, not bad data. */
 export class StorageUnavailable extends Transient {}
 

@@ -661,7 +661,19 @@ describe('Round 6: which copy of a room key is in charge', () => {
   it('lets a vouched copy supersede an unvouched one (also at an equal index), and never the reverse', async () => {
     const server = new FakeKeyServer();
     const alice = await device(server, 'u_alice');
-    const bob = await device(server, 'u_bob');
+    // Bob's view of the server can be made to stop vouching for alice's device (her own view is
+    // unchanged, so she still may send).
+    let hideAlice = false;
+    const bobApi = server.as('u_bob');
+    const query = bobApi.query;
+    bobApi.query = async (ids, signal) => {
+      const r = await query(ids, signal);
+      if (hideAlice && r.devices.u_alice) r.devices.u_alice = r.devices.u_alice.map(({ master_signature: _, ...d }) => d);
+      return r;
+    };
+    const bob = await CryptoEngine.open('u_bob', bobApi, await openCryptoStore('u_bob'));
+    opened.push(bob);
+    await verify(server, bob);
     server.join('r1', 'u_alice', 'u_bob');
     type Rec = { first_index: number; verified?: boolean; from_backup?: boolean };
     const bobRecords = async () => {
@@ -686,7 +698,7 @@ describe('Round 6: which copy of a room key is in charge', () => {
       await s.write([['out:r1', out]]);
       s.close();
     };
-    const opened = async (m: SealedMessage) => {
+    const body = async (m: SealedMessage) => {
       const r = await bob.decrypt(m);
       return r.state === 'decrypted' ? { body: r.inner.body, authenticated: r.authenticated } : r.state;
     };
@@ -702,8 +714,8 @@ describe('Round 6: which copy of a room key is in charge', () => {
     let r = await bobRecords();
     expect(r.primary).toMatchObject({ first_index: 2, verified: true });
     expect(r.covers).toEqual([expect.objectContaining({ first_index: 0, verified: false })]);
-    expect(await opened(m2)).toEqual({ body: 'two', authenticated: true });
-    expect(await opened(m0)).toEqual({ body: 'zero', authenticated: false });
+    expect(await body(m2)).toEqual({ body: 'two', authenticated: true });
+    expect(await body(m0)).toEqual({ body: 'zero', authenticated: false });
 
     // At an equal index, too.
     await patchPrimary({ verified: false, first_index: 3 });
@@ -712,11 +724,11 @@ describe('Round 6: which copy of a room key is in charge', () => {
     await bob.receive();
     r = await bobRecords();
     expect(r.primary).toMatchObject({ first_index: 3, verified: true });
-    expect(await opened(m3)).toEqual({ body: 'three', authenticated: true });
+    expect(await body(m3)).toEqual({ body: 'three', authenticated: true });
 
     // A copy from a device no longer vouched for, reaching earlier than the primary, never
     // replaces it, and is no better a cover than the one kept.
-    delete server.devices.get('u_alice')!.get(alice.deviceId)!.master_signature;
+    hideAlice = true;
     await patchPrimary({ first_index: 9 });
     await reshare();
     const m4 = await send('r1', alice, 'four');
@@ -724,6 +736,6 @@ describe('Round 6: which copy of a room key is in charge', () => {
     r = await bobRecords();
     expect(r.primary).toMatchObject({ first_index: 9, verified: true });
     expect(r.covers).toEqual([expect.objectContaining({ first_index: 0 })]);
-    expect(await opened(m4)).toEqual({ body: 'four', authenticated: true });
+    expect(await body(m4)).toEqual({ body: 'four', authenticated: true });
   });
 });

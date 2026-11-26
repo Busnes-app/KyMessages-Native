@@ -1,7 +1,7 @@
 import 'fake-indexeddb/auto';
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { abandonDevice, encryptionRetry, identityStatus, ownDeviceVerified, prepareIdentity, restoreIdentity, forgetCryptoStore, keyGeneration, NOT_YET, onRoomKeys, openMessage, receiveRoomKeys, replaceDevice, RETIRE_MS, retireDevice, retryable, retryEncryptionNow, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
+import { abandonDevice, encryptionRetry, identityStatus, onIdentityChanged, StaleStatus, ownDeviceVerified, prepareIdentity, restoreIdentity, forgetCryptoStore, keyGeneration, NOT_YET, onRoomKeys, openMessage, receiveRoomKeys, replaceDevice, RETIRE_MS, retireDevice, retryable, retryEncryptionNow, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
 import { EARLY } from '../crypto/engine';
 import { FakeKeyServer, TENANT } from '../crypto/fakeKeyServer';
 import { pqc } from '../pqc/index';
@@ -741,7 +741,8 @@ describe('Round 4: retirement races', () => {
     await vi.waitFor(() => expect(deleted).toContain(first.deviceId));
     expect(pendingRetirements()).toEqual([expect.objectContaining({ device_id: first.deviceId, deleted: true, delisted: false })]);
     backupDown = true;
-    await expect(restoreIdentity(p.recoveryKey)).rejects.toThrow();
+    // Verified, with the restore left pending for the retry.
+    expect(await restoreIdentity(p.recoveryKey)).toBe(0);
     await vi.waitFor(() => expect(pendingRetirements()).toEqual([]));
     expect(server.masters.get('u_alice')!.device_list!.device_ids).not.toContain(first.deviceId);
   });
@@ -1042,9 +1043,15 @@ describe('Round 6', () => {
     await new Promise((r) => setTimeout(r, 100));
     mailboxDown = false;
     m.device_list = older; // the pass then ends in a verdict: a rollback
+    const announced = vi.fn();
+    const off = onIdentityChanged(announced);
     resolve();
     await run;
+    off();
     expect(encryptionRetry().pending).toBe(true);
+    // The verdict reaches the gate, whose status now carries the reset action's problem.
+    expect(announced).toHaveBeenCalled();
+    expect(await identityStatus()).toMatchObject({ state: 'verified', problem: 'rollback' });
   });
 
   it('stops waiting for a starting device when its own-device check is aborted, leaving the start-up alone', async () => {
@@ -1084,5 +1091,38 @@ describe('Round 6: status checks share one run', () => {
     const all = await Promise.all(Array.from({ length: 5 }, () => identityStatus()));
     expect(all.every((s) => s.state === 'verified')).toBe(true);
     expect(masters).toBeLessThanOrEqual(2 * one);
+  });
+});
+
+describe('Round 7: status belongs to its device start-up', () => {
+  it('never lets a status asked of a replaced device stall or answer for its replacement, which updates the gate', async () => {
+    const server = new FakeKeyServer();
+    let holdOnce: { promise: Promise<undefined>; release: () => void } | undefined;
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice', { fn: (method, path) => {
+      if (method === 'GET' && path === '/api/v1/keys/master' && holdOnce) {
+        const h = holdOnce;
+        holdOnce = undefined;
+        return h.promise;
+      }
+      return undefined;
+    } })));
+    const first = await startE2EE('u_alice');
+    await (await prepareIdentity()).commit();
+    await new Promise((r) => setTimeout(r, 100));
+    let release = () => {};
+    holdOnce = { promise: new Promise<undefined>((r) => { release = () => r(undefined); }), release: () => release() };
+    const stale = identityStatus().catch((e: unknown) => e);
+    await vi.waitFor(() => expect(holdOnce).toBeUndefined()); // that check is now stalled
+    const announced = vi.fn();
+    const off = onIdentityChanged(announced);
+    await replaceDevice(first.deviceId);
+    const fresh = await startE2EE('u_alice');
+    expect(fresh.deviceId).not.toBe(first.deviceId);
+    // The replacement announced itself, and its own status runs at once.
+    await vi.waitFor(() => expect(announced).toHaveBeenCalled());
+    expect(await identityStatus()).toMatchObject({ state: 'verified' });
+    release();
+    expect(await stale).toBeInstanceOf(StaleStatus);
+    off();
   });
 });

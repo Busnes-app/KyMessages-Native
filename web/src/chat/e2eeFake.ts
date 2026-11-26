@@ -139,6 +139,7 @@ export function setFakeIdentity(s: typeof fakeIdentity, changes: typeof fakeChan
   fakeChanges = changes;
   for (const fn of identityListeners) fn();
 }
+export class StaleStatus extends Error {}
 export const identityStatus = async () => fakeIdentity;
 export const identityChanges = async () => fakeChanges;
 export const onIdentityChanged = (fn: () => void) => {

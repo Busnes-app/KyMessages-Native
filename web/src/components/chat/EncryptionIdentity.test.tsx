@@ -254,4 +254,14 @@ describe('identity screens', () => {
     expect(poll).toHaveBeenCalledTimes(1);
     expect(seen?.aborted).toBe(true);
   });
+
+  it('ignores a status answer asked of a device since replaced, and shows the next one', async () => {
+    fake.setFakeIdentity({ state: 'unverified', fingerprint: 'ab'.repeat(32), quarantined: false });
+    vi.spyOn(fake, 'identityStatus').mockRejectedValueOnce(new fake.StaleStatus());
+    render(<Gate />);
+    await act(async () => undefined);
+    expect(screen.queryByRole('alert')).toBeNull();
+    act(() => fake.setFakeIdentity({ state: 'unverified', fingerprint: 'ab'.repeat(32), quarantined: false }));
+    expect(await screen.findByRole('button', { name: 'Verify this device' })).toBeTruthy();
+  });
 });

@@ -13,7 +13,7 @@
 import { InboundGroupSession } from './index';
 import { b64, pqc, unb64, type BackupRef, type Hybrid } from '../pqc/index';
 import type { CryptoStore } from './store';
-import { backupCoverKey, backupQueueKey, backupRefusedKey, Conflict, inboundKey, isObj, isStr, isTransient, parseJSON, sleep, Transient, type InboundRecord } from './records';
+import { backupCoverKey, backupQueueKey, backupRefusedKey, Conflict, IdentityMoved, inboundKey, isObj, isStr, isTransient, parseJSON, sleep, Transient, type InboundRecord } from './records';
 
 // --- The key server, as the identity needs it (chat/e2ee.ts implements it over HTTP) ---
 
@@ -66,7 +66,8 @@ export interface PairingState {
 
 /** Writes answer Conflict when the identity, pin set, device list or backup version moved on. */
 export interface IdentityServer {
-  getMaster(): Promise<{ tenant_id: string; master: OwnMaster | null }>;
+  /** signal: the asking screen closed or its deadline passed, so the read is dropped. */
+  getMaster(signal?: AbortSignal): Promise<{ tenant_id: string; master: OwnMaster | null }>;
   putMaster(req: MasterPut): Promise<number>;
   /** signature: the master key's kymessages.pins-write.v1 signature over this write. */
   putPins(version: number, expectedCounter: number, sealed: string, signature: Hybrid): Promise<void>;
@@ -259,7 +260,7 @@ export interface IdentityContext {
   store: CryptoStore;
   pickleKey: Uint8Array;
   /** Runs fn under the device's per-user lock (not re-entrant). */
-  locked<T>(fn: () => Promise<T>): Promise<T>;
+  locked<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T>;
   /** Called with the session IDs a restored backup page stored, so waiting messages reopen. */
   onRestored?(sessionIds: string[]): void;
   /** Called when background work (restore, backup) failed for availability and should be retried. */
@@ -537,7 +538,7 @@ export class Identity {
           await this.ensureListed(l, false);
           await this.enrolled();
         } catch (e) {
-          if (e instanceof Transient) this.later(e);
+          if (isTransient(e)) this.later(e);
           else if (!(e instanceof Rollback)) throw e;
           else problem = e.kind;
         }
@@ -600,13 +601,24 @@ export class Identity {
    * durable: pending retirements can be signed now (before any backup page is read).
    */
   private async enrolled(): Promise<void> {
-    const l = await this.local();
-    const signed = await this.ctx.store.get<{ version: number; device_id: string }>(SIGNED);
-    if (!l || !(await this.ctx.store.get(ENROLLING)) || signed?.version !== l.version || signed.device_id !== this.ctx.deviceId) return;
-    const { master } = await this.ctx.server.getMaster();
-    if (!master?.device_list?.device_ids.includes(this.ctx.deviceId)) return;
-    await this.ctx.store.write([], [ENROLLING]);
-    this.ctx.onAdopted?.();
+    try {
+      const l = await this.local();
+      const signed = await this.ctx.store.get<{ version: number; device_id: string }>(SIGNED);
+      if (!l || !(await this.ctx.store.get(ENROLLING)) || signed?.version !== l.version || signed.device_id !== this.ctx.deviceId) return;
+      // Confirmed only against the identity this device holds, as published now, and a list
+      // that identity signed naming this device; otherwise the marker stays for the next try.
+      const { tenant_id, master } = await this.ctx.server.getMaster();
+      const dl = master?.device_list;
+      if (!master || tenant_id !== l.tenant_id || master.version !== l.version || pqc.fingerprint(master.master_key) !== l.fingerprint ||
+        !dl || !this.signedList(l.master_key, l.tenant_id, this.ctx.userId, l.version, dl) || !dl.device_ids.includes(this.ctx.deviceId)) return;
+      // Not older than (nor a fork of) a list this device saw.
+      if (await this.observeList(l.tenant_id, this.ctx.userId, l.fingerprint, l.version, dl) !== 'ok') return;
+      await this.ctx.store.write([], [ENROLLING]);
+      this.ctx.onAdopted?.();
+    } catch (e) {
+      // Enrollment already happened; failing to confirm it now is retried, never reported.
+      this.unlessTransient(e);
+    }
   }
 
   /** Background work that failed for availability asks for a retry. */
@@ -644,7 +656,7 @@ export class Identity {
       if (wait > 0) await new Promise((r) => setTimeout(r, wait));
       const { tenant_id, master } = await this.ctx.server.getMaster();
       if (!master || tenant_id !== l.tenant_id || master.version !== l.version || pqc.fingerprint(master.master_key) !== l.fingerprint) {
-        throw new Error('The encryption identity changed; the device list was not edited.');
+        throw new IdentityMoved('The encryption identity changed; the device list was not edited.');
       }
       const cur = master.device_list;
       if (cur !== undefined && !this.signedList(l.master_key, l.tenant_id, user, l.version, cur)) {
@@ -807,27 +819,54 @@ export class Identity {
    * Takes the identity on: stores it, signs this device and lists it, syncs pins, then reads the
    * key backup in (resumable, one page per lock) and seals what this device holds to it.
    */
-  private async adopt(tenantId: string, master: OwnMaster, masterSeed: string, backupSeed: string): Promise<number> {
+  private async adopt(tenantId: string, master: OwnMaster, masterSeed: string, backupSeed: string, abort?: { signal: AbortSignal; late: () => Error | undefined }): Promise<number> {
     const local = await this.sealLocal(tenantId, master, masterSeed, backupSeed);
+    const stop = () => {
+      const timedOut = abort?.late();
+      if (timedOut) throw timedOut;
+      abort?.signal.throwIfAborted();
+    };
     await this.ctx.locked(async () => {
+      // Checked again holding the lock: another tab may have committed a newer or different
+      // identity meanwhile (this device's own baseline), or the server may have moved on.
+      // A newer identity, or another at the same version, is never overwritten by this one; a
+      // reset (an older one held here) is replaced as intended.
+      const held = await this.local();
+      if (held && held.tenant_id === tenantId && (held.version > local.version || (held.version === local.version && held.fingerprint !== local.fingerprint))) {
+        throw new Error('This browser took on another encryption identity meanwhile. Start again.');
+      }
+      const { tenant_id: t2, master: m2 } = await this.ctx.server.getMaster(abort?.signal);
+      if (!m2 || t2 !== tenantId || m2.version !== master.version || pqc.fingerprint(m2.master_key) !== local.fingerprint) {
+        throw new Error('This account’s encryption identity changed meanwhile. Start again.');
+      }
       // Every verified room key this device already holds goes to the backup too.
       // A new identity has a new, empty backup: what an old one refused is tried again.
       const queue = (await this.ctx.store.list<InboundRecord>('in:')).filter(([, r]) => r.verified && !r.from_backup).map(([k]): [string, unknown] => [backupQueueKey(k), k]);
       const refused = (await this.ctx.store.list('bqf:')).map(([k]) => k);
       const restore: RestoreCursor = { version: local.version, after: { room_id: '', sender_key: '', session_id: '' }, count: 0 };
       this.backupGen = { version: master.version, generation: master.backup_generation };
+      // The last point the screen or its deadline can still call this off.
+      stop();
       // The seeds are durable from here: enrollment (signing and listing this device) that then
       // fails for availability is finished by the bounded retry, not undone.
       await this.ctx.store.write([[IDENTITY, local], [RESTORE, restore], [ENROLLING, true], ...queue], [SIGNED, ...refused]);
       await this.signOwnDevice(local).catch((e: unknown) => this.unlessTransient(e));
       await this.syncPins().catch(() => undefined);
+    }, abort?.signal).catch((e: unknown) => {
+      // A deadline that ran out while waiting for the lock reads as the pairing's own timeout.
+      throw abort?.late() ?? e;
     });
     // Outside the lock: waiting out another device's reservation must not hold every tab.
     await this.ensureListed(local).catch((e: unknown) => this.unlessTransient(e));
     this.notify();
     await this.backupStateChanged();
     await this.enrolled();
-    const restored = await this.resumeRestore();
+    // The identity is taken on: a backup read that fails for availability now leaves its cursor
+    // pending for the retry; it is not a failed verification.
+    const restored = await this.resumeRestore().catch((e: unknown) => {
+      this.unlessTransient(e);
+      return 0;
+    });
     await this.ctx.locked(() => this.flushBackup()).catch((e: unknown) => this.later(e));
     return restored;
   }
@@ -853,7 +892,7 @@ export class Identity {
     for (let attempt = 0; attempt < 3; attempt++) {
       const { tenant_id, master } = await this.ctx.server.getMaster();
       if (!master || tenant_id !== l.tenant_id || master.version !== l.version || pqc.fingerprint(master.master_key) !== l.fingerprint) {
-        throw new Error('The encryption identity changed; check this device again.');
+        throw new IdentityMoved('The encryption identity changed; check this device again.');
       }
       const counter = master.pins.counter;
       if (counter < ((await this.ctx.store.get<number>(mark)) ?? 0)) throw new Rollback('rollback', 'The server returned an older pin set than this device has seen.');
@@ -1221,6 +1260,8 @@ export class Identity {
         const late = () => new Error('The other device did not approve in time. Start again.');
         let failures = 0;
         let got: { initiator_device: string; sealed: string } | undefined;
+        // The deadline and the screen's signal stay live through the fresh identity read and the
+        // adoption's lock, up to the last check before the seeds are written.
         try {
           while (!got) {
             signal?.throwIfAborted();
@@ -1237,24 +1278,38 @@ export class Identity {
             }
             await sleep(PAIRING_POLL_MS, stop).catch(() => undefined);
           }
+          let keys: { master_seed: string; backup_seed: string };
+          try {
+            keys = pqc.transferOpen(eph.seed, q.secret, q.pairing_id, got.initiator_device, this.ctx.deviceId, got.sealed);
+          } catch {
+            throw new Error('The keys from the other device did not open. Start again.');
+          }
+          // The approval may have taken minutes: the identity is read again (its version, backup
+          // key and generation as published now) and the seeds checked against that, so nothing
+          // stale is adopted. A consumed transfer cannot be replayed: the seeds are held here
+          // through a few retries of that read when it fails for availability.
+          let fresh: { tenant_id: string; master: OwnMaster | null } | undefined;
+          for (let attempt = 0; !fresh; attempt++) {
+            signal?.throwIfAborted();
+            if (deadline.signal.aborted) throw late();
+            try {
+              fresh = await this.ctx.server.getMaster(stop);
+            } catch (e) {
+              signal?.throwIfAborted();
+              if (deadline.signal.aborted) throw late();
+              if (!isTransient(e) || attempt >= PAIRING_RETRIES) throw e;
+              await sleep(PAIRING_POLL_MS, stop).catch(() => undefined);
+            }
+          }
+          const now = fresh.master;
+          if (!now || pqc.fingerprint(now.master_key) !== q.fingerprint) {
+            throw new Error('This account’s encryption identity changed while waiting for approval. Start again.');
+          }
+          this.checkOwn(fresh.tenant_id, now, keys.master_seed, keys.backup_seed, q.fingerprint);
+          return await this.adopt(fresh.tenant_id, now, keys.master_seed, keys.backup_seed, { signal: stop, late: () => (deadline.signal.aborted ? late() : undefined) });
         } finally {
           clearTimeout(timer);
         }
-        let keys: { master_seed: string; backup_seed: string };
-        try {
-          keys = pqc.transferOpen(eph.seed, q.secret, q.pairing_id, got.initiator_device, this.ctx.deviceId, got.sealed);
-        } catch {
-          throw new Error('The keys from the other device did not open. Start again.');
-        }
-        // The approval may have taken minutes: the identity is read again (its version, backup
-        // key and generation as published now) and the seeds checked against that, so nothing
-        // stale is adopted. A consumed transfer cannot be replayed, so the seeds are kept.
-        const { tenant_id: tenantNow, master: now } = await this.ctx.server.getMaster();
-        if (!now || pqc.fingerprint(now.master_key) !== q.fingerprint) {
-          throw new Error('This account’s encryption identity changed while waiting for approval. Start again.');
-        }
-        this.checkOwn(tenantNow, now, keys.master_seed, keys.backup_seed, q.fingerprint);
-        return this.adopt(tenantNow, now, keys.master_seed, keys.backup_seed);
       },
       cancel: () => this.ctx.server.pairingCancel(q.pairing_id),
     };
