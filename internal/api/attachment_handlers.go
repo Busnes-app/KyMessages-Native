@@ -305,13 +305,7 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 		VersionID:  putRes.VersionID,
 	}
 	if err := s.store.Chat().CommitAttachmentWithQuota(r.Context(), res.ID, att, limits); err != nil {
-		// A connection failure can leave the commit outcome unknown. The queue owns
-		// cleanup until the transaction consumes the intent and inserts the attachment.
-		if s.writePoolError(w, err) {
-			return
-		}
-		switch {
-		case errors.Is(err, store.ErrAttachmentInvalid):
+		if errors.Is(err, store.ErrAttachmentNotCommitted) {
 			// This refusal happened before the insert. Publication may have finished
 			// after an earlier sweep erased the key or found it absent.
 			ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
@@ -322,6 +316,13 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 					log.Printf("[ATTACHMENTS] late upload %s remains: %v", putRes.Key, eraseErr)
 				}
 			}
+		}
+		// Once Commit is attempted, the persisted intent decides cleanup.
+		if s.writePoolError(w, err) {
+			return
+		}
+		switch {
+		case errors.Is(err, store.ErrAttachmentInvalid):
 			s.writeError(w, http.StatusRequestTimeout, "The upload took too long; send the file again")
 		case errors.Is(err, store.ErrAttachmentUploadQuotaExceeded):
 			s.writeError(w, http.StatusRequestEntityTooLarge, "File exceeds organization upload limit")

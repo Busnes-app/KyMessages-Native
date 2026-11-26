@@ -1451,7 +1451,13 @@ func (c *chatStore) ReleaseAttachmentQuota(ctx context.Context, tenantID, reserv
 	return err
 }
 
-func (c *chatStore) CommitAttachmentWithQuota(ctx context.Context, reservationID string, a *Attachment, limits AttachmentQuotaLimits) error {
+func (c *chatStore) CommitAttachmentWithQuota(ctx context.Context, reservationID string, a *Attachment, limits AttachmentQuotaLimits) (err error) {
+	commitAttempted := false
+	defer func() {
+		if err != nil && !commitAttempted {
+			err = errors.Join(ErrAttachmentNotCommitted, err)
+		}
+	}()
 	a.TenantID = normalizeTenant(a.TenantID)
 	if a.ID == "" {
 		a.ID = "att_" + uuid.Must(uuid.NewV7()).String()
@@ -1537,6 +1543,7 @@ func (c *chatStore) CommitAttachmentWithQuota(ctx context.Context, reservationID
 	); err != nil {
 		return uniqueError(err)
 	}
+	commitAttempted = true
 	return tx.Commit()
 }
 

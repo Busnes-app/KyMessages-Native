@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { applyReactionDelta, forgetDeleted, isGroupedWithPrevious, mergeMessageBatch, rememberDeleted, replaceMessageHistory, resolvePending, searchSignature, sortRooms, upsertMessage } from './state';
-import { parseWsEvent, type ChatMessage, type ChatRoomSummary } from './types';
+import { parseMessagesPage, parseWsEvent, type ChatMessage, type ChatRoomSummary } from './types';
 
 function makeMsg(overrides: Partial<ChatMessage> = {}): ChatMessage {
   return {
@@ -179,6 +179,14 @@ describe('encrypted files', () => {
     expect(upsertMessage([failed], confirmed).map((m) => m.id)).toEqual(['m_real']);
     // Another message with the same text and rows is not that send.
     expect(upsertMessage([optimistic], { ...confirmed, ref: 'other' }).map((m) => m.id)).toEqual(['m_real', 'pending_k']);
+  });
+
+  it('rejects wire IDs reserved for retryable local sends', () => {
+    const id = 'pending_k';
+    const row = { ...base, id, sender_id: 'other' };
+    expect(() => parseMessagesPage({ messages: [row] })).toThrow('Server message uses a local send ID');
+    expect(parseWsEvent({ t: 'message.new', room: base.room_id, d: row })).toBeNull();
+    expect(parseWsEvent({ t: 'message.delete', room: base.room_id, d: { id } })).toBeNull();
   });
 
   it('carries a failed file send through a history jump and back to the latest slice', () => {

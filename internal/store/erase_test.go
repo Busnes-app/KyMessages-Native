@@ -41,7 +41,7 @@ func TestCommitRefusesAnInactiveUploader(t *testing.T) {
 	if err := st.Chat().DeactivateForErasure(ctx, org, "u_up"); err != nil {
 		t.Fatal(err)
 	}
-	if err := commit("att_late_0001"); !errors.Is(err, store.ErrForbidden) {
+	if err := commit("att_late_0001"); !errors.Is(err, store.ErrForbidden) || !errors.Is(err, store.ErrAttachmentNotCommitted) {
 		t.Fatalf("erased uploader: %v", err)
 	}
 }

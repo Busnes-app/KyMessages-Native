@@ -426,6 +426,14 @@ export function parseAttachment(v: unknown): ChatAttachment {
   };
 }
 
+export const LOCAL_SEND_PREFIX = 'pending_';
+
+function wireMessageId(v: unknown): string {
+  const id = str(v, 128);
+  if (id.startsWith(LOCAL_SEND_PREFIX)) throw new Error('Server message uses a local send ID');
+  return id;
+}
+
 export function parseMessage(v: unknown): ChatMessage {
   const o = obj(v);
   const encoding = opt(o.encoding, (e) => oneOf(e, ENCODINGS)) ?? 'plain_v1';
@@ -433,7 +441,7 @@ export function parseMessage(v: unknown): ChatMessage {
   // Ciphertext never sits in body, so nothing that shows or indexes body can leak it.
   const sealed = encoding === 'e2ee_room_v1' && !opt(o.deleted_at, num);
   return {
-    id: str(o.id, 128),
+    id: wireMessageId(o.id),
     tenant_id: opt(o.tenant_id, (s) => str(s, 128)) ?? 'default',
     room_id: str(o.room_id, 128),
     seq: opt(o.seq, count) ?? 0,
@@ -693,7 +701,7 @@ export function parseWsEvent(raw: unknown): WsServerEvent | null {
           const d = obj(data);
           if (d.refetch === true) {
             // Too large for the bus: the row is named so it can be fetched again exactly.
-            const messageId = opt(d.id, (s) => str(s, 128));
+            const messageId = opt(d.id, wireMessageId);
             return t === 'message.edit' ? { kind: t, roomId, seq, refetch: true, messageId } : { kind: t, roomId, seq, refetch: true };
           }
           return { kind: t, roomId, seq, message: parseMessage(d), refetch: false };
@@ -707,7 +715,7 @@ export function parseWsEvent(raw: unknown): WsServerEvent | null {
           kind: 'message.delete',
           roomId,
           seq,
-          messageId: str(d.id, 128),
+          messageId: wireMessageId(d.id),
           deletedAt: opt(d.deleted_at, num) ?? Date.now(),
         };
       }
@@ -717,7 +725,7 @@ export function parseWsEvent(raw: unknown): WsServerEvent | null {
         return {
           kind: 'reaction.set',
           roomId,
-          messageId: str(d.message_id, 128),
+          messageId: wireMessageId(d.message_id),
           userId: str(d.user_id, 128),
           emoji: str(d.emoji, 32),
           added: bool(d.added),

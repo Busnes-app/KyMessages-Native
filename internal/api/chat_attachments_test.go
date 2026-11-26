@@ -1191,7 +1191,18 @@ func (b *lateUploadBlobs) Put(tenantID, key string, r io.Reader, maxBytes int64,
 }
 
 func TestChatLatePublicationQueuesCleanupAfterIntentWasSwept(t *testing.T) {
+	t.Run("missing intent", func(t *testing.T) {
+		testLatePublicationCleanup(t, false, http.StatusRequestTimeout)
+	})
+	t.Run("quota refusal", func(t *testing.T) {
+		testLatePublicationCleanup(t, true, http.StatusRequestEntityTooLarge)
+	})
+}
+
+func testLatePublicationCleanup(t *testing.T, fillQuota bool, want int) {
+	t.Helper()
 	srv, st, cfg := setupTestServer(t)
+	cfg.Attachments.MaxTotalBytes = 4096
 	startChatBus(t, srv)
 	defer srv.CloseChat()
 	_, token := createChatTestUser(t, st, "u_late_upload", "lateupload", "user")
@@ -1205,12 +1216,20 @@ func TestChatLatePublicationQueuesCleanupAfterIntentWasSwept(t *testing.T) {
 		if refs, err := st.Chat().PendingBlobDeletes(ctx, 100); err != nil || len(refs) != 0 {
 			t.Fatalf("intent after first sweep = %+v, %v", refs, err)
 		}
+		if fillQuota {
+			if err := st.Chat().CreateAttachment(ctx, &store.Attachment{
+				RoomID: room, UploaderID: "u_late_upload", Filename: "fill.bin",
+				MimeType: "application/octet-stream", SizeBytes: cfg.Attachments.MaxTotalBytes,
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 	api.SetBlobsForTest(srv, backend)
 
 	rec := doMultipartUpload(t, srv, "/api/v1/rooms/"+room+"/attachments", token, "file", "file.bin", []byte("opaque file"))
-	if rec.Code != http.StatusRequestTimeout {
-		t.Fatalf("late upload = %d, want 408: %s", rec.Code, rec.Body.String())
+	if rec.Code != want {
+		t.Fatalf("late upload = %d, want %d: %s", rec.Code, want, rec.Body.String())
 	}
 	if refs, err := st.Chat().PendingBlobDeletes(ctx, 100); err != nil || len(refs) != 1 || refs[0].Key != backend.key {
 		t.Fatalf("late publication cleanup = %+v, %v", refs, err)

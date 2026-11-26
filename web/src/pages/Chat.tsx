@@ -76,6 +76,7 @@ import {
 } from '../chat/push';
 import {
   DEFAULT_ATTACHMENT_LIMITS,
+  LOCAL_SEND_PREFIX,
   attachmentUrl,
   formatBytes,
   type CallState,
@@ -1208,7 +1209,7 @@ export const Chat: React.FC<ChatProps> = ({
     if (!existing?.loaded) {
       void loadRoomHistory(activeRoomId, hasUnreadDivider);
     } else {
-      const latest = existing.messages[existing.messages.length - 1]?.seq ?? 0;
+      const latest = existing.messages.filter((m) => m.delivery.kind === 'synced').at(-1)?.seq ?? 0;
       if (latest > 0 && isActiveRef.current) void syncReadCursor(activeRoomId, latest);
       if (pendingJumpRef.current?.roomId !== activeRoomId) {
         requestAnimationFrame(() => {
@@ -1451,7 +1452,7 @@ export const Chat: React.FC<ChatProps> = ({
     if (!me) return;
 
     const optimistic: ChatMessage = {
-      id: `pending_${clientKey}`,
+      id: `${LOCAL_SEND_PREFIX}${clientKey}`,
       tenant_id: 'default',
       room_id: roomId,
       seq: Number.MAX_SAFE_INTEGER,
