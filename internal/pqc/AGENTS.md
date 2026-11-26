@@ -1,27 +1,27 @@
 # Post-quantum primitives
 
 ## Purpose
-Thin, vendored stand-ins for ky-primitives `xwing` and `hybridsig` (PQC Stack Plan,
-Busnes-app/ky-primitives#80, "Shared code"), until those packages ship.
+ky-primitives `xwing` (PR #83 @ cc038a1f) and `hybridsig` (PR #84 @ ead9d5da), vendored verbatim
+with their tests and vectors until those PRs merge (PQC Stack Plan, Busnes-app/ky-primitives#80).
 
 ## Ownership
 - `xwing/`: X-Wing keys from a 32-byte seed and `Seal(pub, info, aad, msg)` / `Open`: HPKE base
-  mode, KEM 0x647A (`crypto/hpke.MLKEM768X25519`), HKDF-SHA256, AES-256-GCM; wire
-  `version 1 ‖ enc (1120 B) ‖ ct`; public key 1216 B.
+  mode, KEM 0x647A, HKDF-SHA256, AES-256-GCM; wire `version 1 ‖ enc (1120 B) ‖ ct`; info must
+  start with a non-empty caller label.
 - `hybridsig/`: ML-DSA-65 (empty context, hedged) and pure Ed25519 over
-  SHA-256(domain ‖ 0x00 ‖ msg); both halves required. kyguard-server `internal/pqcrypto/sig.go`'s
-  construction. Seeds are 64 B (ML-DSA seed ‖ Ed25519 seed).
+  SHA-256(label ‖ 0x00 ‖ msg); both halves required; keys and signatures tagged
+  `"mldsa65+ed25519" 0x00 ‖ halves`.
 
 ## Local Contracts
-- Standard library only (Go 1.27 `crypto/hpke`, `crypto/mldsa`); no product logic here.
-  KyMessages statements live in `internal/e2eeid`.
-- Keep the APIs a subset of the ky-primitives plan, so swapping to
-  `github.com/Busnes-app/ky-primitives/{xwing,hybridsig}` is an import change.
-- Both packages also build for `js/wasm` (`web/pqc-wasm`).
+- Never edit these files: replace them with a newer upstream copy, or delete the directory and
+  import `github.com/Busnes-app/ky-primitives/{xwing,hybridsig}` once merged (an import change
+  in `internal/e2eeid` and `internal/api` only). Only the tests' import paths and the draft
+  vector's path (`xwing/testdata/xwing-vector.json`) differ from upstream.
+- KyMessages statements live in `internal/e2eeid`. Both packages also build for `js/wasm`.
 
 ## Verification
-- `go test ./internal/pqc/...` (`xwing/testdata/xwing-vector.json` is the draft-ietf-hpke-pq
-  vector copied from ky-primitives `recoverykey`, cross-checked against that package).
+- `go test ./internal/pqc/...` runs upstream's tests and `testdata/vectors.json`
+  (`xwing/testdata/xwing-vector.json` is ky-primitives `recoverykey`'s draft-ietf-hpke-pq vector).
 - `PATH="$(go env GOROOT)/lib/wasm:$PATH" GOOS=js GOARCH=wasm go test ./internal/pqc/...`
 
 ## Child DOX Index

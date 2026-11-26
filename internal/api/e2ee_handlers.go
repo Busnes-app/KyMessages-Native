@@ -186,7 +186,7 @@ type e2eeDeviceJSON struct {
 	Ed25519    string `json:"ed25519"`
 	Signature  string `json:"signature"`
 	// The current master key's cross-signature; absent until the device is verified.
-	MasterSignature *hybridJSON `json:"master_signature,omitempty"`
+	MasterSignature string `json:"master_signature,omitempty"`
 }
 
 // POST /api/v1/keys/query lists the devices and master keys of users in the caller's
@@ -216,10 +216,8 @@ func (s *Server) handleE2EEQuery(w http.ResponseWriter, r *http.Request) {
 	version := map[string]int64{}
 	masterOut := map[string]e2eeMasterJSON{}
 	for i := range masters {
-		if mj, ok := masterJSON(&masters[i]); ok {
-			masterOut[masters[i].UserID] = mj
-			version[masters[i].UserID] = mj.Version
-		}
+		masterOut[masters[i].UserID] = masterJSON(&masters[i])
+		version[masters[i].UserID] = masters[i].Version
 	}
 	out := make(map[string][]e2eeDeviceJSON, len(req.UserIDs))
 	for _, id := range req.UserIDs {
@@ -229,9 +227,7 @@ func (s *Server) handleE2EEQuery(w http.ResponseWriter, r *http.Request) {
 		j := e2eeDeviceJSON{DeviceID: d.DeviceID, Curve25519: d.Curve25519, Ed25519: d.Ed25519, Signature: d.Signature}
 		// Only a signature by the current master key counts; a reset leaves none.
 		if v, ok := version[d.UserID]; ok && d.MasterVersion == v {
-			if sg, ok := parseHybrid(d.MasterSignature); ok {
-				j.MasterSignature = &sg
-			}
+			j.MasterSignature = d.MasterSignature
 		}
 		out[d.UserID] = append(out[d.UserID], j)
 	}

@@ -62,39 +62,35 @@ export function pqcCall<T = unknown>(name: string, ...args: string[]): T {
 
 export const HYBRID_ALG = 'mldsa65+ed25519';
 
-/** A hybridsig public key or signature on the wire. */
-export interface Hybrid {
-  alg: typeof HYBRID_ALG;
-  mldsa65: string;
-  ed25519: string;
-}
+/**
+ * A hybridsig public key or signature on the wire: unpadded base64 of its tagged encoding
+ * ("mldsa65+ed25519" 0x00 ‖ ML-DSA-65 half ‖ Ed25519 half), as ky-primitives hybridsig writes it.
+ */
+export type Hybrid = string;
 
-export interface MasterKeyPair extends Hybrid {
+export interface MasterKeyPair {
   seed: string;
+  public_key: Hybrid;
   fingerprint: string;
 }
-
-const pub = (k: Hybrid) => [k.mldsa65, k.ed25519] as const;
-const sig = (s: Hybrid) => [s.mldsa65, s.ed25519] as const;
-const strip = (h: Hybrid): Hybrid => ({ alg: HYBRID_ALG, mldsa65: h.mldsa65, ed25519: h.ed25519 });
 
 export const pqc = {
   masterGenerate: () => pqcCall<MasterKeyPair>('masterGenerate'),
   masterPublic: (seed: string) => {
-    const k = pqcCall<Hybrid & { fingerprint: string }>('masterPublic', seed);
-    return { key: strip(k), fingerprint: k.fingerprint };
+    const k = pqcCall<{ public_key: Hybrid; fingerprint: string }>('masterPublic', seed);
+    return { key: k.public_key, fingerprint: k.fingerprint };
   },
-  fingerprint: (k: Hybrid) => pqcCall<string>('fingerprint', ...pub(k)),
+  fingerprint: (k: Hybrid) => pqcCall<string>('fingerprint', k),
   signMaster: (seed: string, tenant: string, user: string) => pqcCall<Hybrid>('signMaster', seed, tenant, user),
-  verifyMaster: (k: Hybrid, tenant: string, user: string, s: Hybrid) => pqcCall<boolean>('verifyMaster', ...pub(k), tenant, user, ...sig(s)),
+  verifyMaster: (k: Hybrid, tenant: string, user: string, s: Hybrid) => pqcCall<boolean>('verifyMaster', k, tenant, user, s),
   signDevice: (seed: string, tenant: string, user: string, device: string, curve: string, ed: string) =>
     pqcCall<Hybrid>('signDevice', seed, tenant, user, device, curve, ed),
   verifyDevice: (k: Hybrid, tenant: string, user: string, device: string, curve: string, ed: string, s: Hybrid) =>
-    pqcCall<boolean>('verifyDevice', ...pub(k), tenant, user, device, curve, ed, ...sig(s)),
+    pqcCall<boolean>('verifyDevice', k, tenant, user, device, curve, ed, s),
   signBackupKey: (seed: string, tenant: string, user: string, version: number, backupKey: string) =>
     pqcCall<Hybrid>('signBackupKey', seed, tenant, user, String(version), backupKey),
   verifyBackupKey: (k: Hybrid, tenant: string, user: string, version: number, backupKey: string, s: Hybrid) =>
-    pqcCall<boolean>('verifyBackupKey', ...pub(k), tenant, user, String(version), backupKey, ...sig(s)),
+    pqcCall<boolean>('verifyBackupKey', k, tenant, user, String(version), backupKey, s),
   xwingGenerate: () => pqcCall<{ seed: string; public: string }>('xwingGenerate'),
   xwingPublic: (seed: string) => pqcCall<string>('xwingPublic', seed),
   backupSeal: (backupKey: string, masterSeed: string, roomId: string, sessionId: string, plaintext: string) =>

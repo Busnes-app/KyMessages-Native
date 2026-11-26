@@ -30,11 +30,8 @@ async function call(path: string, method: string, body?: unknown, signal?: Abort
   return res.status === 204 ? null : res.json();
 }
 
-const hybrid = (v: unknown): Hybrid => {
-  const o = obj(v);
-  if (o.alg !== 'mldsa65+ed25519') throw new Error('Unknown signature algorithm');
-  return { alg: o.alg, mldsa65: str(o.mldsa65, 8192), ed25519: str(o.ed25519, 128) };
-};
+// hybridsig keys and signatures: base64 of the tagged encoding, which names the algorithm.
+const hybrid = (v: unknown): Hybrid => str(v, 8192);
 
 const device = (v: unknown): DeviceKeys => {
   const o = obj(v);

@@ -137,8 +137,8 @@ function memo(key: string, check: () => boolean): boolean {
   return ok;
 }
 
-const isHybrid = (v: unknown): v is Hybrid =>
-  isObj(v) && v.alg === 'mldsa65+ed25519' && isStr(v.mldsa65, 8192) && isStr(v.ed25519, 128);
+// A tagged hybridsig key is 2000 bytes and a signature 3389; base64 makes them 2667 and 4519.
+const isHybrid = (v: unknown): v is Hybrid => isStr(v, 8192);
 
 export function validMaster(v: unknown): v is MasterKeyRecord {
   return isObj(v) && typeof v.version === 'number' && v.version >= 1 && isHybrid(v.master_key) && isHybrid(v.self_signature);
@@ -221,7 +221,7 @@ export class Identity {
     if (!validMaster(rec)) return undefined;
     const k = rec.master_key;
     const s = rec.self_signature;
-    if (!memo(`m|${tenantId}|${userId}|${k.mldsa65}|${k.ed25519}|${s.mldsa65}|${s.ed25519}`, () => pqc.verifyMaster(k, tenantId, userId, s))) return undefined;
+    if (!memo(`m|${tenantId}|${userId}|${k}|${s}`, () => pqc.verifyMaster(k, tenantId, userId, s))) return undefined;
     const fp = pqc.fingerprint(k);
     if (userId === this.ctx.userId) {
       // The user's own key is pinned by verification itself, never by first sight.
@@ -246,7 +246,7 @@ export class Identity {
   deviceTrusted(master: Hybrid, tenantId: string, userId: string, d: { device_id: string; curve25519: string; ed25519: string; master_signature?: unknown }): boolean {
     const s = d.master_signature;
     if (!isHybrid(s)) return false;
-    return memo(`d|${tenantId}|${userId}|${d.device_id}|${d.curve25519}|${d.ed25519}|${master.mldsa65}|${master.ed25519}|${s.mldsa65}|${s.ed25519}`,
+    return memo(`d|${tenantId}|${userId}|${d.device_id}|${d.curve25519}|${d.ed25519}|${master}|${s}`,
       () => pqc.verifyDevice(master, tenantId, userId, d.device_id, d.curve25519, d.ed25519, s));
   }
 
@@ -334,7 +334,7 @@ export class Identity {
         const user = this.ctx.userId;
         const own: OwnMaster = {
           version,
-          master_key: { alg: master.alg, mldsa65: master.mldsa65, ed25519: master.ed25519 },
+          master_key: master.public_key,
           self_signature: pqc.signMaster(master.seed, tenant_id, user),
           backup_key: { public_key: backup.public, signature: pqc.signBackupKey(master.seed, tenant_id, user, version, backup.public) },
           recovery: {

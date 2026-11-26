@@ -62,12 +62,14 @@ func TestStatementsBindEveryField(t *testing.T) {
 
 func TestFingerprintCoversTheWholeKey(t *testing.T) {
 	k, _ := hybridsig.Generate()
-	p := k.Public()
-	fp := e2eeid.Fingerprint(p)
-	for _, q := range []hybridsig.PublicKey{
-		{MLDSA65: flipped(p.MLDSA65, len(p.MLDSA65)-1), Ed25519: p.Ed25519},
-		{MLDSA65: p.MLDSA65, Ed25519: flipped(p.Ed25519, 0)},
-	} {
+	b := k.Public().Bytes()
+	fp := e2eeid.Fingerprint(k.Public())
+	// The last byte of the ML-DSA half, and the last byte of the Ed25519 half.
+	for _, i := range []int{len(b) - 33, len(b) - 1} {
+		q, err := hybridsig.ParsePublicKey(flipped(b, i))
+		if err != nil {
+			continue // not every flip still parses as a key; the next one does
+		}
 		if e2eeid.Fingerprint(q) == fp {
 			t.Fatal("fingerprint ignores part of the key")
 		}
@@ -111,7 +113,7 @@ func TestRecoveryKeyFormat(t *testing.T) {
 
 func TestRecoveryWrapBindsPurposeOrgAndUser(t *testing.T) {
 	rk, _ := e2eeid.NewSecret()
-	seed := bytes.Repeat([]byte{7}, hybridsig.SeedBytes)
+	seed := bytes.Repeat([]byte{7}, e2eeid.MasterSeedBytes)
 	w, err := e2eeid.WrapRecovery(rk, "master-key", "t1", "u1", seed)
 	if err != nil {
 		t.Fatal(err)
@@ -141,23 +143,23 @@ func TestRecoveryWrapBindsPurposeOrgAndUser(t *testing.T) {
 func TestBackupSealBindsRoomSessionAndMaster(t *testing.T) {
 	k, _ := xwing.Generate()
 	m, _ := hybridsig.Generate()
-	sealed, err := e2eeid.SealBackup(k.Public(), m.Seed(), "room1", "sess1", []byte("export"))
+	sealed, err := e2eeid.SealBackup(k.Public(), e2eeid.MasterSeed(m), "room1", "sess1", []byte("export"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, err := e2eeid.OpenBackup(k, m.Seed(), "room1", "sess1", sealed); err != nil || string(got) != "export" {
+	if got, err := e2eeid.OpenBackup(k, e2eeid.MasterSeed(m), "room1", "sess1", sealed); err != nil || string(got) != "export" {
 		t.Fatalf("open: %v", err)
 	}
 	for _, c := range [][2]string{{"room2", "sess1"}, {"room1", "sess2"}, {"room1s", "ess1"}} {
-		if _, err := e2eeid.OpenBackup(k, m.Seed(), c[0], c[1], sealed); !errors.Is(err, e2eeid.ErrOpen) {
+		if _, err := e2eeid.OpenBackup(k, e2eeid.MasterSeed(m), c[0], c[1], sealed); !errors.Is(err, e2eeid.ErrOpen) {
 			t.Errorf("%v opened", c)
 		}
 	}
 	// The server holds the backup public key and can seal to it, but not with the master seed:
 	// a restore refuses what it forges.
 	other, _ := hybridsig.Generate()
-	forged, _ := e2eeid.SealBackup(k.Public(), other.Seed(), "room1", "sess1", []byte("forged"))
-	if _, err := e2eeid.OpenBackup(k, m.Seed(), "room1", "sess1", forged); !errors.Is(err, e2eeid.ErrOpen) {
+	forged, _ := e2eeid.SealBackup(k.Public(), e2eeid.MasterSeed(other), "room1", "sess1", []byte("forged"))
+	if _, err := e2eeid.OpenBackup(k, e2eeid.MasterSeed(m), "room1", "sess1", forged); !errors.Is(err, e2eeid.ErrOpen) {
 		t.Fatal("a session sealed without the master seed opened")
 	}
 }
@@ -191,18 +193,18 @@ func TestTransferNeedsBothLayers(t *testing.T) {
 
 func TestPinsNeedTheMasterSeed(t *testing.T) {
 	k, _ := hybridsig.Generate()
-	sealed, err := e2eeid.SealPins(k.Seed(), "t1", "u1", 1, []byte("pins"))
+	sealed, err := e2eeid.SealPins(e2eeid.MasterSeed(k), "t1", "u1", 1, []byte("pins"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, err := e2eeid.OpenPins(k.Seed(), "t1", "u1", 1, sealed); err != nil || string(got) != "pins" {
+	if got, err := e2eeid.OpenPins(e2eeid.MasterSeed(k), "t1", "u1", 1, sealed); err != nil || string(got) != "pins" {
 		t.Fatalf("open: %v", err)
 	}
 	other, _ := hybridsig.Generate()
-	if _, err := e2eeid.OpenPins(other.Seed(), "t1", "u1", 1, sealed); !errors.Is(err, e2eeid.ErrOpen) {
+	if _, err := e2eeid.OpenPins(e2eeid.MasterSeed(other), "t1", "u1", 1, sealed); !errors.Is(err, e2eeid.ErrOpen) {
 		t.Fatal("opened under another master key")
 	}
-	if _, err := e2eeid.OpenPins(k.Seed(), "t1", "u2", 1, sealed); !errors.Is(err, e2eeid.ErrOpen) {
+	if _, err := e2eeid.OpenPins(e2eeid.MasterSeed(k), "t1", "u2", 1, sealed); !errors.Is(err, e2eeid.ErrOpen) {
 		t.Fatal("opened for another user")
 	}
 }
@@ -310,7 +312,8 @@ func obj(v any) map[string]string { return v.(map[string]string) }
 func writeVectors(t *testing.T) {
 	const tenant, user, device = "00000000-0000-4000-8000-00000000000a", "usr_alice", "DEVICE_ALICE_1"
 	const curve, ed = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU", "MDEyMzQ1Njc4OWFiY2RlZmdoaWprbG1ub3BxcnN0dXY"
-	ms := seed("master", hybridsig.SeedBytes)
+	str := func(v any) string { return v.(string) }
+	ms := seed("master", e2eeid.MasterSeedBytes)
 	mp := obj(must(t, "masterPublic", ms))
 	xs := seed("backup", xwing.SeedBytes)
 	xp := must(t, "xwingPublic", xs).(string)
@@ -318,12 +321,12 @@ func writeVectors(t *testing.T) {
 	ep := must(t, "xwingPublic", es).(string)
 	rk := seed("recovery", 32)
 	rtext := must(t, "recoveryFormat", rk).(string)
-	selfSig := obj(must(t, "signMaster", ms, tenant, user))
-	devSig := obj(must(t, "signDevice", ms, tenant, user, device, curve, ed))
-	bkSig := obj(must(t, "signBackupKey", ms, tenant, user, "1", xp))
+	selfSig := str(must(t, "signMaster", ms, tenant, user))
+	devSig := str(must(t, "signDevice", ms, tenant, user, device, curve, ed))
+	bkSig := str(must(t, "signBackupKey", ms, tenant, user, "1", xp))
 	plain := b64.EncodeToString([]byte(`{"session_key":"vector"}`))
 	sealedBackup := must(t, "backupSeal", xp, ms, "room-1", "session-1", plain).(string)
-	forgedBackup := must(t, "backupSeal", xp, seed("other", hybridsig.SeedBytes), "room-1", "session-1", plain).(string)
+	forgedBackup := must(t, "backupSeal", xp, seed("other", e2eeid.MasterSeedBytes), "room-1", "session-1", plain).(string)
 	wrapM := must(t, "recoveryWrap", rk, "master-key", tenant, user, ms).(string)
 	wrapB := must(t, "recoveryWrap", rk, "backup-key", tenant, user, xs).(string)
 	pairing := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 16))
@@ -333,6 +336,14 @@ func writeVectors(t *testing.T) {
 	pins := b64.EncodeToString([]byte(`{"usr_bob":"fingerprint"}`))
 	sealedPins := must(t, "pinsSeal", ms, tenant, user, "3", pins).(string)
 
+	tamperedAt := func(s string, i int) string {
+		b, _ := b64.DecodeString(s)
+		if i < 0 {
+			i += len(b)
+		}
+		b[i] ^= 1
+		return b64.EncodeToString(b)
+	}
 	tampered := func(s string) string {
 		b, _ := b64.DecodeString(s)
 		b[len(b)/2] ^= 1
@@ -340,17 +351,17 @@ func writeVectors(t *testing.T) {
 	}
 	vs := []vector{
 		{Name: "master public key from seed", Call: "masterPublic", Args: []string{ms}, Want: mp},
-		{Name: "fingerprint", Call: "fingerprint", Args: []string{mp["mldsa65"], mp["ed25519"]}, Want: mp["fingerprint"]},
-		{Name: "master self-binding verifies", Call: "verifyMaster", Args: []string{mp["mldsa65"], mp["ed25519"], tenant, user, selfSig["mldsa65"], selfSig["ed25519"]}, Want: true},
-		{Name: "master self-binding for another user", Call: "verifyMaster", Args: []string{mp["mldsa65"], mp["ed25519"], tenant, "usr_bob", selfSig["mldsa65"], selfSig["ed25519"]}, Want: false},
-		{Name: "master self-binding for another org", Call: "verifyMaster", Args: []string{mp["mldsa65"], mp["ed25519"], "default", user, selfSig["mldsa65"], selfSig["ed25519"]}, Want: false},
-		{Name: "device cross-signature verifies", Call: "verifyDevice", Args: []string{mp["mldsa65"], mp["ed25519"], tenant, user, device, curve, ed, devSig["mldsa65"], devSig["ed25519"]}, Want: true},
-		{Name: "device cross-signature, tampered ML-DSA half", Call: "verifyDevice", Args: []string{mp["mldsa65"], mp["ed25519"], tenant, user, device, curve, ed, tampered(devSig["mldsa65"]), devSig["ed25519"]}, Want: false},
-		{Name: "device cross-signature, tampered Ed25519 half", Call: "verifyDevice", Args: []string{mp["mldsa65"], mp["ed25519"], tenant, user, device, curve, ed, devSig["mldsa65"], tampered(devSig["ed25519"])}, Want: false},
-		{Name: "device cross-signature on another device", Call: "verifyDevice", Args: []string{mp["mldsa65"], mp["ed25519"], tenant, user, "DEVICE_ALICE_2", curve, ed, devSig["mldsa65"], devSig["ed25519"]}, Want: false},
-		{Name: "self-binding is not a device signature", Call: "verifyDevice", Args: []string{mp["mldsa65"], mp["ed25519"], tenant, user, device, curve, ed, selfSig["mldsa65"], selfSig["ed25519"]}, Want: false},
-		{Name: "backup key signature verifies", Call: "verifyBackupKey", Args: []string{mp["mldsa65"], mp["ed25519"], tenant, user, "1", xp, bkSig["mldsa65"], bkSig["ed25519"]}, Want: true},
-		{Name: "backup key signature, other version", Call: "verifyBackupKey", Args: []string{mp["mldsa65"], mp["ed25519"], tenant, user, "2", xp, bkSig["mldsa65"], bkSig["ed25519"]}, Want: false},
+		{Name: "fingerprint", Call: "fingerprint", Args: []string{mp["public_key"]}, Want: mp["fingerprint"]},
+		{Name: "master self-binding verifies", Call: "verifyMaster", Args: []string{mp["public_key"], tenant, user, selfSig}, Want: true},
+		{Name: "master self-binding for another user", Call: "verifyMaster", Args: []string{mp["public_key"], tenant, "usr_bob", selfSig}, Want: false},
+		{Name: "master self-binding for another org", Call: "verifyMaster", Args: []string{mp["public_key"], "default", user, selfSig}, Want: false},
+		{Name: "device cross-signature verifies", Call: "verifyDevice", Args: []string{mp["public_key"], tenant, user, device, curve, ed, devSig}, Want: true},
+		{Name: "device cross-signature, tampered ML-DSA half", Call: "verifyDevice", Args: []string{mp["public_key"], tenant, user, device, curve, ed, tamperedAt(devSig, 40)}, Want: false},
+		{Name: "device cross-signature, tampered Ed25519 half", Call: "verifyDevice", Args: []string{mp["public_key"], tenant, user, device, curve, ed, tamperedAt(devSig, -1)}, Want: false},
+		{Name: "device cross-signature on another device", Call: "verifyDevice", Args: []string{mp["public_key"], tenant, user, "DEVICE_ALICE_2", curve, ed, devSig}, Want: false},
+		{Name: "self-binding is not a device signature", Call: "verifyDevice", Args: []string{mp["public_key"], tenant, user, device, curve, ed, selfSig}, Want: false},
+		{Name: "backup key signature verifies", Call: "verifyBackupKey", Args: []string{mp["public_key"], tenant, user, "1", xp, bkSig}, Want: true},
+		{Name: "backup key signature, other version", Call: "verifyBackupKey", Args: []string{mp["public_key"], tenant, user, "2", xp, bkSig}, Want: false},
 		{Name: "X-Wing public key from seed", Call: "xwingPublic", Args: []string{xs}, Want: xp},
 		{Name: "backup session opens", Call: "backupOpen", Args: []string{xs, ms, "room-1", "session-1", sealedBackup}, Want: plain},
 		{Name: "backup session in another room", Call: "backupOpen", Args: []string{xs, ms, "room-2", "session-1", sealedBackup}, Error: true},
@@ -369,7 +380,7 @@ func writeVectors(t *testing.T) {
 		{Name: "transfer without the QR secret", Call: "transferOpen", Args: []string{es, rk, pairing, "DEVICE_ALICE_1", "DEVICE_ALICE_2", transfer}, Error: true},
 		{Name: "pins open", Call: "pinsOpen", Args: []string{ms, tenant, user, "3", sealedPins}, Want: pins},
 		{Name: "pins replayed at another counter", Call: "pinsOpen", Args: []string{ms, tenant, user, "4", sealedPins}, Error: true},
-		{Name: "pins under another master key", Call: "pinsOpen", Args: []string{seed("other", hybridsig.SeedBytes), tenant, user, "3", sealedPins}, Error: true},
+		{Name: "pins under another master key", Call: "pinsOpen", Args: []string{seed("other", e2eeid.MasterSeedBytes), tenant, user, "3", sealedPins}, Error: true},
 		{Name: "transfer to another device", Call: "transferOpen", Args: []string{es, qr["secret"], pairing, "DEVICE_ALICE_1", "DEVICE_ALICE_3", transfer}, Error: true},
 	}
 	out, err := json.MarshalIndent(vs, "", "  ")

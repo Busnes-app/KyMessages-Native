@@ -31,13 +31,22 @@ describe('pqc.wasm', () => {
 
   it('signs with both halves and refuses either half alone', () => {
     const m = pqc.masterGenerate();
-    expect(m.alg).toBe('mldsa65+ed25519');
     const key = pqc.masterPublic(m.seed).key;
+    expect(key).toBe(m.public_key);
+    expect(atob(key.slice(0, 24))).toMatch(/^mldsa65\+ed25519\0/);
     const s = pqc.signDevice(m.seed, 't', 'u', 'DEVICE01', 'curve', 'ed');
     expect(pqc.verifyDevice(key, 't', 'u', 'DEVICE01', 'curve', 'ed', s)).toBe(true);
     const other = pqc.signDevice(pqc.masterGenerate().seed, 't', 'u', 'DEVICE01', 'curve', 'ed');
-    expect(pqc.verifyDevice(key, 't', 'u', 'DEVICE01', 'curve', 'ed', { ...s, mldsa65: other.mldsa65 })).toBe(false);
-    expect(pqc.verifyDevice(key, 't', 'u', 'DEVICE01', 'curve', 'ed', { ...s, ed25519: other.ed25519 })).toBe(false);
+    // Tag (16 bytes), ML-DSA-65 (3309), Ed25519 (64): splice in the other key's half.
+    const bytes = (v: string) => Uint8Array.from(atob(v.padEnd(v.length + ((4 - (v.length % 4)) % 4), '=')), (c) => c.charCodeAt(0));
+    const text = (b: Uint8Array) => btoa(String.fromCharCode(...b)).replace(/=+$/, '');
+    const splice = (from: number, to: number) => {
+      const out = bytes(s);
+      out.set(bytes(other).subarray(from, to), from);
+      return text(out);
+    };
+    expect(pqc.verifyDevice(key, 't', 'u', 'DEVICE01', 'curve', 'ed', splice(16, 16 + 3309))).toBe(false);
+    expect(pqc.verifyDevice(key, 't', 'u', 'DEVICE01', 'curve', 'ed', splice(16 + 3309, 16 + 3309 + 64))).toBe(false);
     expect(pqc.verifyDevice(key, 't2', 'u', 'DEVICE01', 'curve', 'ed', s)).toBe(false);
   });
 

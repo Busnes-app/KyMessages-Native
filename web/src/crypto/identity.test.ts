@@ -122,7 +122,7 @@ describe('device trust (master-key cross-signing)', () => {
     // The server swaps bob's identity for one it made, then alice signs in on a new browser.
     const forger = pqc.masterGenerate();
     const bobMaster = server.masters.get('u_bob')!;
-    bobMaster.master_key = { alg: forger.alg, mldsa65: forger.mldsa65, ed25519: forger.ed25519 };
+    bobMaster.master_key = forger.public_key;
     bobMaster.self_signature = pqc.signMaster(forger.seed, TENANT, 'u_bob');
     for (const d of server.devices.get('u_bob')!.values()) d.master_signature = pqc.signDevice(forger.seed, TENANT, 'u_bob', d.device_id, d.curve25519, d.ed25519);
     const laptop = await open(server, 'u_alice', 'alice_laptop');
@@ -206,7 +206,7 @@ describe('recovery key and key backup', () => {
     // The server republishes another master key next to the user's real wraps.
     const forger = pqc.masterGenerate();
     const m = server.masters.get('u_alice')!;
-    m.master_key = { alg: forger.alg, mldsa65: forger.mldsa65, ed25519: forger.ed25519 };
+    m.master_key = forger.public_key;
     m.self_signature = pqc.signMaster(forger.seed, TENANT, 'u_alice');
     const laptop = await open(server, 'u_alice', 'alice_laptop');
     await expect(laptop.restoreIdentity(rk)).rejects.toThrow(/do not match/);

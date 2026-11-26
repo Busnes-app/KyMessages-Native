@@ -79,9 +79,27 @@ func Fields(fields ...[]byte) []byte {
 
 func s(v string) []byte { return []byte(v) }
 
+// MasterSeedBytes is a master key's seed as KyMessages stores and transfers it: the ML-DSA-65
+// seed followed by the Ed25519 seed.
+const MasterSeedBytes = 2 * hybridsig.SeedBytes
+
+// MasterFromSeed rebuilds a master key from its 64-byte seed.
+func MasterFromSeed(seed []byte) (*hybridsig.PrivateKey, error) {
+	if len(seed) != MasterSeedBytes {
+		return nil, hybridsig.ErrLength
+	}
+	return hybridsig.FromSeeds(seed[:hybridsig.SeedBytes], seed[hybridsig.SeedBytes:])
+}
+
+// MasterSeed is MasterFromSeed's input for k.
+func MasterSeed(k *hybridsig.PrivateKey) []byte {
+	m, e := k.Seeds()
+	return append(m, e...)
+}
+
 // MasterSelfMessage is what a master key signs to bind itself to one user in one org.
-func MasterSelfMessage(tenantID, userID string, pub hybridsig.PublicKey) []byte {
-	return Fields(s(hybridsig.Alg), s(tenantID), s(userID), pub.MLDSA65, pub.Ed25519)
+func MasterSelfMessage(tenantID, userID string, pub *hybridsig.PublicKey) []byte {
+	return Fields(s(hybridsig.Alg), s(tenantID), s(userID), pub.Bytes())
 }
 
 // DeviceMessage is what a master key signs to vouch for one of its user's devices: the
@@ -95,12 +113,13 @@ func BackupKeyMessage(tenantID, userID string, version int64, pub []byte) []byte
 	return Fields(s(hybridsig.Alg), s(tenantID), s(userID), s(strconv.FormatInt(version, 10)), pub)
 }
 
-// Fingerprint is SHA-256 over a label and the full hybrid master public key. Clients pin it.
-func Fingerprint(pub hybridsig.PublicKey) [FingerprintBytes]byte {
+// Fingerprint is SHA-256 over a label and the full hybrid master public key (its tagged
+// encoding, which names the algorithm). Clients pin it.
+func Fingerprint(pub *hybridsig.PublicKey) [FingerprintBytes]byte {
 	h := sha256.New()
 	h.Write([]byte(labelFingerprint))
 	h.Write([]byte{0})
-	h.Write(Fields(s(hybridsig.Alg), pub.MLDSA65, pub.Ed25519))
+	h.Write(pub.Bytes())
 	var out [FingerprintBytes]byte
 	h.Sum(out[:0])
 	return out
@@ -302,7 +321,7 @@ func backupAAD(roomID, sessionID string) []byte { return Fields(s(roomID), s(ses
 // the backup public key (the server too) can seal to it; only the user's verified devices,
 // which hold the master seed, can make an entry a restore accepts.
 func backupMAC(masterSeed []byte, roomID, sessionID string, session []byte) ([]byte, error) {
-	if len(masterSeed) != hybridsig.SeedBytes {
+	if len(masterSeed) != MasterSeedBytes {
 		return nil, ErrOpen
 	}
 	k, err := hkdf.Key(sha256.New, masterSeed, nil, labelBackupMAC, 32)

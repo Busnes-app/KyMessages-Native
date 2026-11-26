@@ -44,19 +44,13 @@ func newIdentity(t *testing.T, tenant, user string) *testIdentity {
 	return &testIdentity{tenant, user, m, b, rk}
 }
 
-func hj(m, e []byte) map[string]string {
-	return map[string]string{"alg": hybridsig.Alg, "mldsa65": b64.EncodeToString(m), "ed25519": b64.EncodeToString(e)}
-}
-
-func sigJSON(s hybridsig.Signature) map[string]string { return hj(s.MLDSA65, s.Ed25519) }
-
-func (i *testIdentity) sign(t *testing.T, domain string, msg []byte) map[string]string {
+func (i *testIdentity) sign(t *testing.T, domain string, msg []byte) string {
 	t.Helper()
 	s, err := i.master.Sign(domain, msg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return sigJSON(s)
+	return b64.EncodeToString(s)
 }
 
 // put is the PUT /api/v1/keys/master body for this identity at expected+1.
@@ -64,11 +58,11 @@ func (i *testIdentity) put(t *testing.T, expected int64) map[string]any {
 	t.Helper()
 	pub := i.master.Public()
 	bpub := i.backup.Public().Bytes()
-	wm, _ := e2eeid.WrapRecovery(i.recovery, "master-key", i.tenant, i.user, i.master.Seed())
+	wm, _ := e2eeid.WrapRecovery(i.recovery, "master-key", i.tenant, i.user, e2eeid.MasterSeed(i.master))
 	wb, _ := e2eeid.WrapRecovery(i.recovery, "backup-key", i.tenant, i.user, i.backup.Seed())
 	return map[string]any{
 		"expected_version": expected,
-		"master_key":       hj(pub.MLDSA65, pub.Ed25519),
+		"master_key":       b64.EncodeToString(pub.Bytes()),
 		"self_signature":   i.sign(t, e2eeid.DomainMaster, e2eeid.MasterSelfMessage(i.tenant, i.user, pub)),
 		"backup_key": map[string]any{
 			"public_key": b64.EncodeToString(bpub),
@@ -120,33 +114,37 @@ func TestE2EEMasterKeyIsValidatedAndVersioned(t *testing.T) {
 	// Garbage is refused before it is stored.
 	other := newIdentity(t, orgA, "usr_e3_bob")
 	otherOrg := newIdentity(t, orgB, alice.ID)
-	tamper := func(path ...string) map[string]any {
+	// tamper flips byte at (negative: from the end) of the base64 field at path.
+	tamper := func(at int, path ...string) map[string]any {
 		b := clone(id.put(t, 0))
 		m := b
 		for _, p := range path[:len(path)-1] {
 			m = m[p].(map[string]any)
 		}
-		v := m[path[len(path)-1]].(string)
-		raw, _ := b64.DecodeString(v)
-		raw[len(raw)/2] ^= 1
+		raw, _ := b64.DecodeString(m[path[len(path)-1]].(string))
+		if at < 0 {
+			at += len(raw)
+		}
+		raw[at] ^= 1
 		m[path[len(path)-1]] = b64.EncodeToString(raw)
 		return b
 	}
+	// The signature encoding is the tag, then ML-DSA-65 (3309 B), then Ed25519 (64 B).
+	const mldsaByte, edByte = 100, -1
 	foreignSelf := clone(id.put(t, 0))
 	foreignSelf["self_signature"] = clone(other.put(t, 0))["self_signature"]
 	replayedUser := clone(other.put(t, 0)) // bob's identity uploaded as alice's
 	replayedOrg := clone(otherOrg.put(t, 0))
 	wrongVersion := clone(id.put(t, 1))
 	wrongVersion["expected_version"] = 0
-	wrongAlg := clone(id.put(t, 0))
-	wrongAlg["master_key"].(map[string]any)["alg"] = "ed25519"
+	wrongAlg := tamper(0, "master_key") // the algorithm tag
 	shortBackup := clone(id.put(t, 0))
 	shortBackup["backup_key"].(map[string]any)["public_key"] = b64.EncodeToString(make([]byte, 32))
 	for name, body := range map[string]map[string]any{
-		"self-signature, ML-DSA half tampered":  tamper("self_signature", "mldsa65"),
-		"self-signature, Ed25519 half tampered": tamper("self_signature", "ed25519"),
-		"backup key signature tampered":         tamper("backup_key", "signature", "ed25519"),
-		"backup key swapped":                    tamper("backup_key", "public_key"),
+		"self-signature, ML-DSA half tampered":  tamper(mldsaByte, "self_signature"),
+		"self-signature, Ed25519 half tampered": tamper(edByte, "self_signature"),
+		"backup key signature tampered":         tamper(edByte, "backup_key", "signature"),
+		"backup key swapped":                    tamper(600, "backup_key", "public_key"),
 		"self-signature by another key":         foreignSelf,
 		"another user's identity":               replayedUser,
 		"bound to another org":                  replayedOrg,
@@ -171,8 +169,8 @@ func TestE2EEMasterKeyIsValidatedAndVersioned(t *testing.T) {
 	var got struct {
 		TenantID string `json:"tenant_id"`
 		Master   struct {
-			Version   int64             `json:"version"`
-			MasterKey map[string]string `json:"master_key"`
+			Version   int64  `json:"version"`
+			MasterKey string `json:"master_key"`
 			BackupKey struct {
 				PublicKey string `json:"public_key"`
 			} `json:"backup_key"`
@@ -184,7 +182,7 @@ func TestE2EEMasterKeyIsValidatedAndVersioned(t *testing.T) {
 	}
 	rec = doBearerJSON(t, srv, http.MethodGet, "/api/v1/keys/master", tok, nil, nil)
 	decodeBody(t, rec.Body.Bytes(), &got)
-	if got.TenantID != orgA || got.Master.Version != 1 || got.Master.MasterKey["ed25519"] != b64.EncodeToString(id.master.Public().Ed25519) {
+	if got.TenantID != orgA || got.Master.Version != 1 || got.Master.MasterKey != b64.EncodeToString(id.master.Public().Bytes()) {
 		t.Fatalf("stored identity = %s", rec.Body.String())
 	}
 	if rec.Header().Get("Cache-Control") != "no-store" {
@@ -192,7 +190,7 @@ func TestE2EEMasterKeyIsValidatedAndVersioned(t *testing.T) {
 	}
 	// The recovery wraps come back exactly, and only the recovery key opens them.
 	wm, _ := b64.DecodeString(got.Master.Recovery["wrapped_master_key"])
-	if seed, err := e2eeid.UnwrapRecovery(id.recovery, "master-key", orgA, alice.ID, wm); err != nil || string(seed) != string(id.master.Seed()) {
+	if seed, err := e2eeid.UnwrapRecovery(id.recovery, "master-key", orgA, alice.ID, wm); err != nil || string(seed) != string(e2eeid.MasterSeed(id.master)) {
 		t.Fatalf("recovery wrap does not round-trip: %v", err)
 	}
 
@@ -275,9 +273,9 @@ func TestE2EEDeviceCrossSignatureAndQuery(t *testing.T) {
 		TenantID   string `json:"tenant_id"`
 		Devices    map[string][]map[string]any
 		MasterKeys map[string]struct {
-			Version       int64             `json:"version"`
-			MasterKey     map[string]string `json:"master_key"`
-			SelfSignature map[string]string `json:"self_signature"`
+			Version       int64  `json:"version"`
+			MasterKey     string `json:"master_key"`
+			SelfSignature string `json:"self_signature"`
 		} `json:"master_keys"`
 	}
 	var q queried
@@ -300,13 +298,13 @@ func TestE2EEDeviceCrossSignatureAndQuery(t *testing.T) {
 	}
 	// The listed master key and signature verify independently, as a client checks them.
 	mk := q.MasterKeys[alice.ID].MasterKey
-	m, _ := b64.DecodeString(mk["mldsa65"])
-	e, _ := b64.DecodeString(mk["ed25519"])
-	pub := hybridsig.PublicKey{MLDSA65: m, Ed25519: e}
-	ss := q.MasterKeys[alice.ID].SelfSignature
-	sm, _ := b64.DecodeString(ss["mldsa65"])
-	se, _ := b64.DecodeString(ss["ed25519"])
-	if pub.Verify(e2eeid.DomainMaster, e2eeid.MasterSelfMessage(orgA, alice.ID, pub), hybridsig.Signature{MLDSA65: sm, Ed25519: se}) != nil {
+	raw, _ := b64.DecodeString(mk)
+	pub, err := hybridsig.ParsePublicKey(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ss, _ := b64.DecodeString(q.MasterKeys[alice.ID].SelfSignature)
+	if pub.Verify(e2eeid.DomainMaster, e2eeid.MasterSelfMessage(orgA, alice.ID, pub), ss) != nil {
 		t.Fatal("listed self-binding does not verify")
 	}
 
@@ -332,7 +330,7 @@ func TestE2EEKeyBackupRoutes(t *testing.T) {
 		t.Fatalf("empty batch = %d", c)
 	}
 	entry := func(room, session string, idx int64) map[string]any {
-		sealed, err := e2eeid.SealBackup(id.backup.Public(), id.master.Seed(), room, session, []byte(`{"session":"`+session+`"}`))
+		sealed, err := e2eeid.SealBackup(id.backup.Public(), e2eeid.MasterSeed(id.master), room, session, []byte(`{"session":"`+session+`"}`))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -379,7 +377,7 @@ func TestE2EEKeyBackupRoutes(t *testing.T) {
 		t.Fatalf("backup page = %s", rec.Body.String())
 	}
 	raw, _ := b64.DecodeString(page.Sessions[1]["sealed"].(string))
-	if got, err := e2eeid.OpenBackup(id.backup, id.master.Seed(), "rm_2", "sessB", raw); err != nil || string(got) != `{"session":"sessB"}` {
+	if got, err := e2eeid.OpenBackup(id.backup, e2eeid.MasterSeed(id.master), "rm_2", "sessB", raw); err != nil || string(got) != `{"session":"sessB"}` {
 		t.Fatalf("backed-up session does not open with the backup key: %v", err)
 	}
 	rec = doBearerJSON(t, srv, http.MethodGet, "/api/v1/keys/backup?version=1&after_room=rm_1&after_session=sessA", tok, nil, nil)
@@ -407,7 +405,7 @@ func TestE2EEPinSet(t *testing.T) {
 	if rec := doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/master", tok, id.put(t, 0), nil); rec.Code != http.StatusOK {
 		t.Fatal(rec.Body.String())
 	}
-	sealed, _ := e2eeid.SealPins(id.master.Seed(), orgA, alice.ID, 1, []byte(`{}`))
+	sealed, _ := e2eeid.SealPins(e2eeid.MasterSeed(id.master), orgA, alice.ID, 1, []byte(`{}`))
 	body := map[string]any{"version": 1, "expected_counter": 0, "sealed": b64.EncodeToString(sealed)}
 	if rec := doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/pins", tok, body, nil); rec.Code != http.StatusOK || rec.Body.String() != `{"counter":1}`+"\n" {
 		t.Fatalf("pins = %d %s", rec.Code, rec.Body.String())
@@ -508,14 +506,14 @@ func TestE2EEPairingRelaysTwoLayerTransferOnce(t *testing.T) {
 	}
 
 	// The verified device seals the master and backup seeds in two layers.
-	sealed, err := e2eeid.SealTransfer(eph.Public(), secret, p.id, old.id, fresh.id, e2eeid.Fields(id.master.Seed(), id.backup.Seed()))
+	sealed, err := e2eeid.SealTransfer(eph.Public(), secret, p.id, old.id, fresh.id, e2eeid.Fields(e2eeid.MasterSeed(id.master), id.backup.Seed()))
 	if err != nil {
 		t.Fatal(err)
 	}
 	seal := func(device string, private bool) int {
 		body := map[string]any{"device_id": device, "sealed": b64.EncodeToString(sealed)}
 		if private {
-			body["master_private_key"] = b64.EncodeToString(id.master.Seed())
+			body["master_private_key"] = b64.EncodeToString(e2eeid.MasterSeed(id.master))
 		}
 		return doBearerJSON(t, srv, http.MethodPut, path+"/sealed", tok, body, nil).Code
 	}
@@ -549,7 +547,7 @@ func TestE2EEPairingRelaysTwoLayerTransferOnce(t *testing.T) {
 	}
 	raw, _ := b64.DecodeString(got["sealed"])
 	keys, err := e2eeid.OpenTransfer(eph, secret, p.id, old.id, fresh.id, raw)
-	if err != nil || string(keys) != string(e2eeid.Fields(id.master.Seed(), id.backup.Seed())) {
+	if err != nil || string(keys) != string(e2eeid.Fields(e2eeid.MasterSeed(id.master), id.backup.Seed())) {
 		t.Fatalf("transfer does not open on the new device: %v", err)
 	}
 	// One-time: the pairing is gone.
@@ -583,7 +581,7 @@ func TestE2EEIdentityRoutesRefuseSecretFields(t *testing.T) {
 	alice, tok := createOrgUser(t, st, "usr_e3s_alice", "e3salice", "user", orgA)
 	id := newIdentity(t, orgA, alice.ID)
 	secrets := []string{"private_key", "master_private_key", "backup_private_key", "recovery_key", "seed", "session_key", "secret"}
-	sealedSession, _ := e2eeid.SealBackup(id.backup.Public(), id.master.Seed(), "rm_1", "sess", []byte("x"))
+	sealedSession, _ := e2eeid.SealBackup(id.backup.Public(), e2eeid.MasterSeed(id.master), "rm_1", "sess", []byte("x"))
 	routes := []struct {
 		method, path string
 		body         map[string]any

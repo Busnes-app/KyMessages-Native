@@ -39,52 +39,21 @@ var (
 	e2eePairingID = regexp.MustCompile(`^[A-Za-z0-9_-]{22}$`)
 )
 
-// hybridJSON is a hybridsig key or signature on the wire.
-type hybridJSON struct {
-	Alg     string `json:"alg"`
-	MLDSA65 string `json:"mldsa65"`
-	Ed25519 string `json:"ed25519"`
-}
-
-func (h hybridJSON) halves() ([]byte, []byte, bool) {
-	m, err1 := base64.RawStdEncoding.DecodeString(h.MLDSA65)
-	e, err2 := base64.RawStdEncoding.DecodeString(h.Ed25519)
-	return m, e, h.Alg == hybridsig.Alg && err1 == nil && err2 == nil
-}
-
-func (h hybridJSON) publicKey() (hybridsig.PublicKey, bool) {
-	m, e, ok := h.halves()
-	p := hybridsig.PublicKey{MLDSA65: m, Ed25519: e}
-	return p, ok && p.Check() == nil
-}
-
-func (h hybridJSON) signature() (hybridsig.Signature, bool) {
-	m, e, ok := h.halves()
-	return hybridsig.Signature{MLDSA65: m, Ed25519: e}, ok
-}
-
-func (h hybridJSON) encode() string {
-	b, _ := json.Marshal(h)
-	return string(b)
-}
-
-func parseHybrid(s string) (hybridJSON, bool) {
-	var h hybridJSON
-	return h, json.Unmarshal([]byte(s), &h) == nil
+// Master keys and their signatures travel as unpadded base64 of hybridsig's tagged encodings
+// ("mldsa65+ed25519" 0x00 ‖ ML-DSA-65 half ‖ Ed25519 half), which name the algorithm.
+func parseMasterKey(v string) (*hybridsig.PublicKey, bool) {
+	b, err := base64.RawStdEncoding.DecodeString(v)
+	if err != nil {
+		return nil, false
+	}
+	p, err := hybridsig.ParsePublicKey(b)
+	return p, err == nil
 }
 
 // verifyHybrid reports whether sig verifies under pub for domain and msg.
-func verifyHybrid(pub hybridsig.PublicKey, domain string, msg []byte, sig hybridJSON) bool {
-	sg, ok := sig.signature()
-	return ok && pub.Verify(domain, msg, sg) == nil
-}
-
-func storedMasterPublic(m *store.E2EEMasterKey) (hybridsig.PublicKey, bool) {
-	h, ok := parseHybrid(m.MasterKey)
-	if !ok {
-		return hybridsig.PublicKey{}, false
-	}
-	return h.publicKey()
+func verifyHybrid(pub *hybridsig.PublicKey, domain string, msg []byte, sig string) bool {
+	b, err := base64.RawStdEncoding.DecodeString(sig)
+	return err == nil && len(b) == hybridsig.SignatureBytes && pub.Verify(domain, msg, b) == nil
 }
 
 // decodeIdentity is decodeStrict with a larger cap: master keys and their signatures are
@@ -104,12 +73,12 @@ func decodedLen(s string) (int, bool) {
 // recovery key or a session key (TestE2EEIdentityBodiesCarryNoSecrets).
 type (
 	e2eeMasterPut struct {
-		ExpectedVersion int64      `json:"expected_version"`
-		MasterKey       hybridJSON `json:"master_key"`
-		SelfSignature   hybridJSON `json:"self_signature"`
+		ExpectedVersion int64  `json:"expected_version"`
+		MasterKey       string `json:"master_key"`
+		SelfSignature   string `json:"self_signature"`
 		BackupKey       struct {
-			PublicKey string     `json:"public_key"`
-			Signature hybridJSON `json:"signature"`
+			PublicKey string `json:"public_key"`
+			Signature string `json:"signature"`
 		} `json:"backup_key"`
 		Recovery struct {
 			WrappedMasterKey string `json:"wrapped_master_key"`
@@ -122,8 +91,8 @@ type (
 		Sealed          string `json:"sealed"`
 	}
 	e2eeDeviceSignature struct {
-		Version   int64      `json:"version"`
-		Signature hybridJSON `json:"signature"`
+		Version   int64  `json:"version"`
+		Signature string `json:"signature"`
 	}
 	e2eeBackupEntry struct {
 		RoomID     string `json:"room_id"`
@@ -149,15 +118,13 @@ type (
 )
 
 type e2eeMasterJSON struct {
-	Version       int64      `json:"version"`
-	MasterKey     hybridJSON `json:"master_key"`
-	SelfSignature hybridJSON `json:"self_signature"`
+	Version       int64  `json:"version"`
+	MasterKey     string `json:"master_key"`
+	SelfSignature string `json:"self_signature"`
 }
 
-func masterJSON(m *store.E2EEMasterKey) (e2eeMasterJSON, bool) {
-	k, ok1 := parseHybrid(m.MasterKey)
-	sg, ok2 := parseHybrid(m.SelfSignature)
-	return e2eeMasterJSON{m.Version, k, sg}, ok1 && ok2
+func masterJSON(m *store.E2EEMasterKey) e2eeMasterJSON {
+	return e2eeMasterJSON{m.Version, m.MasterKey, m.SelfSignature}
 }
 
 // GET /api/v1/keys/master answers the caller's own identity, with the recovery-key wraps a
@@ -177,15 +144,9 @@ func (s *Server) handleE2EEGetMaster(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusInternalServerError, "Failed to load the encryption identity")
 		return
 	}
-	mj, ok1 := masterJSON(m)
-	bs, ok2 := parseHybrid(m.BackupSignature)
-	if !ok1 || !ok2 {
-		s.writeError(w, http.StatusInternalServerError, "Failed to load the encryption identity")
-		return
-	}
 	s.writeJSON(w, http.StatusOK, map[string]any{"tenant_id": tenantID, "master": map[string]any{
-		"version": mj.Version, "master_key": mj.MasterKey, "self_signature": mj.SelfSignature,
-		"backup_key": map[string]any{"public_key": m.BackupKey, "signature": bs},
+		"version": m.Version, "master_key": m.MasterKey, "self_signature": m.SelfSignature,
+		"backup_key": map[string]any{"public_key": m.BackupKey, "signature": m.BackupSignature},
 		"recovery":   map[string]string{"wrapped_master_key": m.RecoveryMaster, "wrapped_backup_key": m.RecoveryBackup},
 		"pins":       map[string]any{"counter": m.PinsCounter, "sealed": m.Pins},
 	}})
@@ -211,7 +172,7 @@ func (s *Server) handleE2EEPutMaster(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	version := req.ExpectedVersion + 1
-	pub, ok := req.MasterKey.publicKey()
+	pub, ok := parseMasterKey(req.MasterKey)
 	backupPub, err := base64.RawStdEncoding.DecodeString(req.BackupKey.PublicKey)
 	if !ok || err != nil || xwingKey(backupPub) != nil {
 		s.writeError(w, http.StatusBadRequest, "Invalid encryption identity")
@@ -228,8 +189,8 @@ func (s *Server) handleE2EEPutMaster(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	m := &store.E2EEMasterKey{TenantID: tenantID, UserID: user.ID, MasterKey: req.MasterKey.encode(), SelfSignature: req.SelfSignature.encode(),
-		BackupKey: req.BackupKey.PublicKey, BackupSignature: req.BackupKey.Signature.encode(),
+	m := &store.E2EEMasterKey{TenantID: tenantID, UserID: user.ID, MasterKey: req.MasterKey, SelfSignature: req.SelfSignature,
+		BackupKey: req.BackupKey.PublicKey, BackupSignature: req.BackupKey.Signature,
 		RecoveryMaster: req.Recovery.WrappedMasterKey, RecoveryBackup: req.Recovery.WrappedBackupKey}
 	switch err := s.store.E2EE().PutMasterKey(r.Context(), m, req.ExpectedVersion); {
 	case errors.Is(err, store.ErrE2EEVersion):
@@ -302,12 +263,12 @@ func (s *Server) handleE2EESignDevice(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusInternalServerError, "Failed to load the encryption identity")
 		return
 	}
-	pub, ok := storedMasterPublic(m)
+	pub, ok := parseMasterKey(m.MasterKey)
 	if !ok || !verifyHybrid(pub, e2eeid.DomainDevice, e2eeid.DeviceMessage(tenantID, user.ID, dev.DeviceID, dev.Curve25519, dev.Ed25519), req.Signature) {
 		s.writeError(w, http.StatusBadRequest, "The device signature does not verify")
 		return
 	}
-	switch err := s.store.E2EE().SignDevice(r.Context(), user.ID, dev.DeviceID, req.Version, req.Signature.encode()); {
+	switch err := s.store.E2EE().SignDevice(r.Context(), user.ID, dev.DeviceID, req.Version, req.Signature); {
 	case errors.Is(err, store.ErrE2EEVersion):
 		s.writeError(w, http.StatusConflict, "The encryption identity changed; reload it")
 		return

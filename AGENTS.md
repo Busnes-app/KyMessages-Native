@@ -247,7 +247,7 @@ the compose checks. Run the same checks locally with `make ci` (`tidy-check lint
 - [internal/config/AGENTS.md](internal/config/AGENTS.md): Configuration management and environment loader.
 - [internal/store/AGENTS.md](internal/store/AGENTS.md): Pluggable database abstraction layer (SQLite & PostgreSQL).
 - [internal/crypto/AGENTS.md](internal/crypto/AGENTS.md): Cryptographic primitives (AES-256-GCM, HMAC, SHA-256, randomness, PKCE).
-- [internal/pqc/AGENTS.md](internal/pqc/AGENTS.md): Vendored X-Wing and ML-DSA-65+Ed25519 hybrid signatures, until ky-primitives ships them.
+- [internal/pqc/AGENTS.md](internal/pqc/AGENTS.md): ky-primitives `xwing` and `hybridsig` (open PRs #83/#84) vendored verbatim until they merge.
 - [internal/e2eeid/AGENTS.md](internal/e2eeid/AGENTS.md): E3 identity formats (master key statements, recovery key, key backup, QR transfer) shared with the browser.
 - [internal/auth/AGENTS.md](internal/auth/AGENTS.md): Authentication, MFA (TOTP), recovery codes, sessions, and CAPTCHA.
 - [internal/sso/AGENTS.md](internal/sso/AGENTS.md): KyIdentity OIDC sign-in and signed directory webhooks.

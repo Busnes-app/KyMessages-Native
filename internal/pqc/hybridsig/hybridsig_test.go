@@ -1,3 +1,5 @@
+//go:build go1.27
+
 package hybridsig_test
 
 import (
@@ -11,82 +13,159 @@ import (
 	"github.com/Busnes-app/ky_server_base/internal/pqc/hybridsig"
 )
 
-func TestDigestIsDomainNulMessage(t *testing.T) {
-	d, err := hybridsig.Digest("kymessages.test.v1", []byte("msg"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := sha256.Sum256([]byte("kymessages.test.v1\x00msg")); d != want {
-		t.Fatal("digest is not SHA-256(domain || 0x00 || msg)")
-	}
-	for _, bad := range []string{"", "a\x00b"} {
-		if _, err := hybridsig.Digest(bad, nil); !errors.Is(err, hybridsig.ErrDomain) {
-			t.Fatalf("domain %q: %v", bad, err)
-		}
-	}
-}
+const label = "ky-primitives/hybridsig-test/1"
 
-func TestSignVerifyNeedsBothHalves(t *testing.T) {
+var msg = []byte(`{"op":"grant","to":"alice"}`)
+
+func newKey(t *testing.T) *hybridsig.PrivateKey {
+	t.Helper()
 	k, err := hybridsig.Generate()
 	if err != nil {
 		t.Fatal(err)
 	}
-	pub := k.Public()
-	if pub.Check() != nil || len(pub.MLDSA65) != hybridsig.MLDSA65PublicKeyBytes {
-		t.Fatal("public key sizes")
-	}
-	msg := []byte("statement")
-	sig, err := k.Sign("kymessages.test.v1", msg)
+	return k
+}
+
+func sign(t *testing.T, k *hybridsig.PrivateKey) []byte {
+	t.Helper()
+	s, err := k.Sign(label, msg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := pub.Verify("kymessages.test.v1", msg, sig); err != nil {
+	return s
+}
+
+func flip(b []byte, i int) []byte {
+	c := bytes.Clone(b)
+	c[i] ^= 0x01
+	return c
+}
+
+// tagLen is len("mldsa65+ed25519\x00"), where both halves start.
+const tagLen = len(hybridsig.Alg) + 1
+
+func TestSignVerify(t *testing.T) {
+	k := newKey(t)
+	s := sign(t, k)
+	if len(s) != hybridsig.SignatureBytes || len(k.Public().Bytes()) != hybridsig.PublicKeyBytes {
+		t.Fatalf("sizes %d, %d", len(s), len(k.Public().Bytes()))
+	}
+	if err := k.Public().Verify(label, msg, s); err != nil {
 		t.Fatal(err)
 	}
-	// Each half is a standard signature over the digest: ML-DSA-65 with an empty context, pure Ed25519.
-	d, _ := hybridsig.Digest("kymessages.test.v1", msg)
-	mpk, _ := mldsa.NewPublicKey(mldsa.MLDSA65(), pub.MLDSA65)
-	if mldsa.Verify(mpk, d[:], sig.MLDSA65, &mldsa.Options{}) != nil || !ed25519.Verify(pub.Ed25519, d[:], sig.Ed25519) {
-		t.Fatal("halves are not standard signatures over the digest")
-	}
+}
 
-	other, _ := hybridsig.Generate()
-	otherSig, _ := other.Sign("kymessages.test.v1", msg)
-	flip := func(b []byte) []byte { c := bytes.Clone(b); c[0] ^= 1; return c }
-	for name, c := range map[string]struct {
-		domain string
-		msg    []byte
-		sig    hybridsig.Signature
-	}{
-		"other domain":                 {"kymessages.other.v1", msg, sig},
-		"other message":                {"kymessages.test.v1", []byte("other"), sig},
-		"tampered ML-DSA half":         {"kymessages.test.v1", msg, hybridsig.Signature{MLDSA65: flip(sig.MLDSA65), Ed25519: sig.Ed25519}},
-		"tampered Ed25519":             {"kymessages.test.v1", msg, hybridsig.Signature{MLDSA65: sig.MLDSA65, Ed25519: flip(sig.Ed25519)}},
-		"ML-DSA half from another key": {"kymessages.test.v1", msg, hybridsig.Signature{MLDSA65: otherSig.MLDSA65, Ed25519: sig.Ed25519}},
-		"Ed25519 from another key":     {"kymessages.test.v1", msg, hybridsig.Signature{MLDSA65: sig.MLDSA65, Ed25519: otherSig.Ed25519}},
-		"missing ML-DSA half":          {"kymessages.test.v1", msg, hybridsig.Signature{Ed25519: sig.Ed25519}},
-		"missing Ed25519 half":         {"kymessages.test.v1", msg, hybridsig.Signature{MLDSA65: sig.MLDSA65}},
-	} {
-		if err := pub.Verify(c.domain, c.msg, c.sig); err == nil {
-			t.Errorf("%s verified", name)
+// Each half alone is not enough: a signature with a valid ML-DSA half and a broken Ed25519
+// half fails, and the other way round.
+func TestBothHalvesMustVerify(t *testing.T) {
+	k := newKey(t)
+	s := sign(t, k)
+	other := sign(t, newKey(t))
+	mlEnd := tagLen + mldsa.MLDSA65SignatureSize
+	cases := map[string][]byte{
+		"ml-dsa byte flipped":  flip(s, tagLen+100),
+		"ml-dsa from another":  append(bytes.Clone(other[:mlEnd]), s[mlEnd:]...),
+		"ed25519 byte flipped": flip(s, len(s)-1),
+		"ed25519 from another": append(bytes.Clone(s[:mlEnd]), other[mlEnd:]...),
+		"truncated":            s[:len(s)-1],
+	}
+	for name, sig := range cases {
+		if err := k.Public().Verify(label, msg, sig); !errors.Is(err, hybridsig.ErrSignature) {
+			t.Errorf("%s: Verify = %v", name, err)
 		}
 	}
 }
 
-func TestSeedRoundTrip(t *testing.T) {
-	k, _ := hybridsig.Generate()
-	seed := k.Seed()
-	if len(seed) != hybridsig.SeedBytes {
-		t.Fatalf("seed is %d bytes", len(seed))
+func TestVerifyRefusesAnotherAlgorithmTag(t *testing.T) {
+	k := newKey(t)
+	s := sign(t, k)
+	for _, alg := range []string{"mldsa87+ed25519", "ed25519+mldsa65", "MLDSA65+ED25519"} {
+		sig := append([]byte(alg+"\x00"), s[tagLen:]...)
+		if err := k.Public().Verify(label, msg, sig); !errors.Is(err, hybridsig.ErrAlg) {
+			t.Errorf("signature tag %q: Verify = %v", alg, err)
+		}
+		pub := append([]byte(alg+"\x00"), k.Public().Bytes()[tagLen:]...)
+		if _, err := hybridsig.ParsePublicKey(pub); !errors.Is(err, hybridsig.ErrAlg) {
+			t.Errorf("public key tag %q: ParsePublicKey = %v", alg, err)
+		}
 	}
-	k2, err := hybridsig.FromSeed(seed)
+}
+
+func TestLabelAndMessageAreBound(t *testing.T) {
+	k := newKey(t)
+	s := sign(t, k)
+	if err := k.Public().Verify(label+"x", msg, s); !errors.Is(err, hybridsig.ErrSignature) {
+		t.Errorf("other label: %v", err)
+	}
+	if err := k.Public().Verify(label, flip(msg, 0), s); !errors.Is(err, hybridsig.ErrSignature) {
+		t.Errorf("other message: %v", err)
+	}
+	if err := newKey(t).Public().Verify(label, msg, s); !errors.Is(err, hybridsig.ErrSignature) {
+		t.Errorf("other key: %v", err)
+	}
+	for _, bad := range []string{"", "a\x00b"} {
+		if _, err := k.Sign(bad, msg); !errors.Is(err, hybridsig.ErrLabel) {
+			t.Errorf("Sign(%q) = %v", bad, err)
+		}
+		if err := k.Public().Verify(bad, msg, s); !errors.Is(err, hybridsig.ErrLabel) {
+			t.Errorf("Verify(%q) = %v", bad, err)
+		}
+	}
+}
+
+func TestKeyEncodings(t *testing.T) {
+	k := newKey(t)
+	ms, es := k.Seeds()
+	k2, err := hybridsig.FromSeeds(ms, es)
+	if err != nil || !bytes.Equal(k2.Public().Bytes(), k.Public().Bytes()) {
+		t.Fatalf("FromSeeds(Seeds()) differs: %v", err)
+	}
+	p, err := hybridsig.ParsePublicKey(k.Public().Bytes())
+	if err != nil || p.ID() != k.Public().ID() {
+		t.Fatalf("ParsePublicKey round trip: %v", err)
+	}
+	if err := p.Verify(label, msg, sign(t, k2)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hybridsig.FromSeeds(ms[:31], es); !errors.Is(err, hybridsig.ErrLength) {
+		t.Fatal(err)
+	}
+	if _, err := hybridsig.ParsePublicKey(k.Public().Bytes()[1:]); !errors.Is(err, hybridsig.ErrAlg) {
+		t.Fatal(err)
+	}
+	if _, err := hybridsig.ParsePublicKey(k.Public().Bytes()[:hybridsig.PublicKeyBytes-1]); !errors.Is(err, hybridsig.ErrLength) {
+		t.Fatal(err)
+	}
+	var zero *hybridsig.PublicKey
+	if zero.Bytes() != nil || zero.ID() != "" || !errors.Is(zero.Verify(label, msg, nil), hybridsig.ErrUninitializedKey) {
+		t.Fatal("nil public key is usable")
+	}
+	if _, err := (&hybridsig.PrivateKey{}).Sign(label, msg); !errors.Is(err, hybridsig.ErrUninitializedKey) {
+		t.Fatal(err)
+	}
+}
+
+// kyguard-server internal/pqcrypto (sig.go @ 37b302b) signs D = SHA-256("kyguard/1/<type>"
+// ‖ 0x00 ‖ JCS) with ML-DSA-65 (empty context) and Ed25519. Its halves, built here the way
+// kyguard builds them, verify through this package, so kyguard can import it unchanged.
+func TestKyguardConstructionVerifies(t *testing.T) {
+	k := newKey(t)
+	ms, es := k.Seeds()
+	m, err := mldsa.NewPrivateKey(mldsa.MLDSA65(), ms)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(k2.Public().MLDSA65, k.Public().MLDSA65) || !bytes.Equal(k2.Public().Ed25519, k.Public().Ed25519) {
-		t.Fatal("seed does not rebuild the key")
-	}
-	if _, err := hybridsig.FromSeed(seed[:63]); !errors.Is(err, hybridsig.ErrKey) {
+	h := sha256.New()
+	h.Write([]byte("kyguard/1/tx"))
+	h.Write([]byte{0})
+	h.Write(msg)
+	d := h.Sum(nil)
+	mSig, err := m.Sign(nil, d, &mldsa.Options{Context: ""})
+	if err != nil {
 		t.Fatal(err)
+	}
+	sig := append(append([]byte(hybridsig.Alg+"\x00"), mSig...), ed25519.Sign(ed25519.NewKeyFromSeed(es), d)...)
+	if err := k.Public().Verify("kyguard/1/tx", msg, sig); err != nil {
+		t.Fatalf("kyguard-built signature: %v", err)
 	}
 }

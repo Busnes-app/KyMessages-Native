@@ -58,34 +58,43 @@ func master(seed string) (*hybridsig.PrivateKey, error) {
 	if err != nil {
 		return nil, err
 	}
-	return hybridsig.FromSeed(b)
+	return MasterFromSeed(b)
 }
 
-func pubObj(p hybridsig.PublicKey) map[string]string {
+// masterKey reads a public key in hybridsig's tagged encoding.
+func masterKey(v string) (*hybridsig.PublicKey, error) {
+	b, err := dec(v)
+	if err != nil {
+		return nil, err
+	}
+	return hybridsig.ParsePublicKey(b)
+}
+
+func pubObj(p *hybridsig.PublicKey) map[string]string {
 	fp := Fingerprint(p)
-	return map[string]string{"alg": hybridsig.Alg, "mldsa65": b64.EncodeToString(p.MLDSA65), "ed25519": b64.EncodeToString(p.Ed25519), "fingerprint": hex.EncodeToString(fp[:])}
-}
-
-func sigObj(sg hybridsig.Signature) map[string]string {
-	return map[string]string{"alg": hybridsig.Alg, "mldsa65": b64.EncodeToString(sg.MLDSA65), "ed25519": b64.EncodeToString(sg.Ed25519)}
+	return map[string]string{"public_key": b64.EncodeToString(p.Bytes()), "fingerprint": hex.EncodeToString(fp[:])}
 }
 
 // A statement builder takes the signing key's public half and the statement's fields.
-type statement func(pub hybridsig.PublicKey, fields []string) ([]byte, error)
+type statement func(pub *hybridsig.PublicKey, fields []string) ([]byte, error)
 
-// verifyWith(domain, msg) takes (mldsa65, ed25519, fields..., sig_mldsa65, sig_ed25519).
+// verifyWith(domain, msg) takes (public_key, fields..., signature), each key and signature in
+// hybridsig's tagged encoding.
 func verifyWith(domain string, msg statement) func(a []string) (any, error) {
 	return func(a []string) (any, error) {
-		k, err := decAll(a[0], a[1], a[len(a)-2], a[len(a)-1])
+		pub, err := masterKey(a[0])
 		if err != nil {
 			return false, nil
 		}
-		pub := hybridsig.PublicKey{MLDSA65: k[0], Ed25519: k[1]}
-		m, err := msg(pub, a[2:len(a)-2])
+		sig, err := dec(a[len(a)-1])
 		if err != nil {
 			return false, nil
 		}
-		return pub.Verify(domain, m, hybridsig.Signature{MLDSA65: k[2], Ed25519: k[3]}) == nil, nil
+		m, err := msg(pub, a[1:len(a)-1])
+		if err != nil {
+			return false, nil
+		}
+		return pub.Verify(domain, m, sig) == nil, nil
 	}
 }
 
@@ -104,19 +113,19 @@ func signWith(domain string, msg statement) func(a []string) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return sigObj(sg), nil
+		return b64.EncodeToString(sg), nil
 	}
 }
 
-func masterMsg(pub hybridsig.PublicKey, a []string) ([]byte, error) {
+func masterMsg(pub *hybridsig.PublicKey, a []string) ([]byte, error) {
 	return MasterSelfMessage(a[0], a[1], pub), nil
 }
 
-func deviceMsg(_ hybridsig.PublicKey, a []string) ([]byte, error) {
+func deviceMsg(_ *hybridsig.PublicKey, a []string) ([]byte, error) {
 	return DeviceMessage(a[0], a[1], a[2], a[3], a[4]), nil
 }
 
-func backupKeyMsg(_ hybridsig.PublicKey, a []string) ([]byte, error) {
+func backupKeyMsg(_ *hybridsig.PublicKey, a []string) ([]byte, error) {
 	v, err := strconv.ParseInt(a[2], 10, 64)
 	if err != nil || v < 1 {
 		return nil, errArg
@@ -150,14 +159,15 @@ type call struct {
 }
 
 var calls = map[string]call{
-	// Master key (hybridsig ML-DSA-65 + Ed25519).
+	// Master key (hybridsig ML-DSA-65 + Ed25519). Keys and signatures are hybridsig's tagged
+	// encodings; the seed is MasterSeedBytes.
 	"masterGenerate": {0, func([]string) (any, error) {
 		k, err := hybridsig.Generate()
 		if err != nil {
 			return nil, err
 		}
 		out := pubObj(k.Public())
-		out["seed"] = b64.EncodeToString(k.Seed())
+		out["seed"] = b64.EncodeToString(MasterSeed(k))
 		return out, nil
 	}},
 	"masterPublic": {1, func(a []string) (any, error) {
@@ -167,30 +177,26 @@ var calls = map[string]call{
 		}
 		return pubObj(k.Public()), nil
 	}},
-	"fingerprint": {2, func(a []string) (any, error) {
-		k, err := decAll(a[0], a[1])
+	"fingerprint": {1, func(a []string) (any, error) {
+		pub, err := masterKey(a[0])
 		if err != nil {
 			return nil, err
-		}
-		pub := hybridsig.PublicKey{MLDSA65: k[0], Ed25519: k[1]}
-		if pub.Check() != nil {
-			return nil, hybridsig.ErrKey
 		}
 		fp := Fingerprint(pub)
 		return hex.EncodeToString(fp[:]), nil
 	}},
 	// signMaster(seed, tenant, user): the master key's self-binding.
 	"signMaster": {3, signWith(DomainMaster, masterMsg)},
-	// verifyMaster(mldsa65, ed25519, tenant, user, sig_mldsa65, sig_ed25519)
-	"verifyMaster": {6, verifyWith(DomainMaster, masterMsg)},
+	// verifyMaster(public_key, tenant, user, signature)
+	"verifyMaster": {4, verifyWith(DomainMaster, masterMsg)},
 	// signDevice(seed, tenant, user, device, curve25519, ed25519)
 	"signDevice": {6, signWith(DomainDevice, deviceMsg)},
-	// verifyDevice(mldsa65, ed25519, tenant, user, device, curve25519, ed25519, sig_m, sig_e)
-	"verifyDevice": {9, verifyWith(DomainDevice, deviceMsg)},
+	// verifyDevice(public_key, tenant, user, device, curve25519, ed25519, signature)
+	"verifyDevice": {7, verifyWith(DomainDevice, deviceMsg)},
 	// signBackupKey(seed, tenant, user, version, backup_public_key)
 	"signBackupKey": {5, signWith(DomainBackupKey, backupKeyMsg)},
-	// verifyBackupKey(mldsa65, ed25519, tenant, user, version, backup_public_key, sig_m, sig_e)
-	"verifyBackupKey": {8, verifyWith(DomainBackupKey, backupKeyMsg)},
+	// verifyBackupKey(public_key, tenant, user, version, backup_public_key, signature)
+	"verifyBackupKey": {6, verifyWith(DomainBackupKey, backupKeyMsg)},
 
 	// pinsSeal(master_seed, tenant, user, counter, plaintext) and pinsOpen(..., sealed).
 	"pinsSeal": {5, pinsCall(SealPins)},
@@ -333,7 +339,7 @@ var calls = map[string]call{
 		if err != nil {
 			return nil, err
 		}
-		if len(k[1]) != hybridsig.SeedBytes || len(k[2]) != xwing.SeedBytes {
+		if len(k[1]) != MasterSeedBytes || len(k[2]) != xwing.SeedBytes {
 			return nil, errArg
 		}
 		out, err := SealTransfer(pub, k[0], a[2], a[3], a[4], Fields(k[1], k[2]))
@@ -368,7 +374,7 @@ func pinsCall(f func(seed []byte, tenantID, userID string, counter int64, b []by
 			return nil, err
 		}
 		n, err := strconv.ParseInt(a[3], 10, 64)
-		if err != nil || n < 1 || len(k[0]) != hybridsig.SeedBytes {
+		if err != nil || n < 1 || len(k[0]) != MasterSeedBytes {
 			return nil, errArg
 		}
 		out, err := f(k[0], a[1], a[2], n, k[1])
@@ -381,7 +387,7 @@ func pinsCall(f func(seed []byte, tenantID, userID string, counter int64, b []by
 
 // splitTransfer reads Fields(master seed, backup seed) back.
 func splitTransfer(b []byte) (masterSeed, backupSeed []byte, ok bool) {
-	const m, x = hybridsig.SeedBytes, xwing.SeedBytes
+	const m, x = MasterSeedBytes, xwing.SeedBytes
 	if len(b) != 8+m+x || binary.BigEndian.Uint32(b) != m || binary.BigEndian.Uint32(b[4+m:]) != x {
 		return nil, nil, false
 	}

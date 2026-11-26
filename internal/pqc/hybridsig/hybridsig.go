@@ -1,107 +1,83 @@
-// Package hybridsig is the Ky hybrid signature: ML-DSA-65 (crypto/mldsa, empty context) and
-// pure Ed25519, both over the same domain-separated SHA-256 digest, and both required to
-// verify. It is the construction of kyguard-server internal/pqcrypto/sig.go, which the
-// ky-primitives `hybridsig` plan lifts (PQC Stack Plan, ky-primitives#80); it is a Ky-internal
-// format, not the RFC 10073 X.509 composite. Once ky-primitives ships `hybridsig`, this package
-// is replaced by that import.
+// Vendored verbatim from github.com/Busnes-app/ky-primitives hybridsig @ ead9d5da (PR #84). Once that
+// merges, delete this directory and import the package instead; nothing else changes.
+
+//go:build go1.27
+
+// Package hybridsig signs with ML-DSA-65 and Ed25519 together; a signature verifies only if
+// both halves do, so it stands while either algorithm does. It needs Go 1.27 (crypto/mldsa).
+//
+// The construction is kyguard-server's (internal/pqcrypto/sig.go @ 37b302b), kept as it is:
+// both halves sign the same 32-byte digest
+//
+//	D = SHA-256(label ‖ 0x00 ‖ msg)
+//
+// ML-DSA-65 (FIPS 204, hedged, empty context) and pure Ed25519 (RFC 8032) each sign D.
+// The label names the caller and purpose ("kyguard/1/tx"), so a signature made for one
+// purpose never verifies for another. kyguard's own digest is this one with its
+// "kyguard/1/<type>" label and JCS bytes as msg, so kyguard can import this package.
+//
+// Encodings, each starting with the algorithm tag Alg and a 0x00:
+//
+//	public key: "mldsa65+ed25519" 0x00 ‖ ML-DSA-65 public key (1952) ‖ Ed25519 public key (32)
+//	signature:  "mldsa65+ed25519" 0x00 ‖ ML-DSA-65 signature (3309)  ‖ Ed25519 signature (64)
+//	key ID:     "mldsa65+ed25519:" ‖ lowercase hex SHA-256("ky/hybridsig/1/key-id" 0x00 ‖ public key)
+//
+// This is a Ky-internal format. It is not the RFC 10073 X.509 composite signature and not
+// the draft JOSE composite: neither reads it, and it reads neither. Use it only where Ky
+// code signs and Ky code verifies; testdata/vectors.json is the contract for other
+// languages.
 package hybridsig
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/mldsa"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
 )
 
 const (
-	// Alg names the algorithm in every signed statement and on the wire.
+	// Alg is the only algorithm tag.
 	Alg = "mldsa65+ed25519"
-	// SeedBytes is one private key's seed: the ML-DSA-65 seed then the Ed25519 seed.
-	SeedBytes = mldsa.PrivateKeySize + ed25519.SeedSize
-	// MLDSA65PublicKeyBytes and MLDSA65SignatureBytes are ML-DSA-65's sizes (FIPS 204).
-	MLDSA65PublicKeyBytes = 1952
-	MLDSA65SignatureBytes = 3309
+	// SeedBytes is the length of each of the two private key seeds.
+	SeedBytes = 32
+	// PublicKeyBytes is the length of an encoded public key.
+	PublicKeyBytes = len(tag) + mldsa.MLDSA65PublicKeySize + ed25519.PublicKeySize
+	// SignatureBytes is the length of an encoded signature.
+	SignatureBytes = len(tag) + mldsa.MLDSA65SignatureSize + ed25519.SignatureSize
+)
+
+const (
+	tag     = Alg + "\x00"
+	idLabel = "ky/hybridsig/1/key-id\x00"
 )
 
 var (
-	// ErrKey reports a seed or public key of the wrong length or encoding.
-	ErrKey = errors.New("hybridsig: invalid key")
-	// ErrSignature reports a signature that does not verify, in either half.
-	ErrSignature = errors.New("hybridsig: invalid signature")
-	// ErrDomain reports an empty domain or one containing NUL.
-	ErrDomain = errors.New("hybridsig: invalid domain")
+	// ErrAlg reports an encoding whose tag is not Alg.
+	ErrAlg = errors.New("hybridsig: algorithm is not " + Alg)
+	// ErrLength reports a seed, key or signature of the wrong length.
+	ErrLength = errors.New("hybridsig: wrong length")
+	// ErrLabel reports an empty label or one containing 0x00.
+	ErrLabel = errors.New("hybridsig: label must be non-empty and contain no 0x00")
+	// ErrSignature reports a signature that does not verify. Which half failed is not said.
+	ErrSignature = errors.New("hybridsig: signature does not verify")
+	// ErrUninitializedKey reports a nil or zero-value key.
+	ErrUninitializedKey = errors.New("hybridsig: zero-value key; use Generate, FromSeeds or ParsePublicKey")
 )
-
-var opts = &mldsa.Options{Context: ""}
-
-// Digest is SHA-256(domain ‖ 0x00 ‖ msg): what both halves sign.
-func Digest(domain string, msg []byte) ([32]byte, error) {
-	if domain == "" || strings.IndexByte(domain, 0) >= 0 {
-		return [32]byte{}, ErrDomain
-	}
-	h := sha256.New()
-	h.Write([]byte(domain))
-	h.Write([]byte{0})
-	h.Write(msg)
-	var d [32]byte
-	h.Sum(d[:0])
-	return d, nil
-}
-
-// PublicKey is a hybrid public key.
-type PublicKey struct {
-	MLDSA65 []byte
-	Ed25519 []byte
-}
-
-// Signature carries both halves over the same digest.
-type Signature struct {
-	MLDSA65 []byte
-	Ed25519 []byte
-}
-
-// Check reports whether p has the right sizes and a valid ML-DSA-65 encoding.
-func (p PublicKey) Check() error {
-	if len(p.MLDSA65) != MLDSA65PublicKeyBytes || len(p.Ed25519) != ed25519.PublicKeySize {
-		return ErrKey
-	}
-	if _, err := mldsa.NewPublicKey(mldsa.MLDSA65(), p.MLDSA65); err != nil {
-		return ErrKey
-	}
-	return nil
-}
-
-// Verify checks both halves of sig over Digest(domain, msg). Both are always computed;
-// either failing rejects.
-func (p PublicKey) Verify(domain string, msg []byte, sig Signature) error {
-	if len(p.MLDSA65) != MLDSA65PublicKeyBytes || len(p.Ed25519) != ed25519.PublicKeySize {
-		return ErrKey
-	}
-	if len(sig.MLDSA65) != MLDSA65SignatureBytes || len(sig.Ed25519) != ed25519.SignatureSize {
-		return ErrSignature
-	}
-	d, err := Digest(domain, msg)
-	if err != nil {
-		return err
-	}
-	pk, err := mldsa.NewPublicKey(mldsa.MLDSA65(), p.MLDSA65)
-	if err != nil {
-		return ErrKey
-	}
-	errM := mldsa.Verify(pk, d[:], sig.MLDSA65, opts)
-	okE := ed25519.Verify(ed25519.PublicKey(p.Ed25519), d[:], sig.Ed25519)
-	if errM != nil || !okE {
-		return ErrSignature
-	}
-	return nil
-}
 
 // PrivateKey is a hybrid signing key.
 type PrivateKey struct {
 	mldsa *mldsa.PrivateKey
 	ed    ed25519.PrivateKey
+}
+
+// PublicKey is a hybrid verification key.
+type PublicKey struct {
+	mldsa *mldsa.PublicKey
+	ed    ed25519.PublicKey
 }
 
 // Generate makes a fresh key.
@@ -117,40 +93,116 @@ func Generate() (*PrivateKey, error) {
 	return &PrivateKey{mldsa: m, ed: ed}, nil
 }
 
-// FromSeed rebuilds a key from Seed's 64 bytes.
-func FromSeed(seed []byte) (*PrivateKey, error) {
-	if len(seed) != SeedBytes {
-		return nil, ErrKey
+// FromSeeds rebuilds a key from its ML-DSA-65 and Ed25519 seeds, 32 bytes each.
+func FromSeeds(mldsaSeed, edSeed []byte) (*PrivateKey, error) {
+	if len(mldsaSeed) != SeedBytes || len(edSeed) != ed25519.SeedSize {
+		return nil, ErrLength
 	}
-	m, err := mldsa.NewPrivateKey(mldsa.MLDSA65(), seed[:mldsa.PrivateKeySize])
+	m, err := mldsa.NewPrivateKey(mldsa.MLDSA65(), mldsaSeed)
 	if err != nil {
-		return nil, ErrKey
+		return nil, fmt.Errorf("hybridsig: %w", err)
 	}
-	return &PrivateKey{mldsa: m, ed: ed25519.NewKeyFromSeed(seed[mldsa.PrivateKeySize:])}, nil
+	return &PrivateKey{mldsa: m, ed: ed25519.NewKeyFromSeed(edSeed)}, nil
 }
 
-// Seed returns the ML-DSA-65 seed followed by the Ed25519 seed.
-func (k *PrivateKey) Seed() []byte {
-	return append(k.mldsa.Bytes(), k.ed.Seed()...)
+// Seeds returns copies of the two seeds, the only private encoding.
+func (k *PrivateKey) Seeds() (mldsaSeed, edSeed []byte) {
+	return k.mldsa.Bytes(), bytes.Clone(k.ed.Seed())
 }
 
-// Public returns the hybrid public key.
-func (k *PrivateKey) Public() PublicKey {
-	return PublicKey{
-		MLDSA65: k.mldsa.PublicKey().Bytes(),
-		Ed25519: append([]byte(nil), k.ed.Public().(ed25519.PublicKey)...),
-	}
+// Public returns the matching public key.
+func (k *PrivateKey) Public() *PublicKey {
+	return &PublicKey{mldsa: k.mldsa.PublicKey(), ed: bytes.Clone(k.ed.Public().(ed25519.PublicKey))}
 }
 
-// Sign signs Digest(domain, msg) with both halves: hedged ML-DSA-65 and pure Ed25519.
-func (k *PrivateKey) Sign(domain string, msg []byte) (Signature, error) {
-	d, err := Digest(domain, msg)
-	if err != nil {
-		return Signature{}, err
+// digest is D = SHA-256(label ‖ 0x00 ‖ msg). A label with 0x00 in it could move bytes
+// between label and msg, so it is refused.
+func digest(label string, msg []byte) ([]byte, error) {
+	if label == "" || strings.IndexByte(label, 0) >= 0 {
+		return nil, ErrLabel
 	}
-	m, err := k.mldsa.Sign(nil, d[:], opts)
-	if err != nil {
-		return Signature{}, fmt.Errorf("hybridsig: %w", err)
+	h := sha256.New()
+	h.Write([]byte(label))
+	h.Write([]byte{0})
+	h.Write(msg)
+	return h.Sum(nil), nil
+}
+
+// Sign signs msg under label with both halves and returns the encoded signature.
+func (k *PrivateKey) Sign(label string, msg []byte) ([]byte, error) {
+	if k == nil || k.mldsa == nil {
+		return nil, ErrUninitializedKey
 	}
-	return Signature{MLDSA65: m, Ed25519: ed25519.Sign(k.ed, d[:])}, nil
+	d, err := digest(label, msg)
+	if err != nil {
+		return nil, err
+	}
+	m, err := k.mldsa.Sign(nil, d, &mldsa.Options{Context: ""})
+	if err != nil {
+		return nil, fmt.Errorf("hybridsig: %w", err)
+	}
+	out := make([]byte, 0, SignatureBytes)
+	return append(append(append(out, tag...), m...), ed25519.Sign(k.ed, d)...), nil
+}
+
+// ParsePublicKey reads an encoded public key.
+func ParsePublicKey(b []byte) (*PublicKey, error) {
+	if !bytes.HasPrefix(b, []byte(tag)) {
+		return nil, ErrAlg
+	}
+	if len(b) != PublicKeyBytes {
+		return nil, ErrLength
+	}
+	b = b[len(tag):]
+	m, err := mldsa.NewPublicKey(mldsa.MLDSA65(), b[:mldsa.MLDSA65PublicKeySize])
+	if err != nil {
+		return nil, fmt.Errorf("hybridsig: %w", err)
+	}
+	return &PublicKey{mldsa: m, ed: bytes.Clone(b[mldsa.MLDSA65PublicKeySize:])}, nil
+}
+
+// Bytes returns the encoded public key, or nil if p is zero.
+func (p *PublicKey) Bytes() []byte {
+	if p == nil || p.mldsa == nil {
+		return nil
+	}
+	out := make([]byte, 0, PublicKeyBytes)
+	return append(append(append(out, tag...), p.mldsa.Bytes()...), p.ed...)
+}
+
+// ID returns "mldsa65+ed25519:" and the hex key ID, or "" if p is zero.
+func (p *PublicKey) ID() string {
+	b := p.Bytes()
+	if b == nil {
+		return ""
+	}
+	h := sha256.New()
+	h.Write([]byte(idLabel))
+	h.Write(b)
+	return Alg + ":" + hex.EncodeToString(h.Sum(nil))
+}
+
+// Verify checks an encoded signature over msg under label. Both halves are always checked
+// and both must verify.
+func (p *PublicKey) Verify(label string, msg, sig []byte) error {
+	if p == nil || p.mldsa == nil {
+		return ErrUninitializedKey
+	}
+	d, err := digest(label, msg)
+	if err != nil {
+		return err
+	}
+	if !bytes.HasPrefix(sig, []byte(tag)) {
+		return ErrAlg
+	}
+	if len(sig) != SignatureBytes {
+		return ErrSignature
+	}
+	sig = sig[len(tag):]
+	errM := mldsa.Verify(p.mldsa, d, sig[:mldsa.MLDSA65SignatureSize], &mldsa.Options{Context: ""})
+	okE := ed25519.Verify(p.ed, d, sig[mldsa.MLDSA65SignatureSize:])
+	if errM != nil || !okE {
+		return ErrSignature
+	}
+	return nil
 }
