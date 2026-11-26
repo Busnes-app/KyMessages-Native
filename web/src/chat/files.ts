@@ -73,6 +73,7 @@ export function limiter(n: number) {
       });
     }
     try {
+      signal?.throwIfAborted();
       return await task();
     } finally {
       release();
@@ -147,7 +148,7 @@ export function uploadEncryptedFile(
   return uploads(async () => {
     const thumb = await makeThumbnail(file);
     if (thumb && !signal?.aborted) onPreview?.(thumb.blob);
-    const sealed = await encryptBlob(file, 'file');
+    const sealed = await encryptBlob(file, 'file', undefined, signal);
     const desc: FileDescriptor = {
       ...sealed.sealed,
       attachment_id: '',
@@ -155,16 +156,10 @@ export function uploadEncryptedFile(
       mime_type: cleanMime(file.type),
       ...(thumb ? { width: thumb.width, height: thumb.height } : {}),
     };
-    signal?.throwIfAborted(); // removed or left while encrypting: upload nothing
-    try {
-      desc.attachment_id = (await uploadCiphertext(roomId, sealed.ciphertext, signal)).id;
-    } catch (e) {
-      discardUploads([desc]);
-      throw e;
-    }
+    desc.attachment_id = (await uploadCiphertext(roomId, sealed.ciphertext, signal)).id;
     if (!thumb) return desc;
     try {
-      const sealedThumb = await encryptBlob(thumb.blob, 'thumb');
+      const sealedThumb = await encryptBlob(thumb.blob, 'thumb', undefined, signal);
       const att = await uploadCiphertext(roomId, sealedThumb.ciphertext, signal);
       desc.thumb = { ...sealedThumb.sealed, attachment_id: att.id, mime_type: thumb.blob.type, width: thumb.thumbWidth, height: thumb.thumbHeight };
     } catch (e) {
@@ -264,7 +259,9 @@ export async function openSealed(
     const res = await fetch(attachmentUrl(blob.attachment_id), { credentials: 'same-origin', cache: 'no-store', signal: done });
     if (!res.ok) throw new Error(res.status === 404 ? 'This file is no longer available.' : 'Could not download this file.');
     // The deadline and the caller bound decryption too: nothing decrypted is returned after either.
-    const plain = new Blob(await decryptBlob(await readExactly(res, ciphertext_size, progress, done), blob, kind, done), { type });
+    const ciphertext = await readExactly(res, ciphertext_size, progress, done);
+    clearTimeout(timer);
+    const plain = new Blob(await decryptBlob(ciphertext, blob, kind, done), { type });
     if (image) await checkImage(plain, image);
     done.throwIfAborted();
     return plain;

@@ -162,6 +162,9 @@ func TestTenantDirectoryQuotasSerializeReservationsAndCommit(t *testing.T) {
 		t.Fatalf("old reservation bypassed new quota: %v", err)
 	}
 	a.SizeBytes = 2048
+	if err := st.Chat().QueueUploadIntent(ctx, org, a.ID, time.Now().Add(time.Minute).UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
 	if err := st.Chat().CommitAttachmentWithQuota(ctx, reservation.ID, a, limits); err != nil {
 		t.Fatal(err)
 	}

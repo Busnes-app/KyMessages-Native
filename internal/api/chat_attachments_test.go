@@ -1178,6 +1178,126 @@ func TestChatAttachmentBlobRemovalsAreDurable(t *testing.T) {
 	}
 }
 
+type uncertainUploadCommitStore struct {
+	store.Store
+	chat *uncertainUploadCommitChat
+}
+
+func (s uncertainUploadCommitStore) Chat() store.ChatStore { return s.chat }
+
+type uncertainUploadCommitChat struct {
+	store.ChatStore
+	attachmentID string
+}
+
+func (c *uncertainUploadCommitChat) CommitAttachmentWithQuota(ctx context.Context, reservation string, att *store.Attachment, limits store.AttachmentQuotaLimits) error {
+	if err := c.ChatStore.CommitAttachmentWithQuota(ctx, reservation, att, limits); err != nil {
+		return err
+	}
+	c.attachmentID = att.ID
+	return io.ErrUnexpectedEOF
+}
+
+func TestChatUploadUncertainCommitPreservesCommittedBlob(t *testing.T) {
+	srv, st, _ := setupTestServer(t)
+	startChatBus(t, srv)
+	defer srv.CloseChat()
+	_, token := createChatTestUser(t, st, "u_upload", "upload", "user")
+	room := roomOf(t, doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", token, map[string]any{"kind": store.RoomKindChannel, "name": "uploads"}, nil))
+	chat := &uncertainUploadCommitChat{ChatStore: st.Chat()}
+	api.SetStoreForTest(srv, uncertainUploadCommitStore{Store: st, chat: chat})
+
+	ciphertext := []byte("opaque file")
+	rec := doMultipartUpload(t, srv, "/api/v1/rooms/"+room+"/attachments", token, "file", "file.bin", ciphertext)
+	if rec.Code != http.StatusInternalServerError || chat.attachmentID == "" {
+		t.Fatalf("uncertain upload = %d, attachment %q", rec.Code, chat.attachmentID)
+	}
+	if _, err := srv.SweepOrphanAttachments(context.Background(), time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	rec = doBearerJSON(t, srv, http.MethodGet, "/api/v1/attachments/"+chat.attachmentID, token, nil, nil)
+	if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), ciphertext) {
+		t.Fatalf("download after uncertain commit = %d, %q", rec.Code, rec.Body.Bytes())
+	}
+}
+
+type slowAttachmentBlobs struct {
+	blobs.Backend
+	delay time.Duration
+}
+
+func (b slowAttachmentBlobs) Put(tenantID, key string, r io.Reader, maxBytes int64, opts blobs.PutOptions) (blobs.PutResult, error) {
+	time.Sleep(b.delay)
+	return b.Backend.Put(tenantID, key, r, maxBytes, opts)
+}
+
+func (b slowAttachmentBlobs) Open(tenantID, key string, sizeBytes int64) (io.ReadSeekCloser, int64, error) {
+	time.Sleep(b.delay)
+	return b.Backend.Open(tenantID, key, sizeBytes)
+}
+
+func TestChatAttachmentTransfersExtendHTTPWriteDeadline(t *testing.T) {
+	srv, st, _ := setupTestServer(t)
+	startChatBus(t, srv)
+	defer srv.CloseChat()
+	_, token := createChatTestUser(t, st, "u_slow_upload", "slowupload", "user")
+	room := roomOf(t, doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", token, map[string]any{"kind": store.RoomKindChannel, "name": "slow-uploads"}, nil))
+
+	const serverDeadline = 200 * time.Millisecond
+	api.SetBlobsForTest(srv, slowAttachmentBlobs{Backend: api.BlobsForTest(srv), delay: 2 * serverDeadline})
+	server := httptest.NewUnstartedServer(srv)
+	server.Config.WriteTimeout = serverDeadline
+	server.Start()
+	defer server.Close()
+
+	payload := []byte("opaque file")
+	var body bytes.Buffer
+	form := multipart.NewWriter(&body)
+	file, err := form.CreateFormFile("file", "encrypted.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := form.Close(); err != nil {
+		t.Fatal(err)
+	}
+	request := func(method, path string, body io.Reader) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(method, server.URL+path, body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		if body != nil {
+			req.Header.Set("Content-Type", form.FormDataContentType())
+		}
+		res, err := server.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = res.Body.Close() })
+		return res
+	}
+
+	uploaded := request(http.MethodPost, "/api/v1/rooms/"+room+"/attachments?encrypted=1", &body)
+	if uploaded.StatusCode != http.StatusCreated {
+		t.Fatalf("slow upload = %d", uploaded.StatusCode)
+	}
+	var result struct {
+		Attachment store.Attachment `json:"attachment"`
+	}
+	if err := json.NewDecoder(uploaded.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	downloaded := request(http.MethodGet, "/api/v1/attachments/"+result.Attachment.ID, nil)
+	data, err := io.ReadAll(downloaded.Body)
+	if err != nil || downloaded.StatusCode != http.StatusOK || !bytes.Equal(data, payload) {
+		t.Fatalf("slow download = %d, %q, %v", downloaded.StatusCode, data, err)
+	}
+}
+
 // A body that overflows while the handler looks for another part is reported as too large, not
 // as an extra part.
 func TestChatEncryptedUploadOverflowIsTooLarge(t *testing.T) {

@@ -711,8 +711,10 @@ describe('Native Chat page', () => {
     expect(uploads.every((u) => u.url.endsWith('?encrypted=1') && u.name === 'encrypted.bin')).toBe(true);
   });
 
-  it('fetches again exactly the row an edit too large for the bus names, even seq 1, retrying a failure', async () => {
+  it.each([false, true])('refetches a slim edit of seq 1 when its history is still in flight: %s', async (early) => {
     const fetched: string[] = [];
+    let releaseHistory = () => {};
+    const history = new Promise<void>((resolve) => { releaseHistory = resolve; });
     const row = (body: string, edited?: number) => ({ id: 'm_old', room_id: 'rm_gen', seq: 1, sender_id: 'bot_1', sender_name: 'Bot', encoding: 'plain_v1', body, created_at: 1, reactions: [], attachments: [], ...(edited ? { edited_at: edited } : {}) });
     vi.stubGlobal(
       'fetch',
@@ -731,19 +733,22 @@ describe('Native Chat page', () => {
           return fetched.length === 1 ? json({ error: 'busy' }, 503) : json({ message: row('caption, edited', 50) });
         }
         if (url.startsWith('/api/v1/rooms/rm_gen/messages')) {
+          if (early) await history;
           return json({ messages: [row('first caption')], has_more: false });
         }
         return json({ error: 'not found' }, 404);
       }),
     );
     render(<Chat />);
-    await screen.findByText('first caption');
+    if (early) await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    else await screen.findByText('first caption');
     act(() => FakeWebSocket.instances[0].emit({ t: 'message.edit', room: 'rm_gen', seq: 1, d: { refetch: true, id: 'm_old' } }));
+    releaseHistory();
     expect(await screen.findByText('caption, edited', {}, { timeout: 3000 })).toBeTruthy();
     expect(fetched).toEqual(['/api/v1/rooms/rm_gen/messages/m_old', '/api/v1/rooms/rm_gen/messages/m_old']);
   });
 
-  it('does not take a send as confirmed by an answer that does not seal its key', async () => {
+  it.each(['ref', 'sender', 'room'])('rejects send confirmation with a different %s', async (mismatch) => {
     vi.stubGlobal(
       'fetch',
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -756,9 +761,11 @@ describe('Native Chat page', () => {
           });
         }
         if (url === '/api/v1/rooms/rm_gen/messages' && init?.method === 'POST') {
-          // Some other message of Alice's, not the one just sent.
-          return json({ message: { id: 'm_other', room_id: 'rm_gen', seq: 7, sender_id: 'u_alice', sender_name: 'Alice', encoding: 'e2ee_room_v1', created_at: 1, reactions: [], attachments: [],
-            body: fakeEnvelope({ room_id: 'rm_gen', type: 'text', body: 'an older message', ref: 'not-this-send', files: [] }) } }, 201);
+          const ref = mismatch === 'ref' ? 'not-this-send' : new Headers(init.headers).get('Idempotency-Key') ?? '';
+          const room_id = mismatch === 'room' ? 'rm_other' : 'rm_gen';
+          const sender_id = mismatch === 'sender' ? 'u_other' : 'u_alice';
+          return json({ message: { id: 'm_other', room_id, seq: 7, sender_id, sender_name: 'Other', encoding: 'e2ee_room_v1', created_at: 1, reactions: [], attachments: [],
+            body: fakeEnvelope({ room_id, type: 'text', body: 'an unrelated message', ref, files: [] }) } }, 201);
         }
         if (url.startsWith('/api/v1/rooms/rm_gen/messages')) return json({ messages: [], has_more: false });
         return json({ error: 'not found' }, 404);
@@ -768,8 +775,9 @@ describe('Native Chat page', () => {
     await screen.findByRole('heading', { name: 'Welcome to #general' });
     fireEvent.change(screen.getByLabelText('Message input'), { target: { value: 'hello there' } });
     fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
-    expect(await screen.findByText(/The server did not confirm this message/)).toBeTruthy();
+    expect(await screen.findByText(/The server did not confirm this message|Unexpected message/)).toBeTruthy();
     expect(screen.getByText('hello there')).toBeTruthy();
+    expect(screen.queryByText('an unrelated message')).toBeNull();
   });
 
   it('closes an image preview when its message is deleted', async () => {

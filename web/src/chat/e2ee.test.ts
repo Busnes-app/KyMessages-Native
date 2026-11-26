@@ -1,7 +1,7 @@
 import 'fake-indexeddb/auto';
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { abandonDevice, forgetCryptoStore, keyGeneration, NOT_YET, onRoomKeys, openMessage, replaceDevice, RETIRE_MS, retireDevice, retryable, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
+import { abandonDevice, forgetCryptoStore, keyGeneration, keysArrivedFor, NOT_YET, onRoomKeys, openMessage, replaceDevice, RETIRE_MS, retireDevice, retryable, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
 import { openCryptoStore } from '../crypto/store';
 import { parseMessage } from './types';
 
@@ -48,7 +48,11 @@ describe('the signed-in device', () => {
       return json({ error: `unexpected ${url}` }, 404);
     }));
 
+    const beforeStartup = keyGeneration();
+    expect(keysArrivedFor(undefined, beforeStartup)).toBe(false);
     const first = await startE2EE('u_alice');
+    expect(keysArrivedFor(undefined, beforeStartup)).toBe(true);
+    expect(keysArrivedFor(undefined, keyGeneration())).toBe(false);
     // Registered once, self-signed, then stocked with 50 one-time keys.
     expect(uploads[0].device_keys).toBeTruthy();
     expect(uploads.reduce((n, u) => n + u.one_time_keys.length, 0)).toBe(50);

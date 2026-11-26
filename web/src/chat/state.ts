@@ -26,8 +26,9 @@ export function tombstone(m: ChatMessage, at: number): ChatMessage {
 }
 
 const settle = (m: ChatMessage): ChatMessage => {
+  if (m.deleted_at !== undefined) rememberDeleted(m.id, m.deleted_at);
   const at = deleted.get(m.id);
-  return at !== undefined && !m.deleted_at ? tombstone(m, at) : m;
+  return at === undefined ? m : tombstone(m, at);
 };
 
 /** What the on-device search index holds of a message: a change means it is indexed again. */
@@ -53,10 +54,25 @@ function keep(held: ChatMessage, incoming: ChatMessage): ChatMessage {
  * same sender that seals that send's idempotency key as its `ref`. A reply without it resolves nothing.
  */
 export function resolvePending(list: ChatMessage[]): ChatMessage[] {
-  const confirmed = new Set(list.flatMap((m) => (m.delivery.kind === 'synced' && m.ref ? [`${m.sender_id}\u0000${m.ref}`] : [])));
+  const confirmed = new Set(list.flatMap((m) => {
+    const key = confirmedSendKey(m);
+    return key === undefined ? [] : [key];
+  }));
   if (confirmed.size === 0) return list;
-  const next = list.filter((m) => m.delivery.kind === 'synced' || !confirmed.has(`${m.sender_id}\u0000${m.delivery.idempotencyKey}`));
+  const next = list.filter((m) => {
+    const key = pendingSendKey(m);
+    return key === undefined || !confirmed.has(key);
+  });
   return next.length === list.length ? list : next;
+}
+
+const sendKey = (m: ChatMessage, ref: string) => `${m.room_id}\u0000${m.sender_id}\u0000${ref}`;
+const confirmedSendKey = (m: ChatMessage) => m.delivery.kind === 'synced' && m.ref ? sendKey(m, m.ref) : undefined;
+const pendingSendKey = (m: ChatMessage) => m.delivery.kind !== 'synced' ? sendKey(m, m.delivery.idempotencyKey) : undefined;
+
+export function confirmsSend(pending: ChatMessage, incoming: ChatMessage): boolean {
+  const key = pendingSendKey(pending);
+  return key !== undefined && key === confirmedSendKey(incoming);
 }
 
 /** Insert or replace a message, keeping deletions and newer edits, and confirming its send. */

@@ -1515,17 +1515,18 @@ func (c *chatStore) CommitAttachmentWithQuota(ctx context.Context, reservationID
 		}
 	}
 
-	// The upload's intent goes with its commit; one a sweep already leased means the upload came
-	// too late, its blob being erased, so it commits nothing.
-	var claimed int
-	if err := tx.QueryRowContext(ctx, c.store.rebind(`SELECT COUNT(*) FROM pending_blob_deletes WHERE tenant_id = ? AND blob_key = ? AND user_id = ?`), a.TenantID, a.BlobKey, blobDeleteClaimed).Scan(&claimed); err != nil {
+	// Consuming the unclaimed intent fences the attachment insert against a sweep
+	// that has claimed or already erased this blob.
+	intent, err := tx.ExecContext(ctx, c.store.rebind(`DELETE FROM pending_blob_deletes WHERE tenant_id = ? AND blob_key = ? AND user_id = ''`), a.TenantID, a.BlobKey)
+	if err != nil {
 		return err
 	}
-	if claimed > 0 {
+	n, err := intent.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
 		return ErrAttachmentInvalid
-	}
-	if _, err := tx.ExecContext(ctx, c.store.rebind(`DELETE FROM pending_blob_deletes WHERE tenant_id = ? AND blob_key = ? AND user_id = ''`), a.TenantID, a.BlobKey); err != nil {
-		return err
 	}
 	insQ := c.store.rebind(`
 		INSERT INTO attachments (id, tenant_id, room_id, message_id, uploader_id, blob_key, filename, mime_type, size_bytes, sha256_hex, created_at, version_id)

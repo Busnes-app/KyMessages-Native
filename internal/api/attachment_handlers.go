@@ -29,6 +29,8 @@ const (
 	// multipartEnvelopeOverhead leaves headroom for multipart boundaries and headers
 	// without allowing arbitrary request inflation beyond MaxUploadBytes.
 	multipartEnvelopeOverhead = 64 << 10
+	// The object store can spend two minutes publishing the blob after the body is read.
+	attachmentCommitGrace = 3 * time.Minute
 )
 
 // attachmentUploadDeadline is a minute plus the upload limit at 128 KiB/s (about 1 Mbit/s),
@@ -151,7 +153,12 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Extend read deadline for larger uploads on real connections; ignored on httptest recorders.
-	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(attachmentUploadDeadline(maxBytes)))
+	uploadBudget := attachmentUploadDeadline(maxBytes)
+	responseBudget := uploadBudget + attachmentCommitGrace
+	now := time.Now()
+	controller := http.NewResponseController(w)
+	_ = controller.SetReadDeadline(now.Add(uploadBudget))
+	_ = controller.SetWriteDeadline(now.Add(responseBudget))
 	r.Body = http.MaxBytesReader(w, r.Body, maxBytes+multipartEnvelopeOverhead)
 
 	mr, err := r.MultipartReader()
@@ -198,7 +205,7 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 		requestedBytes = r.ContentLength
 	}
 	reserve := func() (*store.AttachmentQuotaReservation, error) {
-		return s.store.Chat().ReserveAttachmentQuota(r.Context(), tenantID, user.ID, requestedBytes, limits, attachmentUploadDeadline(maxBytes)+time.Minute)
+		return s.store.Chat().ReserveAttachmentQuota(r.Context(), tenantID, user.ID, requestedBytes, limits, responseBudget)
 	}
 	res, err := reserve()
 	// No usable grant, or less of it than this upload may need: report the org once and look
@@ -261,7 +268,7 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 	}
 	// Durable before any byte is written: if this request dies between the blob and its row, the
 	// sweep erases the blob once the upload's deadline has passed (its commit removes the intent).
-	intentDue := time.Now().Add(attachmentUploadDeadline(maxBytes) + time.Minute).UnixMilli()
+	intentDue := time.Now().Add(responseBudget).UnixMilli()
 	if err := s.store.Chat().QueueUploadIntent(r.Context(), tenantID, attID, intentDue); err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to store uploaded file")
 		return
@@ -298,7 +305,8 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 		VersionID:  putRes.VersionID,
 	}
 	if err := s.store.Chat().CommitAttachmentWithQuota(r.Context(), res.ID, att, limits); err != nil {
-		s.abandonUpload(r.Context(), tenantID, putRes.Key)
+		// A connection failure can leave the commit outcome unknown. The queue owns
+		// cleanup until the transaction consumes the intent and inserts the attachment.
 		if s.writePoolError(w, err) {
 			return
 		}
@@ -432,6 +440,9 @@ func (s *Server) handleChatDownloadAttachment(w http.ResponseWriter, r *http.Req
 		}
 	}
 
+	// Give an authorized transfer a bounded budget for opening and streaming the file.
+	streamBudget := 30*time.Second + time.Duration(att.SizeBytes/(64<<10))*time.Second
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(streamBudget))
 	f, _, err := s.blobs.Open(att.TenantID, att.BlobKey, att.SizeBytes)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) || errors.Is(err, blobs.ErrInvalidKey) {

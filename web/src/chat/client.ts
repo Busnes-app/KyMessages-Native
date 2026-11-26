@@ -37,6 +37,12 @@ import {
   type WsStatus,
 } from './types';
 
+export class ChatRequestError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
+}
+
 async function apiJSON(input: string, init: RequestInit = {}, fallback = 'Request failed'): Promise<unknown> {
   const headers = new Headers(init.headers);
   if (init.body && !headers.has('Content-Type')) {
@@ -44,7 +50,7 @@ async function apiJSON(input: string, init: RequestInit = {}, fallback = 'Reques
   }
   const res = await secureFetch(input, { credentials: 'same-origin', ...init, headers });
   if (!res.ok) {
-    throw new Error(await errorMessage(res, fallback));
+    throw new ChatRequestError(res.status, await errorMessage(res, fallback));
   }
   return res.json();
 }
@@ -202,9 +208,9 @@ export async function fetchMessages(
 }
 
 /** One message, read from the primary: the exact row a slim edit frame names. */
-export async function fetchMessage(roomId: string, messageId: string): Promise<ChatMessage> {
+export async function fetchMessage(roomId: string, messageId: string, signal?: AbortSignal): Promise<ChatMessage> {
   const data = obj(
-    await apiJSON(`/api/v1/rooms/${encodeURIComponent(roomId)}/messages/${encodeURIComponent(messageId)}`, {}, 'Could not load message'),
+    await apiJSON(`/api/v1/rooms/${encodeURIComponent(roomId)}/messages/${encodeURIComponent(messageId)}`, { signal }, 'Could not load message'),
   );
   const m = parseMessage(data.message);
   if (m.id !== messageId || m.room_id !== roomId) throw new Error('Unexpected message');
@@ -266,7 +272,9 @@ export async function sendMessage(params: {
       'Could not send message',
     ),
   );
-  return openMessage(parseMessage(data.message));
+  const m = parseMessage(data.message);
+  if (m.room_id !== params.roomId) throw new Error('Unexpected message');
+  return openMessage(m);
 }
 
 export async function editMessage(params: {
@@ -292,7 +300,9 @@ export async function editMessage(params: {
       'Could not edit message',
     ),
   );
-  return openMessage(parseMessage(data.message));
+  const m = parseMessage(data.message);
+  if (m.room_id !== roomId || m.id !== messageId) throw new Error('Unexpected message');
+  return openMessage(m);
 }
 
 /**

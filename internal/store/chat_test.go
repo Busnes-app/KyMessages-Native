@@ -430,7 +430,13 @@ func TestAttachmentQuotaAtomicConcurrencyAndReservationRelease(t *testing.T) {
 			go func(idx int) {
 				defer wg.Done()
 				<-start
+				id := fmt.Sprintf("att_pending_%d", idx)
+				if err := chat.QueueUploadIntent(ctx, "", id, time.Now().Add(time.Minute).UnixMilli()); err != nil {
+					errs <- err
+					return
+				}
 				att := &store.Attachment{
+					ID:         id,
 					RoomID:     room.ID,
 					UploaderID: "u_alice",
 					Filename:   fmt.Sprintf("p-%d.bin", idx),
@@ -492,7 +498,13 @@ func TestAttachmentQuotaAtomicConcurrencyAndReservationRelease(t *testing.T) {
 						_ = chat.ReleaseAttachmentQuota(ctx, store.DefaultTenantID, res.ID)
 						return
 					}
+					id := fmt.Sprintf("att_%s_%d", uploader, idx)
+					if err := chat.QueueUploadIntent(ctx, "", id, time.Now().Add(time.Minute).UnixMilli()); err != nil {
+						errs <- err
+						return
+					}
 					att := &store.Attachment{
+						ID:         id,
 						RoomID:     room.ID,
 						UploaderID: uploader,
 						Filename:   fmt.Sprintf("t-%s-%d.bin", uploader, idx),
@@ -664,7 +676,17 @@ func TestChatStoreUploadIntentsAndQueuedRemovals(t *testing.T) {
 		t.Fatalf("late commit = %v, want ErrAttachmentInvalid", err)
 	}
 
+	if err := chat.ClearPendingBlobDeletes(ctx, []store.BlobRef{{TenantID: store.DefaultTenantID, Key: "att_intent_late"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := chat.CommitAttachmentWithQuota(ctx, "", att("att_intent_late"), store.AttachmentQuotaLimits{}); !errors.Is(err, store.ErrAttachmentInvalid) {
+		t.Fatalf("commit after completed cleanup = %v, want ErrAttachmentInvalid", err)
+	}
+
 	// A staged removal is queued with the row, due at once.
+	if err := chat.QueueUploadIntent(ctx, "", "att_staged", future); err != nil {
+		t.Fatal(err)
+	}
 	if err := chat.CommitAttachmentWithQuota(ctx, "", att("att_staged"), store.AttachmentQuotaLimits{}); err != nil {
 		t.Fatal(err)
 	}

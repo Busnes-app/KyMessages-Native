@@ -116,7 +116,9 @@ export async function encryptBlob(
   data: Blob,
   kind: BlobKind,
   chunkSize = CHUNK_SIZE,
+  signal?: AbortSignal,
 ): Promise<{ ciphertext: Uint8Array<ArrayBuffer>; sealed: Omit<SealedBlob, 'attachment_id'> }> {
+  signal?.throwIfAborted();
   if (!Number.isInteger(chunkSize) || chunkSize < MIN_CHUNK || chunkSize > MAX_CHUNK) throw new Error('Invalid chunk size');
   const raw = crypto.getRandomValues(new Uint8Array(32));
   const prefix = crypto.getRandomValues(new Uint8Array(7));
@@ -124,11 +126,15 @@ export async function encryptBlob(
   const n = chunkCount(data.size, chunkSize);
   const ciphertext = new Uint8Array(ciphertextSize(data.size, chunkSize));
   for (let i = 0, off = 0; i < n; i++) {
+    signal?.throwIfAborted();
     const plain = new Uint8Array(await data.slice(i * chunkSize, (i + 1) * chunkSize).arrayBuffer());
     const ct = new Uint8Array(await crypto.subtle.encrypt(chunkParams(prefix, kind, i, i === n - 1), key, plain));
     ciphertext.set(ct, off);
     off += ct.length;
   }
+  signal?.throwIfAborted();
+  const sha256 = await sha256Hex(ciphertext);
+  signal?.throwIfAborted();
   return {
     ciphertext,
     sealed: {
@@ -137,7 +143,7 @@ export async function encryptBlob(
       key: b64(raw),
       nonce_prefix: b64(prefix),
       chunk_size: chunkSize,
-      sha256: await sha256Hex(ciphertext),
+      sha256,
       ciphertext_size: ciphertext.length,
       size: data.size,
     },
@@ -282,7 +288,8 @@ function parseProvenance(v: unknown): Provenance | { kind: 'legacy'; rows?: unde
   if (v.kind === 'legacy') {
     if (v.rows === undefined) return { kind: 'legacy' };
     const rows = v.rows;
-    return Array.isArray(rows) && rows.length <= MAX_FILES && rows.every((r): r is string => typeof r === 'string' && ID_RE.test(r))
+    return Array.isArray(rows) && rows.length <= MAX_FILES && new Set(rows).size === rows.length
+      && rows.every((r): r is string => typeof r === 'string' && ID_RE.test(r))
       ? { kind: 'legacy', rows }
       : undefined;
   }
@@ -359,8 +366,10 @@ export function messageFiles(
     // From before E5: its rows are the server's word alone (docs §5). Only an envelope that says it
     // carried attachments lets a first edit name those rows; a text message's edit names none.
     if (inner.files === undefined) {
-      const rows = inner.type === 'attachment' ? attached.map((a) => a.id).slice(0, MAX_FILES) : [];
-      return { provenance: { kind: 'legacy', rows } };
+      // Before E5, a reply's envelope did not say whether it carried files.
+      if (inner.type === 'reply' && attached.length > 0) return {};
+      const rows = inner.type === 'attachment' ? attached.map((a) => a.id) : [];
+      return rows.length > MAX_FILES ? {} : { provenance: { kind: 'legacy', rows } };
     }
     if (typeof inner.ref !== 'string' || !REF_RE.test(inner.ref)) return undefined;
     const files = openFiles(inner.files, attached);

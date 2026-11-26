@@ -299,6 +299,8 @@ describe('descriptors', () => {
       // only when the envelope itself says it carried attachments.
       expect(messageFiles({ type: 'attachment' }, undefined, at('att_old'), 0)).toEqual({ provenance: { kind: 'legacy', rows: ['att_old'] } });
       expect(messageFiles({ type: 'text' }, undefined, at('att_old'), 0)).toEqual({ provenance: { kind: 'legacy', rows: [] } });
+      // A pre-E5 reply could have files without naming them in its inner envelope.
+      expect(messageFiles({ type: 'reply' }, undefined, at('att_old'), 0)).toEqual({});
       // An E5 message without its ID, or with bad descriptors, is damaged.
       expect(messageFiles({ type: 'text', files: [] }, undefined, at(), 0)).toBeUndefined();
       expect(messageFiles({ type: 'text', ref: REF, files: [{ bogus: 1 }] }, undefined, at(), 0)).toBeUndefined();
@@ -335,6 +337,7 @@ describe('descriptors', () => {
       expect(messageFiles(legacyEdit, undefined, at('att_old', 'att_injected'), 0)).toEqual({ provenance: { kind: 'legacy', rows: ['att_old'] }, plainIds: ['att_old'] });
       expect(needsOriginal(legacyEdit)).toBe(false);
       expect(messageFiles(edit({ kind: 'legacy', rows: ['../x'] }), undefined, at(), 0)).toBeUndefined();
+      expect(messageFiles(edit({ kind: 'legacy', rows: ['att_old', 'att_old'] }), undefined, at(), 0)).toBeUndefined();
     });
 
     it('never need an original for a legacy, file-less or older edit, so none is opened', () => {

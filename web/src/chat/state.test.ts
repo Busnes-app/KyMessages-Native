@@ -196,6 +196,17 @@ describe('encrypted files', () => {
 });
 
 describe('deletions and confirmations', () => {
+  it('remembers fetched tombstones after a noncontiguous history replacement', () => {
+    const stale = makeMsg({ id: 'm_fetched', body: 'deleted caption' });
+    try {
+      const fetched = mergeMessageBatch([], [{ ...stale, deleted_at: 20 }]);
+      expect(fetched[0].body).toBe('');
+      const replacement = mergeMessageBatch([], [makeMsg({ id: 'm_other' })]);
+      expect(mergeMessageBatch(replacement, [stale]).find((m) => m.id === stale.id)).toMatchObject({ deleted_at: 20, body: '' });
+    } finally {
+      forgetDeleted();
+    }
+  });
   const base = { id: 'm1', tenant_id: 't', room_id: 'r', seq: 1, sender_id: 'u', sender_name: 'U', encoding: 'e2ee_room_v1' as const, body: 'hello', created_at: 1, reactions: [], attachments: [], delivery: { kind: 'synced' as const }, e2ee: { kind: 'decrypted' as const } };
 
   it('keeps a deletion that arrived before the message, through pages and responses', () => {
@@ -215,6 +226,7 @@ describe('deletions and confirmations', () => {
     // No ref (an unopened or untrusted answer), another sender, another ref: nothing resolved.
     expect(resolvePending([pending, { ...base }])).toHaveLength(2);
     expect(resolvePending([pending, { ...base, ref: 'k', sender_id: 'mallory' }])).toHaveLength(2);
+    expect(resolvePending([pending, { ...base, ref: 'k', room_id: 'other' }])).toHaveLength(2);
     expect(resolvePending([pending, { ...base, ref: 'other' }])).toHaveLength(2);
     expect(resolvePending([pending, { ...base, ref: 'k' }]).map((m) => m.id)).toEqual(['m1']);
     // The same rule on a page of history.

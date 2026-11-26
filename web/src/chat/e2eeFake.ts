@@ -24,7 +24,7 @@ let keyGen = 0;
 export const keyGeneration = () => keyGen;
 
 const sessionGen = new Map<string, number>();
-export const keysArrivedFor = (session: string | undefined, since: number) => session === undefined || (sessionGen.get(session) ?? 0) > since;
+export const keysArrivedFor = (session: string | undefined, since: number) => (session === undefined ? keyGen : sessionGen.get(session) ?? 0) > since;
 
 export function deliverKey(session: string): void {
   keys.add(session);

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/Busnes-app/ky_server_base/internal/store"
 )
@@ -29,6 +30,9 @@ func TestCommitRefusesAnInactiveUploader(t *testing.T) {
 	}
 	limits := store.AttachmentQuotaLimits{ActiveUploader: true}
 	commit := func(id string) error {
+		if err := st.Chat().QueueUploadIntent(ctx, org, id, time.Now().Add(time.Minute).UnixMilli()); err != nil {
+			return err
+		}
 		return st.Chat().CommitAttachmentWithQuota(ctx, "", &store.Attachment{ID: id, TenantID: org, RoomID: room.ID, UploaderID: "u_up", Filename: "f", MimeType: "text/plain", SizeBytes: 1, SHA256Hex: "h"}, limits)
 	}
 	if err := commit("att_live_0001"); err != nil {

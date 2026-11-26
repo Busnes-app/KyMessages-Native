@@ -25,6 +25,7 @@ import {
 import '../styles/chat.css';
 import type { SessionUser } from '../dto';
 import {
+  ChatRequestError,
   ChatSocket,
   createChannel,
   createInstantMeeting,
@@ -54,6 +55,7 @@ import { ciphertextSize, sealedIds, type FileDescriptor } from '../crypto/attach
 import { Lightbox, SealedLightbox, previewable } from '../components/chat/Attachments';
 import {
   applyReactionDelta,
+  confirmsSend,
   formatDayDivider,
   isGroupedWithPrevious,
   mergeMessageBatch,
@@ -222,6 +224,13 @@ export const Chat: React.FC<ChatProps> = ({
   const activeRoomIdRef = useRef<string | null>(null);
   const currentUserRef = useRef<ChatCurrentUser | null>(null);
   const bucketsRef = useRef<Record<string, RoomMessageBucket>>({});
+  const pendingEdits = useRef(new Map<string, string>());
+  const editReads = useRef<AbortController | undefined>(undefined);
+  useEffect(() => {
+    const ctrl = new AbortController();
+    editReads.current = ctrl;
+    return () => ctrl.abort();
+  }, []);
   const roomsRef = useRef<ChatRoomSummary[]>([]);
   const drawerOpenRef = useRef(false);
   const highlightTimerRef = useRef<number | null>(null);
@@ -667,9 +676,8 @@ export const Chat: React.FC<ChatProps> = ({
     [scrollToBottom, syncReadCursor],
   );
 
-  // An edit too large for the bus names its row: fetch exactly that row again and replace the
-  // copy held here (catching up by sequence would never see an older row change). A row not held
-  // here only loses its stale search entry.
+  // Read slim edits from the primary. Keep the invalidation until an in-flight history page
+  // installs the affected row, without inserting rows outside the visible history slice.
   const refetchRow = useCallback(
     async (roomId: string, id?: string) => {
       if (!id) {
@@ -678,25 +686,43 @@ export const Chat: React.FC<ChatProps> = ({
       }
       if (!bucketsRef.current[roomId]?.messages.some((m) => m.id === id)) {
         forgetIndexed(id);
+        const pending = pendingEdits.current;
+        pending.delete(id);
+        pending.set(id, roomId);
+        if (pending.size > 1000) {
+          const oldest = pending.keys().next().value;
+          if (oldest !== undefined) pending.delete(oldest);
+        }
         return;
       }
-      // A failed read is tried again a few times; a room switch or reload fetches it anyway.
-      for (let attempt = 0; attempt < 3; attempt++) {
+      const signal = editReads.current?.signal;
+      for (let attempt = 0; attempt < 3 && !signal?.aborted; attempt++) {
         try {
-          const row = await fetchMessage(roomId, id);
+          const deadline = AbortSignal.timeout(8_000);
+          const row = await fetchMessage(roomId, id, signal ? AbortSignal.any([signal, deadline]) : deadline);
+          if (signal?.aborted) return;
           setBuckets((prev) => {
             const current = prev[roomId];
             if (!current?.messages.some((m) => m.id === id)) return prev;
             return { ...prev, [roomId]: { ...current, messages: upsertMessage(current.messages, row) } };
           });
           return;
-        } catch {
-          await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
+        } catch (e) {
+          if (signal?.aborted || (e instanceof ChatRequestError && (e.status === 403 || e.status === 404))) return;
+          if (attempt < 2) await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
         }
       }
     },
     [catchUpRoom, forgetIndexed],
   );
+  useEffect(() => {
+    for (const [id, roomId] of pendingEdits.current) {
+      if (buckets[roomId]?.messages.some((m) => m.id === id)) {
+        pendingEdits.current.delete(id);
+        void refetchRow(roomId, id);
+      }
+    }
+  }, [buckets, refetchRow]);
 
   const handleWsEvent = useCallback(
     (event: WsServerEvent) => {
@@ -1466,10 +1492,10 @@ export const Chat: React.FC<ChatProps> = ({
         idempotencyKey: clientKey,
       });
       // Only the message sealing this send's key confirms it; any other answer leaves it failed.
-      const ours = confirmed.ref === clientKey;
+      const ours = confirmsSend(optimistic, confirmed);
       setBuckets((prev) => {
         const current = prev[roomId] ?? { messages: [], hasMore: false, loaded: true };
-        const next = upsertMessage(current.messages, confirmed);
+        const next = ours ? upsertMessage(current.messages, confirmed) : current.messages;
         return {
           ...prev,
           [roomId]: {
@@ -1537,7 +1563,7 @@ export const Chat: React.FC<ChatProps> = ({
           releasePreviewUrl(item.previewUrl);
         }
       }
-      const remaining = current.filter((item) => item.kind === 'uploading');
+      const remaining = current.filter((item) => item.kind === 'uploading' || (item.kind === 'error' && item.attachmentId));
       return { ...prev, [activeRoomId]: remaining };
     });
     setUnreadDividerSeq(null);

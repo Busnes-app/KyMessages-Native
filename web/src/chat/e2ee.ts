@@ -137,7 +137,7 @@ function keysArrived(share: boolean, sessions?: string[]): void {
 }
 /** Whether the key to `session` (any key, when unknown) may have arrived after generation `since`. */
 export function keysArrivedFor(session: string | undefined, since: number): boolean {
-  return session === undefined || unknownGen > since || (sessionGen.get(session) ?? 0) > since;
+  return (session === undefined ? keyGen : Math.max(unknownGen, sessionGen.get(session) ?? 0)) > since;
 }
 const isKeys = (d: unknown): d is { sessions: string[] } =>
   typeof d === 'object' && d !== null && 'type' in d && d.type === 'keys' && 'sessions' in d
