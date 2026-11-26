@@ -1,11 +1,11 @@
 // The signed-in user's encrypted-room device (crypto/engine.ts) wired to the real key server, and
 // the message-level helpers the chat client uses: messages are sealed before they are posted and
 // opened as they arrive, so the rest of the app only ever sees decrypted text in `body`.
-import { errorMessage, secureFetch } from '../api';
+import { adminFetch, errorMessage } from '../api';
 import { arr, bool, obj, str } from '../dto';
 import { keepStorage } from '../persist';
 import { Conflict, CryptoEngine, DeviceChanged, type ClaimedKey, type DeviceKeys, type KeyServer, type Mail, type RoomInner } from '../crypto/engine';
-import type { BackupEntry, IdentityChange, IdentityStatus, MasterKeyRecord, OwnMaster, PairingJoin, PairingOffer } from '../crypto/identity';
+import type { BackupEntry, DeviceList, IdentityChange, IdentityStatus, MasterKeyRecord, OwnMaster, PairingJoin, PairingOffer } from '../crypto/identity';
 import { loadCrypto } from '../crypto/index';
 import { loadPQC, type Hybrid } from '../pqc/index';
 import { type CryptoStore, deleteCryptoStores, openCryptoStore, storedDevices } from '../crypto/store';
@@ -17,8 +17,10 @@ export class KeyServerError extends Error {
   }
 }
 
+// Through adminFetch: a step-up refusal (identity setup, reset, backup deletion) opens
+// "Confirm it's you" and retries once the user signed in again in place.
 async function call(path: string, method: string, body?: unknown, signal?: AbortSignal): Promise<unknown> {
-  const res = await secureFetch(path, {
+  const res = await adminFetch(path, {
     method,
     signal,
     credentials: 'same-origin',
@@ -40,10 +42,18 @@ const device = (v: unknown): DeviceKeys => {
   return d;
 };
 
+const deviceList = (v: unknown): DeviceList | undefined => {
+  if (v === undefined || v === null) return undefined;
+  const o = obj(v);
+  if (typeof o.epoch !== 'number') throw new Error('Invalid device list');
+  return { epoch: o.epoch, device_ids: arr(o.device_ids).map((d) => str(d, 64)), signature: hybrid(o.signature) };
+};
+
 const masterRecord = (v: unknown): MasterKeyRecord => {
   const o = obj(v);
   if (typeof o.version !== 'number') throw new Error('Invalid master key');
-  return { version: o.version, master_key: hybrid(o.master_key), self_signature: hybrid(o.self_signature) };
+  const dl = deviceList(o.device_list);
+  return { version: o.version, master_key: hybrid(o.master_key), self_signature: hybrid(o.self_signature), ...(dl ? { device_list: dl } : {}) };
 };
 
 const ownMaster = (v: unknown): OwnMaster => {
@@ -141,13 +151,16 @@ const keyServer = (signal: AbortSignal): KeyServer => ({
   async signDevice(deviceId, version, signature) {
     await call(`/api/v1/keys/devices/${encodeURIComponent(deviceId)}/signature`, 'POST', { version, signature }, signal);
   },
-  async getBackup(version, afterRoom, afterSession) {
-    const q = new URLSearchParams({ version: String(version), after_room: afterRoom, after_session: afterSession });
+  async putDeviceList(version, expectedEpoch, deviceIds, signature) {
+    await call('/api/v1/keys/devices/list', 'PUT', { version, expected_epoch: expectedEpoch, device_ids: deviceIds, signature }, signal);
+  },
+  async getBackup(version, after) {
+    const q = new URLSearchParams({ version: String(version), after_room: after.room_id, after_sender: after.sender_key, after_session: after.session_id });
     const o = obj(await call(`/api/v1/keys/backup?${q}`, 'GET', undefined, signal));
     const sessions = arr(o.sessions).flatMap((v): BackupEntry[] => {
       try {
         const e = obj(v);
-        return [{ room_id: str(e.room_id, 128), session_id: str(e.session_id, 128), first_index: typeof e.first_index === 'number' ? e.first_index : 0, sealed: str(e.sealed, 16384) }];
+        return [{ room_id: str(e.room_id, 128), sender_key: str(e.sender_key, 64), session_id: str(e.session_id, 128), first_index: typeof e.first_index === 'number' ? e.first_index : 0, sealed: str(e.sealed, 16384) }];
       } catch {
         return [];
       }
@@ -159,7 +172,7 @@ const keyServer = (signal: AbortSignal): KeyServer => ({
   },
   async pairingStart(deviceId) {
     const o = obj(await call('/api/v1/keys/pairings', 'POST', { device_id: deviceId }, signal));
-    return { pairing_id: str(o.pairing_id, 64), expires_at: typeof o.expires_at === 'number' ? o.expires_at : Date.now() };
+    return { pairing_id: str(o.pairing_id, 64), expires_in_ms: typeof o.expires_in_ms === 'number' ? o.expires_in_ms : 0 };
   },
   async pairingGet(id) {
     const o = obj(await call(pairingPath(id), 'GET', undefined, signal));
@@ -293,7 +306,7 @@ export function startE2EE(userId: string): Promise<CryptoEngine> {
       e.close();
       live();
     }
-    void retireAbandoned(userId, entry.controller.signal).catch(() => undefined);
+    void retireAbandoned(userId, entry.controller.signal, e).catch(() => undefined);
     e.onKeys(() => keysArrived(true));
     return e;
   })();
@@ -380,7 +393,7 @@ export const identityStatus = (): Promise<IdentityStatus> => identityEngine().th
 
 /** A new identity for this account: show recoveryKey, then commit once the user saved it. */
 export async function prepareIdentity(reset = false): Promise<{ recoveryKey: string; commit(): Promise<void> }> {
-  const p = (await identityEngine()).prepareIdentity(reset);
+  const p = await (await identityEngine()).prepareIdentity(reset);
   return { recoveryKey: p.recoveryKey, commit: async () => { await p.commit(); announceIdentity(); keysArrived(true); } };
 }
 
@@ -400,9 +413,15 @@ export async function joinVerification(text: string): Promise<PairingJoin> {
 
 export const identityChanges = (): Promise<IdentityChange[]> => identityEngine().then((e) => e.identityChanges());
 
-export async function acceptIdentity(userId: string): Promise<void> {
-  await (await identityEngine()).acceptIdentity(userId);
+/** Accepts exactly the change the viewer saw, from previous to fingerprint. */
+export async function acceptIdentity(userId: string, previous: string, fingerprint: string): Promise<void> {
+  await (await identityEngine()).acceptIdentity(userId, previous, fingerprint);
   announceIdentity();
+}
+
+/** Checks a room's members' identities as it opens, so a change shows before anyone sends. */
+export function checkRoomIdentities(roomId: string): void {
+  void withEngine((e) => e.checkRoom(roomId)).catch(() => undefined);
 }
 
 /** Reads the device mailbox: on start, on a `to_device` wake and after a reconnect. */
@@ -455,7 +474,7 @@ export async function openMessage(m: ChatMessage): Promise<ChatMessage> {
     if (r.state === 'waiting') return shut({ kind: 'waiting', gen });
     if (r.state === 'failed') return shut({ kind: 'failed', reason: r.reason });
     // The encrypted reply target is the true one; the server's copy is only a hint.
-    return { ...m, body: r.inner.body, reply_to_id: r.inner.reply_to_id, e2ee: { kind: 'decrypted' } };
+    return { ...m, body: r.inner.body, reply_to_id: r.inner.reply_to_id, e2ee: r.authenticated ? { kind: 'decrypted' } : { kind: 'decrypted', unauthenticated: true } };
   } catch {
     // Not a verdict on the message: the engine's own checks return 'failed' without throwing.
     return shut({ kind: 'failed', reason: NOT_YET, gen });
@@ -467,6 +486,8 @@ export function openMessages(list: ChatMessage[]): Promise<ChatMessage[]> {
 }
 
 export const RETIRE_MS = 5000;
+// The part of RETIRE_MS sign-out spends taking the device off its signed list.
+const DELIST_MS = 2000;
 
 /**
  * Removes this browser's device from the key server, for sign-out: members stop sending it keys
@@ -481,6 +502,9 @@ export function retireDevice() {
     const e = await entry?.engine.catch(() => undefined);
     if (!e) return false;
     try {
+      // Off the signed device list first, so the server cannot bring the device back later;
+      // bounded, so sign-out never waits long on it.
+      await Promise.race([e.delistDevices([e.deviceId]).catch(() => undefined), new Promise((r) => setTimeout(r, DELIST_MS))]);
       await call(`/api/v1/keys/devices/${encodeURIComponent(e.deviceId)}`, 'DELETE', undefined, entry?.controller.signal);
       return true;
     } catch (err) {
@@ -524,7 +548,10 @@ function saveAbandoned(list: Abandoned[]): void {
   }
 }
 
-async function retireAbandoned(userId: string, signal: AbortSignal): Promise<void> {
+async function retireAbandoned(userId: string, signal: AbortSignal, e?: CryptoEngine): Promise<void> {
+  const mine = abandoned().filter((d) => d.user_id === userId).map((d) => d.device_id);
+  // A verified device takes them off the signed device list; an unverified one cannot sign.
+  if (e && mine.length > 0) await e.delistDevices(mine).catch(() => undefined);
   const left: Abandoned[] = [];
   for (const d of abandoned()) {
     if (d.user_id !== userId) {

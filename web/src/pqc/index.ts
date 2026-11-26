@@ -21,34 +21,65 @@ declare global {
 
 let loading: Promise<void> | undefined;
 
-async function start(source: () => Promise<WebAssembly.WebAssemblyInstantiatedSource>): Promise<void> {
+/** How long the Go program may take to register kyPQCCall after it starts. */
+export const PQC_START_MS = 10_000;
+
+type Source = (this: GoRuntime) => Promise<WebAssembly.WebAssemblyInstantiatedSource>;
+
+// Starts the Go program and resolves once it registered kyPQCCall. If the program exits (a
+// crash, or a start that never registers), the call is withdrawn and the next load starts
+// over, so one failure never leaves a dead function behind or a load pending forever.
+async function start(source: Source, runtime: () => GoRuntime, startMs: number): Promise<void> {
   if (globalThis.kyPQCCall) return;
-  const go = new globalThis.Go();
+  const go = runtime();
+  let timer: ReturnType<typeof setTimeout> | undefined;
   const ready = new Promise<void>((resolve) => {
     globalThis.kyPQCReady = resolve;
   });
-  const { instance } = await source.call(go);
-  void go.run(instance);
-  await ready;
+  try {
+    const { instance } = await source.call(go);
+    const exited = go.run(instance).then(
+      () => { throw new Error('The post-quantum module exited'); },
+      (e: unknown) => { throw e instanceof Error ? e : new Error('The post-quantum module crashed'); },
+    );
+    void exited.catch(() => {
+      globalThis.kyPQCCall = undefined;
+      loading = undefined;
+    });
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('The post-quantum module did not start')), startMs);
+    });
+    await Promise.race([ready, exited, timeout]);
+  } catch (e) {
+    globalThis.kyPQCCall = undefined;
+    throw e;
+  } finally {
+    clearTimeout(timer);
+    globalThis.kyPQCReady = undefined;
+  }
 }
 
-// A failed load (offline start, a swapped asset) is retried by the next call.
-export function loadPQC(): Promise<void> {
-  loading ??= start(function (this: GoRuntime) {
-    return WebAssembly.instantiateStreaming(fetch(new URL('./pqc.wasm', import.meta.url)), this.importObject);
-  }).catch((e: unknown) => {
+function load(source: Source, runtime: () => GoRuntime = () => new globalThis.Go(), startMs = PQC_START_MS): Promise<void> {
+  loading ??= start(source, runtime, startMs).catch((e: unknown) => {
     loading = undefined;
     throw e;
   });
   return loading;
 }
 
-// Tests run in Node, where the module is read from disk.
-export function loadPQCFrom(bytes: BufferSource): Promise<void> {
-  loading ??= start(function (this: GoRuntime) {
-    return WebAssembly.instantiate(bytes, this.importObject);
+// A failed load (offline start, a swapped asset, a crashed module) is retried by the next call.
+export function loadPQC(): Promise<void> {
+  return load(function (this: GoRuntime) {
+    return WebAssembly.instantiateStreaming(fetch(new URL('./pqc.wasm', import.meta.url)), this.importObject);
   });
-  return loading;
+}
+
+// Tests run in Node, where the module is read from disk; runtime and startMs let them fake a
+// failing Go.
+export function loadPQCFrom(bytes: BufferSource, runtime?: () => GoRuntime, startMs?: number): Promise<void> {
+  return load(function (this: GoRuntime) {
+    return WebAssembly.instantiate(bytes, this.importObject);
+  }, runtime, startMs);
 }
 
 /** Calls internal/e2eeid.Call by name; throws its error. */
@@ -67,6 +98,14 @@ export const HYBRID_ALG = 'mldsa65+ed25519';
  * ("mldsa65+ed25519" 0x00 ‖ ML-DSA-65 half ‖ Ed25519 half), as ky-primitives hybridsig writes it.
  */
 export type Hybrid = string;
+
+/** What a key backup entry's seal binds: its room, sender key, session and first index. */
+export interface BackupRef {
+  room_id: string;
+  sender_key: string;
+  session_id: string;
+  first_index: number;
+}
 
 export interface MasterKeyPair {
   seed: string;
@@ -93,10 +132,16 @@ export const pqc = {
     pqcCall<boolean>('verifyBackupKey', k, tenant, user, String(version), backupKey, s),
   xwingGenerate: () => pqcCall<{ seed: string; public: string }>('xwingGenerate'),
   xwingPublic: (seed: string) => pqcCall<string>('xwingPublic', seed),
-  backupSeal: (backupKey: string, masterSeed: string, roomId: string, sessionId: string, plaintext: string) =>
-    pqcCall<string>('backupSeal', backupKey, masterSeed, roomId, sessionId, plaintext),
-  backupOpen: (backupSeed: string, masterSeed: string, roomId: string, sessionId: string, sealed: string) =>
-    pqcCall<string>('backupOpen', backupSeed, masterSeed, roomId, sessionId, sealed),
+  backupSeal: (backupKey: string, masterSeed: string, e: BackupRef, plaintext: string) =>
+    pqcCall<string>('backupSeal', backupKey, masterSeed, e.room_id, e.sender_key, e.session_id, String(e.first_index), plaintext),
+  backupOpen: (backupSeed: string, masterSeed: string, e: BackupRef, sealed: string) =>
+    pqcCall<string>('backupOpen', backupSeed, masterSeed, e.room_id, e.sender_key, e.session_id, String(e.first_index), sealed),
+  signDeviceList: (seed: string, tenant: string, user: string, version: number, epoch: number, deviceIds: string[]) =>
+    pqcCall<Hybrid>('signDeviceList', seed, tenant, user, String(version), String(epoch), JSON.stringify(deviceIds)),
+  verifyDeviceList: (k: Hybrid, tenant: string, user: string, version: number, epoch: number, deviceIds: string[], s: Hybrid) =>
+    pqcCall<boolean>('verifyDeviceList', k, tenant, user, String(version), String(epoch), JSON.stringify(deviceIds), s),
+  /** Hex SHA-256 of the length-prefixed fields: a compact cache key. */
+  hash: (...fields: string[]) => pqcCall<string>('hash', ...fields),
   recoveryGenerate: () => pqcCall<{ key: string; text: string }>('recoveryGenerate'),
   recoveryParse: (text: string) => pqcCall<string>('recoveryParse', text),
   recoveryWrap: (key: string, purpose: 'master-key' | 'backup-key', tenant: string, user: string, seed: string) =>

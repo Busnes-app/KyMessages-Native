@@ -1,23 +1,33 @@
 // The user's post-quantum encryption identity on this device (E3 of
-// docs/superpowers/specs/2026-11-22-e2ee-design.md, §3): the hybrid ML-DSA-65 + Ed25519 master
-// key that vouches for the user's devices, TOFU pins of colleagues' master keys (synced between
-// the user's own verified devices), the recovery key, the X-Wing key backup and QR device
-// verification. Every primitive is the Go code in internal/e2eeid, run as WebAssembly (pqc/).
+// docs/superpowers/specs/2026-11-22-e2ee-design.md, §3.1): the hybrid ML-DSA-65 + Ed25519 master
+// key that vouches for the user's devices, the master-signed device list, TOFU pins of
+// colleagues' master keys (synced between the user's own verified devices), the recovery key,
+// the X-Wing key backup and QR device verification. Every primitive is the Go code in
+// internal/e2eeid, run as WebAssembly (pqc/).
 //
 // Nothing the server says is trusted: master keys must carry a valid self-binding and match the
-// pin, devices must carry the pinned master key's signature, recovery wraps and transfers must
-// open to the very key the server publishes, and backup entries must carry the master key's MAC.
+// pin, devices must carry the pinned master key's signature and be on its newest device list,
+// recovery wraps and transfers must open to the very key the server publishes, and backup
+// entries must carry the master key's MAC. A device that is not verified trusts nobody.
+// Nothing the server says can delete this device's copy of the master and backup seeds.
 import { InboundGroupSession } from './index';
-import { b64, pqc, unb64, type Hybrid } from '../pqc/index';
+import { b64, pqc, unb64, type BackupRef, type Hybrid } from '../pqc/index';
 import type { CryptoStore } from './store';
 import { backupQueueKey, Conflict, inboundKey, isObj, isStr, parseJSON, type InboundRecord } from './records';
 
 // --- The key server, as the identity needs it (chat/e2ee.ts implements it over HTTP) ---
 
+export interface DeviceList {
+  epoch: number;
+  device_ids: string[];
+  signature: Hybrid;
+}
+
 export interface MasterKeyRecord {
   version: number;
   master_key: Hybrid;
   self_signature: Hybrid;
+  device_list?: DeviceList;
 }
 
 export interface OwnMaster extends MasterKeyRecord {
@@ -34,11 +44,14 @@ export interface MasterPut {
   recovery: { wrapped_master_key: string; wrapped_backup_key: string };
 }
 
-export interface BackupEntry {
-  room_id: string;
-  session_id: string;
-  first_index: number;
+export interface BackupEntry extends BackupRef {
   sealed: string;
+}
+
+export interface BackupCursor {
+  room_id: string;
+  sender_key: string;
+  session_id: string;
 }
 
 export interface PairingState {
@@ -49,15 +62,16 @@ export interface PairingState {
   sealed: boolean;
 }
 
-/** Writes answer Conflict when the identity, pin set or backup version moved on. */
+/** Writes answer Conflict when the identity, pin set, device list or backup version moved on. */
 export interface IdentityServer {
   getMaster(): Promise<{ tenant_id: string; master: OwnMaster | null }>;
   putMaster(req: MasterPut): Promise<number>;
   putPins(version: number, expectedCounter: number, sealed: string): Promise<void>;
+  putDeviceList(version: number, expectedEpoch: number, deviceIds: string[], signature: Hybrid): Promise<void>;
   signDevice(deviceId: string, version: number, signature: Hybrid): Promise<void>;
-  getBackup(version: number, afterRoom: string, afterSession: string): Promise<{ sessions: BackupEntry[]; more: boolean }>;
+  getBackup(version: number, after: BackupCursor): Promise<{ sessions: BackupEntry[]; more: boolean }>;
   putBackup(version: number, sessions: BackupEntry[]): Promise<void>;
-  pairingStart(deviceId: string): Promise<{ pairing_id: string; expires_at: number }>;
+  pairingStart(deviceId: string): Promise<{ pairing_id: string; expires_in_ms: number }>;
   pairingGet(id: string): Promise<PairingState>;
   pairingJoin(id: string, deviceId: string, ephemeralKey: string): Promise<void>;
   pairingSeal(id: string, deviceId: string, sealed: string): Promise<void>;
@@ -67,11 +81,13 @@ export interface IdentityServer {
 }
 
 export type IdentityStatus =
-  | { state: 'none' }
-  | { state: 'unverified'; fingerprint: string }
-  | { state: 'verified'; fingerprint: string };
+  /** quarantined: this device set aside the seeds of an identity the server no longer lists. */
+  | { state: 'none'; quarantined: boolean }
+  | { state: 'unverified'; fingerprint: string; quarantined: boolean }
+  /** restoring: sessions from the key backup are still being read in. */
+  | { state: 'verified'; fingerprint: string; restoring: boolean };
 
-/** A colleague (or this user) whose master key changed since it was pinned. */
+/** A colleague whose master key changed since it was pinned. */
 export interface IdentityChange {
   user_id: string;
   fingerprint: string;
@@ -81,7 +97,8 @@ export interface IdentityChange {
 export interface PairingOffer {
   /** What the QR code and the copyable code carry. */
   text: string;
-  expiresAt: number;
+  /** Milliseconds the pairing stays open, by the server's clock. */
+  expiresInMs: number;
   /** The comparison code once the new device has joined. */
   poll(): Promise<{ code: string; device: string } | undefined>;
   /** Sends the keys to the device that showed the code poll returned. */
@@ -90,11 +107,17 @@ export interface PairingOffer {
 }
 
 export interface PairingJoin {
-  /** The six digits to compare with the verified device's screen. */
+  /** The six digits to compare with the verified device's screen, before finish. */
   code: string;
   /** Waits for the verified device's approval, then verifies this device; returns restored sessions. */
   finish(signal?: AbortSignal): Promise<number>;
   cancel(): Promise<void>;
+}
+
+/** A colleague's trusted master key and the devices on its newest device list. */
+export interface TrustedMaster {
+  key: Hybrid;
+  devices: ReadonlySet<string>;
 }
 
 // --- Stored records ---
@@ -108,29 +131,54 @@ interface LocalIdentity {
   seeds: { iv: Uint8Array; ct: ArrayBuffer };
 }
 
+/**
+ * A pinned colleague. n counts the pin's changes; an accepted change records the fingerprint it
+ * replaced (prev), so another device adopts it only as a change from exactly its own pin.
+ */
 interface PinRecord {
   fingerprint: string;
-  at: number;
+  n: number;
+  accepted: boolean;
+  prev?: string;
+}
+
+interface RestoreCursor {
+  version: number;
+  after: BackupCursor;
+  count: number;
 }
 
 const IDENTITY = 'identity';
 const SIGNED = 'identity:signed';
+const PINS_HWM = 'pins:hwm';
+const RESTORE = 'backup:restore';
+const previousKey = (fp: string, version: number) => `identity:previous:${fp}:${version}`;
 const pinKey = (userId: string) => `mpin:${userId}`;
 const changeKey = (userId: string) => `mchg:${userId}`;
+const listKey = (userId: string) => `dlh:${userId}`;
 const BACKUP_BATCH = 100;
+const BACKUP_PAGE_MAX = 200;
+const BACKUP_MAX_SESSIONS = 2000;
 const PAIRING_POLL_MS = 1500;
 
 // Signature checks are pure, and every send lists every member's keys again: verify each
-// distinct (statement, signature) once.
+// distinct (statement, signature) once. Keys are SHA-256 of the inputs, not the inputs; a
+// check that threw (the module was not loaded) is not remembered.
 const verified = new Map<string, boolean>();
-function memo(key: string, check: () => boolean): boolean {
+function memo(fields: string[], check: () => boolean): boolean {
+  let key: string;
+  try {
+    key = pqc.hash(...fields);
+  } catch {
+    return false;
+  }
   const hit = verified.get(key);
   if (hit !== undefined) return hit;
-  let ok = false;
+  let ok: boolean;
   try {
     ok = check();
   } catch {
-    ok = false;
+    return false;
   }
   if (verified.size >= 4096) verified.clear();
   verified.set(key, ok);
@@ -144,10 +192,27 @@ export function validMaster(v: unknown): v is MasterKeyRecord {
   return isObj(v) && typeof v.version === 'number' && v.version >= 1 && isHybrid(v.master_key) && isHybrid(v.self_signature);
 }
 
+function validList(v: unknown): v is DeviceList {
+  return isObj(v) && typeof v.epoch === 'number' && v.epoch >= 1 && Array.isArray(v.device_ids) &&
+    v.device_ids.every((d) => isStr(d, 64)) && isHybrid(v.signature);
+}
+
+const validPin = (p: unknown): p is PinRecord =>
+  isObj(p) && isStr(p.fingerprint, 64) && /^[0-9a-f]{64}$/.test(p.fingerprint) && typeof p.n === 'number' && typeof p.accepted === 'boolean' &&
+  (p.prev === undefined || isStr(p.prev, 64));
+
+/** Pin sets compared by content, whatever order their keys arrived in. */
+function canon(pins: Record<string, PinRecord>): string {
+  return JSON.stringify(Object.keys(pins).sort().map((u) => [u, pins[u].fingerprint, pins[u].n, pins[u].accepted, pins[u].prev ?? '']));
+}
+
 /** Groups a 64-hex-digit fingerprint for people to compare. */
 export function formatFingerprint(fp: string): string {
   return fp.toUpperCase().match(/.{1,4}/g)?.join(' ') ?? fp;
 }
+
+const cursorAfter = (a: BackupCursor, b: BackupCursor) =>
+  a.room_id !== b.room_id ? a.room_id > b.room_id : a.sender_key !== b.sender_key ? a.sender_key > b.sender_key : a.session_id > b.session_id;
 
 export interface IdentityContext {
   userId: string;
@@ -165,10 +230,12 @@ export class Identity {
   private readonly listeners = new Set<() => void>();
   private pinsDirty = false;
   private changed = false;
+  private batchSynced = false;
+  private restoring?: Promise<number>;
 
   constructor(private readonly ctx: IdentityContext) {}
 
-  /** Calls fn when a pinned identity changes or a change is accepted. */
+  /** Calls fn when this device's identity, a pinned identity or a pending change changes. */
   onChange(fn: () => void): () => void {
     this.listeners.add(fn);
     return () => this.listeners.delete(fn);
@@ -203,51 +270,97 @@ export class Identity {
     return this.ctx.store.get<LocalIdentity>(IDENTITY);
   }
 
-  /** Whether this device holds the user's master key (it is verified). */
+  /** Whether this device holds the user's current master key (it is verified). */
   async isVerified(): Promise<boolean> {
     return (await this.local()) !== undefined;
+  }
+
+  /**
+   * Sets this device's identity aside, never deleting it: a server answer (a bumped version, a
+   * restore, no identity at all) cannot destroy the user's last copy of the seeds. It comes back
+   * by itself if the server lists that same identity again.
+   */
+  private async quarantine(l: LocalIdentity): Promise<void> {
+    await this.ctx.store.write([[previousKey(l.fingerprint, l.version), l]], [IDENTITY, SIGNED]);
+  }
+
+  private async hasQuarantined(): Promise<boolean> {
+    return (await this.ctx.store.list('identity:previous:')).length > 0;
   }
 
   // --- Trust: what the engine shares room keys with ---
 
   /**
-   * userId's master key from a key query, if it is validly self-bound in tenantId and matches
-   * the pin; undefined otherwise. Pins a first sight (TOFU) and records a mismatch as an
-   * identity change, both into writes. Call with the lock held.
+   * userId's master key from a key query, with the devices on its newest signed device list, if
+   * this device is verified and the key is validly self-bound in tenantId, has no pending change
+   * and matches the pin; undefined otherwise. A first sight is pinned (after the pin set is
+   * synced) and a mismatch is recorded as a change. Pin writes go into writes. Lock held.
    */
-  async trustedMaster(userId: string, rec: unknown, tenantId: string, writes: [string, unknown][]): Promise<Hybrid | undefined> {
+  async trustedMaster(userId: string, rec: unknown, tenantId: string, writes: [string, unknown][]): Promise<TrustedMaster | undefined> {
     const own = await this.local();
-    if (own && own.tenant_id !== tenantId) return undefined; // the server named another org
+    // An unverified device cannot check anyone: it pins nobody and trusts nobody.
+    if (!own || own.tenant_id !== tenantId) return undefined;
     if (!validMaster(rec)) return undefined;
     const k = rec.master_key;
     const s = rec.self_signature;
-    if (!memo(`m|${tenantId}|${userId}|${k}|${s}`, () => pqc.verifyMaster(k, tenantId, userId, s))) return undefined;
+    if (!memo(['master', tenantId, userId, k, s], () => pqc.verifyMaster(k, tenantId, userId, s))) return undefined;
     const fp = pqc.fingerprint(k);
     if (userId === this.ctx.userId) {
       // The user's own key is pinned by verification itself, never by first sight.
-      return own?.fingerprint === fp ? k : undefined;
+      return own.fingerprint === fp && own.version === rec.version ? this.withList(userId, rec, tenantId, writes) : undefined;
     }
-    const pin = await this.ctx.store.get<PinRecord>(pinKey(userId));
+    // A pending change blocks this member until it is accepted, even if the server goes back to
+    // serving the old key.
+    if (await this.ctx.store.get<IdentityChange>(changeKey(userId))) return undefined;
+    let pin = await this.ctx.store.get<PinRecord>(pinKey(userId));
+    if (!pin && !this.batchSynced) {
+      // Another of the user's devices may already have pinned this member: never pin by first
+      // sight what the synced set could have said otherwise.
+      await this.syncPins();
+      this.batchSynced = true;
+      pin = await this.ctx.store.get<PinRecord>(pinKey(userId));
+    }
     if (!pin) {
-      writes.push([pinKey(userId), { fingerprint: fp, at: Date.now() } satisfies PinRecord]);
+      pin = await this.ctx.store.putIfAbsent<PinRecord>(pinKey(userId), { fingerprint: fp, n: 1, accepted: false });
       this.pinsDirty = true;
-      return k;
     }
-    if (pin.fingerprint === fp) return k;
-    const seen = await this.ctx.store.get<IdentityChange>(changeKey(userId));
-    if (seen?.fingerprint !== fp) {
+    if (pin.fingerprint !== fp) {
       writes.push([changeKey(userId), { user_id: userId, fingerprint: fp, previous: pin.fingerprint } satisfies IdentityChange]);
       this.changed = true;
+      return undefined;
     }
-    return undefined;
+    return this.withList(userId, rec, tenantId, writes);
   }
 
-  /** Whether device d of userId carries master's valid cross-signature. */
-  deviceTrusted(master: Hybrid, tenantId: string, userId: string, d: { device_id: string; curve25519: string; ed25519: string; master_signature?: unknown }): boolean {
+  /**
+   * The devices on rec's signed device list. The newest epoch seen per user and identity version
+   * is remembered, so a server serving an older list (one that still names a removed device)
+   * gets no device trusted.
+   */
+  private async withList(userId: string, rec: MasterKeyRecord, tenantId: string, writes: [string, unknown][]): Promise<TrustedMaster> {
+    const none: TrustedMaster = { key: rec.master_key, devices: new Set() };
+    const dl = rec.device_list;
+    if (!validList(dl)) return none;
+    const ids = JSON.stringify(dl.device_ids);
+    if (!memo(['list', tenantId, userId, String(rec.version), String(dl.epoch), ids, rec.master_key, dl.signature],
+      () => pqc.verifyDeviceList(rec.master_key, tenantId, userId, rec.version, dl.epoch, dl.device_ids, dl.signature))) return none;
+    const seen = await this.ctx.store.get<{ version: number; epoch: number }>(listKey(userId));
+    if (seen && seen.version === rec.version && dl.epoch < seen.epoch) return none;
+    if (!seen || seen.version !== rec.version || dl.epoch > seen.epoch) writes.push([listKey(userId), { version: rec.version, epoch: dl.epoch }]);
+    return { key: rec.master_key, devices: new Set(dl.device_ids) };
+  }
+
+  /** Starts one trust check (a send, a room open, a mailbox read): it syncs pins at most once. */
+  startBatch(): void {
+    this.batchSynced = false;
+  }
+
+  /** Whether device d of userId is on master's device list and carries its cross-signature. */
+  deviceTrusted(master: TrustedMaster, tenantId: string, userId: string, d: { device_id: string; curve25519: string; ed25519: string; master_signature?: unknown }): boolean {
     const s = d.master_signature;
-    if (!isHybrid(s)) return false;
-    return memo(`d|${tenantId}|${userId}|${d.device_id}|${d.curve25519}|${d.ed25519}|${master}|${s}`,
-      () => pqc.verifyDevice(master, tenantId, userId, d.device_id, d.curve25519, d.ed25519, s));
+    if (!master.devices.has(d.device_id) || !isHybrid(s)) return false;
+    return memo(['device', tenantId, userId, d.device_id, d.curve25519, d.ed25519, master.key, s],
+      () => pqc.verifyDevice(master.key, tenantId, userId, d.device_id, d.curve25519, d.ed25519, s));
   }
 
   /** After trustedMaster's writes are stored: announce changes, and sync new pins to the
@@ -259,20 +372,27 @@ export class Identity {
     }
     if (!this.pinsDirty) return;
     this.pinsDirty = false;
-    setTimeout(() => void this.ctx.locked(() => this.syncPins(false)).catch(() => undefined), 0);
+    setTimeout(() => void this.ctx.locked(() => this.syncPins()).catch(() => undefined), 0);
   }
 
   changes(): Promise<IdentityChange[]> {
     return this.ctx.store.list<IdentityChange>('mchg:').then((rows) => rows.map(([, v]) => v));
   }
 
-  /** The viewer accepts userId's new identity: it is pinned and room keys flow to it again. */
-  acceptChange(userId: string): Promise<void> {
+  /**
+   * The viewer accepts userId's change from previous to fingerprint, exactly as shown: if the
+   * pending change is anything else (another tab or the server changed it meanwhile) nothing is
+   * accepted. The new pin syncs to the user's other devices.
+   */
+  acceptChange(userId: string, previous: string, fingerprint: string): Promise<void> {
     return this.ctx.locked(async () => {
       const c = await this.ctx.store.get<IdentityChange>(changeKey(userId));
-      if (!c || userId === this.ctx.userId) return;
-      await this.ctx.store.write([[pinKey(userId), { fingerprint: c.fingerprint, at: Date.now() } satisfies PinRecord]], [changeKey(userId)]);
-      await this.syncPins(false).catch(() => undefined);
+      if (!c || c.previous !== previous || c.fingerprint !== fingerprint) {
+        throw new Error('This identity changed again. Check the new fingerprint before accepting.');
+      }
+      const pin = await this.ctx.store.get<PinRecord>(pinKey(userId));
+      await this.ctx.store.write([[pinKey(userId), { fingerprint, n: (pin?.n ?? 0) + 1, accepted: true, prev: previous } satisfies PinRecord]], [changeKey(userId)]);
+      await this.syncPins().catch(() => undefined);
       this.notify();
     });
   }
@@ -280,28 +400,47 @@ export class Identity {
   // --- This device's state ---
 
   /**
-   * Whether the user has an identity and this device holds it. A verified device makes sure the
-   * server lists its cross-signature; a device whose identity was replaced elsewhere drops it.
+   * Whether the user has an identity and this device holds it. A verified device makes sure it
+   * is cross-signed and on the device list, resumes a key backup restore and drains its backup
+   * queue. A device whose identity the server no longer lists sets its seeds aside.
    */
   status(): Promise<IdentityStatus> {
-    return this.ctx.locked(async () => {
+    return this.ctx.locked(async (): Promise<IdentityStatus> => {
       const { tenant_id, master } = await this.ctx.server.getMaster();
-      const l = await this.local();
-      if (!master) return { state: 'none' } as const;
+      let l = await this.local();
+      if (!master) {
+        if (l) {
+          await this.quarantine(l);
+          this.notify();
+        }
+        return { state: 'none', quarantined: await this.hasQuarantined() };
+      }
       if (!validMaster(master) || !pqc.verifyMaster(master.master_key, tenant_id, this.ctx.userId, master.self_signature)) {
         throw new Error('The server sent an encryption identity that does not verify');
       }
       const fp = pqc.fingerprint(master.master_key);
-      if (l && l.fingerprint === fp && l.version === master.version && l.tenant_id === tenant_id) {
+      const current = (x?: LocalIdentity) => !!x && x.fingerprint === fp && x.version === master.version && x.tenant_id === tenant_id;
+      if (!l) {
+        // The server lists an identity set aside earlier again: take it back.
+        const prev = await this.ctx.store.get<LocalIdentity>(previousKey(fp, master.version));
+        if (current(prev)) {
+          await this.ctx.store.write([[IDENTITY, prev]], [previousKey(fp, master.version)]);
+          l = prev;
+        }
+      }
+      if (l && current(l)) {
         await this.signOwnDevice(l);
-        return { state: 'verified', fingerprint: fp } as const;
+        await this.ensureListed(l);
+        // A failed resume keeps its cursor, shows as restoring, and runs again on the next status.
+        void this.resumeRestore().catch(() => undefined);
+        void this.ctx.locked(() => this.flushBackup()).catch(() => undefined);
+        return { state: 'verified', fingerprint: fp, restoring: (await this.ctx.store.get(RESTORE)) !== undefined };
       }
       if (l) {
-        // Replaced from another device (a reset): this device must verify again.
-        await this.ctx.store.write([], [IDENTITY, SIGNED]);
+        await this.quarantine(l);
         this.notify();
       }
-      return { state: 'unverified', fingerprint: fp } as const;
+      return { state: 'unverified', fingerprint: fp, quarantined: await this.hasQuarantined() };
     });
   }
 
@@ -315,36 +454,86 @@ export class Identity {
     await this.ctx.store.write([[SIGNED, { version: l.version, device_id: this.ctx.deviceId }]]);
   }
 
+  /** Rewrites the signed device list with change applied, until it holds. */
+  private async editList(l: LocalIdentity, change: (ids: Set<string>) => void): Promise<void> {
+    const seeds = await this.seeds(l);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const { master } = await this.ctx.server.getMaster();
+      if (!master || master.version !== l.version) return;
+      const cur = validList(master.device_list) ? master.device_list : undefined;
+      const ids = new Set(cur?.device_ids ?? []);
+      const before = [...ids].sort().join('\n');
+      change(ids);
+      const next = [...ids].sort();
+      if (cur && next.join('\n') === before) return;
+      const epoch = (cur?.epoch ?? 0) + 1;
+      try {
+        await this.ctx.server.putDeviceList(l.version, epoch - 1, next, pqc.signDeviceList(seeds.master, l.tenant_id, this.ctx.userId, l.version, epoch, next));
+        await this.ctx.store.write([[listKey(this.ctx.userId), { version: l.version, epoch }]]);
+        return;
+      } catch (e) {
+        if (!(e instanceof Conflict)) throw e;
+      }
+    }
+  }
+
+  private ensureListed(l: LocalIdentity): Promise<void> {
+    return this.editList(l, (ids) => ids.add(this.ctx.deviceId));
+  }
+
+  /**
+   * Takes devices off the signed list (this one at sign-out, abandoned ones after). Not under the
+   * per-user lock: sign-out must never wait behind another tab's crypto work, and the server's
+   * compare-and-swap on the epoch already orders concurrent edits.
+   */
+  async delist(deviceIds: string[]): Promise<void> {
+    const l = await this.local();
+    if (l) await this.editList(l, (ids) => deviceIds.forEach((d) => ids.delete(d)));
+  }
+
   /**
    * A new identity for the user's first device (or a reset, which colleagues see as an identity
-   * change). Nothing is uploaded until commit, which the UI calls only after the user confirms
-   * they saved the recovery key.
+   * change). The version it replaces is read now, so commit never replaces an identity made
+   * meanwhile. Nothing is uploaded until commit, which the UI calls only after the user confirms
+   * they saved the recovery key; a commit retried after a lost answer is harmless.
    */
-  prepare(reset: boolean): { recoveryKey: string; commit(): Promise<void> } {
+  async prepare(reset: boolean): Promise<{ recoveryKey: string; commit(): Promise<void> }> {
+    const { tenant_id, master: current } = await this.ctx.server.getMaster();
+    if (current && !reset) throw new Conflict('This account already has an encryption identity');
+    const expected = current?.version ?? 0;
+    const version = expected + 1;
+    const user = this.ctx.userId;
     const master = pqc.masterGenerate();
     const backup = pqc.xwingGenerate();
     const recovery = pqc.recoveryGenerate();
+    const own: OwnMaster = {
+      version,
+      master_key: master.public_key,
+      self_signature: pqc.signMaster(master.seed, tenant_id, user),
+      backup_key: { public_key: backup.public, signature: pqc.signBackupKey(master.seed, tenant_id, user, version, backup.public) },
+      recovery: {
+        wrapped_master_key: pqc.recoveryWrap(recovery.key, 'master-key', tenant_id, user, master.seed),
+        wrapped_backup_key: pqc.recoveryWrap(recovery.key, 'backup-key', tenant_id, user, backup.seed),
+      },
+      pins: { counter: 0, sealed: '' },
+    };
+    // What is uploaded must restore with the key the user is about to save.
+    this.checkOwn(tenant_id, own,
+      pqc.recoveryUnwrap(recovery.key, 'master-key', tenant_id, user, own.recovery.wrapped_master_key),
+      pqc.recoveryUnwrap(recovery.key, 'backup-key', tenant_id, user, own.recovery.wrapped_backup_key),
+      master.fingerprint);
     return {
       recoveryKey: recovery.text,
       commit: async () => {
-        const { tenant_id, master: current } = await this.ctx.server.getMaster();
-        if (current && !reset) throw new Conflict('This account already has an encryption identity');
-        const expected = current?.version ?? 0;
-        const version = expected + 1;
-        const user = this.ctx.userId;
-        const own: OwnMaster = {
-          version,
-          master_key: master.public_key,
-          self_signature: pqc.signMaster(master.seed, tenant_id, user),
-          backup_key: { public_key: backup.public, signature: pqc.signBackupKey(master.seed, tenant_id, user, version, backup.public) },
-          recovery: {
-            wrapped_master_key: pqc.recoveryWrap(recovery.key, 'master-key', tenant_id, user, master.seed),
-            wrapped_backup_key: pqc.recoveryWrap(recovery.key, 'backup-key', tenant_id, user, backup.seed),
-          },
-          pins: { counter: 0, sealed: '' },
-        };
-        const stored = await this.ctx.server.putMaster({ expected_version: expected, master_key: own.master_key, self_signature: own.self_signature, backup_key: own.backup_key, recovery: own.recovery });
-        if (stored !== version) throw new Conflict('The encryption identity changed meanwhile');
+        try {
+          const stored = await this.ctx.server.putMaster({ expected_version: expected, master_key: own.master_key, self_signature: own.self_signature, backup_key: own.backup_key, recovery: own.recovery });
+          if (stored !== version) throw new Conflict('The encryption identity changed meanwhile');
+        } catch (e) {
+          // A retry whose first answer was lost finds its own identity already stored.
+          if (!(e instanceof Conflict)) throw e;
+          const { master: now } = await this.ctx.server.getMaster();
+          if (now?.master_key !== own.master_key || now.version !== version) throw e;
+        }
         await this.adopt(tenant_id, own, master.seed, backup.seed);
       },
     };
@@ -383,63 +572,102 @@ export class Identity {
     if (!ok) throw new Error('The keys do not match this account’s published identity.');
   }
 
-  /** Takes the identity on: stores it, signs this device, syncs pins and the key backup. */
+  /**
+   * Takes the identity on: stores it, signs this device and lists it, syncs pins, then reads the
+   * key backup in (resumable, one page per lock) and seals what this device holds to it.
+   */
   private async adopt(tenantId: string, master: OwnMaster, masterSeed: string, backupSeed: string): Promise<number> {
     const local = await this.sealLocal(tenantId, master, masterSeed, backupSeed);
-    return this.ctx.locked(async () => {
-      // Every room key this device already holds goes to the backup too.
-      const queue = (await this.ctx.store.list<InboundRecord>('in:')).filter(([, r]) => !r.from_backup).map(([k]): [string, unknown] => [backupQueueKey(k), k]);
-      await this.ctx.store.write([[IDENTITY, local], ...queue], [SIGNED]);
+    await this.ctx.locked(async () => {
+      // Every verified room key this device already holds goes to the backup too.
+      const queue = (await this.ctx.store.list<InboundRecord>('in:')).filter(([, r]) => r.verified && !r.from_backup).map(([k]): [string, unknown] => [backupQueueKey(k), k]);
+      const restore: RestoreCursor = { version: local.version, after: { room_id: '', sender_key: '', session_id: '' }, count: 0 };
+      await this.ctx.store.write([[IDENTITY, local], [RESTORE, restore], ...queue], [SIGNED]);
       await this.signOwnDevice(local);
-      await this.syncPins(true).catch(() => undefined);
-      const restored = await this.restoreBackup(local).catch(() => 0);
-      await this.flushBackup().catch(() => undefined);
-      this.notify();
-      return restored;
+      await this.ensureListed(local);
+      await this.syncPins().catch(() => undefined);
     });
+    this.notify();
+    const restored = await this.resumeRestore();
+    await this.ctx.locked(() => this.flushBackup()).catch(() => undefined);
+    return restored;
   }
 
   // --- Pins shared with the user's other devices ---
 
   /**
-   * Merges this device's pins with the sealed set on the server and writes the result back.
-   * adoptRemote (on verification) lets the synced pins replace local first-sight ones, which this
-   * device made before it could check them. Call with the lock held.
+   * Merges this device's pins with the sealed set on the server and writes the result back. A
+   * pin never silently changes: a different fingerprint is adopted only as an accepted change
+   * from exactly this device's pin, and any other disagreement is kept as a pending change. The
+   * counter's high-water mark refuses a rolled-back set. Lock held.
    */
-  private async syncPins(adoptRemote: boolean): Promise<void> {
+  async syncPins(): Promise<void> {
     const l = await this.local();
     if (!l) return;
     const seeds = await this.seeds(l);
+    const hwm = (await this.ctx.store.get<number>(PINS_HWM)) ?? 0;
     for (let attempt = 0; attempt < 3; attempt++) {
       const { master } = await this.ctx.server.getMaster();
       if (!master || master.version !== l.version) return;
+      const counter = master.pins.counter;
+      if (counter < hwm) throw new Error('The server returned an older pin set than this device has seen');
       let remote: Record<string, PinRecord> = {};
-      if (master.pins.counter > 0) {
-        try {
-          const p = parseJSON(unb64(pqc.pinsOpen(seeds.master, l.tenant_id, this.ctx.userId, master.pins.counter, master.pins.sealed)));
-          if (isObj(p)) remote = p as Record<string, PinRecord>;
-        } catch {
-          // Not sealed by a device holding the master key: ignore it and write ours over it.
-        }
+      if (counter > 0) {
+        const p = parseJSON(unb64(pqc.pinsOpen(seeds.master, l.tenant_id, this.ctx.userId, counter, master.pins.sealed)));
+        if (!isObj(p)) throw new Error('The pin set does not open');
+        for (const [u, r] of Object.entries(p)) if (validPin(r)) remote[u] = r;
       }
-      const local = new Map((await this.ctx.store.list<PinRecord>('mpin:')).map(([k, v]) => [k.slice(5), v]));
+      const local = new Map((await this.ctx.store.list<PinRecord>('mpin:')).filter(([, v]) => validPin(v)).map(([k, v]) => [k.slice(5), v]));
       const merged: Record<string, PinRecord> = {};
-      const writes: [string, unknown][] = [];
+      const writes: [string, unknown][] = [[PINS_HWM, counter]];
+      const deletes: string[] = [];
       for (const user of new Set([...local.keys(), ...Object.keys(remote)])) {
         if (user === this.ctx.userId) continue;
         const a = local.get(user);
         const r = remote[user];
-        const valid = (p: PinRecord | undefined): p is PinRecord => !!p && /^[0-9a-f]{64}$/.test(p.fingerprint) && typeof p.at === 'number';
-        const pick = !valid(r) ? a : !valid(a) || adoptRemote || r.at > a.at ? r : a;
-        if (!pick) continue;
-        merged[user] = pick;
-        if (pick !== a) writes.push([pinKey(user), pick]);
+        if (!a || !r) {
+          merged[user] = (a ?? r)!;
+          if (!a) writes.push([pinKey(user), r]);
+          continue;
+        }
+        if (a.fingerprint === r.fingerprint) {
+          const newer = r.n > a.n ? r : a;
+          const m: PinRecord = { fingerprint: a.fingerprint, n: Math.max(a.n, r.n), accepted: a.accepted || r.accepted, ...(newer.prev ? { prev: newer.prev } : {}) };
+          merged[user] = m;
+          if (canon({ x: m }) !== canon({ x: a })) writes.push([pinKey(user), m]);
+          continue;
+        }
+        if (r.accepted && r.n > a.n && r.prev === a.fingerprint) {
+          // Accepted on another of the user's devices, as a change from exactly this pin.
+          merged[user] = r;
+          writes.push([pinKey(user), r]);
+          const c = await this.ctx.store.get<IdentityChange>(changeKey(user));
+          if (c?.fingerprint === r.fingerprint) deletes.push(changeKey(user));
+          this.changed = true;
+          continue;
+        }
+        merged[user] = a;
+        if (!(a.accepted && a.n > r.n && a.prev === r.fingerprint)) {
+          // Two devices pinned different keys: keep ours and let the user decide.
+          const c = await this.ctx.store.get<IdentityChange>(changeKey(user));
+          if (!c) {
+            writes.push([changeKey(user), { user_id: user, fingerprint: r.fingerprint, previous: a.fingerprint } satisfies IdentityChange]);
+            this.changed = true;
+          }
+        }
       }
-      await this.ctx.store.write(writes);
-      if (JSON.stringify(merged) === JSON.stringify(remote)) return;
-      const sealed = pqc.pinsSeal(seeds.master, l.tenant_id, this.ctx.userId, master.pins.counter + 1, b64(JSON.stringify(merged)));
+      await this.ctx.store.write(writes, deletes);
+      if (this.changed) {
+        this.changed = false;
+        this.notify();
+      }
+      if (canon(merged) === canon(remote)) {
+        return;
+      }
+      const sealed = pqc.pinsSeal(seeds.master, l.tenant_id, this.ctx.userId, counter + 1, b64(JSON.stringify(merged)));
       try {
-        await this.ctx.server.putPins(l.version, master.pins.counter, sealed);
+        await this.ctx.server.putPins(l.version, counter, sealed);
+        await this.ctx.store.write([[PINS_HWM, counter + 1]]);
         return;
       } catch (e) {
         if (!(e instanceof Conflict)) throw e;
@@ -449,7 +677,7 @@ export class Identity {
 
   // --- Key backup ---
 
-  /** Seals queued room sessions to the backup key. Call with the lock held. */
+  /** Seals queued room sessions to the backup key; a bad entry is dropped alone. Lock held. */
   async flushBackup(): Promise<void> {
     const l = await this.local();
     if (!l) return;
@@ -462,17 +690,17 @@ export class Identity {
       for (const [qk, ik] of queue.slice(i, i + BACKUP_BATCH)) {
         done.push(qk);
         const rec = await this.ctx.store.get<InboundRecord>(ik);
-        if (!rec || rec.from_backup) continue;
-        const s = InboundGroupSession.fromPickle(rec.pickle, this.ctx.pickleKey);
+        if (!rec || rec.from_backup || !rec.verified) continue;
+        let s: InboundGroupSession | undefined;
         try {
-          const payload = {
-            v: 1, room_id: rec.room_id, session_id: s.sessionId, sender_key: rec.sender_key, sender_user: rec.sender_user,
-            sender_device: rec.sender_device, first_index: s.firstKnownIndex, session_key: s.exportAtFirstKnownIndex(),
-          };
-          entries.push({ room_id: rec.room_id, session_id: s.sessionId, first_index: s.firstKnownIndex,
-            sealed: pqc.backupSeal(l.backup_key, seeds.master, rec.room_id, s.sessionId, b64(JSON.stringify(payload))) });
+          s = InboundGroupSession.fromPickle(rec.pickle, this.ctx.pickleKey);
+          const ref: BackupRef = { room_id: rec.room_id, sender_key: rec.sender_key, session_id: s.sessionId, first_index: s.firstKnownIndex };
+          const payload = { v: 1, ...ref, sender_user: rec.sender_user, sender_device: rec.sender_device, session_key: s.exportAtFirstKnownIndex() };
+          entries.push({ ...ref, sealed: pqc.backupSeal(l.backup_key, seeds.master, ref, b64(JSON.stringify(payload))) });
+        } catch {
+          // An unreadable pickle is not worth keeping in the queue.
         } finally {
-          s.free();
+          s?.free();
         }
       }
       if (entries.length > 0) await this.ctx.server.putBackup(l.version, entries);
@@ -480,42 +708,72 @@ export class Identity {
     }
   }
 
-  /** Imports every session in the backup that carries the master key's MAC. Lock held. */
-  private async restoreBackup(l: LocalIdentity): Promise<number> {
-    const seeds = await this.seeds(l);
-    let afterRoom = '';
-    let afterSession = '';
-    let count = 0;
+  /** Reads the rest of the key backup in, if a restore is pending; one restore at a time. */
+  private resumeRestore(): Promise<number> {
+    this.restoring ??= this.restoreAll().finally(() => {
+      this.restoring = undefined;
+    });
+    return this.restoring;
+  }
+
+  // Page by page, each under its own lock, so sends and other tabs are never held for a whole
+  // backup. The cursor is stored after every page, so a reload resumes where this stopped.
+  private async restoreAll(): Promise<number> {
+    let total = 0;
     for (;;) {
-      const page = await this.ctx.server.getBackup(l.version, afterRoom, afterSession);
-      const writes: [string, unknown][] = [];
-      for (const e of page.sessions) {
-        const rec = this.openEntry(seeds, e);
-        if (!rec) continue;
-        const key = inboundKey(rec.sender_key, e.session_id);
-        const known = await this.ctx.store.get<InboundRecord>(key);
-        if (known && (known.room_id !== rec.room_id || known.sender_user !== rec.sender_user || known.sender_device !== rec.sender_device || known.first_index <= rec.first_index)) continue;
-        writes.push([key, rec]);
-        count++;
+      const step = await this.ctx.locked(() => this.restorePage());
+      if (!step) return total;
+      total += step.count;
+      if (step.done) {
+        this.notify();
+        return total;
       }
-      await this.ctx.store.write(writes);
-      if (!page.more || page.sessions.length === 0) return count;
-      const last = page.sessions[page.sessions.length - 1];
-      afterRoom = last.room_id;
-      afterSession = last.session_id;
     }
+  }
+
+  private async restorePage(): Promise<{ count: number; done: boolean } | undefined> {
+    const l = await this.local();
+    const cur = await this.ctx.store.get<RestoreCursor>(RESTORE);
+    if (!l || !cur) return undefined;
+    if (cur.version !== l.version) {
+      await this.ctx.store.write([], [RESTORE]);
+      return { count: 0, done: true };
+    }
+    const seeds = await this.seeds(l);
+    const page = await this.ctx.server.getBackup(l.version, cur.after);
+    if (page.sessions.length > BACKUP_PAGE_MAX) throw new Error('The key backup sent an oversized page');
+    const writes: [string, unknown][] = [];
+    let after = cur.after;
+    let count = 0;
+    for (const e of page.sessions) {
+      // The server pages in a fixed order; going back (a loop) or sideways ends the restore.
+      if (!cursorAfter(e, after)) throw new Error('The key backup did not page forward');
+      after = { room_id: e.room_id, sender_key: e.sender_key, session_id: e.session_id };
+      const rec = this.openEntry(seeds, e);
+      if (!rec) continue;
+      const key = inboundKey(rec.sender_key, e.session_id);
+      const known = await this.ctx.store.get<InboundRecord>(key);
+      if (known && (known.room_id !== rec.room_id || known.sender_user !== rec.sender_user || known.sender_device !== rec.sender_device || known.first_index <= rec.first_index)) continue;
+      writes.push([key, rec]);
+      count++;
+    }
+    const seen = cur.count + page.sessions.length;
+    const done = !page.more || page.sessions.length === 0 || seen >= BACKUP_MAX_SESSIONS;
+    writes.push([RESTORE, { version: cur.version, after, count: seen } satisfies RestoreCursor]);
+    await this.ctx.store.write(done ? writes.slice(0, -1) : writes, done ? [RESTORE] : []);
+    return { count, done };
   }
 
   private openEntry(seeds: { master: string; backup: string }, e: BackupEntry): InboundRecord | undefined {
     let s: InboundGroupSession | undefined;
     try {
-      const p = parseJSON(unb64(pqc.backupOpen(seeds.backup, seeds.master, e.room_id, e.session_id, e.sealed)));
-      if (!isObj(p) || p.v !== 1 || p.room_id !== e.room_id || p.session_id !== e.session_id || !isStr(p.session_key) ||
-        !isStr(p.sender_key, 64) || !isStr(p.sender_user, 128) || !isStr(p.sender_device, 64)) return undefined;
+      const p = parseJSON(unb64(pqc.backupOpen(seeds.backup, seeds.master, e, e.sealed)));
+      if (!isObj(p) || p.v !== 1 || p.room_id !== e.room_id || p.session_id !== e.session_id || p.sender_key !== e.sender_key ||
+        p.first_index !== e.first_index || !isStr(p.session_key) || !isStr(p.sender_user, 128) || !isStr(p.sender_device, 64)) return undefined;
       s = InboundGroupSession.import(p.session_key);
-      if (s.sessionId !== e.session_id) return undefined;
+      if (s.sessionId !== e.session_id || s.firstKnownIndex !== e.first_index) return undefined;
       return { pickle: s.pickle(this.ctx.pickleKey), room_id: e.room_id, sender_user: p.sender_user, sender_device: p.sender_device,
-        sender_key: p.sender_key, first_index: s.firstKnownIndex, from_backup: true };
+        sender_key: e.sender_key, first_index: s.firstKnownIndex, from_backup: true, verified: true };
     } catch {
       return undefined;
     } finally {
@@ -529,12 +787,12 @@ export class Identity {
   async offer(): Promise<PairingOffer> {
     const l = await this.local();
     if (!l) throw new Error('Only a verified device can verify another.');
-    const { pairing_id: id, expires_at } = await this.ctx.server.pairingStart(this.ctx.deviceId);
+    const { pairing_id: id, expires_in_ms } = await this.ctx.server.pairingStart(this.ctx.deviceId);
     const { secret, text } = pqc.qrNew(id, l.fingerprint);
     let joined: { key: string; device: string } | undefined;
     return {
       text,
-      expiresAt: expires_at,
+      expiresInMs: expires_in_ms,
       poll: async () => {
         const st = await this.ctx.server.pairingGet(id);
         if (!st.new_device || !st.ephemeral_key) return undefined;

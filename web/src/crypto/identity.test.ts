@@ -29,7 +29,7 @@ async function open(server: FakeKeyServer, userId: string, storeName = userId, a
 /** A user's first device: it creates the identity and answers the recovery key. */
 async function firstDevice(server: FakeKeyServer, userId: string, storeName = userId): Promise<[CryptoEngine, string]> {
   const e = await open(server, userId, storeName);
-  const p = e.prepareIdentity();
+  const p = await e.prepareIdentity();
   await p.commit();
   return [e, p.recoveryKey];
 }
@@ -55,10 +55,12 @@ describe('device trust (master-key cross-signing)', () => {
     const before = await send('r1', alice, 'before bob verified');
     expect(await read(bob, before)).toBe('waiting');
     expect(server.sent.filter((s) => s.to === 'u_bob')).toHaveLength(0);
-    // An unverified device can still send.
-    expect(await read(alice, await send('r1', bob, 'from an unverified device'))).toBe('from an unverified device');
+    // An unverified device can still send, but it trusts no one, so no one gets its room key.
+    const fromUnverified = await send('r1', bob, 'from an unverified device');
+    expect(await read(alice, fromUnverified)).toBe('waiting');
+    expect(server.sent.filter((s) => s.from === 'u_bob')).toHaveLength(0);
 
-    await bob.prepareIdentity().commit();
+    await (await bob.prepareIdentity()).commit();
     const after = await send('r1', alice, 'after');
     expect(await read(bob, after)).toBe('after');
     // The key bob gets starts at the current index: what was sent before stays unreadable.
@@ -95,7 +97,7 @@ describe('device trust (master-key cross-signing)', () => {
     alice.onIdentityChange(changed);
 
     // Bob resets his identity (or the server swaps it): a new master key, his device re-signed.
-    await bob.prepareIdentity(true).commit();
+    await (await bob.prepareIdentity(true)).commit();
     await bob.identityStatus();
     const blocked = await send('r1', alice, 'held back');
     expect(await read(bob, blocked)).toBe('waiting');
@@ -106,7 +108,9 @@ describe('device trust (master-key cross-signing)', () => {
 
     // A user's own identity is never a change to accept.
     expect(await bob.identityChanges()).toEqual([]);
-    await alice.acceptIdentity('u_bob');
+    // Accepting is compare-and-set on exactly the change the viewer saw.
+    await expect(alice.acceptIdentity('u_bob', changes[0].previous, 'ab'.repeat(32))).rejects.toThrow(/changed again/);
+    await alice.acceptIdentity('u_bob', changes[0].previous, changes[0].fingerprint);
     expect(await alice.identityChanges()).toEqual([]);
     expect(await read(bob, await send('r1', alice, 'flows again'))).toBe('flows again');
   });
@@ -193,9 +197,9 @@ describe('recovery key and key backup', () => {
     const [, rk] = await firstDevice(server, 'u_alice');
     const m = server.masters.get('u_alice')!;
     const forger = pqc.masterGenerate();
-    const payload = { v: 1, room_id: 'r1', session_id: 'x', sender_key: 'k', sender_user: 'u_bob', sender_device: 'D', first_index: 0, session_key: 'AAAA' };
-    server.backups.set('u_alice', new Map([['r1\nx', { room_id: 'r1', session_id: 'x', first_index: 0,
-      sealed: pqc.backupSeal(m.backup_key.public_key, forger.seed, 'r1', 'x', b64(JSON.stringify(payload))) }]]));
+    const ref = { room_id: 'r1', sender_key: 'k', session_id: 'x', first_index: 0 };
+    const payload = { v: 1, ...ref, sender_user: 'u_bob', sender_device: 'D', session_key: 'AAAA' };
+    server.backups.set('u_alice', new Map([['r1\nk\nx', { ...ref, sealed: pqc.backupSeal(m.backup_key.public_key, forger.seed, ref, b64(JSON.stringify(payload))) }]]));
     const laptop = await open(server, 'u_alice', 'alice_laptop');
     expect(await laptop.restoreIdentity(rk)).toBe(0);
   });
@@ -262,5 +266,139 @@ describe('QR verification', () => {
     const forged = pqc.qrNew(q.pairing_id, pqc.masterGenerate().fingerprint).text;
     await expect(laptop.joinVerification(forged)).rejects.toThrow(/another identity/);
     await expect(laptop.joinVerification('garbage')).rejects.toThrow(/not a verification code/);
+  });
+});
+
+describe('Round 1 hardening', () => {
+  it('keeps a pending change blocking even when the server goes back to the pinned key', async () => {
+    const server = new FakeKeyServer();
+    const [alice] = await firstDevice(server, 'u_alice');
+    const [bob] = await firstDevice(server, 'u_bob');
+    server.join('r1', 'u_alice', 'u_bob');
+    await send('r1', alice, 'pins bob');
+    const original = structuredClone(server.masters.get('u_bob')!);
+    const origSigs = new Map([...server.devices.get('u_bob')!].map(([k, d]) => [k, d.master_signature]));
+    await (await bob.prepareIdentity(true)).commit();
+    await bob.identityStatus();
+    await send('r1', alice, 'sees the change');
+    expect((await alice.identityChanges()).map((c) => c.user_id)).toEqual(['u_bob']);
+    // The relay replays bob's old key and signatures: still blocked until alice accepts.
+    server.masters.set('u_bob', original);
+    for (const [k, d] of server.devices.get('u_bob')!) d.master_signature = origSigs.get(k);
+    expect(await read(bob, await send('r1', alice, 'still held'))).toBe('waiting');
+    expect((await alice.identityChanges()).map((c) => c.user_id)).toEqual(['u_bob']);
+  });
+
+  it('never silently replaces a pin when two of the user’s devices disagree', async () => {
+    const server = new FakeKeyServer();
+    const [alice, rk] = await firstDevice(server, 'u_alice');
+    await firstDevice(server, 'u_bob');
+    server.join('r1', 'u_alice', 'u_bob');
+    await send('r1', alice, 'pins bob');
+    await vi.waitFor(() => expect(server.masters.get('u_alice')!.pins.counter).toBeGreaterThan(0));
+    // A second browser of alice's already pinned a different key for bob (say, one the server
+    // showed it before it was verified). Verifying it must not overwrite either pin.
+    const store = await openCryptoStore('alice_laptop');
+    const other = 'cd'.repeat(32);
+    await store.write([['mpin:u_bob', { fingerprint: other, n: 1, accepted: false }]]);
+    store.close();
+    const laptop = await open(server, 'u_alice', 'alice_laptop');
+    await laptop.restoreIdentity(rk);
+    const changes = await laptop.identityChanges();
+    expect(changes).toEqual([expect.objectContaining({ user_id: 'u_bob', previous: other })]);
+    const kept = await openCryptoStore('alice_laptop');
+    expect((await kept.get<{ fingerprint: string }>('mpin:u_bob'))!.fingerprint).toBe(other);
+    kept.close();
+    // Accepting it on the laptop is adopted by alice's first device as a change from its own pin.
+    await laptop.acceptIdentity('u_bob', changes[0].previous, changes[0].fingerprint);
+    expect(await read(laptop, await send('r1', laptop, 'agreed'))).toBe('agreed');
+  });
+
+  it('refuses a pin set the server rolled back to an older counter', async () => {
+    const server = new FakeKeyServer();
+    const [alice] = await firstDevice(server, 'u_alice');
+    await firstDevice(server, 'u_bob');
+    await firstDevice(server, 'u_carol');
+    server.join('r1', 'u_alice', 'u_bob');
+    await send('r1', alice, 'pins bob');
+    await vi.waitFor(() => expect(server.masters.get('u_alice')!.pins.counter).toBe(1));
+    const old = structuredClone(server.masters.get('u_alice')!.pins);
+    server.join('r2', 'u_alice', 'u_carol');
+    await send('r2', alice, 'pins carol');
+    await vi.waitFor(() => expect(server.masters.get('u_alice')!.pins.counter).toBe(2));
+    server.masters.get('u_alice')!.pins = old;
+    await firstDevice(server, 'u_dave');
+    server.join('r3', 'u_alice', 'u_dave');
+    await expect(alice.encrypt('r3', { type: 'text', body: 'to dave' })).rejects.toThrow(/older pin set/);
+  });
+
+  it('never shares with a removed device the server lists again, even with its old device list', async () => {
+    const server = new FakeKeyServer();
+    const [alice] = await firstDevice(server, 'u_alice');
+    const [bob, rk] = await firstDevice(server, 'u_bob');
+    const laptop = await open(server, 'u_bob', 'bob_laptop');
+    await laptop.restoreIdentity(rk);
+    server.join('r1', 'u_alice', 'u_bob');
+    expect(await read(laptop, await send('r1', alice, 'to both'))).toBe('to both');
+    const oldList = structuredClone(server.masters.get('u_bob')!.device_list!);
+    const oldRow = structuredClone(server.devices.get('u_bob')!.get(laptop.deviceId)!);
+    // The laptop signs out: off the signed list, then deleted from the server.
+    await laptop.delistDevices([laptop.deviceId]);
+    server.devices.get('u_bob')!.delete(laptop.deviceId);
+    await send('r1', alice, 'sees the new list');
+    // The server brings the row back with its old cross-signature, first with the current
+    // list, then with the list from before the removal.
+    server.devices.get('u_bob')!.set(laptop.deviceId, oldRow);
+    expect(await read(laptop, await send('r1', alice, 'not for the laptop'))).toBe('waiting');
+    server.masters.get('u_bob')!.device_list = oldList;
+    expect(await read(laptop, await send('r1', alice, 'still not'))).toBe('waiting');
+    expect(await read(bob, await send('r1', alice, 'but bob reads'))).toBe('waiting'); // a rolled-back list trusts no device
+  });
+
+  it('sets local seeds aside, never deleting them, when the server bumps or drops the identity', async () => {
+    const server = new FakeKeyServer();
+    const [alice] = await firstDevice(server, 'u_alice');
+    const m = server.masters.get('u_alice')!;
+    m.version += 1;
+    expect(await alice.identityStatus()).toMatchObject({ state: 'unverified', quarantined: true });
+    const store = await openCryptoStore('u_alice');
+    expect((await store.list('identity:previous:')).length).toBe(1);
+    store.close();
+    // The server lists the identity again: the device takes its seeds back.
+    m.version -= 1;
+    expect(await alice.identityStatus()).toMatchObject({ state: 'verified' });
+    server.masters.delete('u_alice');
+    expect(await alice.identityStatus()).toMatchObject({ state: 'none', quarantined: true });
+  });
+
+  it('stops a restore whose backup pages do not move forward, and keeps the device verified', async () => {
+    const server = new FakeKeyServer();
+    const [alice, rk] = await firstDevice(server, 'u_alice');
+    const [bob] = await firstDevice(server, 'u_bob');
+    server.join('r1', 'u_alice', 'u_bob');
+    expect(await read(alice, await send('r1', bob, 'backed up'))).toBe('backed up');
+    await vi.waitFor(() => expect(server.backups.get('u_alice')?.size).toBe(1));
+    const api = server.as('u_alice');
+    const real = api.getBackup;
+    api.getBackup = async (version) => ({ ...(await real(version, { room_id: '', sender_key: '', session_id: '' })), more: true });
+    const laptop = await open(server, 'u_alice', 'alice_laptop', api);
+    await expect(laptop.restoreIdentity(rk)).rejects.toThrow(/page forward/);
+    expect(await laptop.identityStatus()).toMatchObject({ state: 'verified', restoring: true });
+  });
+
+  it('keeps room keys from a device its master key does not vouch for out of the backup', async () => {
+    const server = new FakeKeyServer();
+    const [alice] = await firstDevice(server, 'u_alice');
+    const [bob] = await firstDevice(server, 'u_bob');
+    server.join('r1', 'u_alice', 'u_bob');
+    // The server strips bob's cross-signature: alice no longer trusts his device, though bob's
+    // device still shares with her.
+    delete server.devices.get('u_bob')!.get(bob.deviceId)!.master_signature;
+    const m = await send('r1', bob, 'unvouched');
+    await alice.receive();
+    const r = await alice.decrypt(m);
+    expect(r).toMatchObject({ state: 'decrypted', authenticated: false });
+    await new Promise((res) => setTimeout(res, 50));
+    expect(server.backups.get('u_alice')?.size ?? 0).toBe(0);
   });
 });

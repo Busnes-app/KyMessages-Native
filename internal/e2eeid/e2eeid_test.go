@@ -140,27 +140,51 @@ func TestRecoveryWrapBindsPurposeOrgAndUser(t *testing.T) {
 	}
 }
 
-func TestBackupSealBindsRoomSessionAndMaster(t *testing.T) {
+func TestBackupSealBindsEntryAndMaster(t *testing.T) {
 	k, _ := xwing.Generate()
 	m, _ := hybridsig.Generate()
-	sealed, err := e2eeid.SealBackup(k.Public(), e2eeid.MasterSeed(m), "room1", "sess1", []byte("export"))
+	e := e2eeid.BackupEntry{RoomID: "room1", SenderKey: "senderA", SessionID: "sess1", FirstIndex: 7}
+	sealed, err := e2eeid.SealBackup(k.Public(), e2eeid.MasterSeed(m), e, []byte("export"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, err := e2eeid.OpenBackup(k, e2eeid.MasterSeed(m), "room1", "sess1", sealed); err != nil || string(got) != "export" {
+	if got, err := e2eeid.OpenBackup(k, e2eeid.MasterSeed(m), e, sealed); err != nil || string(got) != "export" {
 		t.Fatalf("open: %v", err)
 	}
-	for _, c := range [][2]string{{"room2", "sess1"}, {"room1", "sess2"}, {"room1s", "ess1"}} {
-		if _, err := e2eeid.OpenBackup(k, e2eeid.MasterSeed(m), c[0], c[1], sealed); !errors.Is(err, e2eeid.ErrOpen) {
-			t.Errorf("%v opened", c)
+	// Every named field is bound: a row moved to another room, sender, session or a lower first
+	// index (to win the server's keep-the-lowest rule) does not open.
+	for name, moved := range map[string]e2eeid.BackupEntry{
+		"room":        {RoomID: "room2", SenderKey: "senderA", SessionID: "sess1", FirstIndex: 7},
+		"sender key":  {RoomID: "room1", SenderKey: "senderB", SessionID: "sess1", FirstIndex: 7},
+		"session":     {RoomID: "room1", SenderKey: "senderA", SessionID: "sess2", FirstIndex: 7},
+		"first index": {RoomID: "room1", SenderKey: "senderA", SessionID: "sess1", FirstIndex: 0},
+		"shifted":     {RoomID: "room1s", SenderKey: "enderA", SessionID: "sess1", FirstIndex: 7},
+	} {
+		if _, err := e2eeid.OpenBackup(k, e2eeid.MasterSeed(m), moved, sealed); !errors.Is(err, e2eeid.ErrOpen) {
+			t.Errorf("%s: opened", name)
 		}
 	}
 	// The server holds the backup public key and can seal to it, but not with the master seed:
 	// a restore refuses what it forges.
 	other, _ := hybridsig.Generate()
-	forged, _ := e2eeid.SealBackup(k.Public(), e2eeid.MasterSeed(other), "room1", "sess1", []byte("forged"))
-	if _, err := e2eeid.OpenBackup(k, e2eeid.MasterSeed(m), "room1", "sess1", forged); !errors.Is(err, e2eeid.ErrOpen) {
+	forged, _ := e2eeid.SealBackup(k.Public(), e2eeid.MasterSeed(other), e, []byte("forged"))
+	if _, err := e2eeid.OpenBackup(k, e2eeid.MasterSeed(m), e, forged); !errors.Is(err, e2eeid.ErrOpen) {
 		t.Fatal("a session sealed without the master seed opened")
+	}
+}
+
+func TestDeviceListIsCanonical(t *testing.T) {
+	if _, err := e2eeid.DeviceListMessage("t", "u", 1, 1, []string{"B", "A"}); !errors.Is(err, e2eeid.ErrDeviceList) {
+		t.Fatal("unsorted list accepted")
+	}
+	if _, err := e2eeid.DeviceListMessage("t", "u", 1, 1, []string{"A", "A"}); !errors.Is(err, e2eeid.ErrDeviceList) {
+		t.Fatal("duplicate accepted")
+	}
+	a, _ := e2eeid.DeviceListMessage("t", "u", 1, 2, []string{"A", "B"})
+	b, _ := e2eeid.DeviceListMessage("t", "u", 1, 2, []string{"AB"})
+	c, _ := e2eeid.DeviceListMessage("t", "u", 1, 3, []string{"A", "B"})
+	if bytes.Equal(a, b) || bytes.Equal(a, c) {
+		t.Fatal("lists or epochs share an encoding")
 	}
 }
 
@@ -325,8 +349,10 @@ func writeVectors(t *testing.T) {
 	devSig := str(must(t, "signDevice", ms, tenant, user, device, curve, ed))
 	bkSig := str(must(t, "signBackupKey", ms, tenant, user, "1", xp))
 	plain := b64.EncodeToString([]byte(`{"session_key":"vector"}`))
-	sealedBackup := must(t, "backupSeal", xp, ms, "room-1", "session-1", plain).(string)
-	forgedBackup := must(t, "backupSeal", xp, seed("other", e2eeid.MasterSeedBytes), "room-1", "session-1", plain).(string)
+	const sender = "c2VuZGVyIGN1cnZlMjU1MTkga2V5IGZvciB2ZWN0b3JzIQ"
+	sealedBackup := must(t, "backupSeal", xp, ms, "room-1", sender, "session-1", "3", plain).(string)
+	forgedBackup := must(t, "backupSeal", xp, seed("other", e2eeid.MasterSeedBytes), "room-1", sender, "session-1", "3", plain).(string)
+	devList := str(must(t, "signDeviceList", ms, tenant, user, "1", "2", `["DEVICE_ALICE_1","DEVICE_ALICE_2"]`))
 	wrapM := must(t, "recoveryWrap", rk, "master-key", tenant, user, ms).(string)
 	wrapB := must(t, "recoveryWrap", rk, "backup-key", tenant, user, xs).(string)
 	pairing := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 16))
@@ -363,10 +389,16 @@ func writeVectors(t *testing.T) {
 		{Name: "backup key signature verifies", Call: "verifyBackupKey", Args: []string{mp["public_key"], tenant, user, "1", xp, bkSig}, Want: true},
 		{Name: "backup key signature, other version", Call: "verifyBackupKey", Args: []string{mp["public_key"], tenant, user, "2", xp, bkSig}, Want: false},
 		{Name: "X-Wing public key from seed", Call: "xwingPublic", Args: []string{xs}, Want: xp},
-		{Name: "backup session opens", Call: "backupOpen", Args: []string{xs, ms, "room-1", "session-1", sealedBackup}, Want: plain},
-		{Name: "backup session in another room", Call: "backupOpen", Args: []string{xs, ms, "room-2", "session-1", sealedBackup}, Error: true},
-		{Name: "backup session, tampered", Call: "backupOpen", Args: []string{xs, ms, "room-1", "session-1", tampered(sealedBackup)}, Error: true},
-		{Name: "backup session forged without the master seed", Call: "backupOpen", Args: []string{xs, ms, "room-1", "session-1", forgedBackup}, Error: true},
+		{Name: "backup session opens", Call: "backupOpen", Args: []string{xs, ms, "room-1", sender, "session-1", "3", sealedBackup}, Want: plain},
+		{Name: "backup session in another room", Call: "backupOpen", Args: []string{xs, ms, "room-2", sender, "session-1", "3", sealedBackup}, Error: true},
+		{Name: "backup session under another sender", Call: "backupOpen", Args: []string{xs, ms, "room-1", "b3RoZXI", "session-1", "3", sealedBackup}, Error: true},
+		{Name: "backup session claiming an earlier first index", Call: "backupOpen", Args: []string{xs, ms, "room-1", sender, "session-1", "0", sealedBackup}, Error: true},
+		{Name: "backup session, tampered", Call: "backupOpen", Args: []string{xs, ms, "room-1", sender, "session-1", "3", tampered(sealedBackup)}, Error: true},
+		{Name: "backup session forged without the master seed", Call: "backupOpen", Args: []string{xs, ms, "room-1", sender, "session-1", "3", forgedBackup}, Error: true},
+		{Name: "device list verifies", Call: "verifyDeviceList", Args: []string{mp["public_key"], tenant, user, "1", "2", `["DEVICE_ALICE_1","DEVICE_ALICE_2"]`, devList}, Want: true},
+		{Name: "device list at another epoch", Call: "verifyDeviceList", Args: []string{mp["public_key"], tenant, user, "1", "3", `["DEVICE_ALICE_1","DEVICE_ALICE_2"]`, devList}, Want: false},
+		{Name: "device list with a device added", Call: "verifyDeviceList", Args: []string{mp["public_key"], tenant, user, "1", "2", `["DEVICE_ALICE_1","DEVICE_ALICE_2","DEVICE_EVIL"]`, devList}, Want: false},
+		{Name: "hash", Call: "hash", Args: []string{"a", "bc"}, Want: "b534ce16ac9c8b36823f39a395ce8e0e3c7ad9605b82b5444f18cadacd217a5d"},
 		{Name: "recovery key format", Call: "recoveryFormat", Args: []string{rk}, Want: rtext},
 		{Name: "recovery key parse", Call: "recoveryParse", Args: []string{strings.ToLower(strings.ReplaceAll(rtext, " ", "-"))}, Want: rk},
 		{Name: "recovery key with a typo", Call: "recoveryParse", Args: []string{"Z" + rtext[1:]}, Error: true},

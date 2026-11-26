@@ -8,13 +8,33 @@ import { ShieldAlert, ShieldCheck } from 'lucide-react';
 import {
   acceptIdentity, identityChanges, identityStatus, joinVerification, offerVerification, onIdentityChanged, prepareIdentity, restoreIdentity,
 } from '../../chat/e2ee';
-import type { IdentityChange, PairingJoin, PairingOffer } from '../../crypto/identity';
+import { formatFingerprint, type IdentityChange, type IdentityStatus, type PairingJoin, type PairingOffer } from '../../crypto/identity';
 import { ChatDialog } from './ChatModals';
 
 const errText = (e: unknown, fallback: string) => (e instanceof Error && e.message ? e.message : fallback);
 
 function Alert({ text }: { text: string }) {
   return text ? <div className="dr-alert dr-alert-error" role="alert" style={{ padding: '0.5rem 0.65rem', fontSize: '0.82rem' }}>{text}</div> : null;
+}
+
+/** A copy button that says so when the browser refuses. */
+function CopyButton({ text, label = 'Copy' }: { text: string; label?: string }) {
+  const [state, setState] = useState<'idle' | 'copied' | 'failed'>('idle');
+  const copy = async () => {
+    try {
+      if (!navigator.clipboard) throw new Error('no clipboard');
+      await navigator.clipboard.writeText(text);
+      setState('copied');
+    } catch {
+      setState('failed');
+    }
+  };
+  return (
+    <>
+      <button type="button" className="btn-secondary" onClick={() => void copy()}>{state === 'copied' ? 'Copied' : label}</button>
+      {state === 'failed' && <span role="alert">Copying failed. Select the text and copy it, or write it down.</span>}
+    </>
+  );
 }
 
 /** The first device: shows the recovery key once and uploads the identity only after "saved it". */
@@ -26,7 +46,8 @@ export function SetUpEncryption({ reset = false, onDone, onClose }: { reset?: bo
   useEffect(() => {
     let live = true;
     prepareIdentity(reset).then((p) => live && setPrepared(p), (e: unknown) => live && setErr(errText(e, 'Encryption could not start.')));
-    return () => { live = false; };
+    // The key leaves memory with the screen.
+    return () => { live = false; setPrepared(undefined); };
   }, [reset]);
   const submit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -34,6 +55,7 @@ export function SetUpEncryption({ reset = false, onDone, onClose }: { reset?: bo
     setBusy(true);
     setErr('');
     try {
+      // A step-up refusal opens "Confirm it's you" and retries this same identity.
       await prepared.commit();
       onDone();
     } catch (x) {
@@ -53,7 +75,7 @@ export function SetUpEncryption({ reset = false, onDone, onClose }: { reset?: bo
         {prepared ? (
           <>
             <code className="e2ee-recovery-key" aria-label="Recovery key" data-testid="recovery-key">{prepared.recoveryKey}</code>
-            <button type="button" className="btn-secondary" onClick={() => void navigator.clipboard?.writeText(prepared.recoveryKey)}>Copy</button>
+            <CopyButton text={prepared.recoveryKey} />
           </>
         ) : !err && <p>Generating keys…</p>}
         <label className="chat-checkbox-row">
@@ -69,15 +91,24 @@ export function SetUpEncryption({ reset = false, onDone, onClose }: { reset?: bo
   );
 }
 
-/** A new device: verify with another device's code, or with the recovery key. */
+/**
+ * A new device: verify with another device's code, or with the recovery key. With a code, the
+ * user confirms the six digits match the other screen before this device takes any keys.
+ */
 export function VerifyThisDevice({ fingerprint, onDone, onClose, onReset }: { fingerprint: string; onDone: (restored: number) => void; onClose: () => void; onReset: () => void }) {
   const [mode, setMode] = useState<'device' | 'recovery'>('device');
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
   const [join, setJoin] = useState<PairingJoin>();
+  const [waiting, setWaiting] = useState(false);
   const abort = useRef<AbortController | undefined>(undefined);
   useEffect(() => () => abort.current?.abort(), []);
+  const switchMode = (m: 'device' | 'recovery') => {
+    setMode(m);
+    setText(''); // a pasted recovery key never lingers in the other field
+    setErr('');
+  };
 
   const submit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -85,53 +116,68 @@ export function VerifyThisDevice({ fingerprint, onDone, onClose, onReset }: { fi
     setBusy(true);
     try {
       if (mode === 'recovery') {
-        onDone(await restoreIdentity(text));
+        const n = await restoreIdentity(text);
+        setText('');
+        onDone(n);
         return;
       }
-      const j = await joinVerification(text);
-      setJoin(j);
-      abort.current = new AbortController();
-      onDone(await j.finish(abort.current.signal));
+      setJoin(await joinVerification(text));
+      setText('');
+    } catch (x) {
+      setErr(errText(x, 'This device could not be verified.'));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const confirm = async () => {
+    if (!join) return;
+    setWaiting(true);
+    abort.current = new AbortController();
+    try {
+      onDone(await join.finish(abort.current.signal));
     } catch (x) {
       if (abort.current?.signal.aborted) return;
       setErr(errText(x, 'This device could not be verified.'));
       setJoin(undefined);
-      setBusy(false);
+      setWaiting(false);
     }
   };
   const close = () => {
     abort.current?.abort();
     void join?.cancel().catch(() => undefined);
+    setText('');
     onClose();
   };
   return (
-    <ChatDialog title="Verify this device" onClose={close} busy={busy} onSubmit={submit}>
+    <ChatDialog title="Verify this device" onClose={close} busy={busy || waiting} onSubmit={join ? undefined : submit}>
       <div className="chat-modal-body chat-scroll">
         <Alert text={err} />
-        <p>Until this device is verified, it can send messages but cannot read anything sent to you. Your identity: <code>{fingerprint.slice(0, 16).toUpperCase().match(/.{4}/g)?.join(' ')}</code></p>
+        <p>Until this device is verified, it receives nothing sent to you and shares its own messages with no one. Your identity: <code>{formatFingerprint(fingerprint)}</code></p>
         {join ? (
           <div role="status">
-            <p>Check that your other device shows this code, then approve it there:</p>
+            <p>Your other device shows a code. Does it match this one exactly?</p>
             <p className="e2ee-code" data-testid="comparison-code">{join.code}</p>
-            <p>Waiting for your other device…</p>
+            {waiting && <p>Waiting for your other device to approve…</p>}
           </div>
         ) : (
           <>
             <div className="chat-field" role="radiogroup" aria-label="How to verify">
-              <label className="chat-checkbox-row"><input type="radio" checked={mode === 'device'} onChange={() => setMode('device')} /> Use a code from my other device</label>
-              <label className="chat-checkbox-row"><input type="radio" checked={mode === 'recovery'} onChange={() => setMode('recovery')} /> Use my recovery key</label>
+              <label className="chat-checkbox-row"><input type="radio" checked={mode === 'device'} onChange={() => switchMode('device')} /> Use a code from my other device</label>
+              <label className="chat-checkbox-row"><input type="radio" checked={mode === 'recovery'} onChange={() => switchMode('recovery')} /> Use my recovery key</label>
             </div>
             <div className="chat-field">
               <label htmlFor="e2ee-verify-text">{mode === 'device' ? 'Verification code (the shield button, “Verify a device”, on a signed-in device)' : 'Recovery key'}</label>
               <textarea id="e2ee-verify-text" value={text} onChange={(e) => setText(e.target.value)} rows={3} autoFocus spellCheck={false} autoComplete="off" />
             </div>
-            <button type="button" className="btn-link" onClick={onReset}>I lost my recovery key and every other device</button>
+            <button type="button" className="btn-link" onClick={onReset} disabled={busy}>I lost my recovery key and every other device</button>
           </>
         )}
       </div>
       <div className="chat-modal-foot">
-        <button type="button" className="btn-secondary" onClick={close}>{join ? 'Cancel' : 'Not now'}</button>
-        {!join && <button type="submit" disabled={busy || !text.trim()}>{busy ? 'Checking…' : 'Verify'}</button>}
+        <button type="button" className="btn-secondary" onClick={close}>{join ? 'They do not match' : 'Not now'}</button>
+        {join
+          ? <button type="button" onClick={() => void confirm()} disabled={waiting}>{waiting ? 'Waiting…' : 'The codes match'}</button>
+          : <button type="submit" disabled={busy || !text.trim()}>{busy ? 'Checking…' : 'Verify'}</button>}
       </div>
     </ChatDialog>
   );
@@ -153,13 +199,15 @@ export function VerifyAnotherDevice({ onClose }: { onClose: () => void }) {
       try {
         const o = await offerVerification();
         if (!live) return void o.cancel().catch(() => undefined);
+        // The server's lifetime, counted on this clock: the two clocks may disagree.
+        const deadline = Date.now() + o.expiresInMs;
         offerRef.current = o;
         setOffer(o);
         // The copyable code works without the picture.
         setQr(await QRCode.toDataURL(o.text, { margin: 1, width: 220 }).catch(() => ''));
         const poll = async () => {
           if (!live) return;
-          if (Date.now() >= o.expiresAt) return setErr('The code expired. Close this and start again.');
+          if (Date.now() >= deadline) return setErr('The code expired. Close this and start again.');
           try {
             const j = await o.poll();
             if (j) return live && setJoined(j);
@@ -210,7 +258,7 @@ export function VerifyAnotherDevice({ onClose }: { onClose: () => void }) {
             <p>On the new device, choose “Use a code from my other device” and scan or paste this code. It works once, for a few minutes.</p>
             {qr && <img src={qr} alt="Verification QR code" width={220} height={220} />}
             <code className="e2ee-recovery-key" data-testid="verification-code">{offer.text}</code>
-            <button type="button" className="btn-secondary" onClick={() => void navigator.clipboard?.writeText(offer.text)}>Copy code</button>
+            <CopyButton text={offer.text} label="Copy code" />
           </>
         ) : !err && <p>Starting…</p>}
       </div>
@@ -222,26 +270,40 @@ export function VerifyAnotherDevice({ onClose }: { onClose: () => void }) {
   );
 }
 
-type Gate = { state: 'loading' | 'verified' | 'none' } | { state: 'unverified'; fingerprint: string };
+export type GateState = { state: 'loading' } | { state: 'error'; message: string } | IdentityStatus;
 
-/**
- * While this account has no identity or this device is unverified, a banner (it never blocks
- * the page) offers the setup or verification screen. An unverified device can send but
- * receives no room keys, so the banner stays until it is verified.
- */
-export function EncryptionIdentityGate({ ready }: { ready: boolean }) {
-  const [gate, setGate] = useState<Gate>({ state: 'loading' });
-  const [open, setOpen] = useState(false);
-  const [reset, setReset] = useState(false);
+/** This device's identity status, kept current once encryption is ready. */
+export function useIdentityStatus(ready: boolean): [GateState, () => void] {
+  const [gate, setGate] = useState<GateState>({ state: 'loading' });
   const refresh = useCallback(() => {
-    identityStatus().then((s) => setGate(s.state === 'unverified' ? s : { state: s.state }), () => setGate({ state: 'loading' }));
+    identityStatus().then(setGate, (e: unknown) => setGate({ state: 'error', message: errText(e, 'The encryption identity could not be checked.') }));
   }, []);
   useEffect(() => {
     if (!ready) return;
     refresh();
     return onIdentityChanged(refresh);
   }, [ready, refresh]);
+  return [gate, refresh];
+}
+
+/**
+ * While this account has no identity or this device is unverified, a banner (it never blocks
+ * the page) offers the setup or verification screen. An unverified device receives no room
+ * keys, so the banner stays until it is verified. A failed check says so, with Retry.
+ */
+export function EncryptionIdentityGate({ gate, refresh }: { gate: GateState; refresh: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [reset, setReset] = useState(false);
   if (gate.state === 'loading' || gate.state === 'verified') return null;
+  if (gate.state === 'error') {
+    return (
+      <div className="chat-banner chat-banner-error" role="alert">
+        <ShieldAlert size={16} aria-hidden="true" />
+        <span>{gate.message}</span>
+        <button type="button" className="btn-secondary" onClick={refresh}>Retry</button>
+      </div>
+    );
+  }
   const close = () => { setOpen(false); setReset(false); };
   const done = () => { close(); refresh(); };
   return (
@@ -251,7 +313,8 @@ export function EncryptionIdentityGate({ ready }: { ready: boolean }) {
         <span>
           {gate.state === 'none'
             ? 'Set up encryption to read messages sent to you.'
-            : 'Verify this device to read messages sent to you. Until then it can only send.'}
+            : 'Verify this device to read messages sent to you. Until then nothing you send here can be read.'}
+          {gate.quarantined && ' This browser set aside the keys of an identity the server no longer lists; they are kept, not deleted.'}
         </span>
         <button type="button" className="btn-secondary" onClick={() => setOpen(true)}>
           {gate.state === 'none' ? 'Set up encryption' : 'Verify this device'}
@@ -259,7 +322,7 @@ export function EncryptionIdentityGate({ ready }: { ready: boolean }) {
       </div>
       {open && (gate.state === 'none' || reset
         ? <SetUpEncryption reset={reset} onClose={close} onDone={done} />
-        : <VerifyThisDevice fingerprint={gate.state === 'unverified' ? gate.fingerprint : ''} onClose={close} onReset={() => setReset(true)} onDone={done} />)}
+        : <VerifyThisDevice fingerprint={gate.fingerprint} onClose={close} onReset={() => setReset(true)} onDone={done} />)}
     </>
   );
 }
@@ -284,9 +347,11 @@ export function IdentityChangedBanner({ memberIds, nameOf }: { memberIds: string
           <ShieldAlert size={16} aria-hidden="true" />
           <span>
             {nameOf(c.user_id)}’s identity changed. Messages you send here are not shared with their devices until you accept the new identity.
-            {' '}Check with them first. New fingerprint: <code>{c.fingerprint.slice(0, 16).toUpperCase().match(/.{4}/g)?.join(' ')}</code>
+            {' '}Check the whole fingerprint with them first: <code data-testid="new-fingerprint">{formatFingerprint(c.fingerprint)}</code>
           </span>
-          <button type="button" className="btn-secondary" onClick={() => acceptIdentity(c.user_id).catch((e: unknown) => setErr(errText(e, 'Could not accept the identity.')))}>
+          <CopyButton text={formatFingerprint(c.fingerprint)} label="Copy fingerprint" />
+          {/* Accepts exactly the fingerprint shown; if it changed meanwhile, nothing is accepted. */}
+          <button type="button" className="btn-secondary" onClick={() => acceptIdentity(c.user_id, c.previous, c.fingerprint).catch((e: unknown) => setErr(errText(e, 'Could not accept the identity.')))}>
             Accept new identity
           </button>
         </div>

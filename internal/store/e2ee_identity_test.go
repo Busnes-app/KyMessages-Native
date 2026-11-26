@@ -15,6 +15,24 @@ func master(user, tenant, tag string) *store.E2EEMasterKey {
 		BackupKey: "bk-" + tag, BackupSignature: "bs-" + tag, RecoveryMaster: "rm-" + tag, RecoveryBackup: "rb-" + tag}
 }
 
+// signedInitiator gives user an identity in tenant (if it has none) and a device signed by
+// version 1, which a pairing needs.
+func signedInitiator(t *testing.T, st store.Store, user, tenant, deviceID string) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := st.E2EE().GetMasterKey(ctx, user); errors.Is(err, store.ErrNotFound) {
+		if err := st.E2EE().PutMasterKey(ctx, master(user, tenant, "1"), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.E2EE().UpsertDevice(ctx, device(user, deviceID, tenant)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.E2EE().SignDevice(ctx, user, deviceID, 1, "sig"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestE2EEMasterKeyVersions(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
@@ -51,17 +69,34 @@ func TestE2EEMasterKeyVersions(t *testing.T) {
 	if err := k.SignDevice(ctx, "u-a", "D1", 1, "sig-1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := k.PutPins(ctx, "u-a", 1, 0, "pins-1"); err != nil {
+	if err := k.PutPins(ctx, "t1", "u-a", 1, 0, "pins-1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := k.PutPins(ctx, "u-a", 1, 0, "pins-stale"); !errors.Is(err, store.ErrE2EEVersion) {
+	if err := k.PutPins(ctx, "t1", "u-a", 1, 0, "pins-stale"); !errors.Is(err, store.ErrE2EEVersion) {
 		t.Fatalf("stale pin counter: %v", err)
 	}
-	if err := k.PutBackupSessions(ctx, "u-a", 1, []store.E2EEBackupSession{{RoomID: "r", SessionID: "s", FirstIndex: 0, Sealed: "x"}}, 10); err != nil {
+	if err := k.PutPins(ctx, "t2", "u-a", 1, 1, "pins-other-org"); !errors.Is(err, store.ErrE2EEVersion) {
+		t.Fatalf("pins written from another org: %v", err)
+	}
+	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, `["D1"]`, "list-sig"); err != nil {
 		t.Fatal(err)
 	}
-	if err := k.CreatePairing(ctx, &store.E2EEPairing{ID: "p1", TenantID: "t1", UserID: "u-a", InitiatorDevice: "D1", ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+	if err := k.PutDeviceList(ctx, "t1", "u-a", 1, 0, `["D1","D9"]`, "stale"); !errors.Is(err, store.ErrE2EEVersion) {
+		t.Fatalf("stale device list epoch: %v", err)
+	}
+	if err := k.PutBackupSessions(ctx, "u-a", 1, []store.E2EEBackupSession{{RoomID: "r", SenderKey: "k", SessionID: "s", FirstIndex: 0, Sealed: "x"}}, 10, 1<<20); err != nil {
 		t.Fatal(err)
+	}
+	if err := k.CreatePairing(ctx, &store.E2EEPairing{ID: "p0", TenantID: "t1", UserID: "u-a", InitiatorDevice: "D1", MasterVersion: 2, ExpiresAt: time.Now().Add(time.Minute)}); !errors.Is(err, store.ErrE2EEVersion) {
+		t.Fatalf("pairing fenced on a version that is not current: %v", err)
+	}
+	if err := k.CreatePairing(ctx, &store.E2EEPairing{ID: "p1", TenantID: "t1", UserID: "u-a", InitiatorDevice: "D1", MasterVersion: 1, ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	// A colleague's key query reads only the public half.
+	pub, err := k.ListMasterKeys(ctx, "t1", []string{"u-a"})
+	if err != nil || len(pub) != 1 || pub[0].MasterKey != "mk-1" || pub[0].DeviceListEpoch != 1 || pub[0].RecoveryMaster != "" || pub[0].RecoveryBackup != "" || pub[0].Pins != "" || pub[0].BackupKey != "" {
+		t.Fatalf("public projection = %+v %v", pub, err)
 	}
 
 	// A reset: the new identity starts with no backup, pins, pairing or cross-signature.
@@ -70,20 +105,20 @@ func TestE2EEMasterKeyVersions(t *testing.T) {
 		t.Fatalf("reset: %v %d", err, reset.Version)
 	}
 	got, err := k.GetMasterKey(ctx, "u-a")
-	if err != nil || got.MasterKey != "mk-2" || got.Version != 2 || got.Pins != "" || got.PinsCounter != 0 {
+	if err != nil || got.MasterKey != "mk-2" || got.Version != 2 || got.Pins != "" || got.PinsCounter != 0 || got.DeviceListEpoch != 0 || got.DeviceList != "" {
 		t.Fatalf("after reset: %+v %v", got, err)
 	}
 	d, _ := k.GetDevice(ctx, "u-a", "D1")
 	if d.MasterSignature != "" || d.MasterVersion != 0 {
 		t.Fatalf("cross-signature survived the reset: %+v", d)
 	}
-	if rows, _ := k.ListBackupSessions(ctx, "u-a", 1, "", "", 10); len(rows) != 0 {
+	if rows, _ := k.ListBackupSessions(ctx, "u-a", 1, store.E2EEBackupCursor{}, 10); len(rows) != 0 {
 		t.Fatalf("old backup survived: %+v", rows)
 	}
 	if _, err := k.GetPairing(ctx, "t1", "u-a", "p1", time.Now()); !errors.Is(err, store.ErrNotFound) {
 		t.Fatal("pairing survived the reset")
 	}
-	if err := k.PutBackupSessions(ctx, "u-a", 1, []store.E2EEBackupSession{{RoomID: "r", SessionID: "s", Sealed: "x"}}, 10); !errors.Is(err, store.ErrE2EEVersion) {
+	if err := k.PutBackupSessions(ctx, "u-a", 1, []store.E2EEBackupSession{{RoomID: "r", SenderKey: "k", SessionID: "s", Sealed: "x"}}, 10, 1<<20); !errors.Is(err, store.ErrE2EEVersion) {
 		t.Fatalf("write to the old backup version: %v", err)
 	}
 	if list, _ := k.ListMasterKeys(ctx, "t2", []string{"u-a"}); len(list) != 0 {
@@ -99,48 +134,58 @@ func TestE2EEKeyBackupKeepsTheBestCopy(t *testing.T) {
 	if err := k.PutMasterKey(ctx, master("u-a", "t1", "1"), 0); err != nil {
 		t.Fatal(err)
 	}
-	put := func(idx int64, sealed string) {
+	put := func(sender string, idx int64, sealed string) {
 		t.Helper()
-		if err := k.PutBackupSessions(ctx, "u-a", 1, []store.E2EEBackupSession{{RoomID: "r1", SessionID: "s1", FirstIndex: idx, Sealed: sealed}}, 10); err != nil {
+		if err := k.PutBackupSessions(ctx, "u-a", 1, []store.E2EEBackupSession{{RoomID: "r1", SenderKey: sender, SessionID: "s1", FirstIndex: idx, Sealed: sealed}}, 10, 1<<20); err != nil {
 			t.Fatal(err)
 		}
 	}
-	put(5, "from-5")
-	put(9, "from-9") // reaches less far back: ignored
-	put(2, "from-2") // reaches further back: replaces
-	put(2, "again")  // equal: the first copy stays
-	rows, err := k.ListBackupSessions(ctx, "u-a", 1, "", "", 10)
-	if err != nil || len(rows) != 1 || rows[0].Sealed != "from-2" || rows[0].FirstIndex != 2 {
+	put("kA", 5, "from-5")
+	put("kA", 9, "from-9") // reaches less far back: ignored
+	put("kA", 2, "from-2") // reaches further back: replaces
+	put("kA", 2, "again")  // equal: the first copy stays
+	// Another sender re-sharing the same session ID gets its own row and displaces nothing.
+	put("kB", 0, "impostor")
+	rows, err := k.ListBackupSessions(ctx, "u-a", 1, store.E2EEBackupCursor{}, 10)
+	if err != nil || len(rows) != 2 || rows[0].SenderKey != "kA" || rows[0].Sealed != "from-2" || rows[0].FirstIndex != 2 || rows[1].SenderKey != "kB" {
 		t.Fatalf("rows = %+v %v", rows, err)
 	}
 
-	// Paging in (room, session) order, and the cap: a write past it stores nothing.
+	// Paging in (room, sender, session) order, and both caps: a write past one stores nothing.
 	var batch []store.E2EEBackupSession
-	for i := range 9 {
-		batch = append(batch, store.E2EEBackupSession{RoomID: fmt.Sprintf("r%d", i%3+2), SessionID: fmt.Sprintf("s%d", i), Sealed: "x"})
+	for i := range 8 {
+		batch = append(batch, store.E2EEBackupSession{RoomID: fmt.Sprintf("r%d", i%3+2), SenderKey: fmt.Sprintf("k%d", i%2), SessionID: fmt.Sprintf("s%d", i), Sealed: "x"})
 	}
-	if err := k.PutBackupSessions(ctx, "u-a", 1, batch, 10); err != nil {
+	if err := k.PutBackupSessions(ctx, "u-a", 1, batch, 10, 1<<20); err != nil {
 		t.Fatal(err)
 	}
-	if err := k.PutBackupSessions(ctx, "u-a", 1, []store.E2EEBackupSession{{RoomID: "r9", SessionID: "s", Sealed: "x"}}, 10); !errors.Is(err, store.ErrE2EEBackupFull) {
-		t.Fatalf("past the cap: %v", err)
+	if err := k.PutBackupSessions(ctx, "u-a", 1, []store.E2EEBackupSession{{RoomID: "r9", SenderKey: "k", SessionID: "s", Sealed: "x"}}, 10, 1<<20); !errors.Is(err, store.ErrE2EEBackupFull) {
+		t.Fatalf("past the session cap: %v", err)
+	}
+	stored := int64(len("from-2") + len("impostor") + 8)
+	if err := k.PutBackupSessions(ctx, "u-a", 1, []store.E2EEBackupSession{{RoomID: "r1", SenderKey: "kA", SessionID: "s1", FirstIndex: 1, Sealed: "a-longer-copy"}}, 100, stored); !errors.Is(err, store.ErrE2EEBackupFull) {
+		t.Fatalf("past the byte cap: %v", err)
+	}
+	if rows, _ := k.ListBackupSessions(ctx, "u-a", 1, store.E2EEBackupCursor{}, 1); rows[0].Sealed != "from-2" {
+		t.Fatal("a refused write changed a row")
 	}
 	var seen []string
-	afterRoom, afterSession := "", ""
+	var after store.E2EEBackupCursor
 	for {
-		page, err := k.ListBackupSessions(ctx, "u-a", 1, afterRoom, afterSession, 4)
+		page, err := k.ListBackupSessions(ctx, "u-a", 1, after, 3)
 		if err != nil {
 			t.Fatal(err)
 		}
 		for _, p := range page {
-			seen = append(seen, p.RoomID+"/"+p.SessionID)
+			seen = append(seen, p.RoomID+"/"+p.SenderKey+"/"+p.SessionID)
 		}
-		if len(page) < 4 {
+		if len(page) < 3 {
 			break
 		}
-		afterRoom, afterSession = page[len(page)-1].RoomID, page[len(page)-1].SessionID
+		l := page[len(page)-1]
+		after = store.E2EEBackupCursor{RoomID: l.RoomID, SenderKey: l.SenderKey, SessionID: l.SessionID}
 	}
-	if len(seen) != 10 || seen[0] != "r1/s1" || seen[9] != "r4/s8" {
+	if len(seen) != 10 || seen[0] != "r1/kA/s1" || seen[1] != "r1/kB/s1" || seen[9] != "r4/k1/s5" {
 		t.Fatalf("paged %v", seen)
 	}
 	if err := k.DeleteBackup(ctx, "u-a", 2); !errors.Is(err, store.ErrE2EEVersion) {
@@ -149,8 +194,29 @@ func TestE2EEKeyBackupKeepsTheBestCopy(t *testing.T) {
 	if err := k.DeleteBackup(ctx, "u-a", 1); err != nil {
 		t.Fatal(err)
 	}
-	if rows, _ := k.ListBackupSessions(ctx, "u-a", 1, "", "", 10); len(rows) != 0 {
+	if rows, _ := k.ListBackupSessions(ctx, "u-a", 1, store.E2EEBackupCursor{}, 10); len(rows) != 0 {
 		t.Fatal("backup not deleted")
+	}
+}
+
+// A user's row left in another org (only a restore or a manual move makes one) must not block
+// the first setup in their org.
+func TestE2EEFirstSetupReplacesAnotherOrgsRow(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	e2eeUser(t, st, "u-a")
+	k := st.E2EE()
+	if err := k.PutMasterKey(ctx, master("u-a", "old-org", "old"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := k.PutMasterKey(ctx, master("u-a", "t1", "new"), 0); err != nil {
+		t.Fatalf("first setup in the new org: %v", err)
+	}
+	if m, err := k.GetMasterKey(ctx, "u-a"); err != nil || m.TenantID != "t1" || m.MasterKey != "mk-new" {
+		t.Fatalf("after = %+v %v", m, err)
+	}
+	if err := k.PutMasterKey(ctx, master("u-a", "t1", "again"), 0); !errors.Is(err, store.ErrE2EEVersion) {
+		t.Fatalf("a second setup in the same org: %v", err)
 	}
 }
 
@@ -161,9 +227,10 @@ func TestE2EEPairingIsOneTimeShortLivedAndScoped(t *testing.T) {
 	e2eeUser(t, st, "u-b")
 	k := st.E2EE()
 	now := time.Now()
+	signedInitiator(t, st, "u-a", "t1", "OLD")
 	open := func(id string) {
 		t.Helper()
-		if err := k.CreatePairing(ctx, &store.E2EEPairing{ID: id, TenantID: "t1", UserID: "u-a", InitiatorDevice: "OLD", ExpiresAt: now.Add(3 * time.Minute)}); err != nil {
+		if err := k.CreatePairing(ctx, &store.E2EEPairing{ID: id, TenantID: "t1", UserID: "u-a", InitiatorDevice: "OLD", MasterVersion: 1, ExpiresAt: now.Add(3 * time.Minute)}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -240,10 +307,11 @@ func TestE2EEIdentityGoesWithTheUser(t *testing.T) {
 	if err := k.PutMasterKey(ctx, master("u-a", "t1", "1"), 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := k.PutBackupSessions(ctx, "u-a", 1, []store.E2EEBackupSession{{RoomID: "r", SessionID: "s", Sealed: "x"}}, 10); err != nil {
+	if err := k.PutBackupSessions(ctx, "u-a", 1, []store.E2EEBackupSession{{RoomID: "r", SenderKey: "k", SessionID: "s", Sealed: "x"}}, 10, 1<<20); err != nil {
 		t.Fatal(err)
 	}
-	if err := k.CreatePairing(ctx, &store.E2EEPairing{ID: "p", TenantID: "t1", UserID: "u-a", InitiatorDevice: "D", ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+	signedInitiator(t, st, "u-a", "t1", "D")
+	if err := k.CreatePairing(ctx, &store.E2EEPairing{ID: "p", TenantID: "t1", UserID: "u-a", InitiatorDevice: "D", MasterVersion: 1, ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.Users().DeleteUser(ctx, "u-a"); err != nil {
@@ -252,7 +320,7 @@ func TestE2EEIdentityGoesWithTheUser(t *testing.T) {
 	if _, err := k.GetMasterKey(ctx, "u-a"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatal("master key survived the user")
 	}
-	if rows, _ := k.ListBackupSessions(ctx, "u-a", 1, "", "", 10); len(rows) != 0 {
+	if rows, _ := k.ListBackupSessions(ctx, "u-a", 1, store.E2EEBackupCursor{}, 10); len(rows) != 0 {
 		t.Fatal("key backup survived the user")
 	}
 	if _, err := k.GetPairing(ctx, "t1", "u-a", "p", time.Now()); !errors.Is(err, store.ErrNotFound) {

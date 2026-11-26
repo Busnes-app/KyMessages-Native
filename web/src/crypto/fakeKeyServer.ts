@@ -88,7 +88,7 @@ export class FakeKeyServer {
         for (const u of userIds) {
           devices[u] = [...(this.devices.get(u)?.values() ?? [])].map((d) => ({ ...d }));
           const m = this.masters.get(u);
-          if (m) master_keys[u] = { version: m.version, master_key: m.master_key, self_signature: m.self_signature };
+          if (m) master_keys[u] = { version: m.version, master_key: m.master_key, self_signature: m.self_signature, ...(m.device_list ? { device_list: structuredClone(m.device_list) } : {}) };
         }
         return { tenant_id: TENANT, devices, master_keys };
       },
@@ -114,6 +114,12 @@ export class FakeKeyServer {
         if (!m || m.version !== version || m.pins.counter !== expected) throw new Conflict('409');
         m.pins = { counter: expected + 1, sealed };
       },
+      putDeviceList: async (version, expected, deviceIds, signature) => {
+        const m = this.masters.get(userId);
+        if (!m || m.version !== version || (m.device_list?.epoch ?? 0) !== expected) throw new Conflict('409');
+        if (!pqc.verifyDeviceList(m.master_key, TENANT, userId, version, expected + 1, deviceIds, signature)) throw new Error('The device list is not validly signed');
+        m.device_list = { epoch: expected + 1, device_ids: [...deviceIds], signature };
+      },
       signDevice: async (deviceId, version, signature) => {
         const m = this.masters.get(userId);
         const d = this.devices.get(userId)?.get(deviceId);
@@ -122,18 +128,20 @@ export class FakeKeyServer {
         if (!pqc.verifyDevice(m.master_key, TENANT, userId, deviceId, d.curve25519, d.ed25519, signature)) throw new Error('The device signature does not verify');
         d.master_signature = signature;
       },
-      getBackup: async (version, afterRoom, afterSession) => {
+      getBackup: async (version, after) => {
         if (this.masters.get(userId)?.version !== version) throw new Conflict('409');
+        const k = (e: { room_id: string; sender_key: string; session_id: string }) => [e.room_id, e.sender_key, e.session_id];
+        const cmp = (a: string[], b: string[]) => (a[0] !== b[0] ? (a[0] < b[0] ? -1 : 1) : a[1] !== b[1] ? (a[1] < b[1] ? -1 : 1) : a[2] < b[2] ? -1 : a[2] > b[2] ? 1 : 0);
         const rows = [...(this.backups.get(userId)?.values() ?? [])]
-          .sort((a, b) => (a.room_id + '\n' + a.session_id < b.room_id + '\n' + b.session_id ? -1 : 1))
-          .filter((e) => e.room_id > afterRoom || (e.room_id === afterRoom && e.session_id > afterSession));
+          .sort((a, b) => cmp(k(a), k(b)))
+          .filter((e) => cmp(k(e), k(after)) > 0);
         return { sessions: rows.slice(0, 2).map((e) => ({ ...e })), more: rows.length > 2 };
       },
       putBackup: async (version, sessions) => {
         if (this.masters.get(userId)?.version !== version) throw new Conflict('409');
         const box = this.backups.get(userId) ?? new Map<string, BackupEntry>();
         for (const e of sessions) {
-          const k = `${e.room_id}\n${e.session_id}`;
+          const k = `${e.room_id}\n${e.sender_key}\n${e.session_id}`;
           const known = box.get(k);
           if (!known || e.first_index < known.first_index) box.set(k, { ...e });
         }
@@ -146,7 +154,7 @@ export class FakeKeyServer {
         // As the server makes them: 16 random bytes, unpadded base64url.
         const id = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16)))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
         this.pairings.set(id, { user: userId, initiator: deviceId, newDevice: '', ephemeral: '', sealed: '', expires: Date.now() + 180_000 });
-        return { pairing_id: id, expires_at: Date.now() + 180_000 };
+        return { pairing_id: id, expires_in_ms: 180_000 };
       },
       pairingGet: async (id) => {
         const p = this.pairing(userId, id);

@@ -10,6 +10,8 @@ export interface InboundRecord {
   first_index: number;
   /** Set when the key came from the key backup rather than over Olm from its sender. */
   from_backup?: boolean;
+  /** Set when the sending device was vouched for by its member's master key on arrival. */
+  verified?: boolean;
 }
 
 // Room sessions and their replay log are keyed by the sender's verified curve25519 key as well

@@ -28,7 +28,7 @@ async function verify(server: FakeKeyServer, e: CryptoEngine): Promise<CryptoEng
   recoveryKeys.set(server, keys);
   const status = await e.identityStatus();
   if (status.state === 'none') {
-    const p = e.prepareIdentity();
+    const p = await e.prepareIdentity();
     keys.set(e.userId, p.recoveryKey);
     await p.commit();
   } else if (status.state === 'unverified') {
@@ -246,6 +246,7 @@ describe('encrypted rooms between two client engines', () => {
     const aliceServer = server.as('u_alice');
     const alice = await CryptoEngine.open('u_alice', aliceServer, await openCryptoStore('u_alice'));
     opened.push(alice);
+    await verify(server, alice);
     const bob = await device(server, 'u_bob');
     const carol = await device(server, 'u_carol');
     server.join('r1', 'u_alice', 'u_bob', 'u_carol');

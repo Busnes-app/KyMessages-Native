@@ -60,9 +60,11 @@ describe('pqc.wasm', () => {
     expect(pqc.recoveryUnwrap(rk.key, 'master-key', 't', 'u', wrapped)).toBe(m.seed);
     expect(() => pqc.recoveryUnwrap(rk.key, 'backup-key', 't', 'u', wrapped)).toThrow();
 
-    const sealed = pqc.backupSeal(x.public, m.seed, 'rm_1', 'sess', b64('{"k":"é"}'));
-    expect(unb64(pqc.backupOpen(x.seed, m.seed, 'rm_1', 'sess', sealed))).toBe('{"k":"é"}');
-    expect(() => pqc.backupOpen(x.seed, m.seed, 'rm_2', 'sess', sealed)).toThrow();
+    const ref = { room_id: 'rm_1', sender_key: 'senderkey', session_id: 'sess', first_index: 4 };
+    const sealed = pqc.backupSeal(x.public, m.seed, ref, b64('{"k":"é"}'));
+    expect(unb64(pqc.backupOpen(x.seed, m.seed, ref, sealed))).toBe('{"k":"é"}');
+    expect(() => pqc.backupOpen(x.seed, m.seed, { ...ref, room_id: 'rm_2' }, sealed)).toThrow();
+    expect(() => pqc.backupOpen(x.seed, m.seed, { ...ref, first_index: 0 }, sealed)).toThrow();
 
     const eph = pqc.xwingGenerate();
     const qr = pqc.qrNew('QkJCQkJCQkJCQkJCQkJCQg', m.fingerprint);

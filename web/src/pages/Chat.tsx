@@ -87,9 +87,9 @@ import { ChatSidebar } from '../components/chat/ChatSidebar';
 import { MessageRow } from '../components/chat/MessageRow';
 import { RoomDetailsDrawer, type DrawerTab } from '../components/chat/RoomDetailsDrawer';
 import { CreateChannelModal, SearchModal, StartDMModal } from '../components/chat/ChatModals';
-import { EncryptionIdentityGate, IdentityChangedBanner, VerifyAnotherDevice } from '../components/chat/EncryptionIdentity';
+import { EncryptionIdentityGate, IdentityChangedBanner, useIdentityStatus, VerifyAnotherDevice } from '../components/chat/EncryptionIdentity';
 import { searchIndexFor } from '../chat/searchIndex';
-import { keyGeneration, onRoomKeys, openMessages, receiveRoomKeys, retryable, roomMemberLeft, startE2EE } from '../chat/e2ee';
+import { checkRoomIdentities, keyGeneration, onRoomKeys, openMessages, receiveRoomKeys, retryable, roomMemberLeft, startE2EE } from '../chat/e2ee';
 import { CallAudioLayer, CallStage } from '../components/chat/CallStage';
 import { HybridCallController, type HybridCallSnapshot } from '../rtc/hybridCall';
 
@@ -148,6 +148,7 @@ export const Chat: React.FC<ChatProps> = ({
   const [bannerError, setBannerError] = useState('');
   // This browser's encryption device started: the identity screens may ask the server.
   const [e2eeReady, setE2eeReady] = useState(false);
+  const [identity, refreshIdentity] = useIdentityStatus(e2eeReady);
   const [currentUser, setCurrentUser] = useState<ChatCurrentUser | null>(null);
   const [tenantName, setTenantName] = useState('KyMessages');
   const [rooms, setRooms] = useState<ChatRoomSummary[]>([]);
@@ -525,6 +526,8 @@ export const Chat: React.FC<ChatProps> = ({
       const detail = await fetchRoomDetail(roomId);
       if (activeRoomIdRef.current === roomId) {
         setRoomDetail(detail);
+        // A reader who never sends still sees a member's identity change.
+        checkRoomIdentities(roomId);
       }
     } catch (e) {
       setBannerError(e instanceof Error ? e.message : 'Could not load room details');
@@ -2046,7 +2049,7 @@ export const Chat: React.FC<ChatProps> = ({
                 >
                   <Search size={17} />
                 </button>
-                {e2eeReady && (
+                {identity.state === 'verified' && (
                   <button
                     type="button"
                     className="chat-icon-btn"
@@ -2082,7 +2085,7 @@ export const Chat: React.FC<ChatProps> = ({
               </div>
             </header>
 
-            <EncryptionIdentityGate ready={e2eeReady} />
+            <EncryptionIdentityGate gate={identity} refresh={refreshIdentity} />
             {e2eeReady && roomDetail && roomDetail.room.id === activeRoom.id && (
               <IdentityChangedBanner
                 memberIds={roomDetail.members.map((m) => m.user_id)}

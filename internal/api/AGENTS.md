@@ -160,11 +160,15 @@ Owns HTTP routing, request parsing, session cookie validation, CORS headers, and
   budget (600 a minute), not chat writes.
 
 - E3 identity routes (`e2ee_identity_handlers.go`, spec §9.1): `GET/PUT /api/v1/keys/master`,
-  `PUT /api/v1/keys/pins`, `POST /api/v1/keys/devices/{id}/signature`, `GET/PUT/DELETE
-  /api/v1/keys/backup` and `/api/v1/keys/pairings[/{id}[/join|/sealed|/consume]]`. Bodies are
+  `PUT /api/v1/keys/pins`, `PUT /api/v1/keys/devices/list`, `POST /api/v1/keys/devices/{id}/signature`, `GET/PUT/DELETE
+  /api/v1/keys/backup` and `/api/v1/keys/pairings[/{id}[/join|/sealed|/consume]]`. Every
+  `PUT master` and `DELETE backup` needs a session younger than `stepUpWindow` (`e2eeFresh`);
+  recovery wraps must be exactly 93/61 bytes with version 1; backup rows carry `sender_key` and
+  are capped by `E2EEBackupMaxSessions` and `E2EEBackupMaxBytes` (2 MiB; the database is one
+  64 MiB capsule member). Bodies are
   decoded strictly (`decodeIdentity`) and carry no secret field; every hybrid signature is
   verified for the caller's org and user before it is stored; versions are compare-and-swap
-  (`409`); a reset (`expected_version` > 0) needs a session younger than `stepUpWindow`; `/keys/query` adds `tenant_id`, `master_keys` and current-version
+  (`409`); `/keys/query` adds `tenant_id`, `master_keys` and current-version
   `master_signature`s. Pairings are one per user, 3 minutes (`E2EEPairingTTL`), started only by a
   cross-signed device, joined and sealed once, consumed once; another user's or org's reads as
   unknown. Same `e2ee:` budget.

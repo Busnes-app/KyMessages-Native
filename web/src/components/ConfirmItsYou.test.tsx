@@ -89,3 +89,25 @@ it('never leaves a refusal hanging when the answer lands while it is joining', a
   const settled = await Promise.race([b, screen.findByRole('dialog').then((d) => { fireEvent.click(within(d).getByRole('button', { name: 'Cancel' })); return b; })]);
   expect(settled.status).toBe(403);
 });
+
+// A local account signs in again in place (password, then TOTP), never by signing out, which
+// would delete this browser's encryption keys in every tab.
+it('signs a local account in again in place, through TOTP, then retries', async () => {
+  const LOCAL = { error: STEP_UP.error, code: STEP_UP.code };
+  const calls = answers({
+    '/x': [json(LOCAL, 403), json({ ok: true })],
+    '/api/auth/pow-challenge': [json({ error: 'off' }, 404)],
+    '/api/auth/login': [json({ mfa_required: true, mfa_token: 'mfa-1' })],
+    '/api/auth/mfa/totp': [json({ authenticated: true, user: { username: 'alice', role: 'user' } })],
+  });
+  render(<ConfirmItsYou username="alice" />);
+  const pending = adminFetch('/x', { method: 'PUT' });
+  const dialog = await screen.findByRole('dialog', { name: "Confirm it's you" });
+  expect(within(dialog).queryByText(/sign out/)).toBeNull();
+  fireEvent.change(within(dialog).getByLabelText('Password for @alice'), { target: { value: 'pw' } });
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Sign in again' }));
+  fireEvent.change(await within(dialog).findByLabelText(/Authentication code/), { target: { value: '123456' } });
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Verify' }));
+  expect((await pending).status).toBe(200);
+  expect(calls.filter((c) => !c.includes('pow-challenge'))).toEqual(['/x', '/api/auth/login', '/api/auth/mfa/totp', '/x']);
+});

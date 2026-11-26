@@ -17,6 +17,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"slices"
 	"strconv"
 
 	"github.com/Busnes-app/ky_server_base/internal/pqc/hybridsig"
@@ -28,6 +29,7 @@ const (
 	DomainMaster      = "kymessages.master.v1"
 	DomainDevice      = "kymessages.device.v2"
 	DomainBackupKey   = "kymessages.backup-key.v1"
+	DomainDeviceList  = "kymessages.device-list.v1"
 	labelFingerprint  = "kymessages.master-fingerprint.v1"
 	labelRecovery     = "kymessages.recovery.v1"
 	LabelRecoveryMKey = "kymessages.recovery.v1/master-key"
@@ -35,6 +37,7 @@ const (
 	labelRecoveryCode = "kymessages.recovery-key.v1"
 	InfoBackup        = "kymessages.backup.v1"
 	InfoQRTransfer    = "kymessages.qr-transfer.v1"
+	infoQRInner       = "kymessages.qr-transfer.v1/inner"
 	labelQRCode       = "kymessages.qr-transfer.v1/code"
 	labelPins         = "kymessages.pins.v1"
 	labelBackupMAC    = "kymessages.backup.v1/mac"
@@ -49,8 +52,8 @@ const (
 	PairingIDBytes = 16
 	wrapVersion    = 1
 	nonceBytes     = 12
-	// MaxSealedSession bounds one key backup entry.
-	MaxSealedSession = 8 << 10
+	// MaxSealedSession bounds one key backup entry (a sealed export is about 1.5 KB).
+	MaxSealedSession = 4 << 10
 )
 
 var (
@@ -60,6 +63,8 @@ var (
 	ErrRecoveryKey = errors.New("e2eeid: invalid recovery key")
 	// ErrQR reports a QR payload that does not parse.
 	ErrQR = errors.New("e2eeid: invalid verification code")
+	// ErrDeviceList reports a device list that is not sorted and distinct.
+	ErrDeviceList = errors.New("e2eeid: device list must be sorted and distinct")
 )
 
 // Fields is the canonical encoding of a field list: each field as a big-endian uint32 length
@@ -111,6 +116,21 @@ func DeviceMessage(tenantID, userID, deviceID, curve25519, ed25519 string) []byt
 // BackupKeyMessage is what a master key signs to publish the user's X-Wing backup key.
 func BackupKeyMessage(tenantID, userID string, version int64, pub []byte) []byte {
 	return Fields(s(hybridsig.Alg), s(tenantID), s(userID), s(strconv.FormatInt(version, 10)), pub)
+}
+
+// DeviceListMessage is what a master key signs to name the user's devices at one epoch.
+// deviceIDs must be sorted and distinct, so each list has one encoding. Clients trust only
+// devices on the newest list they have seen, so a removed device stays removed even if the
+// server lists its old row and cross-signature again.
+func DeviceListMessage(tenantID, userID string, version, epoch int64, deviceIDs []string) ([]byte, error) {
+	if !slices.IsSorted(deviceIDs) || len(slices.Compact(slices.Clone(deviceIDs))) != len(deviceIDs) {
+		return nil, ErrDeviceList
+	}
+	fields := [][]byte{s(hybridsig.Alg), s(tenantID), s(userID), s(strconv.FormatInt(version, 10)), s(strconv.FormatInt(epoch, 10))}
+	for _, id := range deviceIDs {
+		fields = append(fields, s(id))
+	}
+	return Fields(fields...), nil
 }
 
 // Fingerprint is SHA-256 over a label and the full hybrid master public key (its tagged
@@ -315,12 +335,21 @@ func OpenPins(masterSeed []byte, tenantID, userID string, counter int64, sealed 
 
 // --- Key backup ---
 
-func backupAAD(roomID, sessionID string) []byte { return Fields(s(roomID), s(sessionID)) }
+// BackupEntry names one sealed session: its room, its sender's curve25519 key, its session ID
+// and the first ratchet index the export covers. All four are bound into the AAD and the MAC.
+type BackupEntry struct {
+	RoomID, SenderKey, SessionID string
+	FirstIndex                   int64
+}
+
+func (b BackupEntry) fields() []byte {
+	return Fields(s(b.RoomID), s(b.SenderKey), s(b.SessionID), s(strconv.FormatInt(b.FirstIndex, 10)))
+}
 
 // backupMAC authenticates one entry under a key derived from the master key seed. Anyone with
 // the backup public key (the server too) can seal to it; only the user's verified devices,
 // which hold the master seed, can make an entry a restore accepts.
-func backupMAC(masterSeed []byte, roomID, sessionID string, session []byte) ([]byte, error) {
+func backupMAC(masterSeed []byte, b BackupEntry, session []byte) ([]byte, error) {
 	if len(masterSeed) != MasterSeedBytes {
 		return nil, ErrOpen
 	}
@@ -329,24 +358,24 @@ func backupMAC(masterSeed []byte, roomID, sessionID string, session []byte) ([]b
 		return nil, err
 	}
 	m := hmac.New(sha256.New, k)
-	m.Write(Fields(s(roomID), s(sessionID), session))
+	m.Write(Fields(b.fields(), session))
 	return m.Sum(nil), nil
 }
 
 // SealBackup seals one Megolm session export to the user's X-Wing backup key, with info
-// kymessages.backup.v1 and AAD Fields(room ID, session ID); the plaintext is
-// Fields(session, MAC).
-func SealBackup(pub xwing.PublicKey, masterSeed []byte, roomID, sessionID string, session []byte) ([]byte, error) {
-	mac, err := backupMAC(masterSeed, roomID, sessionID, session)
+// kymessages.backup.v1 and AAD Fields(room ID, sender key, session ID, first index); the
+// plaintext is Fields(session, MAC).
+func SealBackup(pub xwing.PublicKey, masterSeed []byte, b BackupEntry, session []byte) ([]byte, error) {
+	mac, err := backupMAC(masterSeed, b, session)
 	if err != nil {
 		return nil, err
 	}
-	return xwing.Seal(pub, []byte(InfoBackup), backupAAD(roomID, sessionID), Fields(session, mac))
+	return xwing.Seal(pub, []byte(InfoBackup), b.fields(), Fields(session, mac))
 }
 
 // OpenBackup reverses SealBackup with the backup private key and checks the MAC.
-func OpenBackup(priv xwing.PrivateKey, masterSeed []byte, roomID, sessionID string, sealed []byte) ([]byte, error) {
-	out, err := xwing.Open(priv, []byte(InfoBackup), backupAAD(roomID, sessionID), sealed)
+func OpenBackup(priv xwing.PrivateKey, masterSeed []byte, b BackupEntry, sealed []byte) ([]byte, error) {
+	out, err := xwing.Open(priv, []byte(InfoBackup), b.fields(), sealed)
 	if err != nil || len(out) < 4+4+sha256.Size {
 		return nil, ErrOpen
 	}
@@ -355,7 +384,7 @@ func OpenBackup(priv xwing.PrivateKey, masterSeed []byte, roomID, sessionID stri
 		return nil, ErrOpen
 	}
 	session, mac := out[4:4+n], out[8+n:]
-	want, err := backupMAC(masterSeed, roomID, sessionID, session)
+	want, err := backupMAC(masterSeed, b, session)
 	if err != nil || !hmac.Equal(mac, want) {
 		return nil, ErrOpen
 	}
@@ -418,11 +447,12 @@ func ComparisonCode(secret []byte, pairingID string, ephemeralPub []byte) (strin
 	return code, nil
 }
 
-// SealTransfer is the two-layer transfer: AES-256-GCM under HKDF(secret), then xwing.Seal to
+// SealTransfer is the two-layer transfer: AES-256-GCM under HKDF(secret, info
+// kymessages.qr-transfer.v1/inner), then xwing.Seal (info kymessages.qr-transfer.v1) to
 // the new device's ephemeral key. Either layer alone keeps the keys from the server.
 func SealTransfer(ephemeral xwing.PublicKey, secret []byte, pairingID, verifiedDevice, newDevice string, keys []byte) ([]byte, error) {
 	aad := transferAAD(pairingID, verifiedDevice, newDevice)
-	inner, err := sealSym(secret, InfoQRTransfer, aad, keys)
+	inner, err := sealSym(secret, infoQRInner, aad, keys)
 	if err != nil {
 		return nil, err
 	}
@@ -436,5 +466,5 @@ func OpenTransfer(ephemeral xwing.PrivateKey, secret []byte, pairingID, verified
 	if err != nil {
 		return nil, ErrOpen
 	}
-	return openSym(secret, InfoQRTransfer, aad, inner)
+	return openSym(secret, infoQRInner, aad, inner)
 }

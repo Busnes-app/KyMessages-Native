@@ -130,7 +130,9 @@ export interface SealedMessage {
 }
 
 export type Opened =
-  | { state: 'decrypted'; inner: RoomInner }
+  /** authenticated: the session came over Olm from a device its member's master key vouches
+   * for; false for one from an unverified device or restored from the key backup. */
+  | { state: 'decrypted'; inner: RoomInner; authenticated: boolean }
   | { state: 'waiting'; sessionId: string }
   | { state: 'failed'; reason: string };
 
@@ -383,6 +385,7 @@ export class CryptoEngine {
    * saw before, without this device. A device whose keys changed is dropped, never re-pinned.
    */
   async verifiedDevices(userIds: string[]): Promise<Target[]> {
+    this.identity.startBatch();
     const out: Target[] = [];
     const pins: [string, unknown][] = [];
     for (let i = 0; i < userIds.length; i += BATCH) {
@@ -394,7 +397,8 @@ export class CryptoEngine {
         throw new Transient(e instanceof Error ? e.message : 'Could not list devices');
       }
       for (const userId of batch) {
-        // No pinned, validly self-bound master key: none of this member's devices gets keys.
+        // No pinned, validly self-bound master key (or this device is unverified): none of this
+        // member's devices gets keys.
         const master = await this.identity.trustedMaster(userId, listed.master_keys?.[userId], listed.tenant_id, pins);
         if (!master) continue;
         for (const d of listed.devices?.[userId] ?? []) {
@@ -458,7 +462,7 @@ export class CryptoEngine {
   }
 
   /** A new identity (the first device, or a reset); upload happens on commit. */
-  prepareIdentity(reset = false): { recoveryKey: string; commit(): Promise<void> } {
+  prepareIdentity(reset = false): Promise<{ recoveryKey: string; commit(): Promise<void> }> {
     return this.identity.prepare(reset);
   }
 
@@ -481,8 +485,21 @@ export class CryptoEngine {
     return this.identity.changes();
   }
 
-  acceptIdentity(userId: string): Promise<void> {
-    return this.identity.acceptChange(userId);
+  /** Accepts exactly the change shown (previous to fingerprint), or nothing. */
+  acceptIdentity(userId: string, previous: string, fingerprint: string): Promise<void> {
+    return this.identity.acceptChange(userId, previous, fingerprint);
+  }
+
+  /** Checks a room's members' identities when it opens, so a reader sees a change before sending. */
+  checkRoom(roomId: string): Promise<void> {
+    return this.locked(async () => {
+      await this.devicesInRoom(roomId);
+    });
+  }
+
+  /** Takes devices off the user's signed device list (this one at sign-out). */
+  delistDevices(deviceIds: string[]): Promise<void> {
+    return this.identity.delist(deviceIds);
   }
 
   onIdentityChange(fn: () => void): () => void {
@@ -660,6 +677,7 @@ export class CryptoEngine {
               sender_device: this.deviceId,
               sender_key: this.curve25519,
               first_index: own.firstKnownIndex,
+              verified: true,
             } satisfies InboundRecord], [backupQueueKey(k), k]]);
             this.backupSoon();
           } finally {
@@ -725,7 +743,7 @@ export class CryptoEngine {
     if (inner.type === 'edit' && inner.message_id !== m.id) return { state: 'failed', reason: 'This edit belongs to another message.' };
     const owner = await this.store.putIfAbsent(seenKey(env.sender_key, env.session_id, index), m.id);
     if (owner !== m.id) return { state: 'failed', reason: 'This message is a replay of another message.' };
-    return { state: 'decrypted', inner };
+    return { state: 'decrypted', inner, authenticated: rec.verified === true && !rec.from_backup };
   }
 
   /**
@@ -752,11 +770,12 @@ export class CryptoEngine {
       for (;;) {
         const mail = await this.server.mailbox(this.deviceId);
         if (mail.length === 0) return;
+        const trusted = await this.trustedSenders(mail);
         const handled: number[] = [];
         let stop = false;
         for (const m of mail) {
           try {
-            const r = await this.handleMail(m);
+            const r = await this.handleMail(m, trusted);
             if (r) {
               fresh.push(r.sessionId);
               if (r.preKey) spentOneTimeKey();
@@ -778,7 +797,21 @@ export class CryptoEngine {
     });
   }
 
-  private async handleMail(m: Mail): Promise<{ sessionId: string; preKey: boolean } | undefined> {
+  /**
+   * The senders of mail whose master key vouches for them, as "user\ndevice\ncurve25519".
+   * Only their sessions go to the key backup, so no one can fill a member's backup or bake an
+   * impersonation into it by mailing room keys. A lookup that fails trusts no one.
+   */
+  private async trustedSenders(mail: Mail[]): Promise<Set<string>> {
+    const users = [...new Set(mail.map((m) => m.sender_user_id).filter((u) => isStr(u, 128)))];
+    try {
+      return new Set((await this.verifiedDevices(users)).map((t) => `${devKey(t)}\n${t.curve25519}`));
+    } catch {
+      return new Set();
+    }
+  }
+
+  private async handleMail(m: Mail, trusted: Set<string>): Promise<{ sessionId: string; preKey: boolean } | undefined> {
     if (m.type !== ROOM_KEY_TYPE) throw new Error('Unknown mail type');
     const c = parseJSON(m.content);
     if (!isObj(c) || c.algorithm !== 'olm.v1' || !isStr(c.sender_key, 64) || (c.type !== 0 && c.type !== 1) || !isStr(c.body)) {
@@ -796,22 +829,23 @@ export class CryptoEngine {
     let bad: unknown;
     let room: { sessionId: string; key: string; record: InboundRecord } | undefined;
     try {
-      room = await this.roomKey(plaintext, sender);
+      room = await this.roomKey(plaintext, sender, trusted.has(`${devKey(sender)}\n${sender.curve25519}`));
     } catch (e) {
       // A storage failure says nothing about the payload: keep the Olm state as it was, so the
       // queued mail decrypts again on retry. Only a definite refusal commits the spent state.
       if (e instanceof Transient || e instanceof DOMException) throw e;
       bad = e;
     }
-    await this.store.write(room ? [...pin, ...writes, [room.key, room.record], [backupQueueKey(room.key), room.key]] : [...pin, ...writes]);
-    if (room) this.backupSoon();
+    const backup: [string, unknown][] = room?.record.verified ? [[backupQueueKey(room.key), room.key]] : [];
+    await this.store.write(room ? [...pin, ...writes, [room.key, room.record], ...backup] : [...pin, ...writes]);
+    if (backup.length > 0) this.backupSoon();
     if (bad !== undefined) throw bad;
     return room ? { sessionId: room.sessionId, preKey } : undefined;
   }
 
   // Checks a decrypted room key and returns the record to store, or undefined when an equal or
   // better copy is already stored.
-  private async roomKey(plaintext: string, sender: Target): Promise<{ sessionId: string; key: string; record: InboundRecord } | undefined> {
+  private async roomKey(plaintext: string, sender: Target, verified: boolean): Promise<{ sessionId: string; key: string; record: InboundRecord } | undefined> {
     const p = parseJSON(plaintext);
     if (
       !isObj(p) || p.type !== ROOM_KEY_TYPE ||
@@ -846,6 +880,7 @@ export class CryptoEngine {
           sender_device: sender.device_id,
           sender_key: sender.curve25519,
           first_index: session.firstKnownIndex,
+          verified,
         },
       };
     } finally {

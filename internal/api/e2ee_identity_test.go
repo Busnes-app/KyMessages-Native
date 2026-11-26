@@ -1,10 +1,13 @@
 package api_test
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -75,6 +78,17 @@ func (i *testIdentity) put(t *testing.T, expected int64) map[string]any {
 func (i *testIdentity) deviceSig(t *testing.T, d *testDevice, version int64) map[string]any {
 	t.Helper()
 	return map[string]any{"version": version, "signature": i.sign(t, e2eeid.DomainDevice, e2eeid.DeviceMessage(i.tenant, d.userID, d.id, d.curve, d.ed()))}
+}
+
+// staleSession is a valid session of userID signed in 11 minutes ago, past the step-up window.
+func staleSession(t *testing.T, st store.Store, userID string) string {
+	t.Helper()
+	tok := "tok_stale_" + userID + "_" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	if err := st.Sessions().CreateSession(t.Context(), &store.Session{UserID: userID, TokenHash: crypto.SHA256Hex([]byte(tok)),
+		CreatedAt: time.Now().Add(-11 * time.Minute), ExpiresAt: time.Now().Add(time.Hour)}, ""); err != nil {
+		t.Fatal(err)
+	}
+	return tok
 }
 
 func registerDevice(t *testing.T, srv http.Handler, tok string, d *testDevice) {
@@ -156,6 +170,33 @@ func TestE2EEMasterKeyIsValidatedAndVersioned(t *testing.T) {
 			t.Errorf("%s = %d", name, c)
 		}
 	}
+	// A raw seed in place of a wrap (or any other length or version) is refused.
+	for name, fix := range map[string]func(map[string]any){
+		"raw master seed": func(b map[string]any) {
+			b["recovery"].(map[string]any)["wrapped_master_key"] = b64.EncodeToString(e2eeid.MasterSeed(id.master))
+		},
+		"raw backup seed": func(b map[string]any) {
+			b["recovery"].(map[string]any)["wrapped_backup_key"] = b64.EncodeToString(id.backup.Seed())
+		},
+		"wrap of wrong size": func(b map[string]any) {
+			b["recovery"].(map[string]any)["wrapped_backup_key"] = b64.EncodeToString(make([]byte, 93))
+		},
+		"wrap of version two": func(b map[string]any) {
+			w, _ := b64.DecodeString(b["recovery"].(map[string]any)["wrapped_master_key"].(string))
+			w[0] = 2
+			b["recovery"].(map[string]any)["wrapped_master_key"] = b64.EncodeToString(w)
+		},
+	} {
+		b := clone(id.put(t, 0))
+		fix(b)
+		if c := put(b); c != http.StatusBadRequest {
+			t.Errorf("%s = %d", name, c)
+		}
+	}
+	// Even the first setup needs a recent sign-in.
+	if rec := doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/master", staleSession(t, st, alice.ID), id.put(t, 0), nil); rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "reauthentication_required") {
+		t.Fatalf("first setup from a stale session = %d %s", rec.Code, rec.Body.String())
+	}
 	if rec := doBearerJSON(t, srv, http.MethodGet, "/api/v1/keys/master", tok, nil, nil); !strings.Contains(rec.Body.String(), `"master":null`) {
 		t.Fatalf("a refused upload was stored: %s", rec.Body.String())
 	}
@@ -196,11 +237,7 @@ func TestE2EEMasterKeyIsValidatedAndVersioned(t *testing.T) {
 
 	// A reset needs a recent sign-in: a session from 11 minutes ago is asked to step up.
 	reset := newIdentity(t, orgA, alice.ID)
-	oldTok := "tok_e3_old_" + alice.ID
-	if err := st.Sessions().CreateSession(t.Context(), &store.Session{UserID: alice.ID, TokenHash: crypto.SHA256Hex([]byte(oldTok)),
-		CreatedAt: time.Now().Add(-11 * time.Minute), ExpiresAt: time.Now().Add(time.Hour)}, ""); err != nil {
-		t.Fatal(err)
-	}
+	oldTok := staleSession(t, st, alice.ID)
 	if rec := doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/master", oldTok, reset.put(t, 1), nil); rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "reauthentication_required") {
 		t.Fatalf("reset from a stale session = %d %s", rec.Code, rec.Body.String())
 	}
@@ -329,13 +366,17 @@ func TestE2EEKeyBackupRoutes(t *testing.T) {
 	if c := doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/backup", tok, map[string]any{"version": 1, "sessions": []any{}}, nil).Code; c != http.StatusBadRequest {
 		t.Fatalf("empty batch = %d", c)
 	}
-	entry := func(room, session string, idx int64) map[string]any {
-		sealed, err := e2eeid.SealBackup(id.backup.Public(), e2eeid.MasterSeed(id.master), room, session, []byte(`{"session":"`+session+`"}`))
+	senderA := b64.EncodeToString(bytes.Repeat([]byte{0xA}, 32))
+	senderB := b64.EncodeToString(bytes.Repeat([]byte{0xB}, 32))
+	entryFrom := func(room, sender, session string, idx int64) map[string]any {
+		e := e2eeid.BackupEntry{RoomID: room, SenderKey: sender, SessionID: session, FirstIndex: idx}
+		sealed, err := e2eeid.SealBackup(id.backup.Public(), e2eeid.MasterSeed(id.master), e, []byte(`{"session":"`+session+`"}`))
 		if err != nil {
 			t.Fatal(err)
 		}
-		return map[string]any{"room_id": room, "session_id": session, "first_index": idx, "sealed": b64.EncodeToString(sealed)}
+		return map[string]any{"room_id": room, "sender_key": sender, "session_id": session, "first_index": idx, "sealed": b64.EncodeToString(sealed)}
 	}
+	entry := func(room, session string, idx int64) map[string]any { return entryFrom(room, senderA, session, idx) }
 	putB := func(tok string, version int64, sessions ...map[string]any) int {
 		return doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/backup", tok, map[string]any{"version": version, "sessions": sessions}, nil).Code
 	}
@@ -356,14 +397,22 @@ func TestE2EEKeyBackupRoutes(t *testing.T) {
 	short := entry("rm_1", "sessE", 0)
 	short["sealed"] = b64.EncodeToString([]byte("too short to be an X-Wing seal"))
 	badRoom := entry("rm 1", "sessF", 0)
-	for name, e := range map[string]map[string]any{"a session_key field": bad, "not an X-Wing seal": short, "a bad room ID": badRoom} {
+	noSender := entry("rm_1", "sessG", 0)
+	delete(noSender, "sender_key")
+	tooBig := entry("rm_1", "sessH", 0)
+	tooBig["sealed"] = b64.EncodeToString(make([]byte, e2eeid.MaxSealedSession+1))
+	for name, e := range map[string]map[string]any{"a session_key field": bad, "not an X-Wing seal": short, "a bad room ID": badRoom, "no sender key": noSender, "over 4 KiB": tooBig} {
 		if c := putB(tok, 1, e); c != http.StatusBadRequest {
 			t.Errorf("%s = %d", name, c)
 		}
 	}
-	// A copy reaching further back replaces; the server cannot open either.
+	// A copy reaching further back replaces; the server cannot open either. Another sender
+	// with the same session ID is a separate row, so it cannot displace the real sender's.
 	better := entry("rm_1", "sessA", 1)
 	if c := putB(tok, 1, better); c != http.StatusOK {
+		t.Fatal(c)
+	}
+	if c := putB(tok, 1, entryFrom("rm_1", senderB, "sessA", 0)); c != http.StatusOK {
 		t.Fatal(c)
 	}
 	var page struct {
@@ -373,14 +422,14 @@ func TestE2EEKeyBackupRoutes(t *testing.T) {
 	}
 	rec := doBearerJSON(t, srv, http.MethodGet, "/api/v1/keys/backup?version=1", tok, nil, nil)
 	decodeBody(t, rec.Body.Bytes(), &page)
-	if len(page.Sessions) != 2 || page.Sessions[0]["sealed"] != better["sealed"] || page.More {
+	if len(page.Sessions) != 3 || page.Sessions[0]["sealed"] != better["sealed"] || page.Sessions[1]["sender_key"] != senderB || page.More {
 		t.Fatalf("backup page = %s", rec.Body.String())
 	}
-	raw, _ := b64.DecodeString(page.Sessions[1]["sealed"].(string))
-	if got, err := e2eeid.OpenBackup(id.backup, e2eeid.MasterSeed(id.master), "rm_2", "sessB", raw); err != nil || string(got) != `{"session":"sessB"}` {
+	raw, _ := b64.DecodeString(page.Sessions[2]["sealed"].(string))
+	if got, err := e2eeid.OpenBackup(id.backup, e2eeid.MasterSeed(id.master), e2eeid.BackupEntry{RoomID: "rm_2", SenderKey: senderA, SessionID: "sessB"}, raw); err != nil || string(got) != `{"session":"sessB"}` {
 		t.Fatalf("backed-up session does not open with the backup key: %v", err)
 	}
-	rec = doBearerJSON(t, srv, http.MethodGet, "/api/v1/keys/backup?version=1&after_room=rm_1&after_session=sessA", tok, nil, nil)
+	rec = doBearerJSON(t, srv, http.MethodGet, "/api/v1/keys/backup?version=1&after_room=rm_1&after_sender="+url.QueryEscape(senderB)+"&after_session=sessA", tok, nil, nil)
 	decodeBody(t, rec.Body.Bytes(), &page)
 	if len(page.Sessions) != 1 || page.Sessions[0]["room_id"] != "rm_2" {
 		t.Fatalf("second page = %s", rec.Body.String())
@@ -388,6 +437,10 @@ func TestE2EEKeyBackupRoutes(t *testing.T) {
 	// Bob has no backup of his own and cannot read alice's.
 	if c := doBearerJSON(t, srv, http.MethodGet, "/api/v1/keys/backup?version=1", bobTok, nil, nil).Code; c != http.StatusConflict {
 		t.Fatalf("bob reading a backup = %d", c)
+	}
+	// Deleting the backup needs a recent sign-in.
+	if rec := doBearerJSON(t, srv, http.MethodDelete, "/api/v1/keys/backup?version=1", staleSession(t, st, alice.ID), nil, nil); rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "reauthentication_required") {
+		t.Fatalf("delete from a stale session = %d %s", rec.Code, rec.Body.String())
 	}
 	if c := doBearerJSON(t, srv, http.MethodDelete, "/api/v1/keys/backup?version=1", tok, nil, nil).Code; c != http.StatusNoContent {
 		t.Fatalf("delete = %d", c)
@@ -436,6 +489,9 @@ func TestE2EEPairingRelaysTwoLayerTransferOnce(t *testing.T) {
 		exp  int64
 	} {
 		rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/keys/pairings", tok, map[string]string{"device_id": device}, nil)
+		if rec.Code == http.StatusCreated && !strings.Contains(rec.Body.String(), `"expires_in_ms":180000`) {
+			t.Fatalf("no relative lifetime: %s", rec.Body.String())
+		}
 		var b struct {
 			PairingID string `json:"pairing_id"`
 			ExpiresAt int64  `json:"expires_at"`
@@ -581,7 +637,8 @@ func TestE2EEIdentityRoutesRefuseSecretFields(t *testing.T) {
 	alice, tok := createOrgUser(t, st, "usr_e3s_alice", "e3salice", "user", orgA)
 	id := newIdentity(t, orgA, alice.ID)
 	secrets := []string{"private_key", "master_private_key", "backup_private_key", "recovery_key", "seed", "session_key", "secret"}
-	sealedSession, _ := e2eeid.SealBackup(id.backup.Public(), e2eeid.MasterSeed(id.master), "rm_1", "sess", []byte("x"))
+	sender := b64.EncodeToString(make([]byte, 32))
+	sealedSession, _ := e2eeid.SealBackup(id.backup.Public(), e2eeid.MasterSeed(id.master), e2eeid.BackupEntry{RoomID: "rm_1", SenderKey: sender, SessionID: "sess"}, []byte("x"))
 	routes := []struct {
 		method, path string
 		body         map[string]any
@@ -589,7 +646,7 @@ func TestE2EEIdentityRoutesRefuseSecretFields(t *testing.T) {
 		{http.MethodPut, "/api/v1/keys/master", id.put(t, 0)},
 		{http.MethodPut, "/api/v1/keys/pins", map[string]any{"version": 1, "expected_counter": 0, "sealed": b64.EncodeToString(make([]byte, 64))}},
 		{http.MethodPost, "/api/v1/keys/devices/DEVICE_E3S_1/signature", map[string]any{"version": 1}},
-		{http.MethodPut, "/api/v1/keys/backup", map[string]any{"version": 1, "sessions": []any{map[string]any{"room_id": "rm_1", "session_id": "sess", "first_index": 0, "sealed": b64.EncodeToString(sealedSession)}}}},
+		{http.MethodPut, "/api/v1/keys/backup", map[string]any{"version": 1, "sessions": []any{map[string]any{"room_id": "rm_1", "sender_key": sender, "session_id": "sess", "first_index": 0, "sealed": b64.EncodeToString(sealedSession)}}}},
 		{http.MethodPost, "/api/v1/keys/pairings", map[string]any{"device_id": "DEVICE_E3S_1"}},
 	}
 	for _, r := range routes {
@@ -611,5 +668,58 @@ func TestE2EEIdentityRoutesRefuseSecretFields(t *testing.T) {
 	// And none of them stored anything.
 	if _, err := st.E2EE().GetMasterKey(t.Context(), alice.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("a refused body was stored: %v", err)
+	}
+}
+
+func TestE2EEDeviceListIsSignedAndVersioned(t *testing.T) {
+	srv, st, _ := newMultiTenantTestServer(t)
+	alice, tok := createOrgUser(t, st, "usr_e3l_alice", "e3lalice", "user", orgA)
+	_, bobTok := createOrgUser(t, st, "usr_e3l_bob", "e3lbob", "user", orgA)
+	id := newIdentity(t, orgA, alice.ID)
+	if rec := doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/master", tok, id.put(t, 0), nil); rec.Code != http.StatusOK {
+		t.Fatal(rec.Body.String())
+	}
+	list := func(epoch int64, ids []string, signer *testIdentity) map[string]any {
+		msg, err := e2eeid.DeviceListMessage(orgA, alice.ID, 1, epoch, ids)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return map[string]any{"version": 1, "expected_epoch": epoch - 1, "device_ids": ids, "signature": signer.sign(t, e2eeid.DomainDeviceList, msg)}
+	}
+	putL := func(tok string, body map[string]any) int {
+		return doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/devices/list", tok, body, nil).Code
+	}
+	unsorted := list(1, []string{"DEVICE_A_00001"}, id)
+	unsorted["device_ids"] = []string{"DEVICE_B_00002", "DEVICE_A_00001"}
+	for name, c := range map[string]struct {
+		tok  string
+		body map[string]any
+		want int
+	}{
+		"signed by another key":      {tok, list(1, []string{"DEVICE_A_00001"}, newIdentity(t, orgA, alice.ID)), http.StatusBadRequest},
+		"a list not sorted":          {tok, unsorted, http.StatusBadRequest},
+		"signed for a later epoch":   {tok, func() map[string]any { b := list(2, []string{"DEVICE_A_00001"}, id); b["expected_epoch"] = 0; return b }(), http.StatusBadRequest},
+		"another user's list":        {bobTok, list(1, []string{"DEVICE_A_00001"}, id), http.StatusConflict},
+		"a private key riding along": {tok, func() map[string]any { b := list(1, []string{"DEVICE_A_00001"}, id); b["seed"] = "x"; return b }(), http.StatusBadRequest},
+	} {
+		if got := putL(c.tok, c.body); got != c.want {
+			t.Errorf("%s = %d, want %d", name, got, c.want)
+		}
+	}
+	if c := putL(tok, list(1, []string{"DEVICE_A_00001", "DEVICE_B_00002"}, id)); c != http.StatusOK {
+		t.Fatalf("list = %d", c)
+	}
+	if c := putL(tok, list(1, []string{"DEVICE_A_00001"}, id)); c != http.StatusConflict {
+		t.Fatalf("a stale epoch = %d", c)
+	}
+	if c := putL(tok, list(2, []string{"DEVICE_A_00001"}, id)); c != http.StatusOK {
+		t.Fatalf("removing a device = %d", c)
+	}
+	rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/keys/query", bobTok, map[string]any{"user_ids": []string{alice.ID}}, nil)
+	if !strings.Contains(rec.Body.String(), `"device_list":{"epoch":2,"device_ids":["DEVICE_A_00001"]`) {
+		t.Fatalf("query = %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "wrapped_") || strings.Contains(rec.Body.String(), "pins") {
+		t.Fatalf("a colleague's query carries the user's wraps or pins: %s", rec.Body.String())
 	}
 }

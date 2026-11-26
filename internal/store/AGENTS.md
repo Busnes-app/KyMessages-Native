@@ -100,10 +100,15 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
 - Migration 68 (E3, `e2ee_identity.go`): `e2ee_master_keys` (one row per user: hybrid master
   key, self-binding, X-Wing backup key and its signature, recovery-key wraps, sealed pin set and
   counter, `version`), `e2ee_devices.master_signature`/`master_version`, `e2ee_key_backup`
-  (`(user, version, room, session)`, the lowest `first_index` wins, capped per call by `max`) and
-  `e2ee_pairings` (QR pairings). `PutMasterKey` is compare-and-swap on `version`; a replacement
-  deletes the backup, pairings and pins and clears every cross-signature in the same transaction.
-  Backup writes lock the master row on PostgreSQL. `ConsumePairing` is one `DELETE … RETURNING`.
+  (`(user, version, room, sender_key, session)`, the lowest `first_index` wins, capped per call
+  by session count and sealed bytes), the master-signed device list columns, and `e2ee_pairings`
+  (QR pairings, unique per `(tenant_id, user_id)`, carrying the `master_version` they were opened
+  under). `PutMasterKey` is compare-and-swap on `version`; a first setup drops a row the user left
+  in another org; a replacement deletes the backup, pairings, pins and device list and clears
+  every cross-signature in the same transaction. `CreatePairing` checks the version and the
+  initiator's cross-signature in its transaction. `ListMasterKeys` reads public columns only;
+  `PutPins` and `PutDeviceList` are compare-and-swap within the caller's org. Backup writes lock
+  the master row on PostgreSQL. `ConsumePairing` is one `DELETE … RETURNING`.
   All four cascade from `users`; restore deletes pairings and keeps the rest.
 - `store.Open(ctx, cfg)` initializes and auto-migrates the configured database backend. On
   PostgreSQL `migrations.Run` holds `pg_advisory_lock(hashtext('kymessages:migrate'))` on one

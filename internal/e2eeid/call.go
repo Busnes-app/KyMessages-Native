@@ -1,9 +1,11 @@
 package e2eeid
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -21,7 +23,7 @@ func Call(name string, args []string) (any, error) {
 	if !ok {
 		return nil, fmt.Errorf("e2eeid: unknown call %q", name)
 	}
-	if len(args) != c.n {
+	if c.n >= 0 && len(args) != c.n {
 		return nil, fmt.Errorf("e2eeid: %s takes %d arguments", name, c.n)
 	}
 	return c.fn(args)
@@ -137,6 +139,24 @@ func backupKeyMsg(_ *hybridsig.PublicKey, a []string) ([]byte, error) {
 	return BackupKeyMessage(a[0], a[1], v, pub), nil
 }
 
+func backupEntry(a []string) (BackupEntry, error) {
+	n, err := strconv.ParseInt(a[3], 10, 64)
+	if err != nil || n < 0 || n > 1<<32 {
+		return BackupEntry{}, errArg
+	}
+	return BackupEntry{RoomID: a[0], SenderKey: a[1], SessionID: a[2], FirstIndex: n}, nil
+}
+
+func deviceListMsg(_ *hybridsig.PublicKey, a []string) ([]byte, error) {
+	v, err1 := strconv.ParseInt(a[2], 10, 64)
+	e, err2 := strconv.ParseInt(a[3], 10, 64)
+	var ids []string
+	if err1 != nil || err2 != nil || v < 1 || e < 1 || json.Unmarshal([]byte(a[4]), &ids) != nil {
+		return nil, errArg
+	}
+	return DeviceListMessage(a[0], a[1], v, e, ids)
+}
+
 func xwPub(v string) (xwing.PublicKey, error) {
 	b, err := dec(v)
 	if err != nil {
@@ -217,34 +237,59 @@ var calls = map[string]call{
 		}
 		return b64.EncodeToString(k.Public().Bytes()), nil
 	}},
-	// backupSeal(backup_public_key, master_seed, room_id, session_id, plaintext)
-	"backupSeal": {5, func(a []string) (any, error) {
+	// backupSeal(backup_public_key, master_seed, room_id, sender_key, session_id, first_index, plaintext)
+	"backupSeal": {7, func(a []string) (any, error) {
 		pub, err := xwPub(a[0])
 		if err != nil {
 			return nil, err
 		}
-		k, err := decAll(a[1], a[4])
+		k, err := decAll(a[1], a[6])
 		if err != nil {
 			return nil, err
 		}
-		out, err := SealBackup(pub, k[0], a[2], a[3], k[1])
+		b, err := backupEntry(a[2:6])
+		if err != nil {
+			return nil, err
+		}
+		out, err := SealBackup(pub, k[0], b, k[1])
 		return b64.EncodeToString(out), err
 	}},
-	// backupOpen(backup_seed, master_seed, room_id, session_id, sealed)
-	"backupOpen": {5, func(a []string) (any, error) {
+	// backupOpen(backup_seed, master_seed, room_id, sender_key, session_id, first_index, sealed)
+	"backupOpen": {7, func(a []string) (any, error) {
 		k, err := xwPriv(a[0])
 		if err != nil {
 			return nil, err
 		}
-		b, err := decAll(a[1], a[4])
+		raw, err := decAll(a[1], a[6])
 		if err != nil {
 			return nil, err
 		}
-		out, err := OpenBackup(k, b[0], a[2], a[3], b[1])
+		b, err := backupEntry(a[2:6])
+		if err != nil {
+			return nil, err
+		}
+		out, err := OpenBackup(k, raw[0], b, raw[1])
 		if err != nil {
 			return nil, err
 		}
 		return b64.EncodeToString(out), nil
+	}},
+
+	// signDeviceList(seed, tenant, user, version, epoch, device_ids_json): the master key names
+	// the user's devices. device_ids_json is a JSON array of sorted, distinct IDs.
+	"signDeviceList": {6, signWith(DomainDeviceList, deviceListMsg)},
+	// verifyDeviceList(public_key, tenant, user, version, epoch, device_ids_json, signature)
+	"verifyDeviceList": {7, verifyWith(DomainDeviceList, deviceListMsg)},
+
+	// hash(args...) is lowercase hex SHA-256 of Fields(args): a compact, collision-resistant
+	// key for caching signature checks in the browser.
+	"hash": {-1, func(a []string) (any, error) {
+		f := make([][]byte, len(a))
+		for i, v := range a {
+			f[i] = []byte(v)
+		}
+		h := sha256.Sum256(Fields(f...))
+		return hex.EncodeToString(h[:]), nil
 	}},
 
 	// The recovery key and what it wraps.

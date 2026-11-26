@@ -113,7 +113,8 @@ type E2EEStore interface {
 
 	// GetMasterKey reads a user's master key record; ErrNotFound when there is none.
 	GetMasterKey(ctx context.Context, userID string) (*E2EEMasterKey, error)
-	// ListMasterKeys returns userIDs' master keys in tenantID only.
+	// ListMasterKeys returns userIDs' master keys in tenantID only, with their public fields
+	// alone (key, self-binding, version, device list): never the wraps or the pin set.
 	ListMasterKeys(ctx context.Context, tenantID string, userIDs []string) ([]E2EEMasterKey, error)
 	// PutMasterKey stores m as version expected+1 when the stored version is expected (0: none),
 	// else ErrE2EEVersion. Replacing a master key deletes its key backup and pin set and every
@@ -123,17 +124,21 @@ type E2EEStore interface {
 	// that is not the user's current version, ErrNotFound when there is no such device.
 	SignDevice(ctx context.Context, userID, deviceID string, version int64, signature string) error
 	// PutPins stores the user's sealed pin set as counter expected+1 under master key version.
-	PutPins(ctx context.Context, userID string, version, expected int64, pins string) error
-	// PutBackupSessions adds sealed sessions to backup version, keeping for each session the
-	// copy with the lowest first index; ErrE2EEVersion when version is not current and
-	// ErrE2EEBackupFull (storing nothing) past max sessions.
-	PutBackupSessions(ctx context.Context, userID string, version int64, sessions []E2EEBackupSession, max int) error
-	// ListBackupSessions pages backup version in (room, session) order after the given pair.
-	ListBackupSessions(ctx context.Context, userID string, version int64, afterRoom, afterSession string, limit int) ([]E2EEBackupSession, error)
+	PutPins(ctx context.Context, tenantID, userID string, version, expected int64, pins string) error
+	// PutDeviceList stores the master-signed device list as epoch expected+1 under version.
+	PutDeviceList(ctx context.Context, tenantID, userID string, version, expected int64, list, signature string) error
+	// PutBackupSessions adds sealed sessions to backup version, keeping for each (room, sender
+	// key, session) the copy with the lowest first index; ErrE2EEVersion when version is not
+	// current and ErrE2EEBackupFull (storing nothing) past maxSessions or maxBytes of sealed text.
+	PutBackupSessions(ctx context.Context, userID string, version int64, sessions []E2EEBackupSession, maxSessions int, maxBytes int64) error
+	// ListBackupSessions pages backup version in (room, sender key, session) order after the cursor.
+	ListBackupSessions(ctx context.Context, userID string, version int64, after E2EEBackupCursor, limit int) ([]E2EEBackupSession, error)
 	// DeleteBackup removes every session of backup version; ErrE2EEVersion when not current.
 	DeleteBackup(ctx context.Context, userID string, version int64) error
 
-	// CreatePairing opens a QR pairing, cancelling the user's other pairings.
+	// CreatePairing opens a QR pairing, cancelling the user's other pairings, only while
+	// p.MasterVersion is the user's identity version and the initiator is cross-signed by it
+	// (ErrE2EEVersion otherwise).
 	CreatePairing(ctx context.Context, p *E2EEPairing) error
 	// GetPairing reads an unexpired pairing of the user in the tenant, else ErrNotFound.
 	GetPairing(ctx context.Context, tenantID, userID, id string, now time.Time) (*E2EEPairing, error)
@@ -159,20 +164,29 @@ type E2EEMasterKey struct {
 	RecoveryMaster, RecoveryBackup string
 	PinsCounter                    int64
 	Pins                           string
-	UpdatedAt                      time.Time
+	// DeviceList is the JSON array of device IDs the master key signed at DeviceListEpoch.
+	DeviceList, DeviceListSignature string
+	DeviceListEpoch                 int64
+	UpdatedAt                       time.Time
 }
 
 // E2EEBackupSession is one Megolm session sealed to the user's X-Wing backup key.
 type E2EEBackupSession struct {
-	RoomID, SessionID string
-	FirstIndex        int64
-	Sealed            string
+	RoomID, SenderKey, SessionID string
+	FirstIndex                   int64
+	Sealed                       string
+}
+
+// E2EEBackupCursor is the last (room, sender key, session) a backup page ended on.
+type E2EEBackupCursor struct {
+	RoomID, SenderKey, SessionID string
 }
 
 // E2EEPairing is a QR verification in progress, between two devices of one user.
 type E2EEPairing struct {
 	ID, TenantID, UserID       string
 	InitiatorDevice, NewDevice string
+	MasterVersion              int64
 	EphemeralKey, Sealed       string
 	ExpiresAt                  time.Time
 }
