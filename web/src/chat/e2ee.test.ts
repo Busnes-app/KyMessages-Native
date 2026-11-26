@@ -1064,3 +1064,25 @@ describe('Round 6', () => {
     expect((await starting).userId).toBe('u_alice');
   });
 });
+
+describe('Round 6: status checks share one run', () => {
+  it('answers concurrent status requests from at most two checks, the last after every request', async () => {
+    const server = new FakeKeyServer();
+    let masters = 0;
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice', { fn: (method, path) => {
+      if (method === 'GET' && path === '/api/v1/keys/master') masters++;
+      return undefined;
+    } })));
+    await startE2EE('u_alice');
+    await (await prepareIdentity()).commit();
+    await new Promise((r) => setTimeout(r, 100));
+    masters = 0;
+    await identityStatus();
+    const one = masters;
+    expect(one).toBeGreaterThan(0);
+    masters = 0;
+    const all = await Promise.all(Array.from({ length: 5 }, () => identityStatus()));
+    expect(all.every((s) => s.state === 'verified')).toBe(true);
+    expect(masters).toBeLessThanOrEqual(2 * one);
+  });
+});

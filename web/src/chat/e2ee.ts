@@ -448,7 +448,22 @@ async function identityEngine(): Promise<CryptoEngine> {
   return e;
 }
 
-export const identityStatus = (): Promise<IdentityStatus> => identityEngine().then((e) => e.identityStatus());
+// Status checks are asked for by every identity, backup and retry notice, often several at once;
+// each reads the identity from the server. One runs at a time, and requests arriving meanwhile
+// share a single next run, so none misses a change made before it asked.
+let statusRun: Promise<IdentityStatus> | undefined;
+let statusNext: Promise<IdentityStatus> | undefined;
+export function identityStatus(): Promise<IdentityStatus> {
+  if (!statusRun) {
+    statusRun = identityEngine().then((e) => e.identityStatus()).finally(() => { statusRun = undefined; });
+    return statusRun;
+  }
+  statusNext ??= statusRun.catch(() => undefined).then(() => {
+    statusNext = undefined;
+    return identityStatus();
+  });
+  return statusNext;
+}
 
 /** A new identity for this account: show recoveryKey, then commit once the user saved it. */
 export async function prepareIdentity(reset = false): Promise<{ recoveryKey: string; commit(): Promise<void> }> {
