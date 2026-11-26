@@ -15,7 +15,7 @@
 // of one user can share a device without overwriting each other's ratchets.
 import { Account, GroupSession, InboundGroupSession, Session, verifyEd25519 } from './index';
 import type { Hybrid } from '../pqc/index';
-import { Identity, type IdentityChange, type IdentityServer, type IdentityStatus, type MasterKeyRecord, type PairingJoin, type PairingOffer } from './identity';
+import { Identity, Rollback, type IdentityChange, type IdentityServer, type IdentityStatus, type MasterKeyRecord, type PairingJoin, type PairingOffer } from './identity';
 import { backupCoverKey, backupQueueKey, IdentityMoved, inboundKey, isObj, isStr, isTransient, parseJSON, seenKey, Transient, type InboundRecord } from './records';
 import type { CryptoStore } from './store';
 
@@ -460,16 +460,20 @@ export class CryptoEngine {
    * saw before, without this device. A device whose keys changed is dropped, never re-pinned.
    */
   async verifiedDevices(userIds: string[], self?: { trusted: boolean }): Promise<Target[]> {
-    // One authenticated pin sync before the whole check; a failure fails the check.
-    try {
-      await this.identity.beforeTrust();
-    } catch (e) {
-      // Seeds of an identity the server no longer publishes: this device must verify again.
+    // A pin sync that fails: seeds of an identity the server no longer publishes mean this device
+    // must verify again; a rolled-back pin set is the verdict the gate shows; anything else is
+    // retried.
+    function pinSyncFailed(e: unknown): never {
       if (e instanceof IdentityMoved) throw new NotVerified();
+      if (e instanceof Rollback) throw e;
       throw new Transient(e instanceof Error ? e.message : 'Could not sync pinned identities');
     }
+    // One authenticated pin sync before the whole check; a failure fails the check.
+    await this.identity.beforeTrust().catch(pinSyncFailed);
     const out: Target[] = [];
+    // Change warnings (and what else trusting a member records), then device pins.
     const pins: [string, unknown][] = [];
+    const devicePins: [string, unknown][] = [];
     // Members seen for the first time: their devices wait until the synced pin set holds them.
     const sights = new Map<string, string>();
     const proposed = new Map<string, { target: Target; pin?: [string, unknown] }[]>();
@@ -489,8 +493,10 @@ export class CryptoEngine {
         const ok: { target: Target; pin?: [string, unknown] }[] = [];
         for (const d of listed.devices?.[userId] ?? []) {
           if (userId === this.userId && isObj(d) && d.device_id === this.deviceId) {
-            // This device itself, checked like any other (self reports it), never a target.
-            if (self && (await this.checkDevice(userId, d)) && this.identity.deviceTrusted(master, listed.tenant_id, userId, d)) self.trusted = true;
+            // This device itself, with exactly its own keys, checked like any other (self
+            // reports it), never a target. Other keys under its ID are not this device.
+            if (self && d.curve25519 === this.curve25519 && d.ed25519 === this.ed25519 &&
+              (await this.checkDevice(userId, d)) && this.identity.deviceTrusted(master, listed.tenant_id, userId, d)) self.trusted = true;
             continue;
           }
           const checked = await this.checkDevice(userId, d);
@@ -499,19 +505,26 @@ export class CryptoEngine {
         }
         if (sights.has(userId)) proposed.set(userId, ok);
         else for (const c of ok) {
-          if (c.pin) pins.push(c.pin);
+          if (c.pin) devicePins.push(c.pin);
           out.push(c.target);
         }
       }
     }
-    await this.store.write(pins);
+    // A send this device may not make pins nobody: the warnings it found are kept, the first
+    // sights (shared or this device's) wait for a send it may make.
+    if (self && !self.trusted) {
+      await this.store.write(pins);
+      this.identity.afterWrites();
+      throw new NotVerified();
+    }
+    await this.store.write([...pins, ...devicePins]);
     // All first sights in one shared compare-and-swap, before any of them gets a key.
     let committed: Set<string>;
     try {
       committed = await this.identity.commitFirstSights(sights);
     } catch (e) {
       this.identity.afterWrites();
-      throw new Transient(e instanceof Error ? e.message : 'Could not sync pinned identities');
+      pinSyncFailed(e);
     }
     const later: [string, unknown][] = [];
     for (const [userId, ok] of proposed) {
@@ -793,9 +806,8 @@ export class CryptoEngine {
       // server publishes now and on its newest device list (not a stale or reset identity, not
       // a replacement still enrolling, not a retired device), judged from the send's own query.
       if (!(await this.identity.isVerified())) throw new NotVerified();
-      const self = { trusted: false };
-      const { members, devices } = await this.devicesInRoom(roomId, self);
-      if (!self.trusted) throw new NotVerified();
+      // devicesInRoom refuses (NotVerified) unless this device is trusted by the send's own query.
+      const { members, devices } = await this.devicesInRoom(roomId, { trusted: false });
       const outKey = `out:${roomId}`;
       let out = await this.store.get<OutboundRecord>(outKey);
       let session = out ? GroupSession.fromPickle(out.pickle, this.key) : undefined;
@@ -963,7 +975,9 @@ export class CryptoEngine {
     try {
       return new Set((await this.verifiedDevices(users)).map((t) => `${devKey(t)}\n${t.curve25519}`));
     } catch (e) {
-      throw isTransient(e) ? e : new Transient(e instanceof Error ? e.message : 'Could not check the senders');
+      // A rolled-back pin set is a verdict: the mail stays queued and the gate shows it.
+      if (isTransient(e) || e instanceof Rollback) throw e;
+      throw new Transient(e instanceof Error ? e.message : 'Could not check the senders');
     }
   }
 

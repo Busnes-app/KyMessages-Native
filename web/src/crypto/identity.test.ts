@@ -1,13 +1,13 @@
 import 'fake-indexeddb/auto';
 import { readFileSync } from 'node:fs';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { Conflict, CryptoEngine, NotVerified, type KeyServer, type SealedMessage } from './engine';
+import { Conflict, CryptoEngine, deviceSigned, NotVerified, type KeyServer, type SealedMessage } from './engine';
 import { FakeKeyServer, TENANT } from './fakeKeyServer';
-import { loadCryptoSync } from './index';
+import { Account, loadCryptoSync } from './index';
 import { deleteCryptoStores, openCryptoStore } from './store';
 import { b64, loadPQCFrom, pqc, PQCUnavailable } from '../pqc/index';
-import { LIST_WAIT_MAX_MS } from './identity';
-import { Transient } from './records';
+import { LIST_WAIT_MAX_MS, Rollback } from './identity';
+import { isTransient, Transient } from './records';
 
 beforeAll(async () => {
   loadCryptoSync(readFileSync('src/crypto/pkg/kycrypto_bg.wasm'));
@@ -1357,7 +1357,7 @@ describe('Round 6: taking on an identity', () => {
     await offer2.poll();
     await offer2.approve();
     await (await laptop.prepareIdentity(true)).commit();
-    await expect(join2.finish()).rejects.toThrow(/changed while waiting/);
+    await expect(join2.finish()).rejects.toThrow(/changed meanwhile/);
     expect(await tablet.identityStatus()).toMatchObject({ state: 'unverified' });
   });
 
@@ -1428,10 +1428,11 @@ describe('Round 6: restore and unvouched coverage', () => {
     const m = await send('r1', bob, 'from bob');
     expect(await read(alice, m)).toBe('from bob');
     await vi.waitFor(() => expect(server.backups.get('u_alice')?.size).toBe(1));
-    // Alice's copy now reads as an unvouched one reaching less far than the backup's.
+    // Alice's copy now reads as an unvouched one reaching less far than the backup's, on a
+    // browser that no longer holds the identity (restoring the one it holds changes nothing).
     const store = await openCryptoStore('u_alice');
     const [[k, v]] = (await store.list<{ first_index: number }>('in:')).filter(([, r]) => (r as unknown as { sender_user: string }).sender_user === 'u_bob');
-    await store.write([[k, { ...v, verified: false, first_index: 5 }]]);
+    await store.write([[k, { ...v, verified: false, first_index: 5 }]], ['identity']);
     await alice.restoreIdentity(rk);
     const now = (await store.get<{ first_index: number; from_backup?: boolean }>(k))!;
     store.close();
@@ -1577,8 +1578,8 @@ describe('Round 7: from a consumed transfer to adoption', () => {
     const p = await pairing((api) => ({
       pairingConsume: async (...a) => { const r = await api.pairingConsume(...a); afterConsume = true; return r; },
       getMaster: async (s) => {
-        // The second read after the consume is the one under the adoption's lock.
-        if (afterConsume && ++reads === 2) await resetOnServer(server!, 'u_alice');
+        // The read under the adoption's lock, right before the write.
+        if (afterConsume && ++reads === 1) await resetOnServer(server!, 'u_alice');
         return api.getMaster(s);
       },
     }));
@@ -1601,21 +1602,23 @@ describe('Round 7: from a consumed transfer to adoption', () => {
     expect(await holds('alice_laptop')).toBe(false);
   });
 
-  it('writes nothing when the screen closes during the check under the adoption lock', async () => {
+  it('writes nothing when the screen closes while a failed read under the lock backs off', async () => {
     const ac = new AbortController();
     let afterConsume = false;
-    let reads = 0;
     const p = await pairing((api) => ({
       pairingConsume: async (...a) => { const r = await api.pairingConsume(...a); afterConsume = true; return r; },
       getMaster: async (s) => {
-        // The read under the lock answers, but the screen closed meanwhile.
-        if (afterConsume && ++reads === 2) ac.abort(new DOMException('closed', 'AbortError'));
+        if (afterConsume) {
+          setTimeout(() => ac.abort(new DOMException('closed', 'AbortError')), 10);
+          throw new Transient('the network');
+        }
         return api.getMaster(s);
       },
     }));
     await expect(p.join.finish(ac.signal)).rejects.toThrow('closed');
     await new Promise((r) => setTimeout(r, 100)); // nothing is left to land later either
     expect(await holds('alice_laptop')).toBe(false);
+    expect(p.consumed()).toBe(1);
   });
 
   it('keeps the enrollment unconfirmed while the list it would confirm against is forked', async () => {
@@ -1640,11 +1643,12 @@ describe('Round 7: from a consumed transfer to adoption', () => {
     const laptop = await open(server, 'u_alice', 'alice_laptop', api);
     const adopted = vi.fn();
     laptop.onAdopted(adopted);
-    await laptop.restoreIdentity(rk);
+    await expect(laptop.restoreIdentity(rk)).rejects.toThrow(/two device lists/);
     expect(adopted).not.toHaveBeenCalled();
     const s = await openCryptoStore('alice_laptop');
     expect(await s.get('identity:enrolling')).toBe(true);
     s.close();
+    expect(await laptop.identityStatus()).toMatchObject({ state: 'verified', problem: 'fork' });
   });
 
   it('never reports a failure for an enrollment that landed, when only its confirmation failed', async () => {
@@ -1697,5 +1701,245 @@ describe('Round 7: a backup read failing after adoption', () => {
     down = false;
     await laptop.resumeWork();
     expect(await laptop.identityStatus()).toMatchObject({ state: 'verified', restoring: false });
+  });
+});
+
+describe('Round 8: one bounded sequence up to the seed write', () => {
+  // A laptop joining alice's pairing; getMaster wraps the laptop's identity reads, told whether
+  // the transfer was consumed yet.
+  async function pairing(getMaster: (real: KeyServer['getMaster'], consumed: () => boolean) => KeyServer['getMaster']) {
+    const server = new FakeKeyServer();
+    const [alice] = await firstDevice(server, 'u_alice');
+    const api = server.as('u_alice');
+    let consumed = 0;
+    const consume = api.pairingConsume;
+    api.pairingConsume = async (...a) => { const r = await consume(...a); consumed++; return r; };
+    api.getMaster = getMaster(api.getMaster, () => consumed > 0);
+    const laptop = await open(server, 'u_alice', 'alice_laptop', api);
+    const offer = await alice.offerVerification();
+    const join = await laptop.joinVerification(offer.text);
+    await offer.poll();
+    await offer.approve();
+    return { server, laptop, join, consumed: () => consumed };
+  }
+
+  it('lets go of the lock while a failed decisive read backs off, then adopts on the same transfer', async () => {
+    const order: string[] = [];
+    let laptop: CryptoEngine | undefined;
+    let fails = 1;
+    const p = await pairing((real, consumed) => async (s) => {
+      if (consumed() && fails-- > 0) {
+        // Another tab's status check runs while this one waits to try again.
+        void laptop!.identityStatus().then(() => order.push('status'));
+        throw new Transient('the network');
+      }
+      return real(s);
+    });
+    laptop = p.laptop;
+    await p.join.finish().then(() => order.push('finish'));
+    expect(order).toEqual(['status', 'finish']);
+    expect(p.consumed()).toBe(1);
+    expect(await p.laptop.identityStatus()).toMatchObject({ state: 'verified' });
+  });
+
+  it('refuses an identity reset between two tries, writing nothing', async () => {
+    let server: FakeKeyServer | undefined;
+    let reads = 0;
+    const p = await pairing((real, consumed) => async (s) => {
+      if (consumed() && ++reads === 1) {
+        await resetOnServer(server!, 'u_alice');
+        throw new Transient('the network');
+      }
+      return real(s);
+    });
+    server = p.server;
+    await expect(p.join.finish()).rejects.toThrow(/changed meanwhile/);
+    expect(p.consumed()).toBe(1);
+    const s = await openCryptoStore('alice_laptop');
+    expect(await s.get('identity')).toBeUndefined();
+    s.close();
+  });
+
+  it('keeps the progress of the very same identity adopted meanwhile', async () => {
+    const server = new FakeKeyServer();
+    const [, rk] = await firstDevice(server, 'u_alice');
+    const laptop = await open(server, 'u_alice', 'alice_laptop');
+    const adopted = vi.fn();
+    laptop.onAdopted(adopted);
+    await laptop.restoreIdentity(rk);
+    const s = await openCryptoStore('alice_laptop');
+    const signed = await s.get('identity:signed');
+    expect(signed).toBeDefined();
+    await laptop.restoreIdentity(rk);
+    expect(await s.get('identity:signed')).toEqual(signed);
+    expect(await s.get('identity:enrolling')).toBeUndefined();
+    s.close();
+    expect(adopted).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('Round 8: seeds stored are announced', () => {
+  it('announces the identity taken on even when signing this device then refuses', async () => {
+    const server = new FakeKeyServer();
+    const [, rk] = await firstDevice(server, 'u_alice');
+    const api = server.as('u_alice');
+    api.signDevice = async () => { throw new Error('refused'); };
+    const laptop = await open(server, 'u_alice', 'alice_laptop', api);
+    const changed = vi.fn();
+    laptop.onIdentityChange(changed);
+    await expect(laptop.restoreIdentity(rk)).rejects.toThrow('refused');
+    expect(changed).toHaveBeenCalled();
+    const s = await openCryptoStore('alice_laptop');
+    expect(await s.get('identity')).toBeDefined();
+    expect(await s.get('identity:enrolling')).toBe(true);
+    s.close();
+  });
+});
+
+describe('Round 8: confirming enrollment against every authenticated list', () => {
+  // The laptop restores; the read that confirms its enrollment (the first after its listing)
+  // shows the list as edit() makes it.
+  async function confirming(edit: (dl: { epoch: number; device_ids: string[] }, sign: (epoch: number, ids: string[]) => unknown) => unknown) {
+    const server = new FakeKeyServer();
+    const [, rk] = await firstDevice(server, 'u_alice');
+    const api = server.as('u_alice');
+    const putList = api.putDeviceList;
+    const getMaster = api.getMaster;
+    let next = false;
+    api.putDeviceList = async (...a) => { await putList(...a); next = true; };
+    api.getMaster = async (s) => {
+      const r = await getMaster(s);
+      if (next && r.master?.device_list) {
+        next = false;
+        const m = r.master;
+        r.master = { ...m, device_list: edit(structuredClone(m.device_list!),
+          (epoch, ids) => pqc.signDeviceList(masterSeed(server, 'u_alice', rk), TENANT, 'u_alice', m.version, epoch, ids)) as typeof m.device_list };
+      }
+      return r;
+    };
+    const laptop = await open(server, 'u_alice', 'alice_laptop', api);
+    const adopted = vi.fn();
+    laptop.onAdopted(adopted);
+    const without = (ids: string[]) => ids.filter((d) => d !== laptop.deviceId);
+    return { laptop, adopted, rk, without };
+  }
+  const enrolling = async () => {
+    const s = await openCryptoStore('alice_laptop');
+    try {
+      return await s.get('identity:enrolling');
+    } finally {
+      s.close();
+    }
+  };
+
+  it('moves the mark on a newer list leaving the device out, so an older naming one never confirms', async () => {
+    let without: ((ids: string[]) => string[]) | undefined;
+    const c = await confirming((dl, sign) => {
+      const ids = without!(dl.device_ids);
+      return { epoch: dl.epoch + 1, device_ids: ids, signature: sign(dl.epoch + 1, ids) };
+    });
+    without = c.without;
+    await c.laptop.restoreIdentity(c.rk);
+    expect(c.adopted).not.toHaveBeenCalled();
+    // The server's list (older, naming the laptop) is a rollback now.
+    await expect(c.laptop.resumeWork()).rejects.toThrow(/older device list/);
+    expect(c.adopted).not.toHaveBeenCalled();
+    expect(await enrolling()).toBe(true);
+  });
+
+  it('marks a fork on another list at the same epoch leaving the device out', async () => {
+    let without: ((ids: string[]) => string[]) | undefined;
+    const c = await confirming((dl, sign) => {
+      const ids = without!(dl.device_ids);
+      return { epoch: dl.epoch, device_ids: ids, signature: sign(dl.epoch, ids) };
+    });
+    without = c.without;
+    await expect(c.laptop.restoreIdentity(c.rk)).rejects.toThrow(/two device lists/);
+    await expect(c.laptop.resumeWork()).rejects.toThrow(/two device lists/);
+    expect(c.adopted).not.toHaveBeenCalled();
+    expect(await enrolling()).toBe(true);
+    expect(await c.laptop.identityStatus()).toMatchObject({ state: 'verified', problem: 'fork' });
+  });
+
+  it('ignores a list that does not verify, and confirms on the authentic one', async () => {
+    let without: ((ids: string[]) => string[]) | undefined;
+    const c = await confirming((dl) => {
+      const ids = without!(dl.device_ids);
+      const other = pqc.masterGenerate();
+      return { epoch: dl.epoch + 5, device_ids: ids, signature: pqc.signDeviceList(other.seed, TENANT, 'u_alice', 1, dl.epoch + 5, ids) };
+    });
+    without = c.without;
+    await c.laptop.restoreIdentity(c.rk);
+    expect(c.adopted).not.toHaveBeenCalled();
+    await c.laptop.resumeWork();
+    expect(c.adopted).toHaveBeenCalledTimes(1);
+    expect(await enrolling()).toBeUndefined();
+  });
+});
+
+describe('Round 8: trust verdicts and this device\'s own keys', () => {
+  it('keeps the mailbox and reports the verdict when the pin set was rolled back', async () => {
+    const server = new FakeKeyServer();
+    const [alice] = await firstDevice(server, 'u_alice');
+    const [bob] = await firstDevice(server, 'u_bob');
+    await firstDevice(server, 'u_carol');
+    server.join('r1', 'u_alice', 'u_bob');
+    await send('r1', alice, 'pins bob');
+    await vi.waitFor(() => expect(server.masters.get('u_alice')!.pins.counter).toBe(1));
+    const old = structuredClone(server.masters.get('u_alice')!.pins);
+    server.join('r2', 'u_alice', 'u_carol');
+    await send('r2', alice, 'pins carol');
+    await vi.waitFor(() => expect(server.masters.get('u_alice')!.pins.counter).toBe(2));
+    await send('r1', bob, 'waits in the mailbox');
+    const waiting = () => server.mail.get(`u_alice\n${alice.deviceId}`)?.length ?? 0;
+    expect(waiting()).toBeGreaterThan(0);
+    const before = waiting();
+    server.masters.get('u_alice')!.pins = old;
+    const err = await alice.resumeWork().then(() => undefined, (e: unknown) => e);
+    expect(err).toBeInstanceOf(Rollback);
+    expect(isTransient(err)).toBe(false);
+    expect(waiting()).toBe(before); // nothing acknowledged
+    expect(await alice.identityStatus()).toMatchObject({ state: 'verified', problem: 'rollback' });
+  });
+
+  it('reads an identity reset while first sights are committed as this device not verified', async () => {
+    const server = new FakeKeyServer();
+    const api = server.as('u_alice');
+    const query = api.query;
+    let resetAfter = false;
+    api.query = async (...a) => {
+      const r = await query(...a);
+      if (resetAfter) {
+        resetAfter = false;
+        await resetOnServer(server, 'u_alice');
+      }
+      return r;
+    };
+    const alice = await open(server, 'u_alice', 'u_alice', api);
+    await (await alice.prepareIdentity()).commit();
+    await firstDevice(server, 'u_bob');
+    resetAfter = true;
+    await expect(alice.verifiedDevices(['u_bob'])).rejects.toBeInstanceOf(NotVerified);
+  });
+
+  it('refuses a send when other validly signed keys are listed under this device ID, pinning no one', async () => {
+    const server = new FakeKeyServer();
+    const [alice, rk] = await firstDevice(server, 'u_alice');
+    await firstDevice(server, 'u_bob');
+    server.join('r1', 'u_alice', 'u_bob');
+    const acct = new Account();
+    const curve = acct.curve25519;
+    const ed = acct.ed25519;
+    const forged = { device_id: alice.deviceId, curve25519: curve, ed25519: ed, signature: acct.sign(deviceSigned('u_alice', alice.deviceId, curve, ed)),
+      master_signature: pqc.signDevice(masterSeed(server, 'u_alice', rk), TENANT, 'u_alice', alice.deviceId, curve, ed) };
+    acct.free();
+    server.devices.get('u_alice')!.set(alice.deviceId, forged);
+    const counter = server.masters.get('u_alice')!.pins.counter;
+    await expect(alice.encrypt('r1', { type: 'text', body: 'not as this device' })).rejects.toBeInstanceOf(NotVerified);
+    // Bob was a first sight: neither the shared pin set nor this device pinned him.
+    expect(server.masters.get('u_alice')!.pins.counter).toBe(counter);
+    const s = await openCryptoStore('u_alice');
+    expect((await s.list('pin:')).filter(([k]) => k.includes('u_bob'))).toHaveLength(0);
+    s.close();
   });
 });

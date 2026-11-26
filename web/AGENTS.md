@@ -116,14 +116,26 @@ Owns user interface components, service worker caching, PWA installation manifes
   device (a replacement whose signing failed), and runs the restore and backup after a listing
   rollback. Enrollment that fails for availability after the seed write (`identity:enrolling`)
   is finished there, and `onAdopted` fires once `enrolled()` confirms the current identity and a
-  signed, current list naming the device (a failed confirmation keeps the marker and is retried).
-  After a QR consume, the fresh identity read is retried a few times; `adopt` rechecks the
-  published identity and the local baseline under the lock and calls a closed screen or a
-  spent deadline off right before the seed write; a backup read failing afterwards stays
-  pending. `withLock`'s signal ends only the wait for the lock, as Web Locks do. Status checks
-  run per start-up `Entry` (`entry.status`); one asked of a replaced or ended entry rejects with
-  `StaleStatus`, which the gate ignores; engines wire `onIdentityChange` at start, and a ready
-  entry and a retry's verdict call `announceIdentity`. `ensureListed` under the lock (status) never waits on another
+  signed, current list naming the device (a failed confirmation keeps the marker and is retried;
+  every authenticated list goes through `observeList` before membership counts, and a rollback
+  or fork is thrown as `Rollback`). `adopt` is one bounded pre-write sequence under the lock
+  (queue scan, then the decisive `getMaster` and `checkOwn`, then the local baseline, then a
+  last cancellation check and the write); a transient failure releases the lock, backs off and
+  reruns it with the consumed transfer held; the same identity already held is not rewritten;
+  `backupGen` is set only after the write; after it nothing is replayed or remapped to the
+  pairing timeout, and `notify()` runs even if signing or listing refuses. `withLock`'s signal
+  ends only the wait for the lock, as Web Locks do. Status checks run per start-up `Entry`
+  (`statusFor(entry)`, `isLive(entry)`); one asked of a replaced, reset-under or ended entry
+  rejects with `StaleStatus`, which the gate ignores, and never calls the global
+  `identityStatus`; engines wire `onIdentityChange` at start, gated by `isLive`, as are the
+  completion notices of prepare, restore and QR finish (`identityEngine().done`). `replaceDevice`
+  and a peer's `device-reset` set `entry.replacing` (`holdStarts`), which `startE2EE` waits for;
+  `resetDevice` posts `device-reset-done` once the reset settles, and the peer then calls
+  `announceIdentity`. A ready entry and a retry's verdict call `announceIdentity`.
+  `verifiedDevices` keeps `Rollback` (also through `trustedSenders`, so mail stays unacked),
+  maps `IdentityMoved` to `NotVerified` for `beforeTrust` and `commitFirstSights`, trusts self
+  only with this engine's exact curve25519/ed25519, and on a refused self check writes only
+  change warnings, never first sights. `ensureListed` under the lock (status) never waits on another
   device's reservation; lease deadlines use `performance.now()` from before the request. `onBackupStateChanged`
   updates the gate's full notice without a status check.
   `EARLY` (a message from before this device's session) is retryable, so backup pages reopen it.

@@ -1,8 +1,8 @@
 import 'fake-indexeddb/auto';
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { abandonDevice, encryptionRetry, identityStatus, onIdentityChanged, StaleStatus, ownDeviceVerified, prepareIdentity, restoreIdentity, forgetCryptoStore, keyGeneration, NOT_YET, onRoomKeys, openMessage, receiveRoomKeys, replaceDevice, RETIRE_MS, retireDevice, retryable, retryEncryptionNow, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
-import { EARLY } from '../crypto/engine';
+import { abandonDevice, encryptionReadyFor, encryptionRetry, identityStatus, onIdentityChanged, StaleStatus, ownDeviceVerified, prepareIdentity, restoreIdentity, forgetCryptoStore, keyGeneration, NOT_YET, onRoomKeys, openMessage, receiveRoomKeys, replaceDevice, RETIRE_MS, retireDevice, retryable, retryEncryptionNow, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
+import { CryptoEngine, EARLY } from '../crypto/engine';
 import { FakeKeyServer, TENANT } from '../crypto/fakeKeyServer';
 import { pqc } from '../pqc/index';
 import { isTransient } from '../crypto/records';
@@ -1123,6 +1123,103 @@ describe('Round 7: status belongs to its device start-up', () => {
     expect(await identityStatus()).toMatchObject({ state: 'verified' });
     release();
     expect(await stale).toBeInstanceOf(StaleStatus);
+    off();
+  });
+});
+
+describe('Round 8: status and start-ups around a device reset', () => {
+  // Counts device start-ups (each uploads keys) and can hold the next identity read.
+  function serve(server: FakeKeyServer) {
+    const s = { uploads: 0, hold: undefined as undefined | Promise<undefined> };
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice', { fn: (method, path) => {
+      if (method === 'POST' && path === '/api/v1/keys/upload') s.uploads++;
+      if (method === 'GET' && path === '/api/v1/keys/master' && s.hold) {
+        const h = s.hold;
+        s.hold = undefined;
+        return h;
+      }
+      return undefined;
+    } })));
+    return s;
+  }
+  const tick = () => new Promise((r) => setTimeout(r, 50));
+
+  it('fails a queued status stale while the device is replaced, and starts nothing until the reset is stored', async () => {
+    const server = new FakeKeyServer();
+    const s = serve(server);
+    const first = await startE2EE('u_alice');
+    await (await prepareIdentity()).commit();
+    await new Promise((r) => setTimeout(r, 100));
+    s.hold = new Promise<undefined>(() => {}); // the running check stalls
+    const running = identityStatus().catch((e: unknown) => e);
+    const queued = identityStatus().catch((e: unknown) => e);
+    await vi.waitFor(() => expect(s.hold).toBeUndefined());
+    let letReset = () => {};
+    const gate = new Promise<void>((r) => { letReset = r; });
+    const reset = CryptoEngine.resetDevice.bind(CryptoEngine);
+    const spy = vi.spyOn(CryptoEngine, 'resetDevice').mockImplementation(async (...a) => { await gate; return reset(...a); });
+    const peer = new BroadcastChannel('kymessages-room-keys');
+    const heard: string[] = [];
+    peer.onmessage = ({ data }: MessageEvent<{ type?: string } | null>) => { if (data?.type) heard.push(data.type); };
+    const replaced = replaceDevice(first.deviceId);
+    await vi.waitFor(() => expect(spy).toHaveBeenCalled());
+    const uploads = s.uploads;
+    expect(await running).toBeInstanceOf(StaleStatus);
+    expect(await queued).toBeInstanceOf(StaleStatus);
+    // A fresh check and a manual retry during the reset wait for it, starting nothing.
+    const fresh = identityStatus();
+    const retried = retryEncryptionNow();
+    await tick();
+    expect(s.uploads).toBe(uploads);
+    expect(heard).toEqual(['device-reset']); // other tabs hear it is stored only once it is
+    letReset();
+    await replaced;
+    await vi.waitFor(() => expect(heard).toEqual(['device-reset', 'device-reset-done']));
+    peer.close();
+    await retried;
+    expect(await fresh).toMatchObject({ state: 'verified' });
+    expect((await startE2EE('u_alice')).deviceId).not.toBe(first.deviceId);
+  });
+
+  it('answers a status asked of a start-up that then failed after sign-out as stale', async () => {
+    const server = new FakeKeyServer();
+    let fail = () => {};
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice', { fn: (method, path) =>
+      method === 'POST' && path === '/api/v1/keys/upload' ? new Promise<Response>((r) => { fail = () => r(json({ error: 'down' }, 503)); }) : undefined })));
+    void startE2EE('u_alice').catch(() => undefined);
+    const asked = identityStatus().catch((e: unknown) => e);
+    await vi.waitFor(() => expect(fail).not.toBe(undefined));
+    await tick();
+    await forgetCryptoStore();
+    fail();
+    expect(await asked).toBeInstanceOf(StaleStatus);
+  });
+
+  it('waits out another tab\'s reset of this device, then has the gate ask again', async () => {
+    const server = new FakeKeyServer();
+    const s = serve(server);
+    const first = await startE2EE('u_alice');
+    await (await prepareIdentity()).commit();
+    await new Promise((r) => setTimeout(r, 100));
+    const announced = vi.fn();
+    const off = onIdentityChanged(announced);
+    const otherTab = new BroadcastChannel('kymessages-room-keys');
+    otherTab.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId });
+    await vi.waitFor(() => expect(encryptionReadyFor('u_alice')).toBe(false));
+    const uploads = s.uploads;
+    const fresh = identityStatus();
+    await tick();
+    // Before the reset is stored nothing starts, and the gate is not told yet.
+    expect(s.uploads).toBe(uploads);
+    expect(announced).not.toHaveBeenCalled();
+    const store = await openCryptoStore('u_alice');
+    await CryptoEngine.resetDevice('u_alice', first.deviceId, store);
+    store.close();
+    otherTab.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: first.deviceId });
+    await vi.waitFor(() => expect(announced).toHaveBeenCalled());
+    expect(await fresh).toMatchObject({ state: 'verified' });
+    expect((await startE2EE('u_alice')).deviceId).not.toBe(first.deviceId);
+    otherTab.close();
     off();
   });
 });
