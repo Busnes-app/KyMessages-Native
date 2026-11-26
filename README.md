@@ -68,7 +68,7 @@ Compose overlays are combined via `COMPOSE_FILE` in `.env` — append new overla
 
 - **Messaging and realtime:** Direct messages, group channels, threads, reactions, mentions, typing indicators, read receipts, file/image attachments with inline thumbnails, native WebSocket delivery (`/api/v1/ws`), and on-device encrypted IndexedDB message search.
 - **Encryption status:** Room messages and edits are end-to-end encrypted in the web client using vodozemac (Olm/Megolm) compiled to WebAssembly (`web/crypto`). Identity verification, bot devices, encrypted attachments, and call media encryption are still in progress, so releases do not yet carry an end-to-end encrypted release claim — see [docs/PRODUCT.md](docs/PRODUCT.md) for exact boundaries.
-- **Voice, video, and meetings:** Direct P2P WebRTC signaling over `/api/v1/ws` works out of the box with no extra services. Configure `KY_LIVEKIT_*` for optional LiveKit SFU escalation in larger group calls. Configure `KY_MEETING_SYNC_SECRET` for KyCalendar meeting room sync and time-bounded external guest links (`/api/meet/{token}`) with host-approved lobby admission.
+- **Voice, video, and meetings:** Direct P2P WebRTC signaling over `/api/v1/ws` works out of the box with no extra services. Configure `KY_LIVEKIT_*` for optional LiveKit SFU escalation in larger group calls. Pair with KyCalendar (through KyIdentity, or `KY_KYCALENDAR_URL` + `KY_KYCALENDAR_SECRET_FILE`) for KyCalendar meeting room sync and time-bounded external guest links (`/api/meet/{token}`) with host-approved lobby admission.
 - **Web Push notifications:** Installable PWA with RFC 8291/8292 Web Push delivery (`KY_PUSH_ENABLED=true` by default). Push payloads carry sender/room notification metadata only, never message text.
 - **Native agent accounts:** Admins can provision `agent-<name>` bot accounts owned by a team member under **Agents** in the operator console, issuing one-time `kybot_` bearer tokens alongside ready-to-use OpenClaw and Hermes Agent config blocks and the downloadable `kymessages` skill (`agent-skill/kymessages/`). Tokens unused for 90 days are revoked automatically, and agents follow their owner's KyIdentity offboarding state.
 - **Operator console (`/console`):** Built-in admin UI with 10-minute step-up re-authentication and full audit logging covering service health, network-path checks, users/sessions, agents, media policy, workspace branding, SCIM/KyIdentity directory sync, backup schedules/drills, and read-only audit logs.
@@ -99,7 +99,7 @@ Key environment variables (see `internal/config/config.go` and `docker-compose.y
 | `KY_PUSH_ENABLED`, `KY_VAPID_PRIVATE_KEY`, `KY_VAPID_SUBJECT` | Web Push delivery (enabled by default; auto-generates `data/vapid.key` if unset) |
 | `KY_STUN_URLS` | Comma-separated `stun:`/`stuns:` URIs for WebRTC calls |
 | `KY_LIVEKIT_URL`, `KY_LIVEKIT_API_KEY`, `KY_LIVEKIT_API_SECRET` | Optional LiveKit SFU origin and credentials (`*_FILE` variants supported) |
-| `KY_MEETING_SYNC_SECRET` | Shared HMAC secret for KyCalendar meeting sync (`/api/meetings/{id}`) |
+| `KY_KYCALENDAR_URL`, `KY_KYCALENDAR_SECRET_FILE` | Explicit KyCalendar pair (both or neither; default: KyIdentity's suite directory). Signs meeting sync (`/api/meetings/{id}`) and calendar chat/status |
 | `KY_BACKUP_DIR`, `KY_BACKUP_KEEP`, `KY_BACKUP_DEPOSIT_INTERVAL` | Local sealed capsule copies (keep newest 7, interval `24h` by default) |
 | `KY_BACKUP_ALLOW_PRIVATE_RECOVERY` | Opt-in for LAN KyRecovery destinations (`false` by default; HTTPS remains mandatory) |
 

@@ -64,7 +64,7 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
 - Hybrid calling: direct peer-to-peer WebRTC (signaled over `/api/v1/ws`) for 1:1 / small calls,
   with optional LiveKit SFU (`KY_LIVEKIT_URL`, `KY_LIVEKIT_API_KEY`, `KY_LIVEKIT_API_SECRET`) for
   larger group calls and automatic escalation.
-- KyCalendar meeting sync (`PUT`/`DELETE /api/meetings/{id}`, signed with `KY_MEETING_SYNC_SECRET`)
+- KyCalendar meeting sync (`PUT`/`DELETE /api/meetings/{id}`, signed with the KyCalendar pair secret, contract B: organizer as `sub` + `issuer`)
   creates meeting-scoped rooms with scheduled time windows, attendee resolution, and external
   guest links (`/api/meet/{token}`) gated by an interactive waiting-room lobby.
 - Chat from mail and calendar: `POST /api/suite/chat` (`kypost.chat.open`, `kycalendar.chat.open`)

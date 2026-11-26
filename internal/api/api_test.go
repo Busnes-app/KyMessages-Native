@@ -32,7 +32,7 @@ import (
 	"github.com/Busnes-app/ky_server_base/internal/testdb"
 )
 
-func setupTestServer(t *testing.T) (*api.Server, store.Store, *config.Config) {
+func setupTestServer(t *testing.T, opts ...func(*config.Config)) (*api.Server, store.Store, *config.Config) {
 	t.Helper()
 	t.Setenv("KY_DATA_DIR", t.TempDir())
 	cfg, _ := config.LoadFromEnv()
@@ -40,6 +40,9 @@ func setupTestServer(t *testing.T) (*api.Server, store.Store, *config.Config) {
 	db.DataDir = cfg.Database.DataDir // testdb only picks the backend; keep the temp data dir
 	cfg.Database = db
 	cfg.Captcha.Provider = "none" // disable captcha for unit test speed
+	for _, o := range opts {
+		o(cfg)
+	}
 
 	st, err := store.Open(context.Background(), cfg.Database)
 	if err != nil {

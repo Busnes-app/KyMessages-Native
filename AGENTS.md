@@ -133,7 +133,7 @@ When the user requests a durable behavior change, record it here or in the relev
   overlay. Guide: [docs/Reverse_Proxy_Networking.md](docs/Reverse_Proxy_Networking.md).
 - Voice and video calls use native WebRTC signalling (`internal/rtc`) with configurable STUN
   (`KY_STUN_URLS`) and an optional LiveKit SFU (`KY_LIVEKIT_URL`, `KY_LIVEKIT_API_KEY`,
-  `KY_LIVEKIT_API_SECRET`). KyCalendar meeting rooms (`KY_MEETING_SYNC_SECRET`) admit external
+  `KY_LIVEKIT_API_SECRET`). KyCalendar meeting rooms (signed with the KyCalendar pair secret) admit external
   guests from a waiting room during the meeting.
 - `chat.Hub.Dispatch` sends an event that carries `user_id` only to that user's sockets, even when
   it also names a room (call signals, call migrations with their LiveKit token, lobby decisions);

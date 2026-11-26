@@ -43,6 +43,7 @@ func TestCellsRefuseAnotherCellsOrgOnEveryWayIn(t *testing.T) {
 		cfg.SSO.Enabled = true
 		cfg.SSO.KyIdentityIssuer = suiteIssuer
 		cfg.KyPost = config.PairConfig{URL: "https://mail.example", Secret: []byte(cellKyPostKey)}
+		withKyCalendar(cfg)
 	})
 	if err := api.EnsureTenancyMode(ctx, st, config.TenancyConfig{Mode: config.TenancyMulti, StaffOrgID: testStaffOrg, Cells: []string{"us-east-2", "us-east-3"}}); err != nil {
 		t.Fatal(err)
@@ -135,7 +136,8 @@ func TestCellsRefuseAnotherCellsOrgOnEveryWayIn(t *testing.T) {
 		}},
 		{"KyCalendar suite peer call", func(org string) bool {
 			now := time.Now().UTC()
-			return signedDo(http.MethodPut, "/api/meetings/cell-"+org[len(org)-2:]+"-"+uuid.NewString()[:8], "meeting.sync", testMultiTenantHMAC, map[string]any{"org_id": org, "title": "Cell", "organizer_sub": subs[org][0],
+			id := "cell-" + org[len(org)-2:] + "-" + uuid.NewString()[:8]
+			return signedDo(http.MethodPut, "/api/meetings/"+id, "kycalendar.meeting.put", testMultiTenantHMAC, map[string]any{"id": id, "org_id": org, "title": "Cell", "sub": subs[org][0], "issuer": suiteIssuer,
 				"member_subs": []string{subs[org][0]}, "windows": []map[string]string{{"start": now.Format(time.RFC3339), "end": now.Add(time.Hour).Format(time.RFC3339)}}}) == http.StatusOK
 		}},
 	}

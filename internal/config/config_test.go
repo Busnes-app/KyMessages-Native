@@ -222,6 +222,20 @@ func TestLegacyKySignOnEnvironmentFailsStartup(t *testing.T) {
 	}
 }
 
+// KyCalendar signs meetings with the pair secret; a left-over meeting secret must stop startup
+// rather than leave meetings refused under a secret KyCalendar never uses.
+func TestMeetingSyncSecretFailsStartup(t *testing.T) {
+	t.Setenv("KY_DATA_DIR", t.TempDir())
+	t.Setenv("KY_MEETING_SYNC_SECRET", "meeting-sync-secret-key-32-bytes-minimum!!")
+	if _, err := config.LoadFromEnv(); err == nil || !strings.Contains(err.Error(), "KY_KYCALENDAR_SECRET_FILE") {
+		t.Fatalf("KY_MEETING_SYNC_SECRET: err = %v, want one naming the KyCalendar pair", err)
+	}
+	t.Setenv("KY_MEETING_SYNC_SECRET", " ")
+	if _, err := config.LoadFromEnv(); err != nil {
+		t.Fatalf("empty KY_MEETING_SYNC_SECRET: %v", err)
+	}
+}
+
 // Compose passes unset variables as empty strings; an empty legacy name is not a misconfiguration.
 func TestEmptyLegacyKySignOnEnvironmentIsIgnored(t *testing.T) {
 	t.Setenv("KY_DATA_DIR", t.TempDir())
