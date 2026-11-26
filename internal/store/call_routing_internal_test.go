@@ -297,6 +297,12 @@ func TestCallRestoreInvalidatesOwnerAndRetainsSFUWork(t *testing.T) {
 	if pending, err := s.Chat().PendingCallEvictions(ctx, org, "", 10); err != nil || len(pending) != 1 || pending[0].LiveKitRoom != cs.LiveKitRoom {
 		t.Fatalf("restored media cleanup lost: %+v %v", pending, err)
 	}
+	if _, err := s.Chat().AcquireCallRoom(ctx, org, cs.RoomID, "restored-owner", time.Minute); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("stale restored org acquired call room before sync: %v", err)
+	}
+	if err := s.Chat().ApplyTenantDirectory(ctx, TenantDirectoryEntry{TenantID: org, Status: TenantStatusActive, Enabled: true, Valid: true, Revision: 1}); err != nil {
+		t.Fatalf("re-admit org after restore: %v", err)
+	}
 	next, err := s.Chat().AcquireCallRoom(ctx, org, cs.RoomID, "restored-owner", time.Minute)
 	if err != nil || next.Generation <= cs.OwnerGeneration {
 		t.Fatalf("restored generation reused: %+v %v", next, err)

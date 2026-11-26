@@ -17,6 +17,7 @@ import (
 
 	"github.com/Busnes-app/ky_server_base/internal/api"
 	"github.com/Busnes-app/ky_server_base/internal/config"
+	"github.com/Busnes-app/ky_server_base/internal/crypto"
 	"github.com/Busnes-app/ky_server_base/internal/sso"
 	"github.com/Busnes-app/ky_server_base/internal/store"
 )
@@ -705,5 +706,138 @@ func TestErasedFeedFailureCannotAdmitAnOrgFirst(t *testing.T) {
 	}
 	if got, err := e.st.Chat().GetTenant(ctx, replicaOrgA); err != nil || !got.DirectoryReady {
 		t.Fatalf("recovery did not admit org: %+v %v", got, err)
+	}
+}
+
+// Restoring a <24h backup offline must fail closed when KyIdentity is unreachable (refusing
+// startup, customer org admission, and cached storage pool grants while keeping erased_subjects
+// tombstones), and recover cleanly once KyIdentity answers — even for orgs unchanged at the
+// same revision — while keeping deleted/omitted orgs unserved and applying post-backup erasures.
+func TestTenancyRestoreFailsClosedOfflineAndRecovers(t *testing.T) {
+	ctx := context.Background()
+	e := newSyncEnv(t)
+	e.kyid.OnUserErased(func(ctx context.Context, u *store.User) error {
+		_, err := e.st.Chat().EraseUser(ctx, u.OrgID, u)
+		return err
+	})
+	orgKeep := syncOrgID(0)
+	orgDeleted := syncOrgID(1)
+	orgOmitted := syncOrgID(2)
+	e.dir.list(
+		listedOrg{ID: orgKeep, Status: "active", Revision: 10, Enabled: true},
+		listedOrg{ID: orgDeleted, Status: "active", Revision: 10, Enabled: true},
+		listedOrg{ID: orgOmitted, Status: "active", Revision: 10, Enabled: true},
+	)
+	if err := e.kyid.StartupSync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	alice, aliceTok := createOrgUser(t, e.st, "usr_restore_alice", "restorealice", "user", orgKeep)
+	bob, _ := createOrgUser(t, e.st, "usr_restore_bob", "restorebob", "user", orgKeep)
+	_, carolTok := createOrgUser(t, e.st, "usr_restore_carol", "restorecarol", "user", orgDeleted)
+	if err := e.st.Chat().RememberErasedSubject(ctx, "sub-prebackup-erased", orgKeep); err != nil {
+		t.Fatal(err)
+	}
+	seq, _, err := e.st.Chat().NextPoolReport(ctx, orgKeep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.st.Chat().SetPoolGrant(ctx, orgKeep, seq, 0, 1<<20, time.Now().Add(time.Hour).UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate offline restore invalidation of a <24h backup.
+	if err := e.st.InvalidateRestoredGrants(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// KyIdentity unreachable immediately after restore: startup and admission must fail closed.
+	e.dir.mu.Lock()
+	e.dir.down = true
+	e.dir.mu.Unlock()
+	if err := e.kyid.StartupSync(ctx); err == nil {
+		t.Fatal("StartupSync trusted pre-restore <24h sync timestamp while KyIdentity was unreachable")
+	}
+	if _, err := e.st.Settings().GetSetting(ctx, sso.SettingSyncedAt); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("tenancy.kyidentity_synced_at after restore = %v, want ErrNotFound", err)
+	}
+	for _, org := range []string{orgKeep, orgDeleted, orgOmitted} {
+		if got := e.status(t, org); got != store.TenantStatusSuspended {
+			t.Fatalf("org %s status after restore = %q, want suspended", org, got)
+		}
+	}
+	if err := e.st.Sessions().CreateSession(ctx, &store.Session{
+		TokenHash: "post-restore-offline", UserID: alice.ID, CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour),
+	}, ""); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("CreateSession on stale org before sync = %v, want ErrNotFound", err)
+	}
+	if rec := doBearerJSON(t, e.srv, http.MethodGet, "/api/v1/rooms", aliceTok, nil, nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("pre-restore alice token after restore = %d, want 401", rec.Code)
+	}
+	if rec := doBearerJSON(t, e.srv, http.MethodGet, "/api/v1/rooms", carolTok, nil, nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("pre-restore carol token after restore = %d, want 401", rec.Code)
+	}
+	if _, err := e.st.Chat().ReserveAttachmentQuota(ctx, orgKeep, alice.ID, 64, store.AttachmentQuotaLimits{Pool: true, ActiveUploader: true}, time.Minute); !errors.Is(err, store.ErrForbidden) {
+		t.Fatalf("ReserveAttachmentQuota(ActiveUploader) before sync = %v, want ErrForbidden", err)
+	}
+	if _, err := e.st.Chat().ReserveAttachmentQuota(ctx, orgKeep, alice.ID, 64, store.AttachmentQuotaLimits{Pool: true}, time.Minute); !errors.Is(err, store.ErrPoolUnavailable) {
+		t.Fatalf("ReserveAttachmentQuota(Pool) before sync = %v, want ErrPoolUnavailable", err)
+	}
+	if err := e.st.Users().CreateUser(ctx, &store.User{
+		ID: "usr_prebackup_revive", Username: "prebackuprevive", Role: "user", Status: "active",
+		SSOProvider: "kyidentity", SSOSubject: "sub-prebackup-erased", OrgID: orgKeep,
+	}); !errors.Is(err, store.ErrSubjectErased) {
+		t.Fatalf("pre-backup erased_subjects tombstone did not survive restore: %v", err)
+	}
+
+	// KyIdentity comes back online: orgKeep is still active at the same revision 10,
+	// orgDeleted was deleted, orgOmitted is gone from the listing, and bob was erased.
+	e.dir.mu.Lock()
+	e.dir.down = false
+	e.dir.orgs = []listedOrg{
+		{ID: orgKeep, Status: "active", Revision: 10, Enabled: true},
+		{ID: orgDeleted, Status: "deleted", Revision: 11, Enabled: false},
+	}
+	e.dir.erased = []erasedSubject{{Sub: bob.SSOSubject, OrgID: orgKeep, Revision: 1}}
+	e.dir.mu.Unlock()
+
+	if err := e.kyid.StartupSync(ctx); err != nil {
+		t.Fatalf("StartupSync recovery failed: %v", err)
+	}
+	if got, err := e.st.Chat().GetTenant(ctx, orgKeep); err != nil || got.Status != store.TenantStatusActive || !got.DirectoryReady {
+		t.Fatalf("orgKeep did not recover at same revision: %+v %v", got, err)
+	}
+	if got := e.status(t, orgDeleted); got != store.TenantStatusDeleted {
+		t.Fatalf("orgDeleted status after recovery = %q, want deleted", got)
+	}
+	if got := e.status(t, orgOmitted); got != store.TenantStatusSuspended {
+		t.Fatalf("orgOmitted status after recovery = %q, want suspended", got)
+	}
+	if _, err := e.st.Users().GetUserByID(ctx, bob.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("post-backup erased user bob survived recovery: %v", err)
+	}
+	if !e.kyid.FullSyncDue(ctx) {
+		t.Fatal("FullSyncDue = false after restore + startup sync, want true")
+	}
+
+	// Recovered orgKeep can issue a fresh session and serve requests.
+	freshTok := "fresh-post-restore-tok"
+	if err := e.st.Sessions().CreateSession(ctx, &store.Session{
+		TokenHash: crypto.SHA256Hex([]byte(freshTok)), UserID: alice.ID, CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour),
+	}, ""); err != nil {
+		t.Fatalf("CreateSession after recovery: %v", err)
+	}
+	if rec := doBearerJSON(t, e.srv, http.MethodGet, "/api/v1/rooms", freshTok, nil, nil); rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/rooms after recovery = %d %s, want 200", rec.Code, rec.Body.String())
+	}
+
+	// Pre-restore cached storage pool grant remains cleared until a fresh report succeeds.
+	if _, err := e.st.Chat().ReserveAttachmentQuota(ctx, orgKeep, alice.ID, 64, store.AttachmentQuotaLimits{Pool: true, ActiveUploader: true}, time.Minute); !errors.Is(err, store.ErrPoolUnavailable) {
+		t.Fatalf("ReserveAttachmentQuota before fresh pool report = %v, want ErrPoolUnavailable", err)
+	}
+	if err := e.srv.RefreshPool(ctx, time.Now()); err != nil {
+		t.Fatalf("RefreshPool after recovery: %v", err)
+	}
+	if _, err := e.st.Chat().ReserveAttachmentQuota(ctx, orgKeep, alice.ID, 64, store.AttachmentQuotaLimits{Pool: true, ActiveUploader: true}, time.Minute); err != nil {
+		t.Fatalf("ReserveAttachmentQuota after fresh pool grant: %v", err)
 	}
 }

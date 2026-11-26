@@ -62,7 +62,13 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
 - `InvalidateRestoredGrants` runs only on an offline restored database: atomically
   delete sessions, MFA challenges, device pairings, push subscriptions and meeting guest
   sessions (a restored admission would readmit a removed guest), revoke active agent
-  tokens, and audit `restore.grants_invalidated`. Users sign in again.
+  tokens, clear KyIdentity tenancy sync freshness/cursors (`tenancy.kyidentity_synced_at`,
+  `tenancy.full_sync_at`, `tenancy.orgs_revision`, `tenancy.erased_revision`), mark active
+  customer `tenants` `suspended` until a fresh KyIdentity sync re-admits them (leaving
+  `default`, `tenancy.staff_org_id`, terminal `deleted` rows, and immutable `erased_subjects`
+  tombstones intact), clear cached storage pool grants (`pool_ceiling_bytes`,
+  `pool_expires_at`, `pool_reported_bytes`, preserving `pool_seq` and `pool_required_seq`),
+  and audit `restore.grants_invalidated`. Users sign in again.
 - Migrations 5–12 and 17–19 built the retired messaging stack; migration 21 drops its tables
   (children first), `messaging.*` audit rows and the three `messages_*` backup settings, and
   is idempotent. Migrations are append-only: keep their SQL.
