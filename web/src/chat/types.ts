@@ -1,4 +1,4 @@
-import type { FileDescriptor } from '../crypto/attachments';
+import type { MessageFiles } from '../crypto/attachments';
 import { arr, bool, count, obj, oneOf, opt, str } from '../dto';
 
 export type RoomKind = 'dm' | 'channel' | 'meeting';
@@ -149,9 +149,12 @@ export interface ChatMessage {
   delivery: MessageDeliveryState;
   /** For e2ee_room_v1: the envelope as stored. `body` holds only decrypted text, never this. */
   envelope?: string;
+  /** For an edited e2ee_room_v1 message with files: the envelope it was first sent in, which holds them. */
+  original?: string;
   e2ee?: E2EEState;
-  /** From the decrypted message: its encrypted files (keys included). Never from the server. */
-  files?: FileDescriptor[];
+  /** From the decrypted message only, never the server: its encrypted files (keys included). */
+  files?: MessageFiles['files'];
+  filesState?: MessageFiles['filesState'];
 }
 
 export type CallMode = 'p2p_mesh' | 'sfu_livekit';
@@ -435,6 +438,7 @@ export function parseMessage(v: unknown): ChatMessage {
     encoding,
     body: encoding === 'e2ee_room_v1' ? '' : body,
     ...(sealed ? { envelope: body, e2ee: { kind: 'waiting' } as E2EEState } : {}),
+    ...(sealed && typeof o.original_body === 'string' && o.original_body ? { original: str(o.original_body, 65536) } : {}),
     edited_at: opt(o.edited_at, num),
     deleted_at: opt(o.deleted_at, num),
     created_at: opt(o.created_at, num) ?? Date.now(),

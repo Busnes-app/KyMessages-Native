@@ -631,7 +631,8 @@ describe('Native Chat page', () => {
         if (url === '/api/v1/rooms/rm_gen/messages/m_late' && method === 'PATCH') {
           const req = JSON.parse(String(init?.body)) as Record<string, unknown>;
           patched.push(req);
-          return json({ message: { ...lateMessage(), body: req.body, edited_at: Date.now() } });
+          // As the server does: the edit replaces the body and the first envelope is kept.
+          return json({ message: { ...lateMessage(), body: req.body, original_body: lateMessage().body, edited_at: Date.now() } });
         }
         if (url.startsWith('/api/v1/rooms/rm_gen/messages')) return json({ messages: [], has_more: false });
         if (url === '/api/v1/attachments/att_enc1' && method === 'GET') return new Response(uploads[0].bytes);
@@ -672,8 +673,8 @@ describe('Native Chat page', () => {
     expect(saved[0].type).toBe('application/octet-stream');
     expect(new TextDecoder().decode(await saved[0].arrayBuffer())).toBe('hello world');
 
-    // A message whose key arrives late still opens with its files, and an edit afterwards keeps
-    // their keys in the new envelope.
+    // A message whose key arrives late still opens with its files. An edit afterwards seals only
+    // its text (never the file keys) and the files still open, from the kept first envelope.
     const lateInner = { room_id: 'rm_gen', type: 'attachment' as const, body: 'late note', files: inner.files };
     const lateMessage = () => ({
       id: 'm_late', room_id: 'rm_gen', seq: 2, sender_id: 'u_alice', sender_name: 'Alice', encoding: 'e2ee_room_v1',
@@ -694,7 +695,9 @@ describe('Native Chat page', () => {
     await waitFor(() => expect(patched).toHaveLength(1));
     const editInner = JSON.parse(atob((JSON.parse(String(patched[0].body)) as { ciphertext: string }).ciphertext)) as { type: string; files: unknown[] };
     expect(editInner.type).toBe('edit');
-    expect(editInner.files).toEqual(inner.files);
+    expect(editInner.files).toEqual([]);
+    expect(await screen.findByText('late note, edited')).toBeTruthy();
+    expect(screen.getAllByRole('button', { name: 'Download report.txt' })).toHaveLength(2);
 
     // A refused upload is an error on its chip; there is no plaintext retry.
     failUploads = true;
@@ -702,6 +705,32 @@ describe('Native Chat page', () => {
     await screen.findByText('storage full');
     expect(uploads).toHaveLength(2);
     expect(uploads.every((u) => u.url.endsWith('?encrypted=1') && u.name === 'encrypted.bin')).toBe(true);
+  });
+
+  it('closes an image preview when its message is deleted', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === '/api/v1/bootstrap') {
+          return json({
+            user: { id: 'u_alice', username: 'alice', display_name: 'Alice', role: 'user' },
+            tenant: { id: 'default', slug: 'default', display_name: 'Busnes HQ', plan: 'self_hosted' },
+            rooms: [{ id: 'rm_gen', tenant_id: 'default', kind: 'channel', name: 'general', topic: '', is_private: false, last_seq: 1, created_by: 'u_alice', created_at: Date.now(), role: 'owner', last_read_seq: 1, unread_count: 0, notify_mode: 'all' }],
+          });
+        }
+        if (url.startsWith('/api/v1/rooms/rm_gen/messages')) {
+          return json({ messages: [{ id: 'm_img', room_id: 'rm_gen', seq: 1, sender_id: 'bot_1', sender_name: 'Bot', encoding: 'plain_v1', body: '', created_at: Date.now(), reactions: [],
+            attachments: [{ id: 'att_png', room_id: 'rm_gen', uploader_id: 'bot_1', filename: 'chart.png', mime_type: 'image/png', size_bytes: 10, sha256_hex: '', created_at: 1 }] }], has_more: false });
+        }
+        return json({ error: 'not found' }, 404);
+      }),
+    );
+    render(<Chat />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Preview chart.png' }));
+    expect(screen.getByRole('dialog', { name: 'Image preview: chart.png' })).toBeTruthy();
+    act(() => FakeWebSocket.instances[0].emit({ t: 'message.delete', room: 'rm_gen', seq: 2, d: { id: 'm_img', deleted_at: Date.now() } }));
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Image preview: chart.png' })).toBeNull());
   });
 
   it('hides the attachment button when bootstrap reports attachments.available=false', async () => {

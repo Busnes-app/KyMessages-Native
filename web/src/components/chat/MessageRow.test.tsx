@@ -294,12 +294,34 @@ describe('MessageRow', () => {
 
     const att = (id: string): ChatAttachment => ({ id, tenant_id: 't1', room_id: 'r1', uploader_id: 'u1', filename: 'encrypted.bin', mime_type: 'application/octet-stream', size_bytes: 10, sha256_hex: '', created_at: 1 });
 
-    it('names encrypted files by their decrypted names and labels only the plaintext ones', () => {
+    it('names encrypted files by their decrypted names and never offers an upload the message does not name', () => {
       const file = { attachment_id: 'att_sealed', name: 'budget.xlsx', size: 2048 } as FileDescriptor;
       row({ ...sealed, body: '', files: [file], attachments: [att('att_sealed'), { ...att('att_old'), filename: 'old.pdf' }] });
       expect(screen.getByRole('button', { name: 'Download budget.xlsx' })).toBeTruthy();
       expect(screen.queryByText('encrypted.bin')).toBeNull();
-      // Only the upload no descriptor names is plaintext.
+      // A server-added upload in a message that names its files is hidden, never "not encrypted".
+      expect(screen.queryByText('File not encrypted')).toBeNull();
+      expect(screen.queryByRole('link')).toBeNull();
+      expect(screen.getByRole('note').textContent).toMatch(/An attachment this message does not include was hidden/);
+    });
+
+    it('shows a named file the server did not attach as unavailable', () => {
+      const file = { attachment_id: 'att_gone', name: 'budget.xlsx', size: 2048, missing: true } as FileDescriptor & { missing: true };
+      row({ ...sealed, body: 'see file', files: [file], attachments: [] });
+      expect(screen.getByText('budget.xlsx')).toBeTruthy();
+      expect(screen.getByText('Attachment unavailable')).toBeTruthy();
+      expect(screen.queryByRole('button', { name: /Download/ })).toBeNull();
+    });
+
+    it('shows the uploads of a message whose files cannot be read here as unavailable, not plaintext', () => {
+      row({ ...sealed, body: 'new caption', filesState: { reason: 'This message was sent before this device could read the room.' }, attachments: [att('att_1')] });
+      expect(screen.getByText(/Attachment unavailable\. This message was sent before this device could read the room\./)).toBeTruthy();
+      expect(screen.queryByText('File not encrypted')).toBeNull();
+      expect(screen.queryByRole('link')).toBeNull();
+    });
+
+    it('labels the uploads of a message from before E5 as not encrypted', () => {
+      row({ ...sealed, body: 'old', attachments: [{ ...att('att_old'), filename: 'old.pdf' }] });
       expect(screen.getByText('File not encrypted')).toBeTruthy();
       expect(screen.getByRole('link', { name: /old\.pdf/ }).getAttribute('href')).toBe('/api/v1/attachments/att_old');
     });
@@ -310,8 +332,31 @@ describe('MessageRow', () => {
       expect(screen.queryByRole('link')).toBeNull();
     });
 
+    // A PNG header (signature and IHDR) declaring width x height.
+    const pngHeader = (width: number, height: number) => {
+      const b = new Uint8Array(33);
+      b.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52]);
+      new DataView(b.buffer).setUint32(16, width);
+      new DataView(b.buffer).setUint32(20, height);
+      return b;
+    };
+
+    it('never decodes a thumbnail whose header declares another size, such as a decompression bomb', async () => {
+      for (const [w, h, why] of [[30000, 30000, /too large/], [5, 3, /not the size/]] as const) {
+        const { ciphertext, sealed: t } = await encryptBlob(new Blob([pngHeader(w, h)]), 'thumb');
+        const thumb = { ...t, attachment_id: 'att_thumb', mime_type: 'image/png', width: 4, height: 3 };
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(ciphertext)));
+        const made = vi.spyOn(URL, 'createObjectURL');
+        row({ ...sealed, body: '', files: [{ attachment_id: 'att_img', name: 'photo.png', mime_type: 'image/png', size: 9, thumb } as FileDescriptor], attachments: [att('att_img'), att('att_thumb')] });
+        expect(await screen.findByText(why)).toBeTruthy();
+        expect(screen.queryByRole('img')).toBeNull();
+        expect(made).not.toHaveBeenCalled();
+        cleanup();
+      }
+    });
+
     it('decrypts a thumbnail into a blob: URL and revokes it on unmount', async () => {
-      const png = new Uint8Array([137, 80, 78, 71, 1, 2, 3]);
+      const png = pngHeader(4, 3);
       const { ciphertext, sealed: t } = await encryptBlob(new Blob([png]), 'thumb');
       const thumb = { ...t, attachment_id: 'att_thumb', mime_type: 'image/png', width: 4, height: 3 };
       const file = { attachment_id: 'att_img', name: 'photo.png', mime_type: 'image/png', size: 9000, thumb } as FileDescriptor;

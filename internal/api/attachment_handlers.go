@@ -8,6 +8,7 @@ import (
 	"log"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -35,7 +36,8 @@ func attachmentUploadDeadline(maxBytes int64) time.Duration {
 	return time.Minute + time.Duration(maxBytes/(128<<10))*time.Second
 }
 
-var chatLimitUploads = chatLimit{"chat-uploads:", 30}
+// A file and its thumbnail are two uploads, so ten photos are twenty.
+var chatLimitUploads = chatLimit{"chat-uploads:", 60}
 
 func (s *Server) maxUploadBytes() int64 {
 	if s.config != nil && s.config.Attachments.MaxUploadBytes > 0 {
@@ -98,13 +100,14 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 	if !s.allowChatAction(w, user.ID, chatLimitUploads) {
 		return
 	}
-	query := r.URL.Query()
-	encrypted := query.Get("encrypted") == "1"
-	if len(query) > 1 || (len(query) == 1 && !encrypted) {
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	vals, flagged := query["encrypted"]
+	if err != nil || len(query) > 1 || (flagged && (len(vals) != 1 || vals[0] != "1")) || (len(query) == 1 && !flagged) {
 		s.writeError(w, http.StatusBadRequest, "The only upload parameter is encrypted=1")
 		return
 	}
-	if !encrypted && !isBotToken(user, sess) {
+	encrypted := flagged
+	if !encrypted && !plaintextAllowed(user, sess) {
 		s.writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "Files are end-to-end encrypted: upload ciphertext with encrypted=1",
 			"code":  CodeE2EERequired,
@@ -248,12 +251,10 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 	}
 
 	attID := "att_" + uuid.Must(uuid.NewV7()).String()
-	var body io.Reader = filePart
 	if encrypted {
-		body = blobs.Opaque(filePart)
 		rawFilename = encryptedFilename
 	}
-	putRes, err := s.blobs.Put(tenantID, attID, body, res.ReservedBytes)
+	putRes, err := s.blobs.Put(tenantID, attID, filePart, res.ReservedBytes, blobs.PutOptions{Opaque: encrypted})
 	if err != nil {
 		var maxErr *http.MaxBytesError
 		switch {
@@ -271,7 +272,7 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 	// Nothing may follow the ciphertext either: an encrypted upload has no metadata.
 	if encrypted {
 		if _, err := mr.NextPart(); !errors.Is(err, io.EOF) {
-			_ = s.blobs.Erase(tenantID, putRes.Key)
+			s.eraseUncommitted(tenantID, putRes.Key)
 			s.writeError(w, http.StatusBadRequest, "An encrypted upload carries only its file")
 			return
 		}
@@ -290,7 +291,7 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 		VersionID:  putRes.VersionID,
 	}
 	if err := s.store.Chat().CommitAttachmentWithQuota(r.Context(), res.ID, att, limits); err != nil {
-		_ = s.blobs.Erase(tenantID, putRes.Key)
+		s.eraseUncommitted(tenantID, putRes.Key)
 		if s.writePoolError(w, err) {
 			return
 		}
@@ -312,6 +313,14 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 
 	w.Header().Set("Cache-Control", "no-store")
 	s.writeJSON(w, http.StatusCreated, map[string]any{"attachment": att})
+}
+
+// eraseUncommitted removes a blob whose upload was refused before its row was written. A failure
+// is logged: with no row, nothing charges or lists the blob, and the stale-temp sweep cannot see it.
+func (s *Server) eraseUncommitted(tenantID, key string) {
+	if err := s.blobs.Erase(tenantID, key); err != nil {
+		log.Printf("[ATTACHMENTS] refused upload %s left an unlisted blob: %v", key, err)
+	}
 }
 
 // GET /api/v1/attachments/{id}

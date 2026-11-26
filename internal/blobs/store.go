@@ -47,7 +47,7 @@ type PutResult struct {
 // current version only (a user's own delete); Erase and DeletePrefix remove every version
 // (erasure and purge).
 type Backend interface {
-	Put(tenantID, key string, r io.Reader, maxBytes int64) (PutResult, error)
+	Put(tenantID, key string, r io.Reader, maxBytes int64, opts PutOptions) (PutResult, error)
 	Open(tenantID, key string, sizeBytes int64) (io.ReadSeekCloser, int64, error) // sizeBytes: as recorded at upload
 	Delete(tenantID, key string) error
 	Erase(tenantID, key string) error
@@ -140,12 +140,11 @@ func (s *Store) Dir() string {
 	return s.dir
 }
 
-// opaque marks an upload as end-to-end encrypted bytes (Opaque).
-type opaque struct{ io.Reader }
-
-// Opaque wraps the body of a client-encrypted upload: Put stores it as application/octet-stream
-// and never inspects its bytes.
-func Opaque(r io.Reader) io.Reader { return opaque{r} }
+// PutOptions says how Put treats an upload.
+type PutOptions struct {
+	// Opaque marks client-encrypted bytes: stored as application/octet-stream, never inspected.
+	Opaque bool
+}
 
 // ValidKey reports whether key is a safe flat blob identifier.
 func ValidKey(key string) bool {
@@ -153,9 +152,9 @@ func ValidKey(key string) bool {
 }
 
 // Put streams r into the store under key, enforcing 1 <= size <= maxBytes, computing SHA-256,
-// sniffing and validating a safe MIME type (unless r is Opaque), and atomically moving the file
+// sniffing and validating a safe MIME type (unless opts.Opaque), and atomically moving the file
 // into place (mode 0600).
-func (s *Store) Put(tenantID, key string, r io.Reader, maxBytes int64) (PutResult, error) {
+func (s *Store) Put(tenantID, key string, r io.Reader, maxBytes int64, opts PutOptions) (PutResult, error) {
 	rel, err := s.rel(tenantID, key)
 	if err != nil {
 		return PutResult{}, err
@@ -198,7 +197,7 @@ func (s *Store) Put(tenantID, key string, r io.Reader, maxBytes int64) (PutResul
 	}
 
 	mimeType := "application/octet-stream"
-	if _, sealed := r.(opaque); !sealed {
+	if !opts.Opaque {
 		mimeType = detectSafeMIME(tmp, n)
 	}
 

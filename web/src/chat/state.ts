@@ -1,11 +1,18 @@
+import { sealedIds } from '../crypto/attachments';
 import type { ChatMessage, ChatReactionSummary, ChatRoomSummary } from './types';
 
+// An optimistic encrypted send knows its uploads only from its sealed file list; the server's copy
+// lists them as attachments (and, once opened, as files too).
+const attachmentIds = (m: ChatMessage) => (m.files ? sealedIds(m.files) : m.attachments.map((a) => a.id)).sort().join('\n');
+
 function sameAttachmentIds(a: ChatMessage, b: ChatMessage): boolean {
-  if (a.attachments.length !== b.attachments.length) return false;
-  for (let i = 0; i < a.attachments.length; i++) {
-    if (a.attachments[i].id !== b.attachments[i].id) return false;
-  }
-  return true;
+  return attachmentIds(a) === attachmentIds(b);
+}
+
+/** What the on-device search index holds of a message: a change means it is indexed again. */
+export function searchSignature(m: ChatMessage): string {
+  const names = (m.files ?? []).map((f) => f.name).join('\u0001');
+  return [m.body, m.edited_at ?? '', m.deleted_at ?? '', m.delivery.kind, m.e2ee?.kind ?? '', names].join('\u0000');
 }
 
 /** Insert or replace a server-confirmed message, reconciling any optimistic pending copy. */

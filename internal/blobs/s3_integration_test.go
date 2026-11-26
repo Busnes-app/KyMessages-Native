@@ -52,12 +52,12 @@ func TestS3StoreVersionedIntegration(t *testing.T) {
 	}
 	png := []byte("\x89PNG\r\n\x1a\nnot really an image")
 	for _, k := range []struct{ org, key string }{{orgA, "att_first"}, {orgA, "att_second"}, {orgB, "att_first"}} {
-		res, err := st.Put(k.org, k.key, bytes.NewReader(png), 1<<20)
+		res, err := st.Put(k.org, k.key, bytes.NewReader(png), 1<<20, PutOptions{})
 		if err != nil || res.VersionID == "" || res.MimeType != "application/octet-stream" {
 			t.Fatalf("put %v: %+v %v", k, res, err)
 		}
 	}
-	if _, err := st.Put(orgA, "att_first", bytes.NewReader(png), 1<<20); !errors.Is(err, s3.ErrAlreadyExists) {
+	if _, err := st.Put(orgA, "att_first", bytes.NewReader(png), 1<<20, PutOptions{}); !errors.Is(err, s3.ErrAlreadyExists) {
 		t.Fatal("a key was written twice", err)
 	}
 	body, _, err := client.Get(t.Context(), path(orgA, "att_first"), "")

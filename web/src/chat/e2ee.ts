@@ -6,7 +6,7 @@ import { arr, bool, obj, str } from '../dto';
 import { keepStorage } from '../persist';
 import { CryptoEngine, DeviceChanged, type ClaimedKey, type DeviceKeys, type KeyServer, type Mail, type RoomInner } from '../crypto/engine';
 import { loadCrypto } from '../crypto/index';
-import { openFiles } from '../crypto/attachments';
+import { messageFiles, type OpenedEnvelope } from '../crypto/attachments';
 import { type CryptoStore, deleteCryptoStores, openCryptoStore, storedDevices } from '../crypto/store';
 import { parseRoomDetail, type ChatMessage, type E2EEState } from './types';
 
@@ -290,8 +290,11 @@ export async function sealRoomMessage(roomId: string, inner: Omit<RoomInner, 'ro
   const bytes = (s: string) => new TextEncoder().encode(s).length;
   // The server takes envelopes up to 48 KiB. JSON escaping can grow text sixfold (control
   // characters), so the sealed JSON is bounded too, before a ratchet index is spent on it.
-  if (bytes(inner.body) > MAX_MESSAGE_BYTES || bytes(JSON.stringify({ ...inner, room_id: roomId })) > MAX_INNER_BYTES) {
-    throw new Error('Message is too long (16 KiB at most)');
+  if (bytes(inner.body) > MAX_MESSAGE_BYTES) throw new Error('Message is too long (16 KiB at most)');
+  if (bytes(JSON.stringify({ ...inner, room_id: roomId })) > MAX_INNER_BYTES) {
+    throw new Error(inner.files?.length
+      ? 'Too much to send in one message: send fewer files, shorter file names or less text.'
+      : 'Message is too long (16 KiB at most)');
   }
   return withEngine((e) => e.encrypt(roomId, inner));
 }
@@ -311,13 +314,24 @@ export async function openMessage(m: ChatMessage): Promise<ChatMessage> {
     const r = await e.decrypt({ id: m.id, room_id: m.room_id, sender_id: m.sender_id, body: m.envelope });
     if (r.state === 'waiting') return shut({ kind: 'waiting', gen });
     if (r.state === 'failed') return shut({ kind: 'failed', reason: r.reason });
-    const files = openFiles(r.inner.files, m.attachments);
+    const original = r.inner.type === 'edit' && m.original ? await openOriginal(e, m, m.original) : undefined;
+    const files = messageFiles(r.inner, original, m.attachments, gen);
     if (!files) return shut({ kind: 'failed', reason: 'This message is damaged.' });
     // The encrypted reply target is the true one; the server's copy is only a hint.
-    return { ...m, body: r.inner.body, reply_to_id: r.inner.reply_to_id, e2ee: { kind: 'decrypted' }, ...(files.length ? { files } : {}) };
+    return { ...m, body: r.inner.body, reply_to_id: r.inner.reply_to_id, e2ee: { kind: 'decrypted' }, ...files };
   } catch {
     // Not a verdict on the message: the engine's own checks return 'failed' without throwing.
     return shut({ kind: 'failed', reason: NOT_YET, gen });
+  }
+}
+
+// The envelope an edited message was first sent in, which describes its files. An open that throws
+// is not a verdict: it reads as waiting, and is tried again as keys arrive.
+async function openOriginal(e: CryptoEngine, m: ChatMessage, body: string): Promise<OpenedEnvelope> {
+  try {
+    return await e.decrypt({ id: m.id, room_id: m.room_id, sender_id: m.sender_id, body });
+  } catch {
+    return { state: 'waiting' };
   }
 }
 

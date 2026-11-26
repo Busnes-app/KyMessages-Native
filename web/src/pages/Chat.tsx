@@ -57,6 +57,7 @@ import {
   isGroupedWithPrevious,
   mergeMessageBatch,
   sameCalendarDay,
+  searchSignature,
   upsertMessage,
 } from '../chat/state';
 import {
@@ -117,6 +118,8 @@ type ActiveModal = 'none' | 'new-channel' | 'new-dm' | 'search';
 
 // What a row says about its encryption state; a retry replaces the row only when this changes.
 const e2eeLabel = (m: ChatMessage) => (m.e2ee?.kind === 'failed' ? `failed:${m.e2ee.reason}` : m.e2ee?.kind ?? '');
+// A read message whose files' key had not arrived: opened again as keys arrive.
+const filesRetry = (m: ChatMessage) => m.e2ee?.kind === 'decrypted' && m.filesState?.gen !== undefined;
 
 interface RoomMessageBucket {
   messages: ChatMessage[];
@@ -132,7 +135,11 @@ type StagedAttachment =
   | { kind: 'ready'; localId: string; file: FileDescriptor; previewUrl?: string }
   | { kind: 'error'; localId: string; filename: string; error: string; attachmentId?: string };
 
-type LightboxTarget = { kind: 'plain'; attachment: ChatAttachment } | { kind: 'sealed'; file: FileDescriptor };
+// The message a preview came from: it closes when that message, its room or the view of it goes.
+type LightboxTarget = { roomId: string; messageId: string } & (
+  | { kind: 'plain'; attachment: ChatAttachment }
+  | { kind: 'sealed'; file: FileDescriptor }
+);
 
 const isMac =
   typeof navigator !== 'undefined' && /mac|iphone|ipad|ipod/i.test(navigator.platform || navigator.userAgent);
@@ -251,7 +258,7 @@ export const Chat: React.FC<ChatProps> = ({
     const changed: ChatMessage[] = [];
     for (const bucket of Object.values(buckets)) {
       for (const m of bucket.messages) {
-        const sig = `${m.body}\u0000${m.edited_at ?? ''}\u0000${m.deleted_at ?? ''}\u0000${m.delivery.kind}`;
+        const sig = searchSignature(m);
         if (indexedRef.current.get(m.id) !== sig) {
           indexedRef.current.set(m.id, sig);
           changed.push(m);
@@ -282,11 +289,12 @@ export const Chat: React.FC<ChatProps> = ({
             // state (deletion, reactions, pins). A row still waiting takes the newer generation.
             messages: b.messages.map((m) => {
               const o = opened.get(m.id);
-              if (!o || m.deleted_at || m.envelope !== o.envelope || m.e2ee?.kind === 'decrypted') return m;
+              if (!o || m.deleted_at || m.envelope !== o.envelope || (m.e2ee?.kind === 'decrypted' && !filesRetry(m))) return m;
               const gen = (e: ChatMessage['e2ee']) => (e && e.kind !== 'decrypted' ? e.gen : undefined);
-              if (e2eeLabel(m) === e2eeLabel(o) && gen(m.e2ee) === gen(o.e2ee)) return m;
+              const filesSig = (x: ChatMessage) => (x.files ? 'files' : `${x.filesState?.reason ?? ''}\u0000${x.filesState?.gen ?? ''}`);
+              if (e2eeLabel(m) === e2eeLabel(o) && gen(m.e2ee) === gen(o.e2ee) && filesSig(m) === filesSig(o)) return m;
               changed = true;
-              return { ...m, body: o.body, reply_to_id: o.reply_to_id, e2ee: o.e2ee, files: o.files };
+              return { ...m, body: o.body, reply_to_id: o.reply_to_id, e2ee: o.e2ee, files: o.files, filesState: o.filesState };
             }),
           };
         }
@@ -298,7 +306,7 @@ export const Chat: React.FC<ChatProps> = ({
     () =>
       onRoomKeys(() => {
         const retry = Object.values(bucketsRef.current).flatMap((b) =>
-          b.messages.filter((m) => m.e2ee?.kind === 'waiting' || (m.e2ee?.kind === 'failed' && retryable(m.e2ee.reason))),
+          b.messages.filter((m) => m.e2ee?.kind === 'waiting' || (m.e2ee?.kind === 'failed' && retryable(m.e2ee.reason)) || filesRetry(m)),
         );
         if (retry.length > 0) reopen(retry);
       }),
@@ -312,6 +320,7 @@ export const Chat: React.FC<ChatProps> = ({
       b.messages.filter((m) => {
         const e = m.e2ee;
         const again = e?.kind === 'waiting' || (e?.kind === 'failed' && retryable(e.reason));
+        if (filesRetry(m)) return m.filesState!.gen! < now;
         return again && e.gen !== undefined && e.gen < now;
       }),
     );
@@ -375,6 +384,15 @@ export const Chat: React.FC<ChatProps> = ({
         stagedFetchedRef.current.delete(roomId);
       });
   }, [activeRoomId]);
+
+  useEffect(() => {
+    if (!lightboxAttachment) return;
+    const { roomId, messageId } = lightboxAttachment;
+    const source = buckets[roomId]?.messages.find((m) => m.id === messageId);
+    if (activeRoomId !== roomId || !rooms.some((r) => r.id === roomId) || !source || source.deleted_at) {
+      setLightboxAttachment(null);
+    }
+  }, [lightboxAttachment, activeRoomId, rooms, buckets]);
 
   useEffect(() => {
     if (!lightboxAttachment) return;
@@ -753,7 +771,7 @@ export const Chat: React.FC<ChatProps> = ({
                 ...current,
                 messages: current.messages.map((m) =>
                   m.id === event.messageId
-                    ? { ...m, body: '', attachments: [], deleted_at: event.deletedAt ?? Date.now() }
+                    ? { ...m, body: '', attachments: [], files: undefined, filesState: undefined, original: undefined, deleted_at: event.deletedAt ?? Date.now() }
                     : m,
                 ),
               },
@@ -1498,7 +1516,7 @@ export const Chat: React.FC<ChatProps> = ({
   const handleEditMessage = async (messageId: string, newBody: string) => {
     if (!activeRoomId) return;
     const original = bucketsRef.current[activeRoomId]?.messages.find((m) => m.id === messageId);
-    const updated = await editMessage(activeRoomId, messageId, newBody, original?.reply_to_id, original?.files);
+    const updated = await editMessage(activeRoomId, messageId, newBody, original?.reply_to_id);
     setBuckets((prev) => {
       const current = prev[activeRoomId];
       if (!current) return prev;
@@ -1523,7 +1541,9 @@ export const Chat: React.FC<ChatProps> = ({
         [activeRoomId]: {
           ...current,
           messages: current.messages.map((m) =>
-            m.id === messageId ? { ...m, body: '', deleted_at: deleted.deleted_at ?? Date.now() } : m,
+            m.id === messageId
+              ? { ...m, body: '', attachments: [], files: undefined, filesState: undefined, original: undefined, deleted_at: deleted.deleted_at ?? Date.now() }
+              : m,
           ),
         },
       };
@@ -2290,8 +2310,8 @@ export const Chat: React.FC<ChatProps> = ({
                           onJumpToMessage={(seq) => {
                             void jumpToMessageSeq(activeRoom.id, seq);
                           }}
-                          onPreviewImage={(att) => setLightboxAttachment({ kind: 'plain', attachment: att })}
-                          onPreviewFile={(file) => setLightboxAttachment({ kind: 'sealed', file })}
+                          onPreviewImage={(att) => setLightboxAttachment({ kind: 'plain', attachment: att, roomId: activeRoom.id, messageId: msg.id })}
+                          onPreviewFile={(file) => setLightboxAttachment({ kind: 'sealed', file, roomId: activeRoom.id, messageId: msg.id })}
                           onToggleReaction={handleToggleReaction}
                           onEdit={handleEditMessage}
                           onDelete={handleDeleteMessage}

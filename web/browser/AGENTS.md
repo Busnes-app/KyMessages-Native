@@ -24,6 +24,7 @@ This directory owns test setup, disposable server launch and UI assertions. The 
 - Settings Branding at every project: reset to defaults first (a failed project must not break the next on the shared server), a 64-character name typed by keyboard (the header wraps it), a PNG upload previewed by digest with `/app-icon.png` served `no-cache`, then both resets.
 - `e2ee-device-reset.spec.mjs` exercises real shared devices in Chromium and Firefox: the server retires a device but refuses logout after its CSRF header is stripped. Another tab recovers without reload, including a stalled query aborted by the reset and a missed BroadcastChannel notification. A separate peer encrypts history and reads new messages; retained inbound keys, pins and replay records are checked, and a fresh engine decrypts the old ciphertext. Responses remain real server answers.
 - `e2ee-store-signout.spec.mjs`: a started device asks for persistent storage (counted around the browser's own `persist()`); sign-out deletes the encryption store even while another tab holds it, and reports one it cannot delete.
+- `ui.spec.mjs` attachments are end-to-end encrypted: uploads go to `?encrypted=1` as `encrypted.bin` (Firefox shows Playwright the multipart body, so the name, type and bytes are checked there; Chromium leaves a Blob-backed body empty), the stored rows and the HTTP download are opaque ciphertext, and the button's real download decrypts to the original file.
 - Screenshots and failure traces live in ignored `test-results/` and CI artifacts, not production assets.
 
 ## Work Guidance

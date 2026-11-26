@@ -5,6 +5,8 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"image"
+	"image/png"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -189,7 +191,7 @@ func assertNoScratch(t *testing.T, dir string) {
 func TestS3StoreSealsAndServesVerifiedRanges(t *testing.T) {
 	st, bucket, scratch := s3Fixture(t)
 	plain := []byte("<html>untrusted upload must stay an opaque download</html>")
-	res, err := st.Put(objectOrgA, "att_example", bytes.NewReader(plain), 1<<20)
+	res, err := st.Put(objectOrgA, "att_example", bytes.NewReader(plain), 1<<20, PutOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +218,7 @@ func TestS3StoreSealsAndServesVerifiedRanges(t *testing.T) {
 	}
 	assertNoScratch(t, scratch)
 	// A key is written once: a second write never adds a version or erases the first.
-	if _, err := st.Put(objectOrgA, "att_example", bytes.NewReader(plain), 1<<20); !errors.Is(err, s3.ErrAlreadyExists) {
+	if _, err := st.Put(objectOrgA, "att_example", bytes.NewReader(plain), 1<<20, PutOptions{}); !errors.Is(err, s3.ErrAlreadyExists) {
 		t.Fatalf("overwrite: %v", err)
 	}
 	if len(bucket.versions(objectOrgA+"/att/att_example")) != 1 {
@@ -224,9 +226,45 @@ func TestS3StoreSealsAndServesVerifiedRanges(t *testing.T) {
 	}
 }
 
+// Client ciphertext (E5) gets the same outer seal as any upload, and is never sniffed: bytes that
+// happen to form a PNG stay an opaque download.
+func TestS3StoreSealsOpaqueUploadsWithoutSniffing(t *testing.T) {
+	st, bucket, scratch := s3Fixture(t)
+	img := image.NewRGBA(image.Rect(0, 0, 4, 4))
+	var looksLikePNG bytes.Buffer
+	if err := png.Encode(&looksLikePNG, img); err != nil {
+		t.Fatal(err)
+	}
+	ciphertext := looksLikePNG.Bytes()
+	res, err := st.Put(objectOrgA, "att_sealed", bytes.NewReader(ciphertext), 1<<20, PutOptions{Opaque: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.MimeType != "application/octet-stream" || res.SizeBytes != int64(len(ciphertext)) {
+		t.Fatalf("receipt: %+v", res)
+	}
+	if plain, err := st.Put(objectOrgA, "att_sniffed", bytes.NewReader(ciphertext), 1<<20, PutOptions{}); err != nil || plain.MimeType != "image/png" {
+		t.Fatalf("control: the same bytes without Opaque are sniffed: %+v %v", plain, err)
+	}
+	vs := bucket.versions(objectOrgA + "/att/att_sealed")
+	if len(vs) != 1 || bytes.Contains(vs[0].body, ciphertext[:16]) || len(vs[0].body) != len(ciphertext)+SealedOverhead {
+		t.Fatal("the provider holds the client's bytes without the outer seal")
+	}
+	f, _, err := st.Open(objectOrgA, "att_sealed", int64(len(ciphertext)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(f)
+	_ = f.Close()
+	if err != nil || !bytes.Equal(got, ciphertext) {
+		t.Fatalf("opened bytes differ: %v", err)
+	}
+	assertNoScratch(t, scratch)
+}
+
 func TestS3StoreRefusesCrossOrgAndTamperedObjects(t *testing.T) {
 	st, bucket, scratch := s3Fixture(t)
-	if _, err := st.Put(objectOrgA, "att_example", strings.NewReader("org A's file"), 1<<20); err != nil {
+	if _, err := st.Put(objectOrgA, "att_example", strings.NewReader("org A's file"), 1<<20, PutOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	// org B's path serving org A's sealed bytes: the org-bound tag refuses it.
@@ -243,11 +281,11 @@ func TestS3StoreRefusesCrossOrgAndTamperedObjects(t *testing.T) {
 		t.Fatalf("tampered object: %v", err)
 	}
 	for _, org := range []string{"default", "../escape", "", "00000000-0000-4000-8000-0000000000c1"} {
-		if _, err := st.Put(org, "att_example", strings.NewReader("x"), 1<<20); err == nil {
+		if _, err := st.Put(org, "att_example", strings.NewReader("x"), 1<<20, PutOptions{}); err == nil {
 			t.Fatalf("org %q: %v", org, err)
 		}
 	}
-	if _, err := st.Put(objectOrgA, "att_too_large", bytes.NewReader(make([]byte, 1025)), 1<<20); !errors.Is(err, ErrTooLarge) {
+	if _, err := st.Put(objectOrgA, "att_too_large", bytes.NewReader(make([]byte, 1025)), 1<<20, PutOptions{}); !errors.Is(err, ErrTooLarge) {
 		t.Fatal(err)
 	}
 	if bucket.puts != 1 {
@@ -259,7 +297,7 @@ func TestS3StoreRefusesCrossOrgAndTamperedObjects(t *testing.T) {
 func TestS3StoreDeleteRetainsEraseAndPrefixRemoveEveryVersion(t *testing.T) {
 	st, bucket, _ := s3Fixture(t)
 	for _, k := range []struct{ org, key string }{{objectOrgA, "att_keep"}, {objectOrgA, "att_gone"}, {objectOrgA, "att_gone2"}, {objectOrgB, "att_other"}} {
-		if _, err := st.Put(k.org, k.key, strings.NewReader("bytes of "+k.key), 1<<20); err != nil {
+		if _, err := st.Put(k.org, k.key, strings.NewReader("bytes of "+k.key), 1<<20, PutOptions{}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -308,7 +346,7 @@ func TestS3StoreDeleteRetainsEraseAndPrefixRemoveEveryVersion(t *testing.T) {
 func TestS3StoreErasesAWriteWithoutVersion(t *testing.T) {
 	st, bucket, scratch := s3Fixture(t)
 	bucket.omitVersion = true
-	if _, err := st.Put(objectOrgA, "att_unversioned", strings.NewReader("must not linger"), 1<<20); !errors.Is(err, errObjectReceipt) {
+	if _, err := st.Put(objectOrgA, "att_unversioned", strings.NewReader("must not linger"), 1<<20, PutOptions{}); !errors.Is(err, errObjectReceipt) {
 		t.Fatal(err)
 	}
 	if vs := bucket.versions(objectOrgA + "/att/att_unversioned"); len(vs) != 0 {
@@ -335,7 +373,7 @@ func TestS3StoreSweepsStaleScratch(t *testing.T) {
 func TestS3StoreRefusesANullVersion(t *testing.T) {
 	st, bucket, scratch := s3Fixture(t)
 	bucket.nullVersion = true
-	if _, err := st.Put(objectOrgA, "att_nullversion", strings.NewReader("must not linger"), 1<<20); !errors.Is(err, errObjectReceipt) {
+	if _, err := st.Put(objectOrgA, "att_nullversion", strings.NewReader("must not linger"), 1<<20, PutOptions{}); !errors.Is(err, errObjectReceipt) {
 		t.Fatal(err)
 	}
 	if vs := bucket.versions(objectOrgA + "/att/att_nullversion"); len(vs) != 0 {
@@ -347,7 +385,7 @@ func TestS3StoreRefusesANullVersion(t *testing.T) {
 // A local copy that cannot be written (scratch full) fails the download and leaves nothing.
 func TestS3StoreOpenFailsWhenScratchWriteFails(t *testing.T) {
 	st, _, scratch := s3Fixture(t)
-	if _, err := st.Put(objectOrgA, "att_scratchfull", strings.NewReader("verified bytes"), 1<<20); err != nil {
+	if _, err := st.Put(objectOrgA, "att_scratchfull", strings.NewReader("verified bytes"), 1<<20, PutOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	createVerified = func(dir, pattern string) (*os.File, error) {
@@ -370,7 +408,7 @@ func TestS3StoreOpenFailsWhenScratchWriteFails(t *testing.T) {
 func TestS3StoreLowerUploadLimitKeepsExistingFiles(t *testing.T) {
 	st, _, _ := s3Fixture(t)
 	body := bytes.Repeat([]byte("k"), 1000)
-	if _, err := st.Put(objectOrgA, "att_bigger", bytes.NewReader(body), 1<<20); err != nil {
+	if _, err := st.Put(objectOrgA, "att_bigger", bytes.NewReader(body), 1<<20, PutOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	lowered, err := NewS3Store(st.client, bytes.Repeat([]byte{1}, 32), fixtureCell, t.TempDir(), 16)
@@ -382,7 +420,7 @@ func TestS3StoreLowerUploadLimitKeepsExistingFiles(t *testing.T) {
 		t.Fatalf("existing file unreadable after a lower limit: %d %v", size, err)
 	}
 	f.Close()
-	if _, err := lowered.Put(objectOrgA, "att_new_big", bytes.NewReader(body), 1<<20); !errors.Is(err, ErrTooLarge) {
+	if _, err := lowered.Put(objectOrgA, "att_new_big", bytes.NewReader(body), 1<<20, PutOptions{}); !errors.Is(err, ErrTooLarge) {
 		t.Fatalf("lowered limit not applied to a new upload: %v", err)
 	}
 	for _, wrong := range []int64{999, 1001, 0, 200 << 20} {

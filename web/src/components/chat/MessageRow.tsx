@@ -8,7 +8,7 @@ import {
   type ChatMessage,
 } from '../../chat/types';
 import { formatTime, initialsFor, isBotSender, isGuestSender, isWebhookSender } from '../../chat/state';
-import { sealedIds, type FileDescriptor } from '../../crypto/attachments';
+import { sealedIds, type FileDescriptor, type SealedFile } from '../../crypto/attachments';
 import { SealedFiles } from './Attachments';
 
 const WAITING_TEXT = "Waiting for this message's key";
@@ -24,20 +24,43 @@ export function plaintextLabel(msg: ChatMessage): string | null {
 
 /** "Attachment: <name>" or "<n> attachments", naming encrypted files by their decrypted names. */
 export function attachmentSummary(msg: ChatMessage): string {
-  const names = [...(msg.files ?? []).map((f) => f.name), ...plainAttachments(msg).map((a) => a.filename)];
+  const names = [...(msg.files ?? []).map((f) => f.name), ...attachmentView(msg).plain.map((a) => a.filename)];
   if (names.length === 1) return `Attachment: ${names[0]}`;
   return names.length > 1 ? `${names.length} attachments` : '';
 }
 
+interface AttachmentView {
+  /** Encrypted files the message names and the server attached. */
+  sealed: SealedFile[];
+  /** Encrypted files the message names but the server did not attach. */
+  missing: SealedFile[];
+  /** Uploads of a message whose file list cannot be read here, with why. */
+  unreadable: { count: number; reason: string };
+  /** Uploads the server attached that the message does not name: never offered. */
+  unnamed: number;
+  /** Uploads of a message from before E5 (or a bot): plaintext, labelled as such. */
+  plain: ChatAttachment[];
+}
+
 /**
- * The server's attachments that no encrypted descriptor names: files uploaded in the clear (before
- * E5, or by a bot). An encrypted message not opened yet has none: its uploads are not known to be
- * plaintext.
+ * How a message's uploads may be shown. Only a message without a sealed file list (sent before E5,
+ * or plaintext) has plaintext uploads; an encrypted message not opened yet shows none, and one that
+ * names its files never shows an upload it does not name.
  */
-export function plainAttachments(msg: ChatMessage): ChatAttachment[] {
-  if (msg.encoding === 'e2ee_room_v1' && msg.e2ee?.kind !== 'decrypted') return [];
-  const sealed = new Set(sealedIds(msg.files ?? []));
-  return msg.attachments.filter((a) => !sealed.has(a.id));
+export function attachmentView(msg: ChatMessage): AttachmentView {
+  const view: AttachmentView = { sealed: [], missing: [], unreadable: { count: 0, reason: '' }, unnamed: 0, plain: [] };
+  if (msg.encoding === 'e2ee_room_v1' && msg.e2ee?.kind !== 'decrypted') return view;
+  if (msg.files) {
+    const named = new Set(sealedIds(msg.files));
+    view.sealed = msg.files.filter((f) => !f.missing);
+    view.missing = msg.files.filter((f) => f.missing);
+    view.unnamed = msg.attachments.filter((a) => !named.has(a.id)).length;
+  } else if (msg.filesState) {
+    view.unreadable = { count: msg.attachments.length, reason: msg.filesState.reason };
+  } else {
+    view.plain = msg.attachments;
+  }
+  return view;
 }
 
 function messagePreviewText(msg: ChatMessage): string {
@@ -160,8 +183,10 @@ export const MessageRow: React.FC<MessageRowProps> = ({
   const sealedShut = message.e2ee !== undefined && message.e2ee.kind !== 'decrypted';
   const canEdit = isSynced && !isDeleted && isOwn && !sealedShut;
   const plainNote = plaintextLabel(message);
-  const sealedFiles = message.files ?? [];
-  const plainFiles = plainAttachments(message);
+  const files = attachmentView(message);
+  const sealedFiles = files.sealed;
+  const plainFiles = files.plain;
+  const shownFiles = sealedFiles.length + files.missing.length + files.unreadable.count + plainFiles.length;
   const canDelete = isSynced && !isDeleted && (isOwn || canModerate);
   const authorLabel = message.sender_name || 'Unknown';
 
@@ -320,7 +345,7 @@ export const MessageRow: React.FC<MessageRowProps> = ({
             ) : message.e2ee?.kind === 'failed' ? (
               <p className="chat-msg-locked is-error">Can't decrypt this message. {message.e2ee.reason}</p>
             ) : (
-              (message.body || (sealedFiles.length === 0 && plainFiles.length === 0)) && (
+              (message.body || shownFiles === 0) && (
                 <div className="chat-msg-body">
                   {renderFormattedBody(message.body)}
                   {grouped && message.edited_at && <span className="chat-msg-edited"> (edited)</span>}
@@ -330,6 +355,33 @@ export const MessageRow: React.FC<MessageRowProps> = ({
             {plainNote && <p className="chat-msg-e2ee-note">{plainNote}</p>}
 
             {sealedFiles.length > 0 && <SealedFiles files={sealedFiles} onPreview={onPreviewFile} />}
+            {files.missing.length > 0 && (
+              <div className="chat-attachments" aria-label="Unavailable attachments">
+                {files.missing.map((f) => (
+                  <div key={f.attachment_id} className="chat-att-file is-unavailable">
+                    <span className="chat-att-file-icon" aria-hidden="true">
+                      <FileText size={16} />
+                    </span>
+                    <span className="chat-att-file-meta">
+                      <span className="chat-att-name" title={f.name}>{f.name}</span>
+                      <span className="chat-att-size">Attachment unavailable</span>
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+            {files.unreadable.count > 0 && (
+              <p className="chat-msg-e2ee-note">
+                {files.unreadable.count === 1 ? 'Attachment unavailable.' : `${files.unreadable.count} attachments unavailable.`}{' '}
+                {files.unreadable.reason}
+              </p>
+            )}
+            {files.unnamed > 0 && (
+              <p className="chat-msg-e2ee-note is-error" role="note">
+                {files.unnamed === 1 ? 'An attachment' : `${files.unnamed} attachments`} this message does not include
+                {files.unnamed === 1 ? ' was' : ' were'} hidden: the server may have added {files.unnamed === 1 ? 'it' : 'them'}.
+              </p>
+            )}
             {plainFiles.length > 0 && (
               <p className="chat-msg-e2ee-note">{plainFiles.length === 1 ? 'File not encrypted' : 'Files not encrypted'}</p>
             )}

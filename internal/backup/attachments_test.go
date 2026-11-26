@@ -205,7 +205,7 @@ func TestMirrorRestoresEncryptedAttachmentsByteForByte(t *testing.T) {
 		t.Fatal(err)
 	}
 	const key = "att_019a0000-0000-7000-8000-000000000401"
-	if _, err := st.Put("default", key, blobs.Opaque(bytes.NewReader(ciphertext)), 1<<20); err != nil {
+	if _, err := st.Put("default", key, bytes.NewReader(ciphertext), 1<<20, blobs.PutOptions{Opaque: true}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := backup.Collect(context.Background(), cfg, "test"); err != nil {

@@ -53,6 +53,13 @@ func isBotToken(user *store.User, sess *store.Session) bool {
 	return user.Role == "bot" && sess != nil && strings.HasPrefix(sess.TokenHash, auth.AgentSessionPrefix)
 }
 
+// plaintextAllowed is the one gate for plaintext content, messages (plain_v1) and attachment
+// uploads alike: only kybot_ tokens, until bots encrypt.
+// TODO(E4): refuse plaintext from bots too (spec §10), and remove this gate.
+func plaintextAllowed(user *store.User, sess *store.Session) bool {
+	return isBotToken(user, sess)
+}
+
 var errEncoding = errors.New("encoding refused")
 
 // messageEncoding resolves the encoding of a posted or edited body, writing the refusal and
@@ -60,7 +67,7 @@ var errEncoding = errors.New("encoding refused")
 func (s *Server) messageEncoding(w http.ResponseWriter, user *store.User, sess *store.Session, requested, body string) (string, error) {
 	switch strings.TrimSpace(requested) {
 	case "", store.MessageEncodingPlainV1:
-		if !isBotToken(user, sess) {
+		if !plaintextAllowed(user, sess) {
 			s.writeJSON(w, http.StatusBadRequest, map[string]string{
 				"error": "Rooms are end-to-end encrypted: send an e2ee_room_v1 envelope",
 				"code":  CodeE2EERequired,

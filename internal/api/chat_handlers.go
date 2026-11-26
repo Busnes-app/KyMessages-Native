@@ -756,6 +756,11 @@ func (s *Server) handleChatSendMessage(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	// Only encrypted messages carry thumbnails as attachments of their own.
+	if encoding == store.MessageEncodingPlainV1 && len(attIDs) > maxAttachmentsPerMessage {
+		s.writeError(w, http.StatusBadRequest, "At most 10 attachments per message")
+		return
+	}
 	idemKey := strings.TrimSpace(req.IdempotencyKey)
 	if idemKey == "" {
 		idemKey = strings.TrimSpace(r.Header.Get("Idempotency-Key"))

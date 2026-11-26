@@ -232,7 +232,7 @@ func (c *chatStore) eraseActorTx(ctx context.Context, tx *sql.Tx, tenantID, user
 		{`DELETE FROM messages WHERE room_id IN (` + goneErasureRooms + `)`, []any{userID, tenantID, ownerID}},
 		{`DELETE FROM rooms WHERE id IN (` + goneErasureRooms + `)`, []any{userID, tenantID, ownerID}},
 		// Elsewhere: tombstones, and nothing of theirs reacted.
-		{`UPDATE messages SET body = '', sender_name = '', deleted_at = COALESCE(deleted_at, ?) WHERE tenant_id = ? AND sender_id = ?`, []any{now, tenantID, userID}},
+		{`UPDATE messages SET body = '', original_body = '', sender_name = '', deleted_at = COALESCE(deleted_at, ?) WHERE tenant_id = ? AND sender_id = ?`, []any{now, tenantID, userID}},
 		{`DELETE FROM message_reactions WHERE user_id = ?`, []any{userID}},
 		{`DELETE FROM room_members WHERE tenant_id = ? AND user_id = ?`, []any{tenantID, userID}},
 		{`DELETE FROM attachment_upload_reservations WHERE tenant_id = ? AND uploader_id = ?`, []any{tenantID, userID}},

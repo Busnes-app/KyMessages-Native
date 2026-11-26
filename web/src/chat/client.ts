@@ -234,7 +234,8 @@ export async function sendMessage(params: {
     type: params.replyToId ? 'reply' : files.length > 0 ? 'attachment' : 'text',
     body: params.body,
     ...(params.replyToId ? { reply_to_id: params.replyToId } : {}),
-    ...(files.length > 0 ? { files } : {}),
+    // Always present, even empty: it tells receivers this message vouches for every file it has.
+    files,
   });
   const data = obj(
     await apiJSON(
@@ -256,22 +257,11 @@ export async function sendMessage(params: {
   return openMessage(parseMessage(data.message));
 }
 
-export async function editMessage(
-  roomId: string,
-  messageId: string,
-  body: string,
-  replyToId?: string,
-  files: FileDescriptor[] = [],
-): Promise<ChatMessage> {
-  // An edit is sealed too, names the message it replaces and keeps the reply it was. It replaces
-  // the stored envelope, so it carries the message's file keys forward.
-  const envelope = await sealRoomMessage(roomId, {
-    type: 'edit',
-    body,
-    message_id: messageId,
-    ...(replyToId ? { reply_to_id: replyToId } : {}),
-    ...(files.length > 0 ? { files } : {}),
-  });
+export async function editMessage(roomId: string, messageId: string, body: string, replyToId?: string): Promise<ChatMessage> {
+  // An edit is sealed too, names the message it replaces and keeps the reply it was. It never
+  // carries file keys: it goes to whoever is in the room now, and the server keeps the envelope the
+  // files were sent in (original_body). `files: []` marks it as sealed by a client that knows that.
+  const envelope = await sealRoomMessage(roomId, editInner(messageId, body, replyToId));
   const data = obj(
     await apiJSON(
       `/api/v1/rooms/${encodeURIComponent(roomId)}/messages/${encodeURIComponent(messageId)}`,
@@ -283,6 +273,11 @@ export async function editMessage(
     ),
   );
   return openMessage(parseMessage(data.message));
+}
+
+/** The sealed content of an edit: new text only, never the message's file keys. */
+export function editInner(messageId: string, body: string, replyToId?: string) {
+  return { type: 'edit' as const, body, message_id: messageId, ...(replyToId ? { reply_to_id: replyToId } : {}), files: [] };
 }
 
 export async function deleteMessage(roomId: string, messageId: string): Promise<ChatMessage> {

@@ -83,7 +83,7 @@ func (o *S3Store) orgPrefix(tenantID string) (string, error) {
 // Put stages and sniffs the upload exactly as the disk store does, seals it and writes it
 // once with If-None-Match (keys are never reused). When the write may have landed but gave
 // no usable receipt, every version of the key is erased, so no unaccounted object remains.
-func (o *S3Store) Put(tenantID, key string, r io.Reader, maxBytes int64) (PutResult, error) {
+func (o *S3Store) Put(tenantID, key string, r io.Reader, maxBytes int64, opts PutOptions) (PutResult, error) {
 	object, err := o.objectPath(tenantID, key)
 	if err != nil {
 		return PutResult{}, err
@@ -101,7 +101,7 @@ func (o *S3Store) Put(tenantID, key string, r io.Reader, maxBytes int64) (PutRes
 	if err != nil {
 		return PutResult{}, err
 	}
-	meta, err := stage.Put(tenantID, key, r, maxBytes)
+	meta, err := stage.Put(tenantID, key, r, maxBytes, opts)
 	if err != nil {
 		return PutResult{}, err
 	}

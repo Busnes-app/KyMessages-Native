@@ -805,6 +805,8 @@ func TestChatAttachmentsEncryptedUploadsAreOpaque(t *testing.T) {
 		"plaintext from a person":    doPlainUpload(t, srv, up, aliceTok, "file", "plan.pdf", []byte("plain")),
 		"encrypted=0":                doPlainUpload(t, srv, up+"?encrypted=0", aliceTok, "file", "a", []byte("x")),
 		"another query parameter":    doPlainUpload(t, srv, up+"?encrypted=1&key=c2VjcmV0", aliceTok, "file", "a", []byte("x")),
+		"encrypted given twice":      doPlainUpload(t, srv, up+"?encrypted=1&encrypted=1", aliceTok, "file", "a", []byte("x")),
+		"a malformed query":          doPlainUpload(t, srv, up+"?encrypted=1;key=x", aliceTok, "file", "a", []byte("x")),
 		"a field before the file":    post(up+"?encrypted=1", aliceTok, [3]string{"file_key", "", "c2VjcmV0"}, [3]string{"file", "a", "x"}),
 		"a field after the file":     post(up+"?encrypted=1", aliceTok, [3]string{"file", "a", "x"}, [3]string{"private_key", "", "c2VjcmV0"}),
 		"a second file after a file": post(up+"?encrypted=1", aliceTok, [3]string{"file", "a", "x"}, [3]string{"file", "b", "y"}),
@@ -877,5 +879,138 @@ func TestChatAttachmentsEncryptedUploadsAreOpaque(t *testing.T) {
 	}
 	if r := get(carolTok, ""); r.Code != http.StatusNotFound {
 		t.Fatalf("non-member download = %d, want 404", r.Code)
+	}
+}
+
+// An edit replaces only the text: the envelope a message with files was first sent in holds the
+// file keys, so the server keeps it and edits never carry them to later room members.
+func TestChatEncryptedEditKeepsTheFirstEnvelopeOfAMessageWithFiles(t *testing.T) {
+	srv, st, _ := setupTestServer(t)
+	startChatBus(t, srv)
+	defer srv.CloseChat()
+	_, aliceTok := createChatTestUser(t, st, "u_orig_alice", "origalice", "user")
+	room := roomOf(t, doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", aliceTok, map[string]any{"kind": store.RoomKindChannel, "name": "orig"}, nil))
+	var up struct {
+		Attachment store.Attachment `json:"attachment"`
+	}
+	_ = json.Unmarshal(doMultipartUpload(t, srv, "/api/v1/rooms/"+room+"/attachments", aliceTok, "file", "f", []byte("ciphertext")).Body.Bytes(), &up)
+	type msgResp struct {
+		Message store.Message `json:"message"`
+	}
+	post := func(body string, ids []string) store.Message {
+		var r msgResp
+		rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room+"/messages", aliceTok, map[string]any{"body": body, "encoding": "e2ee_room_v1", "attachment_ids": ids}, nil)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("post = %d: %s", rec.Code, rec.Body.String())
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &r)
+		return r.Message
+	}
+	edit := func(id, body string) store.Message {
+		var r msgResp
+		rec := doBearerJSON(t, srv, http.MethodPatch, "/api/v1/rooms/"+room+"/messages/"+id, aliceTok, map[string]any{"body": body, "encoding": "e2ee_room_v1"}, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("edit = %d: %s", rec.Code, rec.Body.String())
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &r)
+		return r.Message
+	}
+
+	first := testEnvelope("with file")
+	withFile := post(first, []string{up.Attachment.ID})
+	if withFile.OriginalBody != "" {
+		t.Fatalf("unedited message has original_body %q", withFile.OriginalBody)
+	}
+	if got := edit(withFile.ID, testEnvelope("caption 2")); got.OriginalBody != first {
+		t.Fatalf("first edit original_body = %q, want the first envelope", got.OriginalBody)
+	}
+	// Later edits keep the very first envelope, and every read returns it.
+	if got := edit(withFile.ID, testEnvelope("caption 3")); got.OriginalBody != first {
+		t.Fatalf("second edit original_body = %q", got.OriginalBody)
+	}
+	var page struct {
+		Messages []store.Message `json:"messages"`
+	}
+	_ = json.Unmarshal(doBearerJSON(t, srv, http.MethodGet, "/api/v1/rooms/"+room+"/messages", aliceTok, nil, nil).Body.Bytes(), &page)
+	if len(page.Messages) != 1 || page.Messages[0].OriginalBody != first {
+		t.Fatalf("listed messages = %+v", page.Messages)
+	}
+	// A text-only message keeps no copy of what it said before.
+	textOnly := post(testEnvelope("typo"), nil)
+	if got := edit(textOnly.ID, testEnvelope("fixed")); got.OriginalBody != "" {
+		t.Fatalf("text edit kept original_body %q", got.OriginalBody)
+	}
+	// Deleting the message removes the kept envelope too.
+	if rec := doBearerJSON(t, srv, http.MethodDelete, "/api/v1/rooms/"+room+"/messages/"+withFile.ID, aliceTok, nil, nil); rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), "original_body") {
+		t.Fatalf("delete = %d: %s", rec.Code, rec.Body.String())
+	}
+	page.Messages = nil // json.Unmarshal would keep omitted fields of reused elements
+	_ = json.Unmarshal(doBearerJSON(t, srv, http.MethodGet, "/api/v1/rooms/"+room+"/messages", aliceTok, nil, nil).Body.Bytes(), &page)
+	for _, m := range page.Messages {
+		if m.ID == withFile.ID && m.OriginalBody != "" {
+			t.Fatalf("deleted message still has original_body")
+		}
+	}
+}
+
+// A refused encrypted upload leaves no blob behind and gives its quota reservation back, and a
+// bot's plaintext message still takes at most ten attachments.
+func TestChatAttachmentsRefusedUploadsReleaseEverything(t *testing.T) {
+	_, st, cfg := setupTestServer(t)
+	cfg.Attachments.MaxUploadBytes = 2048
+	cfg.Attachments.MaxPendingUserBytes = 2048
+	srv := api.NewServer(cfg, st)
+	startChatBus(t, srv)
+	defer srv.CloseChat()
+	_, aliceTok := createChatTestUser(t, st, "u_rel_alice", "relalice", "user")
+	botTok := createChatTestBot(t, st, "u_rel_bot", "relbot", "u_rel_alice")
+	room := roomOf(t, doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", aliceTok, map[string]any{"kind": store.RoomKindChannel, "name": "rel", "member_ids": []string{"u_rel_bot"}}, nil))
+	up := "/api/v1/rooms/" + room + "/attachments"
+	blobsOnDisk := func() int {
+		entries, err := os.ReadDir(filepath.Join(cfg.Database.DataDir, "attachments"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for _, e := range entries {
+			if e.Type().IsRegular() && !strings.HasPrefix(e.Name(), ".") {
+				n++
+			}
+		}
+		return n
+	}
+
+	// Each refused upload reserves about its request size; leaked, six would exceed the 2 KiB cap.
+	for i := 0; i < 6; i++ {
+		body, ct := multipartParts(t, [3]string{"file", "a", strings.Repeat("c", 300)}, [3]string{"note", "", "trailing"})
+		req := httptest.NewRequest(http.MethodPost, up+"?encrypted=1", body)
+		req.Header.Set("Content-Type", ct)
+		req.Header.Set("Authorization", "Bearer "+aliceTok)
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("trailing part = %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+	if n := blobsOnDisk(); n != 0 {
+		t.Fatalf("refused uploads left %d blobs on disk", n)
+	}
+	if rec := doMultipartUpload(t, srv, up, aliceTok, "file", "f", bytes.Repeat([]byte("k"), 1500)); rec.Code != http.StatusCreated {
+		t.Fatalf("upload after refusals = %d: %s (a reservation was not released)", rec.Code, rec.Body.String())
+	}
+
+	var ids []string
+	for i := 0; i < 11; i++ {
+		var a struct {
+			Attachment store.Attachment `json:"attachment"`
+		}
+		_ = json.Unmarshal(doPlainUpload(t, srv, up, botTok, "file", "b.txt", []byte(fmt.Sprintf("bot %d", i))).Body.Bytes(), &a)
+		ids = append(ids, a.Attachment.ID)
+	}
+	if rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room+"/messages", botTok, map[string]any{"body": "files", "encoding": "plain_v1", "attachment_ids": ids}, nil); rec.Code != http.StatusBadRequest {
+		t.Fatalf("plaintext message with 11 attachments = %d, want 400", rec.Code)
+	}
+	if rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room+"/messages", botTok, map[string]any{"body": "files", "encoding": "plain_v1", "attachment_ids": ids[:10]}, nil); rec.Code != http.StatusCreated {
+		t.Fatalf("plaintext message with 10 attachments = %d: %s", rec.Code, rec.Body.String())
 	}
 }

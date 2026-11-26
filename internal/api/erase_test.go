@@ -651,8 +651,8 @@ type versioningBlobs struct {
 	erased []string
 }
 
-func (b *versioningBlobs) Put(tenantID, key string, r io.Reader, maxBytes int64) (blobs.PutResult, error) {
-	res, err := b.Backend.Put(tenantID, key, r, maxBytes)
+func (b *versioningBlobs) Put(tenantID, key string, r io.Reader, maxBytes int64, opts blobs.PutOptions) (blobs.PutResult, error) {
+	res, err := b.Backend.Put(tenantID, key, r, maxBytes, opts)
 	res.VersionID = "v1/" + key
 	return res, err
 }

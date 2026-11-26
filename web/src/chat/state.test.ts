@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { applyReactionDelta, isGroupedWithPrevious, mergeMessageBatch, sortRooms, upsertMessage } from './state';
+import { applyReactionDelta, isGroupedWithPrevious, mergeMessageBatch, searchSignature, sortRooms, upsertMessage } from './state';
 import { parseWsEvent, type ChatMessage, type ChatRoomSummary } from './types';
 
 function makeMsg(overrides: Partial<ChatMessage> = {}): ChatMessage {
@@ -154,5 +154,25 @@ describe('chat state helpers', () => {
 
     const invalid = parseWsEvent({ t: 'unknown.event' });
     expect(invalid).toBeNull();
+  });
+});
+
+describe('encrypted files', () => {
+  const base = { id: 'm1', tenant_id: 't', room_id: 'r', seq: 1, sender_id: 'u', sender_name: 'U', encoding: 'e2ee_room_v1' as const, body: '', created_at: 1, reactions: [], attachments: [], delivery: { kind: 'synced' as const } };
+  const file = { attachment_id: 'att_f', name: 'q3.xlsx', thumb: { attachment_id: 'att_t' } } as NonNullable<ChatMessage['files']>[number];
+
+  it('reindexes an attachment-only message once its key arrives and its files open', () => {
+    const waiting: ChatMessage = { ...base, e2ee: { kind: 'waiting' } };
+    const opened: ChatMessage = { ...base, e2ee: { kind: 'decrypted' }, files: [file] };
+    expect(searchSignature(waiting)).not.toBe(searchSignature(opened));
+    expect(searchSignature(opened)).not.toBe(searchSignature({ ...opened, files: [{ ...file, name: 'q4.xlsx' }] }));
+  });
+
+  it('matches an optimistic encrypted send to the server copy by its sealed uploads', () => {
+    const optimistic: ChatMessage = { ...base, id: 'pending_k', seq: Number.MAX_SAFE_INTEGER, body: 'hi', e2ee: { kind: 'decrypted' }, files: [file], delivery: { kind: 'sending', idempotencyKey: 'k' } };
+    const att = (id: string) => ({ id, tenant_id: 't', room_id: 'r', uploader_id: 'u', filename: 'encrypted.bin', mime_type: 'application/octet-stream', size_bytes: 1, sha256_hex: '', created_at: 1 });
+    const confirmed: ChatMessage = { ...base, id: 'm_real', seq: 5, body: 'hi', e2ee: { kind: 'decrypted' }, attachments: [att('att_t'), att('att_f')] };
+    const out = upsertMessage([optimistic], confirmed);
+    expect(out.map((m) => m.id)).toEqual(['m_real']);
   });
 });

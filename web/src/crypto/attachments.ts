@@ -22,6 +22,8 @@ const MAX_CIPHERTEXT = 100 << 20;
 export const MAX_THUMB_CIPHERTEXT = 1 << 20;
 export const MAX_FILES = 10;
 export const THUMB_MIMES: ReadonlySet<string> = new Set(['image/jpeg', 'image/png', 'image/webp']);
+/** A thumbnail's longest side. */
+export const THUMB_MAX_PX = 400;
 const LABEL = new TextEncoder().encode('kymessages.attachment.v1');
 
 /** How to fetch and open one encrypted blob. Sizes are bytes. */
@@ -182,10 +184,13 @@ const isInt = (v: unknown, min: number, max: number): v is number =>
 const MIME_RE = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/;
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
-/** A file name safe to show and save: no control or bidirectional-override characters. */
+/**
+ * A file name safe to show and save: no control, format (bidirectional override), line or path
+ * separator characters, never "." or "..", at most 255 code points.
+ */
 export function cleanName(name: string): string {
-  const s = name.replace(/[\u0000-\u001f\u007f-\u009f‎‏‪-‮⁦-⁩]/g, '_').trim().slice(0, 255);
-  return s || 'file';
+  const s = Array.from(name.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}/\\]/gu, '_').trim()).slice(0, 255).join('');
+  return s === '' || s === '.' || s === '..' ? 'file' : s;
 }
 
 function parseBlob(v: unknown, maxCiphertext: number): SealedBlob | undefined {
@@ -207,7 +212,7 @@ function parseThumb(v: unknown): ThumbDescriptor | undefined {
   const blob = parseBlob(v, MAX_THUMB_CIPHERTEXT);
   if (!blob || !isObj(v)) return undefined;
   const type = mime(v.mime_type);
-  if (!type || !THUMB_MIMES.has(type) || !isInt(v.width, 1, 65535) || !isInt(v.height, 1, 65535)) return undefined;
+  if (!type || !THUMB_MIMES.has(type) || !isInt(v.width, 1, THUMB_MAX_PX) || !isInt(v.height, 1, THUMB_MAX_PX)) return undefined;
   return { ...blob, mime_type: type, width: v.width, height: v.height };
 }
 
@@ -230,13 +235,16 @@ export function parseFileDescriptor(v: unknown): FileDescriptor | undefined {
   };
 }
 
+/** A file a message names; `missing` when the server did not attach its blob to the message. */
+export type SealedFile = FileDescriptor & { missing?: true };
+
 /**
  * The descriptors of a decrypted message's `files`, or undefined when they are malformed (the
- * message is then damaged). Only blobs the server attached to this message are kept, so a sender
- * cannot point viewers at another message's upload.
+ * message is then damaged). A file whose blob the server did not attach to this message is kept as
+ * `missing`, never dropped, so a sender cannot point viewers at another message's upload and the
+ * server cannot hide a file. A thumbnail the server did not attach is dropped (the file stays).
  */
-export function openFiles(raw: unknown, attached: readonly { id: string }[]): FileDescriptor[] | undefined {
-  if (raw === undefined) return [];
+export function openFiles(raw: unknown, attached: readonly { id: string }[]): SealedFile[] | undefined {
   if (!Array.isArray(raw) || raw.length > MAX_FILES) return undefined;
   const files: FileDescriptor[] = [];
   const ids = new Set<string>();
@@ -251,13 +259,99 @@ export function openFiles(raw: unknown, attached: readonly { id: string }[]): Fi
     files.push(f);
   }
   const have = new Set(attached.map((a) => a.id));
-  return files.flatMap((f) => {
-    if (!have.has(f.attachment_id)) return [];
+  return files.map((f) => {
+    if (!have.has(f.attachment_id)) return { ...f, missing: true };
     const { thumb, ...rest } = f;
-    return [thumb && !have.has(thumb.attachment_id) ? rest : f];
+    return thumb && !have.has(thumb.attachment_id) ? rest : f;
   });
+}
+
+/** What a message's files are once opened: absent for a message from before E5 (plaintext uploads). */
+export interface MessageFiles {
+  files?: SealedFile[];
+  /** Files exist but cannot be read here; `gen` set when worth trying again as keys arrive. */
+  filesState?: { reason: string; gen?: number };
+}
+
+/** An envelope opened as far as files care (crypto/engine.ts `Opened`). */
+export type OpenedEnvelope =
+  | { state: 'decrypted'; inner: { type: string; files?: unknown[] } }
+  | { state: 'waiting' }
+  | { state: 'failed'; reason: string };
+
+export const FILES_WAITING = "Waiting for the key to this message's files.";
+const FILES_GONE = "This message's files are not available.";
+
+/**
+ * A message's files, or undefined when they are damaged. Only the envelope a message was first sent
+ * in describes them: the message itself, or once it was edited the server's kept `original` (edits
+ * never repeat file keys, so a member who joined later gets none). An edit carries `files: []` to
+ * say it was sealed by an E5 client. A message whose envelope has no `files` is from before E5.
+ */
+export function messageFiles(
+  inner: { type: string; files?: unknown[] },
+  original: OpenedEnvelope | undefined,
+  attached: readonly { id: string }[],
+  gen: number,
+): MessageFiles | undefined {
+  const named = (raw: unknown[] | undefined): MessageFiles | undefined => {
+    if (raw === undefined) return {};
+    const files = openFiles(raw, attached);
+    return files && { files };
+  };
+  if (inner.type !== 'edit') return named(inner.files);
+  if (!original) {
+    if (inner.files === undefined) return {};
+    return attached.length > 0 ? { filesState: { reason: FILES_GONE } } : { files: [] };
+  }
+  if (original.state === 'waiting') return { filesState: { reason: FILES_WAITING, gen } };
+  if (original.state === 'failed') return { filesState: { reason: original.reason } };
+  return original.inner.type === 'edit' ? undefined : named(original.inner.files);
 }
 
 /** Every server attachment ID a descriptor list names (files and their thumbnails). */
 export const sealedIds = (files: readonly FileDescriptor[]) =>
   files.flatMap((f) => (f.thumb ? [f.attachment_id, f.thumb.attachment_id] : [f.attachment_id]));
+
+// --- Raster headers, read before any image is decoded (a small file can claim a huge canvas) ---
+
+const SOF = new Set([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf]);
+
+/** The pixel size a PNG, JPEG, GIF or WebP header declares, or undefined if it cannot be read. */
+export function rasterSize(b: Uint8Array): { width: number; height: number } | undefined {
+  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  const is = (off: number, ...bytes: number[]) => bytes.every((x, i) => b[off + i] === x);
+  const ascii = (off: number, s: string) => is(off, ...Array.from(s, (c) => c.charCodeAt(0)));
+  const size = (width: number, height: number) => (width > 0 && height > 0 ? { width, height } : undefined);
+  if (b.length >= 24 && is(0, 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a) && ascii(12, 'IHDR')) {
+    return size(dv.getUint32(16), dv.getUint32(20));
+  }
+  if (b.length >= 10 && (ascii(0, 'GIF87a') || ascii(0, 'GIF89a'))) return size(dv.getUint16(6, true), dv.getUint16(8, true));
+  if (b.length >= 30 && ascii(0, 'RIFF') && ascii(8, 'WEBP')) {
+    if (ascii(12, 'VP8 ') && is(23, 0x9d, 0x01, 0x2a)) return size(dv.getUint16(26, true) & 0x3fff, dv.getUint16(28, true) & 0x3fff);
+    if (ascii(12, 'VP8L') && b[20] === 0x2f) {
+      const bits = dv.getUint32(21, true);
+      return size((bits & 0x3fff) + 1, ((bits >>> 14) & 0x3fff) + 1);
+    }
+    if (ascii(12, 'VP8X')) return size((dv.getUint32(24, true) & 0xffffff) + 1, (dv.getUint32(27, true) & 0xffffff) + 1);
+    return undefined;
+  }
+  if (b.length >= 4 && is(0, 0xff, 0xd8)) {
+    for (let off = 2; off + 9 <= b.length; ) {
+      if (b[off] !== 0xff) return undefined;
+      const marker = b[off + 1];
+      if (marker === 0xff) {
+        off++;
+      } else if (SOF.has(marker)) {
+        return size(dv.getUint16(off + 7), dv.getUint16(off + 5));
+      } else if (marker === 0xd9 || marker === 0xda) {
+        return undefined;
+      } else if ((marker >= 0xd0 && marker <= 0xd7) || marker === 0x01) {
+        off += 2;
+      } else {
+        off += 2 + dv.getUint16(off + 2);
+      }
+    }
+  }
+  return undefined;
+}

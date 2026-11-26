@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   ATTACHMENT_ALG,
   CHUNK_SIZE,
@@ -7,6 +7,8 @@ import {
   cleanName,
   decryptBlob,
   encryptBlob,
+  FILES_WAITING,
+  messageFiles,
   openFiles,
   parseFileDescriptor,
   type BlobKind,
@@ -48,6 +50,44 @@ async function forged(ct: Uint8Array, blob: SealedBlob, edit: (ct: Uint8Array) =
   const out = edit(ct);
   return { ct: out, blob: { ...blob, ciphertext_size: out.length, sha256: await sha256Hex(out), size } };
 }
+
+// Pinned v1 vectors, computed outside this code (Python `cryptography` AESGCM) from the format's
+// definition: key 00..1f, nonce prefix a0..a6, 4 KiB chunks. A change here is a format break.
+describe('A256GCM-STREAM v1 vectors', () => {
+  const KEY = Uint8Array.from({ length: 32 }, (_, i) => i);
+  const PREFIX = Uint8Array.from({ length: 7 }, (_, i) => 0xa0 + i);
+  const hex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
+  const fromHex = (h: string) => Uint8Array.from(h.match(/../g)!, (x) => parseInt(x, 16));
+  const vectors: [string, Uint8Array, BlobKind, string][] = [
+    ['one final chunk', new TextEncoder().encode('kymessages E5\n'), 'file', '1c18247bcb7581a76616f86afa84b6456f84e4858733d855d93953ef10cf'],
+    ['the same bytes as a thumbnail', new TextEncoder().encode('kymessages E5\n'), 'thumb', '1c18247bcb7581a76616f86afa84566008d177da68c400447c958cdd589e'],
+    ['an empty file', new Uint8Array(0), 'file', 'fe8f4d8f2a70be445ccf44c61529c1a7'],
+  ];
+
+  function fixedRandom() {
+    const spy = vi.spyOn(crypto, 'getRandomValues');
+    spy.mockImplementationOnce(<T extends ArrayBufferView | null>(a: T) => ((a as unknown as Uint8Array).set(KEY), a));
+    spy.mockImplementationOnce(<T extends ArrayBufferView | null>(a: T) => ((a as unknown as Uint8Array).set(PREFIX), a));
+  }
+  afterEach(() => vi.restoreAllMocks());
+
+  it.each(vectors)('seals and opens %s exactly as pinned', async (_name, plain, kind, want) => {
+    fixedRandom();
+    const { ciphertext, sealed } = await encryptBlob(new Blob([plain]), kind, 4096);
+    expect(hex(ciphertext)).toBe(want);
+    expect(sealed).toMatchObject({ key: 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8', nonce_prefix: 'oKGio6Slpg', chunk_size: 4096 });
+    const opened = await decryptBlob(fromHex(want), { ...sealed, attachment_id: 'att_v' }, kind);
+    expect(Array.from(join(opened))).toEqual(Array.from(plain));
+  });
+
+  it('seals two chunks, the last one final, as pinned', async () => {
+    fixedRandom();
+    const { ciphertext, sealed } = await encryptBlob(new Blob([new Uint8Array(4097).fill(0x61)]), 'file', 4096);
+    expect(ciphertext.length).toBe(4129);
+    expect(sealed.sha256).toBe('222d3b03c6732738bb7e1389041ff20fa82dbb3e3fa702c9d5cf801c0b6ead52');
+    expect(hex(ciphertext.subarray(-17))).toBe('88e30951e758972e0158b775caafcf1920');
+  });
+});
 
 describe('A256GCM-STREAM', () => {
   it.each([
@@ -202,22 +242,65 @@ describe('descriptors', () => {
     expect(cleanName('invoice‮fdp.exe')).toBe('invoice_fdp.exe');
     expect(cleanName('a\nb\u0000')).toBe('a_b_');
     expect(cleanName('   ')).toBe('file');
+    expect(cleanName('..')).toBe('file');
+    expect(cleanName('.')).toBe('file');
+    expect(cleanName('../etc/passwd')).toBe('.._etc_passwd');
+    expect(cleanName('a\\b\u2028c\u200bd')).toBe('a_b_c_d');
+    // Cut by code point, never through a surrogate pair.
+    const cut = cleanName('\u{1F600}'.repeat(300));
+    expect(Array.from(cut)).toHaveLength(255);
+    expect(cut.endsWith('\u{1F600}')).toBe(true);
   });
 
-  it('keeps only blobs the server attached to the message', () => {
+  it('marks files the server did not attach as missing instead of dropping them', () => {
     const files = [file('att_a', { thumb: thumb('att_at') }), file('att_b', { thumb: thumb('att_bt') }), file('att_c')];
     const out = openFiles(files, [{ id: 'att_a' }, { id: 'att_at' }, { id: 'att_b' }])!;
-    expect(out.map((f) => f.attachment_id)).toEqual(['att_a', 'att_b']);
+    expect(out.map((f) => [f.attachment_id, f.missing ?? false])).toEqual([['att_a', false], ['att_b', false], ['att_c', true]]);
     expect(out[0].thumb?.attachment_id).toBe('att_at');
     expect(out[1].thumb).toBeUndefined();
   });
 
   it('treats malformed or reused descriptors as a damaged message', () => {
-    expect(openFiles(undefined, [])).toEqual([]);
+    expect(openFiles([], [])).toEqual([]);
+    expect(openFiles(undefined, [])).toBeUndefined();
     expect(openFiles('x', [])).toBeUndefined();
     expect(openFiles([file(), { bogus: true }], [])).toBeUndefined();
     expect(openFiles([file('att_a'), file('att_a')], [])).toBeUndefined();
     expect(openFiles([file('att_a', { thumb: thumb('att_a') })], [])).toBeUndefined();
     expect(openFiles(Array.from({ length: 11 }, (_, i) => file(`att_${i}`)), [])).toBeUndefined();
   });
+
+  it('caps thumbnails at 400 px', () => {
+    expect(parseFileDescriptor({ ...file(), thumb: { ...thumb(), width: 400, height: 400 } })?.thumb).toBeDefined();
+    expect(parseFileDescriptor({ ...file(), thumb: { ...thumb(), width: 401 } })).toBeUndefined();
+    expect(parseFileDescriptor({ ...file(), thumb: { ...thumb(), height: 30000 } })).toBeUndefined();
+  });
+
+  describe('a message\'s files', () => {
+  const at = (...ids: string[]) => ids.map((id) => ({ id }));
+  const sent = (files?: unknown[]) => ({ state: 'decrypted' as const, inner: { type: 'attachment', ...(files ? { files } : {}) } });
+
+  it('comes from the message itself, and is absent only for a message from before E5', () => {
+    expect(messageFiles({ type: 'attachment', files: [file('att_a')] }, undefined, at('att_a'), 0)?.files?.[0].attachment_id).toBe('att_a');
+    expect(messageFiles({ type: 'text', files: [] }, undefined, at(), 0)).toEqual({ files: [] });
+    expect(messageFiles({ type: 'text' }, undefined, at('att_old'), 0)).toEqual({});
+    expect(messageFiles({ type: 'text', files: [{ bogus: 1 }] }, undefined, at(), 0)).toBeUndefined();
+  });
+
+  it('comes from the original envelope once edited, never from the edit', () => {
+    const edit = { type: 'edit', files: [file('att_planted')] };
+    expect(messageFiles(edit, sent([file('att_a')]), at('att_a'), 0)?.files?.map((f) => f.attachment_id)).toEqual(['att_a']);
+    // An edit whose original is unreadable here (a member who joined later) has unavailable files.
+    expect(messageFiles(edit, { state: 'failed', reason: 'sent before you joined' }, at('att_a'), 0)).toEqual({ filesState: { reason: 'sent before you joined' } });
+    expect(messageFiles(edit, { state: 'waiting' }, at('att_a'), 7)).toEqual({ filesState: { reason: FILES_WAITING, gen: 7 } });
+    // The server dropped the original of an E5 edit: its uploads are not vouched for.
+    expect(messageFiles(edit, undefined, at('att_a'), 0)?.filesState).toBeDefined();
+    expect(messageFiles(edit, undefined, at(), 0)).toEqual({ files: [] });
+    // An edit sealed before E5 keeps its plaintext uploads, labelled as such.
+    expect(messageFiles({ type: 'edit' }, undefined, at('att_old'), 0)).toEqual({});
+    expect(messageFiles(edit, sent(), at('att_old'), 0)).toEqual({});
+    // An "original" that is itself an edit is a substitution.
+    expect(messageFiles(edit, { state: 'decrypted', inner: { type: 'edit', files: [] } }, at(), 0)).toBeUndefined();
+  });
+});
 });

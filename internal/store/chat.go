@@ -613,7 +613,7 @@ func (c *chatStore) UpdateReadCursor(ctx context.Context, tenantID, roomID, user
 // Messages & Reactions
 // ---------------------------------------------------------------------
 
-const messageColumns = `id, tenant_id, room_id, seq, sender_id, sender_name, reply_to_id, encoding, body, edited_at, deleted_at, idempotency_key, created_at`
+const messageColumns = `id, tenant_id, room_id, seq, sender_id, sender_name, reply_to_id, encoding, body, original_body, edited_at, deleted_at, idempotency_key, created_at`
 
 func scanMessage(row interface{ Scan(...any) error }) (*Message, error) {
 	var m Message
@@ -621,7 +621,7 @@ func scanMessage(row interface{ Scan(...any) error }) (*Message, error) {
 	var editedAt, deletedAt sql.NullInt64
 	err := row.Scan(
 		&m.ID, &m.TenantID, &m.RoomID, &m.Seq, &m.SenderID, &m.SenderName,
-		&replyTo, &m.Encoding, &m.Body, &editedAt, &deletedAt, &idemKey, &m.CreatedAt,
+		&replyTo, &m.Encoding, &m.Body, &m.OriginalBody, &editedAt, &deletedAt, &idemKey, &m.CreatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -957,17 +957,22 @@ func (c *chatStore) EditMessage(ctx context.Context, tenantID, roomID, messageID
 		return nil, ErrNotFound
 	}
 
+	if err := c.attachAttachments(ctx, tx, []*Message{m}); err != nil {
+		return nil, err
+	}
+	// The first envelope of an encrypted message with files keeps their keys; an edit replaces
+	// only the text, so the keys are never sealed again for later room members.
+	if m.OriginalBody == "" && m.Encoding == MessageEncodingE2EERoomV1 && len(m.Attachments) > 0 {
+		m.OriginalBody = m.Body
+	}
 	editedAt := nowMilli()
 	if _, err := tx.ExecContext(ctx,
-		c.store.rebind(`UPDATE messages SET body = ?, encoding = ?, edited_at = ? WHERE tenant_id = ? AND room_id = ? AND id = ?`),
-		newBody, encoding, editedAt, tenantID, roomID, messageID,
+		c.store.rebind(`UPDATE messages SET body = ?, original_body = ?, encoding = ?, edited_at = ? WHERE tenant_id = ? AND room_id = ? AND id = ?`),
+		newBody, m.OriginalBody, encoding, editedAt, tenantID, roomID, messageID,
 	); err != nil {
 		return nil, err
 	}
 	if err := c.attachReactions(ctx, tx, []*Message{m}); err != nil {
-		return nil, err
-	}
-	if err := c.attachAttachments(ctx, tx, []*Message{m}); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -1007,7 +1012,7 @@ func (c *chatStore) DeleteMessage(ctx context.Context, tenantID, roomID, message
 		deletedAt = *m.DeletedAt
 	} else {
 		if _, err := tx.ExecContext(ctx,
-			c.store.rebind(`UPDATE messages SET body = '', deleted_at = ? WHERE tenant_id = ? AND room_id = ? AND id = ?`),
+			c.store.rebind(`UPDATE messages SET body = '', original_body = '', deleted_at = ? WHERE tenant_id = ? AND room_id = ? AND id = ?`),
 			deletedAt, tenantID, roomID, messageID,
 		); err != nil {
 			return nil, err
@@ -1027,6 +1032,7 @@ func (c *chatStore) DeleteMessage(ctx context.Context, tenantID, roomID, message
 	}
 
 	m.Body = ""
+	m.OriginalBody = ""
 	m.DeletedAt = &deletedAt
 	m.Attachments = nil
 	return m, nil

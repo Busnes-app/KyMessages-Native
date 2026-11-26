@@ -5,6 +5,8 @@ import { CryptoEngine, DeviceChanged, deviceSigned, oneTimeKeySigned, parseEnvel
 import { FakeKeyServer } from './fakeKeyServer';
 import { Account, GroupSession, loadCryptoSync } from './index';
 import { deleteCryptoStores, openCryptoStore } from './store';
+import { messageFiles, type OpenedEnvelope } from './attachments';
+import { editInner } from '../chat/client';
 
 beforeAll(() => {
   loadCryptoSync(readFileSync('src/crypto/pkg/kycrypto_bg.wasm'));
@@ -190,6 +192,40 @@ describe('encrypted rooms between two client engines', () => {
     const opened = await bob.decrypt(m1);
     expect(opened.state === 'decrypted' && opened.inner.files).toEqual(files);
     expect(await read(bob, bad)).toBe('failed: This message is damaged.');
+  });
+
+  it('never hands a file key to a member who joined after the file was sent, even through a caption edit', async () => {
+    const server = new FakeKeyServer();
+    const alice = await device(server, 'u_alice');
+    const bob = await device(server, 'u_bob');
+    const carol = await device(server, 'u_carol');
+    server.join('r1', 'u_alice', 'u_bob');
+    const descriptor = { attachment_id: 'att_1', v: 1, alg: 'A256GCM-STREAM', key: `${'S'.repeat(42)}Q`, nonce_prefix: `${'N'.repeat(9)}A`, chunk_size: 65536, sha256: 'a'.repeat(64), ciphertext_size: 26, size: 10, name: 'plan.pdf', mime_type: 'application/pdf' };
+    const original = post('r1', alice, await alice.encrypt('r1', { type: 'attachment', body: 'the plan', files: [descriptor] }));
+    await bob.receive();
+    server.join('r1', 'u_carol');
+    // The edit goes to everyone in the room now, Carol included; the server keeps the original.
+    const editEnvelope = await alice.encrypt('r1', editInner(original.id, 'the plan, v2'));
+    const edited = { ...original, body: editEnvelope };
+    await bob.receive();
+    await carol.receive();
+
+    const filesFor = async (reader: CryptoEngine) => {
+      const e = await reader.decrypt(edited);
+      if (e.state !== 'decrypted') throw new Error(`edit: ${e.state}`);
+      const o: OpenedEnvelope = await reader.decrypt(original);
+      return { body: e.inner.body, editFiles: e.inner.files, files: messageFiles(e.inner, o, [{ id: 'att_1' }], 0) };
+    };
+    const forCarol = await filesFor(carol);
+    expect(forCarol.body).toBe('the plan, v2');
+    expect(forCarol.editFiles).toEqual([]);
+    expect(forCarol.files?.files).toBeUndefined();
+    expect(forCarol.files?.filesState?.reason).toMatch(/before this device could read the room/);
+    expect(JSON.stringify(forCarol)).not.toContain('S'.repeat(42));
+    // Bob, who was there, still reads the file from the original.
+    const forBob = await filesFor(bob);
+    expect(forBob.body).toBe('the plan, v2');
+    expect(forBob.files?.files?.[0]).toMatchObject({ attachment_id: 'att_1', key: `${'S'.repeat(42)}Q` });
   });
 
   it('binds an edit to the message it edits', async () => {
