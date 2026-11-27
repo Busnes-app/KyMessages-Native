@@ -16,13 +16,21 @@ concurrency:
 
 env:
   NODE_VERSION: "26"
+  KY_PUSH_ENABLED: "false"
+  PUSH_RELAY_URL: ""
+  APNS_RELAY_URL: ""
 
 jobs:
   go:
     name: Go build, vet & tests (SQLite)
+    needs: web
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: web-dist
+          path: web/dist
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: stable
@@ -64,7 +72,7 @@ jobs:
       - run: go build ./...
 
       - name: Tests with race detector and coverage
-        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+        run: go test -race -timeout=30m -covermode=atomic -coverprofile=coverage.out ./...
 
       - name: Coverage summary
         run: |
@@ -92,6 +100,7 @@ jobs:
 
   postgres:
     name: Go tests (PostgreSQL)
+    needs: web
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -108,6 +117,10 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: web-dist
+          path: web/dist
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: stable
@@ -118,7 +131,7 @@ jobs:
       - name: Tests against PostgreSQL
         env:
           KY_TEST_POSTGRES_DSN: postgres://ci:ci@127.0.0.1:5432/ci_test?sslmode=disable
-        run: go test -race -count=1 ./...
+        run: go test -race -timeout=30m -count=1 ./...
 
   s3:
     # The S3 attachment backend against a real signature-checking, versioned server.
@@ -162,6 +175,12 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - name: Install pinned wasm-bindgen
+        working-directory: web/crypto
+        run: cargo +1.99.0 install --locked wasm-bindgen-cli --version 0.2.130
       - run: npm ci
         working-directory: web
 
@@ -179,6 +198,11 @@ jobs:
         run: |
           dirty="$(git status --porcelain -- web/dist)"
           if [ -n "$dirty" ]; then printf '%s\n' "$dirty"; exit 1; fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-dist
+          path: web/dist/
 
       - name: npm audit
         run: npm audit --audit-level=high
@@ -199,7 +223,7 @@ jobs:
 
       # rust-toolchain.toml pins the compiler and the wasm32 target; rustup installs them.
       - name: wasm-bindgen-cli
-        run: cargo install --locked wasm-bindgen-cli --version 0.2.130
+        run: cargo +1.99.0 install --locked wasm-bindgen-cli --version 0.2.130
 
       - name: Tests (wasm under Node)
         run: cargo test --locked
@@ -207,15 +231,44 @@ jobs:
       - name: Clippy
         run: rustup component add clippy && cargo clippy --locked --all-targets -- -D warnings
 
-      # The committed module is what web/dist bundles; it must be what this source builds.
+      # Generated JS/types must match; the untracked WASM is built from this source.
       - name: Committed web/src/crypto/pkg matches source
         run: |
           ./build.sh
           dirty="$(git status --porcelain -- ../src/crypto/pkg)"
           if [ -n "$dirty" ]; then printf '%s\n' "$dirty"; git diff --stat -- ../src/crypto/pkg; exit 1; fi
 
+  pqc:
+    name: PQC core (Go/WASM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Build with go.mod's pinned Go and its matching wasm_exec.js.
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # The same tests and shared vectors as the native build, compiled to js/wasm under Node.
+      - name: Tests (js/wasm under Node)
+        run: PATH="$(go env GOROOT)/lib/wasm:$PATH" GOOS=js GOARCH=wasm go test -count=1 ./internal/e2eeid/ github.com/Busnes-app/ky-primitives/xwing github.com/Busnes-app/ky-primitives/hybridsig
+
+      # Build shared command + product adapter; generated WASM must stay out of git.
+      - name: Build pqwasm from the pinned module
+        run: |
+          bash scripts/build-pqwasm.sh
+          test -z "$(git ls-files '*.wasm')"
+          dirty="$(git status --porcelain -- web/src/pqc)"
+          if [ -n "$dirty" ]; then printf '%s\n' "$dirty"; git diff --stat -- web/src/pqc; exit 1; fi
+
   browser:
     name: Browser regressions (production server)
+    needs: web
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -224,8 +277,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
-          go-version: stable
-          check-latest: true
+          go-version-file: go.mod
           cache: true
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -234,8 +286,10 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - run: npm ci
         working-directory: web
-      - run: npm run build
-        working-directory: web
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: web-dist
+          path: web/dist
       - run: go build -o .browser/server ./cmd/server
       - run: npx playwright install --with-deps chromium firefox
         working-directory: web
@@ -250,9 +304,14 @@ jobs:
 
   security:
     name: Vulnerability scan
+    needs: web
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: web-dist
+          path: web/dist
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: stable
@@ -263,9 +322,14 @@ jobs:
 
   smoke:
     name: End-to-end smoke test
+    needs: web
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: web-dist
+          path: web/dist
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: stable
@@ -297,6 +361,7 @@ jobs:
           docker run -d --name ky_ci -p 18080:8080 \
             -e KY_ADMIN_PASSWORD='CiSmokeAdminPass123!' \
             -e KY_CAPTCHA_PROVIDER=none \
+            -e KY_PUSH_ENABLED=false -e PUSH_RELAY_URL= -e APNS_RELAY_URL= \
             kymessages:ci
           trap 'docker logs ky_ci; docker rm -f ky_ci' EXIT
 

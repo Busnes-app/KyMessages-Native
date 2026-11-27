@@ -217,7 +217,8 @@ export const App: React.FC = () => {
         hidden={!isChatView}
         style={isChatView ? undefined : { display: 'none' }}
       >
-        {isAdmin && isChatView && <ConfirmItsYou />}
+        {/* Every signed-in user: encryption setup, reset and backup deletion need a recent sign-in. */}
+        {isChatView && <ConfirmItsYou username={user.username} />}
         {isChatView && error && (
           <div className="dr-alert dr-alert-error app-floating-alert" role="alert">
             <span>{error}</span>
@@ -291,7 +292,7 @@ export const App: React.FC = () => {
               </div>
             )}
 
-            {isAdmin && <ConfirmItsYou />}
+            {isAdmin && <ConfirmItsYou username={user.username} />}
 
             <main className="app-main">
               {errorAlert}

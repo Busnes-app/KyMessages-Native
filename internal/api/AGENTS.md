@@ -159,6 +159,31 @@ Owns HTTP routing, request parsing, session cookie validation, CORS headers, and
   publishes a `to_device` WebSocket event to the recipient. These routes spend their own `e2ee:`
   budget (600 a minute), not chat writes.
 
+- E3 identity routes (`e2ee_identity_handlers.go`, spec §9.1): `GET/PUT /api/v1/keys/master`,
+  `PUT /api/v1/keys/pins`, `POST /api/v1/keys/devices/list/reserve`, `PUT /api/v1/keys/devices/list`, `POST /api/v1/keys/devices/{id}/signature`, `GET/PUT/DELETE
+  /api/v1/keys/backup` and `/api/v1/keys/pairings[/{id}[/join|/sealed|/consume]]`. Every
+  `PUT master` and `DELETE backup` needs a session younger than `stepUpWindow` (`e2eeFresh`);
+  each recovery wrap must be exactly its own length (93/61 bytes) with version 1; bodies are
+  decoded by `encoding/json/v2` (case-sensitive names; an unknown or repeated name or trailing
+  data is refused). A device list is published only under a live reservation of its digest at
+  the epoch the reservation granted, and a reservation needs the master key's
+  `kymessages.device-list-reserve.v1` signature, checked in its fenced transaction
+  (`e2eeid.DeviceListDigest`, `E2EEDeviceListReservation` 30 s; reserve answers `{epoch, expires_in_ms}`, a `409` names `retry_in_ms` while held), so the
+  losing one of two concurrent proposals is refused before it is signed and two proposals never
+  share an epoch; `device_ids` must be an array. The verified device cancels a pairing with
+  `?unsealed=1`, which keeps a sealed one. Pin, backup and device-list writes and device
+  cross-signatures carry master-key signatures that the store checks (`proofOf`, a
+  `store.Proof`) against the master row it locks in the write's transaction. Backup rows carry
+  `sender_key`, a uint32 `first_index`, and are capped by `E2EEBackupMaxSessions` and
+  `E2EEBackupMaxBytes` (2 MiB; the database is one 64 MiB capsule member), checked for inserts and
+  replacements alike; a write is signed for the backup generation (bumped by `DELETE`, which
+  answers it) and answers `{stored, kept, full, refused}`. Bodies are
+  decoded strictly (`decodeIdentity`) and carry no secret field; every hybrid signature is
+  verified for the caller's org and user before it is stored; versions are compare-and-swap
+  (`409`); `/keys/query` adds `tenant_id`, `master_keys` and current-version
+  `master_signature`s. Pairings are one per user, 3 minutes (`E2EEPairingTTL`), started only by a
+  cross-signed device, joined and sealed once, consumed once; another user's or org's reads as
+  unknown. Same `e2ee:` budget.
 - In multi mode, whole-user bus revocations remove call seats on every replica even without a chat socket; session-only revocations leave calls alone. Guest invite replacement, denial and revocation use the same bus path.
 
 ## Verification

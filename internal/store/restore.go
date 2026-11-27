@@ -47,6 +47,8 @@ func (s *SQLStore) InvalidateRestoredGrants(ctx context.Context) error {
 		// revive it either. Devices upload new keys when the upload response shows none.
 		`UPDATE e2ee_one_time_keys SET claimed = 1`,
 		`DELETE FROM e2ee_to_device`,
+		// A QR pairing is a short-lived grant; master keys, cross-signatures and the key backup stay.
+		`DELETE FROM e2ee_pairings`,
 		`DELETE FROM meeting_guest_sessions`,
 		// Clear KyIdentity sync freshness and incremental cursors (never tenancy.mode,
 		// tenancy.staff_org_id, or erased_subjects) so startup refuses a pre-restore <24h
@@ -85,7 +87,7 @@ func (s *SQLStore) InvalidateRestoredGrants(ctx context.Context) error {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, s.rebind(`INSERT INTO audit_records (action, details, created_at) VALUES (?, ?, ?)`),
-		"restore.grants_invalidated", "Sessions, challenges, pairings, push subscriptions, active calls, bot tokens, one-time encryption keys, undelivered encryption mail, tenancy sync state and cached storage pool grants invalidated. Users sign in again and rotate bot tokens.", now); err != nil {
+		"restore.grants_invalidated", "Sessions, challenges, pairings, push subscriptions, active calls, bot tokens, one-time encryption keys, undelivered encryption mail, device verification pairings, tenancy sync state and cached storage pool grants invalidated. Users sign in again and rotate bot tokens.", now); err != nil {
 		return err
 	}
 	return tx.Commit()

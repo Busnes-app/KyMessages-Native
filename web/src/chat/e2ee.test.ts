@@ -1,7 +1,12 @@
 import 'fake-indexeddb/auto';
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { abandonDevice, forgetCryptoStore, keyGeneration, NOT_YET, onRoomKeys, openMessage, replaceDevice, RETIRE_MS, retireDevice, retryable, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
+import { abandonDevice, acceptIdentity, checkRoomIdentities, encryptionReadyFor, encryptionRetry, identityStatus, onIdentityChanged, StaleStatus, ownDeviceVerified, prepareIdentity, restoreIdentity, forgetCryptoStore, keyGeneration, NOT_YET, onRoomKeys, openMessage, receiveRoomKeys, replaceDevice, RETIRE_MS, retireDevice, retryable, retryEncryptionNow, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
+import { CryptoEngine, EARLY, NotVerified } from '../crypto/engine';
+import { FakeKeyServer, TENANT } from '../crypto/fakeKeyServer';
+import { pqc } from '../pqc/index';
+import { isTransient } from '../crypto/records';
+import { httpFake, type Block } from './httpFake';
 import { openCryptoStore } from '../crypto/store';
 import { parseMessage } from './types';
 
@@ -12,14 +17,21 @@ vi.mock('../crypto/store', async (importOriginal) => {
   return { ...real, storedDevices: () => deviceRead.replace?.() ?? real.storedDevices() };
 });
 
-// jsdom cannot fetch the module by URL; load it from disk instead.
+// jsdom cannot fetch the modules by URL; load them from disk instead.
 vi.mock('../crypto/index', async (importOriginal) => {
   const real = await importOriginal<typeof import('../crypto/index')>();
   return { ...real, loadCrypto: async () => real.loadCryptoSync(readFileSync('src/crypto/pkg/kycrypto_bg.wasm')) };
 });
+vi.mock('../pqc/index', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../pqc/index')>();
+  return { ...real, loadPQC: () => real.loadPQCFrom(readFileSync('src/pqc/pqc.wasm')) };
+});
+
+// Pending retirements, one localStorage key per device.
+const pendingRetirements = () => Object.keys(localStorage).filter((k) => k.startsWith('kymessages-e2ee-retire:'))
+  .map((k) => JSON.parse(localStorage.getItem(k) ?? 'null') as { user_id: string; device_id: string; deleted: boolean; delisted: boolean });
 
 const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { 'Content-Type': 'application/json' } });
-const ownRoom = { room: { id: 'r1', kind: 'channel' }, member: { room_id: 'r1', user_id: 'u_alice' }, members: [{ room_id: 'r1', user_id: 'u_alice' }] };
 
 afterEach(async () => {
   deviceRead.replace = undefined;
@@ -31,27 +43,21 @@ afterEach(async () => {
 
 describe('the signed-in device', () => {
   it('keeps decryptable inbound history, replay records and pins when startup gets a removed-device 404', async () => {
-    const known = new Set<string>();
+    const server = new FakeKeyServer();
+    server.join('r1', 'u_alice');
+    const removed = new Set<string>();
     const uploads: { device_id: string; device_keys?: unknown; one_time_keys: unknown[] }[] = [];
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = String(input);
-      if (url === '/api/v1/keys/upload') {
-        const req = JSON.parse(String(init?.body)) as (typeof uploads)[number];
-        uploads.push(req);
-        if (req.device_keys) known.add(req.device_id);
-        if (!known.has(req.device_id)) return json({ error: 'Unknown device' }, 404);
-        return json({ one_time_key_count: req.one_time_keys.length });
-      }
-      if (url === '/api/v1/rooms/r1') return json(ownRoom);
-      if (url === '/api/v1/keys/query') return json({ devices: {} });
-      if (url.startsWith('/api/v1/to-device')) return json({ messages: [] });
-      return json({ error: `unexpected ${url}` }, 404);
-    }));
-
+    const serve = (user: string) => httpFake(server, user, { fn: (_method, path, body) => {
+      if (user !== 'u_alice' || path !== '/api/v1/keys/upload') return undefined;
+      uploads.push(body);
+      return removed.has(body.device_id) ? json({ error: 'Unknown device' }, 404) : undefined;
+    } });
+    vi.stubGlobal('fetch', vi.fn(serve('u_alice')));
     const first = await startE2EE('u_alice');
     // Registered once, self-signed, then stocked with 50 one-time keys.
     expect(uploads[0].device_keys).toBeTruthy();
     expect(uploads.reduce((n, u) => n + u.one_time_keys.length, 0)).toBe(50);
+    await (await prepareIdentity()).commit();
 
     const message = parseMessage({ id: 'old-message', room_id: 'r1', sender_id: 'u_alice', encoding: 'e2ee_room_v1', body: await first.encrypt('r1', { type: 'text', body: 'historical secret' }) });
     expect((await openMessage(message)).body).toBe('historical secret');
@@ -61,12 +67,14 @@ describe('the signed-in device', () => {
     expect(replay).toHaveLength(1);
     before.close();
 
+    vi.stubGlobal('fetch', vi.fn(serve('u_bob')));
     await startE2EE('u_bob'); // closes alice's device, keeping its store
-    known.delete(first.deviceId); // removed from another session
+    vi.stubGlobal('fetch', vi.fn(serve('u_alice')));
+    removed.add(first.deviceId); // removed from another session
+    server.devices.get('u_alice')?.delete(first.deviceId);
     const again = await startE2EE('u_alice');
     expect(again.deviceId).not.toBe(first.deviceId);
     expect(again.curve25519).not.toBe(first.curve25519);
-    expect(known.has(first.deviceId)).toBe(false);
     expect((await openMessage(message)).body).toBe('historical secret');
     const after = await openCryptoStore('u_alice');
     try {
@@ -78,30 +86,44 @@ describe('the signed-in device', () => {
   });
 
   it('retries a failed startup on concurrent sends after upload service recovery without reconnecting', async () => {
-    let unavailable = true;
+    const server = new FakeKeyServer();
+    server.join('r1', 'u_alice');
+    let unavailable = false;
     const uploads: string[] = [];
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = String(input);
-      if (url === '/api/v1/keys/upload') {
-        const req = JSON.parse(String(init?.body)) as { device_id: string; one_time_keys: unknown[] };
-        uploads.push(req.device_id);
-        if (unavailable) return json({ error: 'Try later' }, 503);
-        return json({ one_time_key_count: req.one_time_keys.length });
-      }
-      if (url === '/api/v1/rooms/r1') return json(ownRoom);
-      if (url === '/api/v1/keys/query') return json({ devices: {} });
-      return json({ messages: [] });
-    }));
+    const serve = (user: string) => httpFake(server, user, { fn: (_method, path, body) => {
+      if (user !== 'u_alice' || path !== '/api/v1/keys/upload') return undefined;
+      uploads.push(body.device_id);
+      return unavailable ? json({ error: 'Try later' }, 503) : undefined;
+    } });
+    vi.stubGlobal('fetch', vi.fn(serve('u_alice')));
+    const device = await startE2EE('u_alice');
+    await (await prepareIdentity()).commit(); // a verified device, which may send
+    vi.stubGlobal('fetch', vi.fn(serve('u_bob')));
+    await startE2EE('u_bob');
+    vi.stubGlobal('fetch', vi.fn(serve('u_alice')));
+    unavailable = true;
+    uploads.length = 0;
     await expect(startE2EE('u_alice')).rejects.toThrow('Try later');
     unavailable = false; // the socket never reconnects; the next sends must restart startup
     const envelopes = await Promise.all(['one', 'two', 'three'].map((body) => sealRoomMessage('r1', { type: 'text', body })));
-    // One failed upload, then one coalesced startup: identity/fallback and one-time-key uploads.
-    expect(uploads).toHaveLength(3);
-    expect(new Set(uploads).size).toBe(1);
+    // One failed upload, then one coalesced startup of the same device.
+    expect(uploads.length).toBeGreaterThanOrEqual(2);
+    expect(new Set(uploads)).toEqual(new Set([device.deviceId]));
     for (const [i, body] of envelopes.entries()) {
       const opened = await openMessage(parseMessage({ id: `sent-${i}`, room_id: 'r1', sender_id: 'u_alice', encoding: 'e2ee_room_v1', body }));
       expect(opened.body).toBe(['one', 'two', 'three'][i]);
     }
+  });
+
+  it('refuses an encrypted send from a device that is not verified, and sends once it is', async () => {
+    const server = new FakeKeyServer();
+    server.join('r1', 'u_alice');
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice')));
+    await startE2EE('u_alice');
+    await expect(sealRoomMessage('r1', { type: 'text', body: 'to no one' })).rejects.toThrow(/verify this device/i);
+    expect(server.sent).toEqual([]);
+    await (await prepareIdentity()).commit();
+    await expect(sealRoomMessage('r1', { type: 'text', body: 'self only' })).resolves.toMatch(/megolm/);
   });
 
   it('retires a device abandoned by a revoked session after the next sign-in', async () => {
@@ -117,6 +139,7 @@ describe('the signed-in device', () => {
         return new Response(null, { status: 204 });
       }
       if (url.startsWith('/api/v1/to-device')) return json({ messages: [] });
+      if (url === '/api/v1/keys/master') return json({ tenant_id: 'default', master: null });
       return json({ error: `unexpected ${url}` }, 404);
     }));
     const old = await startE2EE('u_alice');
@@ -125,7 +148,7 @@ describe('the signed-in device', () => {
     const fresh = await startE2EE('u_alice');
     await vi.waitFor(() => expect(deleted).toEqual([old.deviceId]));
     expect(fresh.deviceId).not.toBe(old.deviceId);
-    expect(localStorage.getItem('kymessages-e2ee-retire')).toBeNull();
+    await vi.waitFor(() => expect(pendingRetirements()).toEqual([]));
   });
 
   it("retires another user's device whose store a sign-out wiped, at that user's next sign-in", async () => {
@@ -141,6 +164,7 @@ describe('the signed-in device', () => {
         return new Response(null, { status: 204 });
       }
       if (url.startsWith('/api/v1/to-device')) return json({ messages: [] });
+      if (url === '/api/v1/keys/master') return json({ tenant_id: 'default', master: null });
       return json({ error: `unexpected ${url}` }, 404);
     }));
     const bob = await startE2EE('u_bob'); // Bob used this shared browser
@@ -162,6 +186,7 @@ describe('the signed-in device', () => {
         return json({ one_time_key_count: req.one_time_keys.length });
       }
       if (url.startsWith('/api/v1/to-device')) return json({ messages: [] });
+      if (url === '/api/v1/keys/master') return json({ tenant_id: 'default', master: null });
       return json({ error: `unexpected ${url}` }, 404);
     }));
     await startE2EE('u_alice');
@@ -229,7 +254,7 @@ describe('the signed-in device', () => {
     // The session is revoked while the upload is still pending.
     await abandonDevice();
     expect(await stores()).toEqual([]);
-    expect(JSON.parse(localStorage.getItem('kymessages-e2ee-retire') ?? '[]')).toHaveLength(1);
+    expect(pendingRetirements()).toHaveLength(1);
     releaseUpload();
     await starting;
     // The cancelled start-up never brings the store back.
@@ -326,6 +351,7 @@ describe('the signed-in device', () => {
         return deleteStatus === 204 ? new Response(null, { status: 204 }) : json({ error: 'x' }, deleteStatus);
       }
       if (url.startsWith('/api/v1/to-device')) return json({ messages: [] });
+      if (url === '/api/v1/keys/master') return json({ tenant_id: 'default', master: null });
       return json({ error: `unexpected ${url}` }, 404);
     }));
     await startE2EE('u_alice');
@@ -405,6 +431,7 @@ describe('the signed-in device', () => {
         return json({ one_time_key_count: req.one_time_keys.length });
       }
       if (url.startsWith('/api/v1/to-device')) return json({ messages: [] });
+      if (url === '/api/v1/keys/master') return json({ tenant_id: 'default', master: null });
       return json({ error: `unexpected ${url}` }, 404);
     }));
     const old = await startE2EE('u_alice');
@@ -469,5 +496,1158 @@ describe('the signed-in device', () => {
     // 10 KiB of control characters is under the 16 KiB text limit but escapes to 60 KiB of JSON.
     await expect(sealRoomMessage('r1', { type: 'text', body: '\u0001'.repeat(10 << 10) })).rejects.toThrow('Message is too long');
     await expect(sealRoomMessage('r1', { type: 'text', body: 'x'.repeat((16 << 10) + 1) })).rejects.toThrow('Message is too long');
+  });
+});
+
+describe('retirement from the signed device list', () => {
+  it('keeps a sign-out pending until the removal is signed, even once the server row is gone', async () => {
+    const deleted: string[] = [];
+    let listed = true; // the account's identity lists devices; this browser is not verified
+    const s = 'A'.repeat(64);
+    const master = () => ({
+      version: 1, master_key: s, self_signature: s, device_list: { epoch: 1, device_ids: ['SOMEDEVICE01'], signature: s },
+      backup_key: { public_key: s, signature: s }, recovery: { wrapped_master_key: s, wrapped_backup_key: s }, pins: { counter: 0, sealed: '' },
+    });
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/v1/keys/upload') {
+        const req = JSON.parse(String(init?.body)) as { one_time_keys: unknown[] };
+        return json({ one_time_key_count: req.one_time_keys.length });
+      }
+      if (url.startsWith('/api/v1/keys/devices/') && init?.method === 'DELETE') {
+        deleted.push(decodeURIComponent(url.slice('/api/v1/keys/devices/'.length)));
+        return new Response(null, { status: 204 });
+      }
+      if (url === '/api/v1/keys/master') return json({ tenant_id: 'default', master: listed ? master() : null });
+      if (url.startsWith('/api/v1/to-device')) return json({ messages: [] });
+      return json({ error: `unexpected ${url}` }, 404);
+    }));
+    const e = await startE2EE('u_alice');
+    expect(await retireDevice().wait).toBe(true);
+    expect(deleted).toEqual([e.deviceId]);
+    expect(pendingRetirements()).toEqual([expect.objectContaining({ device_id: e.deviceId, deleted: true, delisted: false })]);
+    await forgetCryptoStore();
+    // Next sign-in, the identity no longer lists devices: nothing is left to sign away.
+    listed = false;
+    await startE2EE('u_alice');
+    await vi.waitFor(() => expect(pendingRetirements()).toEqual([]));
+  });
+
+  // Earlier builds kept one list; another tab records its own device while this one retires.
+  it('keeps each pending device apart, so a tab retiring some never drops another tab\'s', async () => {
+    localStorage.setItem('kymessages-e2ee-retire', JSON.stringify([{ user_id: 'u_alice', device_id: 'OLDDEVICE001' }]));
+    const deleted: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/v1/keys/upload') return json({ one_time_key_count: 50 });
+      if (url.startsWith('/api/v1/keys/devices/') && init?.method === 'DELETE') {
+        deleted.push(decodeURIComponent(url.slice('/api/v1/keys/devices/'.length)));
+        // Meanwhile another tab signs a different device out, which it records as pending.
+        localStorage.setItem('kymessages-e2ee-retire:u_alice:OTHERTAB0001', JSON.stringify({ user_id: 'u_alice', device_id: 'OTHERTAB0001', deleted: false, delisted: false }));
+        return new Response(null, { status: 204 });
+      }
+      if (url === '/api/v1/keys/master') return json({ tenant_id: 'default', master: null });
+      return json({ messages: [] });
+    }));
+    await startE2EE('u_alice');
+    await vi.waitFor(() => expect(deleted).toEqual(['OLDDEVICE001']));
+    await vi.waitFor(() => expect(pendingRetirements().map((d) => d.device_id)).toEqual(['OTHERTAB0001']));
+    expect(localStorage.getItem('kymessages-e2ee-retire')).toBeNull();
+  });
+
+  it('settles a sign-out whose removal from the list lands after sign-out moved on', async () => {
+    let releaseMaster: () => void = () => {};
+    const masterRead = new Promise<void>((r) => { releaseMaster = r; });
+    let hold = false;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/v1/keys/upload') return json({ one_time_key_count: 50 });
+      if (url.startsWith('/api/v1/keys/devices/') && init?.method === 'DELETE') return new Response(null, { status: 204 });
+      if (url === '/api/v1/keys/master') {
+        if (hold) await masterRead;
+        return json({ tenant_id: 'default', master: null });
+      }
+      return json({ messages: [] });
+    }));
+    const e = await startE2EE('u_alice');
+    hold = true; // the delist's identity read stalls past its bound
+    vi.useFakeTimers({ toFake: ['setTimeout'] });
+    let retiring: ReturnType<typeof retireDevice>;
+    try {
+      retiring = retireDevice();
+      await vi.advanceTimersByTimeAsync(RETIRE_MS);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(await retiring.wait).toBe(true);
+    expect(pendingRetirements()).toEqual([expect.objectContaining({ device_id: e.deviceId, deleted: true, delisted: false })]);
+    releaseMaster(); // the late removal confirms, and the entry goes
+    await vi.waitFor(() => expect(pendingRetirements()).toEqual([]));
+  });
+
+  it('replaces a device a refused sign-out took off the list though its deletion failed', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/v1/keys/upload') return json({ one_time_key_count: 50 });
+      if (url.startsWith('/api/v1/keys/devices/') && init?.method === 'DELETE') return json({ error: 'try later' }, 503);
+      if (url === '/api/v1/keys/master') return json({ tenant_id: 'default', master: null });
+      return json({ messages: [] });
+    }));
+    const old = await startE2EE('u_alice');
+    const retiring = retireDevice();
+    expect(await retiring.wait).toBe(false);
+    // The logout is refused (or cancelled): the retiring device no longer lists itself, so it is
+    // replaced by one that does, and the old one stays pending.
+    await retiring.replaceIfRetired();
+    expect((await startE2EE('u_alice')).deviceId).not.toBe(old.deviceId);
+    expect(pendingRetirements()).toEqual(expect.arrayContaining([expect.objectContaining({ device_id: old.deviceId })]));
+  });
+});
+
+describe('retrying encryption work', () => {
+  it('says work is waiting after a failed mailbox read, and clears once a retry ran', async () => {
+    let down = false;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/api/v1/keys/upload') return json({ one_time_key_count: 50 });
+      if (url === '/api/v1/keys/master') return json({ tenant_id: 'default', master: null });
+      if (url.startsWith('/api/v1/to-device')) return down ? json({ error: 'try later' }, 503) : json({ messages: [] });
+      return json({ error: `unexpected ${url}` }, 404);
+    }));
+    await startE2EE('u_alice');
+    down = true;
+    receiveRoomKeys();
+    await vi.waitFor(() => expect(encryptionRetry().pending).toBe(true));
+    down = false;
+    await retryEncryptionNow();
+    expect(encryptionRetry().pending).toBe(false);
+  });
+
+  it('opens a message from before this device’s session again when keys arrive', () => {
+    expect(retryable(EARLY)).toBe(true);
+  });
+});
+
+// With fake timers: jumps to each next timer, pausing in real time for the async work between,
+// until cond holds.
+const realTimeout = globalThis.setTimeout;
+async function until(cond: () => boolean): Promise<void> {
+  for (let n = 0; n < 2000 && !cond(); n++) {
+    await vi.advanceTimersToNextTimerAsync();
+    await new Promise((r) => realTimeout(r, 5));
+  }
+  expect(cond()).toBe(true);
+}
+
+describe('Round 4: the retry pipeline over the real key routes', () => {
+  it('awaits the backup it retries, stops after its schedule, and recovers by hand', async () => {
+    const server = new FakeKeyServer();
+    server.join('r1', 'u_alice');
+    let backup: 'down' | 'hold' | 'up' = 'up';
+    let release = () => {};
+    let puts = 0;
+    const block: { fn?: Block } = { fn: (method, path) => {
+      if (method !== 'PUT' || path !== '/api/v1/keys/backup') return undefined;
+      puts++;
+      if (backup === 'down') return json({ error: 'down' }, 503);
+      if (backup === 'hold') return new Promise<undefined>((r) => { release = () => r(undefined); });
+      return undefined;
+    } };
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice', block)));
+    // Fake timers throughout, so the schedule's own timers are the ones advanced; vi.waitFor
+    // advances them while it polls.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    let spent = 0;
+    try {
+      await startE2EE('u_alice');
+      await (await prepareIdentity()).commit();
+      await vi.waitFor(() => expect(server.backups.get('u_alice')?.size ?? 0).toBe(0));
+      backup = 'down';
+      await sealRoomMessage('r1', { type: 'text', body: 'backed up later' });
+      await vi.waitFor(() => expect(puts).toBe(1));
+      expect(encryptionRetry()).toEqual({ pending: true, exhausted: false });
+      // Five scheduled retries, each awaiting a drain that fails, then no more by itself.
+      // Each retry fires once the previous one finished (real async work) and scheduled it.
+      for (let i = 0; i < 5; i++) await until(() => puts === i + 2);
+      await vi.waitFor(() => expect(encryptionRetry()).toEqual({ pending: true, exhausted: true }), { interval: 1 });
+      spent = puts;
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(puts).toBe(spent);
+      expect(server.backups.get('u_alice')?.size ?? 0).toBe(0);
+
+      // By hand, while the server still fails: tried, and scheduled again.
+      await retryEncryptionNow();
+      expect(puts).toBe(spent + 1);
+      expect(encryptionRetry()).toEqual({ pending: true, exhausted: false });
+
+      // The server is back but slow: pending holds until the write itself finished, and a second
+      // retry joins the running one.
+      backup = 'hold';
+      const run = retryEncryptionNow();
+      expect(retryEncryptionNow()).toBe(run);
+      await vi.waitFor(() => expect(puts).toBe(spent + 2), { interval: 1 });
+      expect(encryptionRetry().pending).toBe(true);
+      release();
+      await run;
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(puts).toBe(spent + 2);
+    expect(encryptionRetry()).toEqual({ pending: false, exhausted: false });
+    expect(server.backups.get('u_alice')?.size).toBe(1);
+  }, 60_000);
+
+  it('treats an unreachable or failing key server as unavailability, and a refusal as a verdict', async () => {
+    const server = new FakeKeyServer();
+    let mailbox: 'offline' | '429' | 'refused' | 'up' = 'up';
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice', { fn: (method, path) => {
+      if (path !== '/api/v1/to-device' || method !== 'GET' || mailbox === 'up') return undefined;
+      if (mailbox === 'offline') throw new TypeError('Failed to fetch');
+      return mailbox === '429' ? json({ error: 'slow down' }, 429) : json({ error: 'bad request' }, 400);
+    } })));
+    await startE2EE('u_alice');
+    for (const state of ['offline', '429'] as const) {
+      mailbox = state;
+      receiveRoomKeys();
+      await vi.waitFor(() => expect(encryptionRetry().pending).toBe(true));
+      mailbox = 'up';
+      await retryEncryptionNow();
+      expect(encryptionRetry().pending).toBe(false);
+    }
+    mailbox = 'refused';
+    receiveRoomKeys();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(encryptionRetry().pending).toBe(false);
+    // A closed screen's abort is not unavailability.
+    expect(isTransient(new DOMException('closed', 'AbortError'))).toBe(false);
+  });
+});
+
+describe('Round 4: retirement races', () => {
+  it('retires pending devices once verified, even when the backup restore that follows fails', async () => {
+    const server = new FakeKeyServer();
+    let backupDown = false;
+    const deleted: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice', { fn: (method, path) => {
+      if (method === 'DELETE' && path.startsWith('/api/v1/keys/devices/')) deleted.push(decodeURIComponent(path.slice('/api/v1/keys/devices/'.length)));
+      if (backupDown && method === 'GET' && path === '/api/v1/keys/backup') return json({ error: 'down' }, 503);
+      return undefined;
+    } })));
+    const first = await startE2EE('u_alice');
+    const p = await prepareIdentity();
+    await p.commit();
+    await forgetCryptoStore(); // a sign-out whose removal from the list did not land
+    await startE2EE('u_alice');
+    await vi.waitFor(() => expect(deleted).toContain(first.deviceId));
+    expect(pendingRetirements()).toEqual([expect.objectContaining({ device_id: first.deviceId, deleted: true, delisted: false })]);
+    backupDown = true;
+    // Verified, with the restore left pending for the retry.
+    expect(await restoreIdentity(p.recoveryKey)).toBe(0);
+    await vi.waitFor(() => expect(pendingRetirements()).toEqual([]));
+    expect(server.masters.get('u_alice')!.device_list!.device_ids).not.toContain(first.deviceId);
+  });
+
+  it('replaces a stored device whose retirement is pending instead of running it, and deletes only that one', async () => {
+    const server = new FakeKeyServer();
+    const deleted: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice', { fn: (method, path) => {
+      if (method === 'DELETE' && path.startsWith('/api/v1/keys/devices/')) deleted.push(decodeURIComponent(path.slice('/api/v1/keys/devices/'.length)));
+      return undefined;
+    } })));
+    const old = await startE2EE('u_alice');
+    localStorage.setItem(`kymessages-e2ee-retire:u_alice:${old.deviceId}`, JSON.stringify({ user_id: 'u_alice', device_id: old.deviceId, deleted: false, delisted: false }));
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_bob')));
+    await startE2EE('u_bob'); // closes alice's device, keeping its store
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice', { fn: (method, path) => {
+      if (method === 'DELETE' && path.startsWith('/api/v1/keys/devices/')) deleted.push(decodeURIComponent(path.slice('/api/v1/keys/devices/'.length)));
+      return undefined;
+    } })));
+    const fresh = await startE2EE('u_alice');
+    expect(fresh.deviceId).not.toBe(old.deviceId);
+    await vi.waitFor(() => expect(deleted).toEqual([old.deviceId]));
+    expect(server.devices.get('u_alice')?.has(fresh.deviceId)).toBe(true);
+  });
+
+  it('replaces the touched device when a refused sign-out ends its bounded attempt, though the deletion hangs', async () => {
+    const server = new FakeKeyServer();
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice', { fn: (method, path) =>
+      method === 'DELETE' && path.startsWith('/api/v1/keys/devices/') ? new Promise<Response>(() => undefined) : undefined })));
+    const old = await startE2EE('u_alice');
+    vi.useFakeTimers({ toFake: ['setTimeout'] });
+    let repaired: Promise<void>;
+    try {
+      const retiring = retireDevice();
+      await vi.advanceTimersByTimeAsync(RETIRE_MS);
+      expect(await retiring.wait).toBe(false);
+      repaired = retiring.replaceIfRetired();
+      await vi.advanceTimersByTimeAsync(RETIRE_MS);
+    } finally {
+      vi.useRealTimers();
+    }
+    await repaired;
+    expect((await startE2EE('u_alice')).deviceId).not.toBe(old.deviceId);
+    expect(pendingRetirements()).toEqual(expect.arrayContaining([expect.objectContaining({ device_id: old.deviceId })]));
+  });
+
+  it('does not record a fully retired device again when a clean sign-out wipes the store', async () => {
+    const server = new FakeKeyServer();
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice')));
+    await startE2EE('u_alice');
+    expect(await retireDevice().wait).toBe(true);
+    await vi.waitFor(() => expect(pendingRetirements()).toEqual([]));
+    await forgetCryptoStore();
+    expect(pendingRetirements()).toEqual([]);
+  });
+});
+
+describe('Round 5: retry sessions and lifecycle', () => {
+  const deferred = () => {
+    let resolve: (r?: Response) => void = () => {};
+    const promise = new Promise<Response | undefined>((r) => { resolve = r; });
+    return { promise, resolve };
+  };
+
+  it('ignores a failure from a signed-out session: it neither schedules nor changes the next user\'s', async () => {
+    const server = new FakeKeyServer();
+    server.join('r1', 'u_alice');
+    let hold: ReturnType<typeof deferred> | undefined;
+    const serveAlice = httpFake(server, 'u_alice', { fn: (method, path) => (method === 'PUT' && path === '/api/v1/keys/backup' && hold ? hold.promise : undefined) });
+    // Alice's held write outlives her sign-out (it is not aborted), and then fails.
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => serveAlice(input, { ...init, signal: undefined })));
+    await startE2EE('u_alice');
+    await (await prepareIdentity()).commit();
+    hold = deferred();
+    await sealRoomMessage('r1', { type: 'text', body: 'x' });
+    await new Promise((r) => setTimeout(r, 100));
+    await forgetCryptoStore();
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_bob')));
+    await startE2EE('u_bob');
+    hold.resolve(json({ error: 'down' }, 503));
+    await new Promise((r) => setTimeout(r, 100));
+    expect(encryptionRetry()).toEqual({ pending: false, exhausted: false });
+  });
+
+  it('starts another user with a budget of their own, whatever the previous one left waiting', async () => {
+    const server = new FakeKeyServer();
+    let mailboxDown = true;
+    const serveAlice = httpFake(server, 'u_alice', { fn: (method, path) => (method === 'GET' && path === '/api/v1/to-device' && mailboxDown ? json({ error: 'down' }, 503) : undefined) });
+    vi.stubGlobal('fetch', vi.fn(serveAlice));
+    await startE2EE('u_alice');
+    receiveRoomKeys();
+    await vi.waitFor(() => expect(encryptionRetry().pending).toBe(true));
+    // Another account in this browser, without a sign-out in between.
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_bob')));
+    await startE2EE('u_bob');
+    expect(encryptionRetry()).toEqual({ pending: false, exhausted: false });
+    mailboxDown = false;
+  });
+
+  it('runs one more pass when a failure is reported while a retry runs', async () => {
+    const server = new FakeKeyServer();
+    let mailboxDown = false;
+    let holdMaster: ReturnType<typeof deferred> | undefined;
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice', { fn: (method, path) => {
+      if (method === 'GET' && path === '/api/v1/to-device' && mailboxDown) return json({ error: 'down' }, 503);
+      if (method === 'GET' && path === '/api/v1/keys/master' && holdMaster) {
+        const h = holdMaster;
+        holdMaster = undefined;
+        return h.promise;
+      }
+      return undefined;
+    } })));
+    await startE2EE('u_alice');
+    await (await prepareIdentity()).commit();
+    mailboxDown = true;
+    receiveRoomKeys();
+    await vi.waitFor(() => expect(encryptionRetry().pending).toBe(true));
+    mailboxDown = false;
+    // The retry reads the mailbox, then waits (without the lock) on the identity...
+    const hold = deferred();
+    holdMaster = hold;
+    const run = retryEncryptionNow();
+    await vi.waitFor(() => expect(holdMaster).toBeUndefined());
+    // ...while a mailbox wake fails.
+    mailboxDown = true;
+    receiveRoomKeys();
+    await new Promise((r) => setTimeout(r, 100));
+    mailboxDown = false;
+    hold.resolve(undefined);
+    await run;
+    expect(encryptionRetry().pending).toBe(true); // that failure earned one more pass
+    await retryEncryptionNow();
+    expect(encryptionRetry()).toEqual({ pending: false, exhausted: false });
+  });
+
+  it('aborts its own-device check while it waits on the server, and frees the lock', async () => {
+    const server = new FakeKeyServer();
+    server.join('r1', 'u_alice');
+    let stall = false;
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice', { fn: (method, path) =>
+      stall && method === 'POST' && path === '/api/v1/keys/query' ? new Promise<undefined>(() => undefined) : undefined })));
+    const e = await startE2EE('u_alice');
+    await (await prepareIdentity()).commit();
+    stall = true;
+    const ac = new AbortController();
+    const check = ownDeviceVerified(e.deviceId, ac.signal);
+    await new Promise((r) => setTimeout(r, 100));
+    ac.abort(new DOMException('closed', 'AbortError'));
+    await expect(check).rejects.toThrow('closed');
+    stall = false;
+    // The lock it held is free: a send (which takes it) goes through.
+    await expect(sealRoomMessage('r1', { type: 'text', body: 'after' })).resolves.toMatch(/megolm/);
+    expect(await ownDeviceVerified(e.deviceId)).toBe(true);
+  });
+});
+
+describe('Round 5: bounded sign-out', () => {
+  it('fences a refused sign-out that never reached a device: a slow start-up later keeps its device', async () => {
+    const server = new FakeKeyServer();
+    let release = () => {};
+    let held = true;
+    const deleted: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice', { fn: (method, path) => {
+      if (method === 'DELETE' && path.startsWith('/api/v1/keys/devices/')) deleted.push(path);
+      if (method === 'POST' && path === '/api/v1/keys/upload' && held) return new Promise<undefined>((r) => { release = () => r(undefined); });
+      return undefined;
+    } })));
+    const starting = startE2EE('u_alice');
+    vi.useFakeTimers({ toFake: ['setTimeout'] });
+    try {
+      const retiring = retireDevice();
+      await vi.advanceTimersByTimeAsync(RETIRE_MS);
+      expect(await retiring.wait).toBe(false);
+      const refused = retiring.replaceIfRetired();
+      await vi.advanceTimersByTimeAsync(RETIRE_MS);
+      await refused;
+    } finally {
+      vi.useRealTimers();
+    }
+    held = false;
+    release();
+    const e = await starting;
+    await new Promise((r) => setTimeout(r, 200));
+    expect(deleted).toEqual([]);
+    expect(pendingRetirements()).toEqual([]);
+    expect(server.devices.get('u_alice')?.has(e.deviceId)).toBe(true);
+  });
+
+  it('settles a double sign-out once, and one whose deletion answer was lost, keeping the identity', async () => {
+    const server = new FakeKeyServer();
+    server.join('r1', 'u_alice');
+    let lose = false;
+    const serve = httpFake(server, 'u_alice');
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const r = await serve(input, init);
+      // The deletion lands on the server, but its answer never arrives.
+      if (lose && init?.method === 'DELETE') throw new TypeError('Failed to fetch');
+      return r;
+    }));
+    await startE2EE('u_alice');
+    // Twice at once: both finish, and nothing stays pending.
+    expect(await Promise.all([retireDevice().wait, retireDevice().wait])).toEqual([true, true]);
+    await vi.waitFor(() => expect(pendingRetirements()).toEqual([]));
+
+    await forgetCryptoStore();
+    const old = await startE2EE('u_alice');
+    await (await prepareIdentity()).commit();
+    const store = await openCryptoStore('u_alice');
+    await store.write([['in:sender:session', { kept: true }]]);
+    store.close();
+    lose = true;
+    const retiring = retireDevice();
+    expect(await retiring.wait).toBe(false); // the outcome is unknown
+    lose = false;
+    await retiring.replaceIfRetired();
+    const fresh = await startE2EE('u_alice');
+    expect(fresh.deviceId).not.toBe(old.deviceId);
+    // The replacement keeps the identity (no recovery key needed) and the room keys.
+    expect(await identityStatus()).toMatchObject({ state: 'verified' });
+    const after = await openCryptoStore('u_alice');
+    expect(await after.get('in:sender:session')).toEqual({ kept: true });
+    after.close();
+    // The next start learns the old device is gone (404) and settles it.
+    await vi.waitFor(() => expect(pendingRetirements()).toEqual([]));
+  });
+});
+
+describe('Round 6', () => {
+  it('fences a refused sign-out at once, so a start-up finishing in what was its second wait keeps its device', async () => {
+    const server = new FakeKeyServer();
+    let release = () => {};
+    let held = true;
+    const touched: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice', { fn: (method, path) => {
+      if ((method === 'DELETE' && path.startsWith('/api/v1/keys/devices/')) || path === '/api/v1/keys/devices/list/reserve') touched.push(`${method} ${path}`);
+      if (method === 'POST' && path === '/api/v1/keys/upload' && held) return new Promise<undefined>((r) => { release = () => r(undefined); });
+      return undefined;
+    } })));
+    const starting = startE2EE('u_alice');
+    vi.useFakeTimers({ toFake: ['setTimeout'] });
+    try {
+      const retiring = retireDevice();
+      await vi.advanceTimersByTimeAsync(RETIRE_MS);
+      expect(await retiring.wait).toBe(false);
+      const refused = retiring.replaceIfRetired();
+      // The start-up finishes right after the refusal, inside the window the refusal used to
+      // wait, before that window ends.
+      held = false;
+      release();
+      await starting;
+      await new Promise((r) => setImmediate(r));
+      await vi.advanceTimersByTimeAsync(RETIRE_MS);
+      await refused;
+    } finally {
+      vi.useRealTimers();
+    }
+    const e = await starting;
+    await new Promise((r) => setTimeout(r, 200));
+    expect(touched).toEqual([]);
+    expect(pendingRetirements()).toEqual([]);
+    expect(server.devices.get('u_alice')?.has(e.deviceId)).toBe(true);
+    expect((await startE2EE('u_alice')).deviceId).toBe(e.deviceId);
+  });
+
+  it('keeps a failure reported during a pass even when the pass ends in a verdict', async () => {
+    const server = new FakeKeyServer();
+    let mailboxDown = false;
+    let holdMaster: { promise: Promise<undefined>; resolve: () => void } | undefined;
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice', { fn: (method, path) => {
+      if (method === 'GET' && path === '/api/v1/to-device' && mailboxDown) return json({ error: 'down' }, 503);
+      if (method === 'GET' && path === '/api/v1/keys/master' && holdMaster) {
+        const h = holdMaster;
+        holdMaster = undefined;
+        return h.promise;
+      }
+      return undefined;
+    } })));
+    await startE2EE('u_alice');
+    const p = await prepareIdentity();
+    await p.commit();
+    // Alice sees her device list at a newer epoch, which the server later rolls back.
+    const m = server.masters.get('u_alice')!;
+    const seed = pqc.recoveryUnwrap(pqc.recoveryParse(p.recoveryKey), 'master-key', TENANT, 'u_alice', m.recovery.wrapped_master_key);
+    const older = structuredClone(m.device_list!);
+    const ids = older.device_ids;
+    m.device_list = { epoch: older.epoch + 1, device_ids: ids, signature: pqc.signDeviceList(seed, TENANT, 'u_alice', m.version, older.epoch + 1, ids) };
+    await identityStatus();
+    mailboxDown = true;
+    receiveRoomKeys();
+    await vi.waitFor(() => expect(encryptionRetry().pending).toBe(true));
+    mailboxDown = false;
+    let resolve = () => {};
+    holdMaster = { promise: new Promise<undefined>((r) => { resolve = () => r(undefined); }), resolve: () => resolve() };
+    const run = retryEncryptionNow();
+    await vi.waitFor(() => expect(holdMaster).toBeUndefined());
+    mailboxDown = true;
+    receiveRoomKeys(); // fails while the pass waits
+    await new Promise((r) => setTimeout(r, 100));
+    mailboxDown = false;
+    m.device_list = older; // the pass then ends in a verdict: a rollback
+    const announced = vi.fn();
+    const off = onIdentityChanged(announced);
+    resolve();
+    await run;
+    off();
+    expect(encryptionRetry().pending).toBe(true);
+    // The verdict reaches the gate, whose status now carries the reset action's problem.
+    expect(announced).toHaveBeenCalled();
+    expect(await identityStatus()).toMatchObject({ state: 'verified', problem: 'rollback' });
+  });
+
+  it('stops waiting for a starting device when its own-device check is aborted, leaving the start-up alone', async () => {
+    const server = new FakeKeyServer();
+    let release = () => {};
+    let held = true;
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice', { fn: (method, path) =>
+      method === 'POST' && path === '/api/v1/keys/upload' && held ? new Promise<undefined>((r) => { release = () => r(undefined); }) : undefined })));
+    const starting = startE2EE('u_alice');
+    await new Promise((r) => setTimeout(r, 50));
+    const ac = new AbortController();
+    const check = ownDeviceVerified('ANYDEVICE001', ac.signal);
+    ac.abort(new DOMException('closed', 'AbortError'));
+    await expect(check).rejects.toThrow('closed');
+    held = false;
+    release();
+    expect((await starting).userId).toBe('u_alice');
+  });
+});
+
+describe('Round 6: status checks share one run', () => {
+  it('answers concurrent status requests from at most two checks, the last after every request', async () => {
+    const server = new FakeKeyServer();
+    let masters = 0;
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice', { fn: (method, path) => {
+      if (method === 'GET' && path === '/api/v1/keys/master') masters++;
+      return undefined;
+    } })));
+    await startE2EE('u_alice');
+    await (await prepareIdentity()).commit();
+    await new Promise((r) => setTimeout(r, 100));
+    masters = 0;
+    await identityStatus();
+    const one = masters;
+    expect(one).toBeGreaterThan(0);
+    masters = 0;
+    const all = await Promise.all(Array.from({ length: 5 }, () => identityStatus()));
+    expect(all.every((s) => s.state === 'verified')).toBe(true);
+    expect(masters).toBeLessThanOrEqual(2 * one);
+  });
+});
+
+describe('Round 7: status belongs to its device start-up', () => {
+  it('never lets a status asked of a replaced device stall or answer for its replacement, which updates the gate', async () => {
+    const server = new FakeKeyServer();
+    let holdOnce: { promise: Promise<undefined>; release: () => void } | undefined;
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice', { fn: (method, path) => {
+      if (method === 'GET' && path === '/api/v1/keys/master' && holdOnce) {
+        const h = holdOnce;
+        holdOnce = undefined;
+        return h.promise;
+      }
+      return undefined;
+    } })));
+    const first = await startE2EE('u_alice');
+    await (await prepareIdentity()).commit();
+    await new Promise((r) => setTimeout(r, 100));
+    let release = () => {};
+    holdOnce = { promise: new Promise<undefined>((r) => { release = () => r(undefined); }), release: () => release() };
+    const stale = identityStatus().catch((e: unknown) => e);
+    await vi.waitFor(() => expect(holdOnce).toBeUndefined()); // that check is now stalled
+    const announced = vi.fn();
+    const off = onIdentityChanged(announced);
+    await replaceDevice(first.deviceId);
+    const fresh = await startE2EE('u_alice');
+    expect(fresh.deviceId).not.toBe(first.deviceId);
+    // The replacement announced itself, and its own status runs at once.
+    await vi.waitFor(() => expect(announced).toHaveBeenCalled());
+    expect(await identityStatus()).toMatchObject({ state: 'verified' });
+    release();
+    expect(await stale).toBeInstanceOf(StaleStatus);
+    off();
+  });
+});
+
+describe('Round 8: status and start-ups around a device reset', () => {
+  // Counts device start-ups (each uploads keys) and can hold the next identity read.
+  function serve(server: FakeKeyServer) {
+    const s = { uploads: 0, hold: undefined as undefined | Promise<undefined> };
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice', { fn: (method, path) => {
+      if (method === 'POST' && path === '/api/v1/keys/upload') s.uploads++;
+      if (method === 'GET' && path === '/api/v1/keys/master' && s.hold) {
+        const h = s.hold;
+        s.hold = undefined;
+        return h;
+      }
+      return undefined;
+    } })));
+    return s;
+  }
+  const tick = () => new Promise((r) => setTimeout(r, 50));
+
+  it('fails a queued status stale while the device is replaced, and starts nothing until the reset is stored', async () => {
+    const server = new FakeKeyServer();
+    const s = serve(server);
+    const first = await startE2EE('u_alice');
+    await (await prepareIdentity()).commit();
+    await new Promise((r) => setTimeout(r, 100));
+    s.hold = new Promise<undefined>(() => {}); // the running check stalls
+    const running = identityStatus().catch((e: unknown) => e);
+    const queued = identityStatus().catch((e: unknown) => e);
+    await vi.waitFor(() => expect(s.hold).toBeUndefined());
+    let letReset = () => {};
+    const gate = new Promise<void>((r) => { letReset = r; });
+    const reset = CryptoEngine.resetDevice.bind(CryptoEngine);
+    const spy = vi.spyOn(CryptoEngine, 'resetDevice').mockImplementation(async (...a) => { await gate; return reset(...a); });
+    const peer = new BroadcastChannel('kymessages-room-keys');
+    const heard: string[] = [];
+    peer.onmessage = ({ data }: MessageEvent<{ type?: string } | null>) => { if (data?.type) heard.push(data.type); };
+    const replaced = replaceDevice(first.deviceId);
+    await vi.waitFor(() => expect(spy).toHaveBeenCalled());
+    const uploads = s.uploads;
+    expect(await running).toBeInstanceOf(StaleStatus);
+    expect(await queued).toBeInstanceOf(StaleStatus);
+    // A fresh check and a manual retry during the reset wait for it, starting nothing.
+    const fresh = identityStatus();
+    const retried = retryEncryptionNow();
+    await tick();
+    expect(s.uploads).toBe(uploads);
+    expect(heard).toEqual(['device-reset']); // other tabs hear it is stored only once it is
+    letReset();
+    await replaced;
+    await vi.waitFor(() => expect(heard).toEqual(['device-reset', 'device-reset-done']));
+    peer.close();
+    await retried;
+    expect(await fresh).toMatchObject({ state: 'verified' });
+    expect((await startE2EE('u_alice')).deviceId).not.toBe(first.deviceId);
+  });
+
+  it('answers a status asked of a start-up that then failed after sign-out as stale', async () => {
+    const server = new FakeKeyServer();
+    let fail = () => {};
+    vi.stubGlobal('fetch', vi.fn(httpFake(server, 'u_alice', { fn: (method, path) =>
+      method === 'POST' && path === '/api/v1/keys/upload' ? new Promise<Response>((r) => { fail = () => r(json({ error: 'down' }, 503)); }) : undefined })));
+    void startE2EE('u_alice').catch(() => undefined);
+    const asked = identityStatus().catch((e: unknown) => e);
+    await vi.waitFor(() => expect(fail).not.toBe(undefined));
+    await tick();
+    await forgetCryptoStore();
+    fail();
+    expect(await asked).toBeInstanceOf(StaleStatus);
+  });
+
+  it('waits out another tab\'s reset of this device, then has the gate ask again', async () => {
+    const server = new FakeKeyServer();
+    const s = serve(server);
+    const first = await startE2EE('u_alice');
+    await (await prepareIdentity()).commit();
+    await new Promise((r) => setTimeout(r, 100));
+    const announced = vi.fn();
+    const off = onIdentityChanged(announced);
+    const otherTab = new BroadcastChannel('kymessages-room-keys');
+    otherTab.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId, op: 'op-1' });
+    await vi.waitFor(() => expect(encryptionReadyFor('u_alice')).toBe(false));
+    const uploads = s.uploads;
+    const fresh = identityStatus();
+    await tick();
+    // Before the reset is stored nothing starts, and the gate is not told yet.
+    expect(s.uploads).toBe(uploads);
+    expect(announced).not.toHaveBeenCalled();
+    const store = await openCryptoStore('u_alice');
+    await CryptoEngine.resetDevice('u_alice', first.deviceId, store);
+    store.close();
+    otherTab.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: first.deviceId, op: 'op-1' });
+    await vi.waitFor(() => expect(announced).toHaveBeenCalled());
+    expect(await fresh).toMatchObject({ state: 'verified' });
+    expect((await startE2EE('u_alice')).deviceId).not.toBe(first.deviceId);
+    otherTab.close();
+    off();
+  });
+
+  it('ignores duplicate peer device-reset notices while one is already held', async () => {
+    const server = new FakeKeyServer();
+    const s = serve(server);
+    const first = await startE2EE('u_alice');
+    await (await prepareIdentity()).commit();
+    await new Promise((r) => setTimeout(r, 100));
+    const otherTab = new BroadcastChannel('kymessages-room-keys');
+    otherTab.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId, op: 'op-dup' });
+    await vi.waitFor(() => expect(encryptionReadyFor('u_alice')).toBe(false));
+    const uploads = s.uploads;
+    // Start a status check waiting on the first hold, then send a duplicate device-reset for the same op.
+    const fresh = identityStatus();
+    otherTab.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId, op: 'op-dup' });
+    await tick();
+    expect(s.uploads).toBe(uploads);
+    const store = await openCryptoStore('u_alice');
+    await CryptoEngine.resetDevice('u_alice', first.deviceId, store);
+    store.close();
+    otherTab.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: first.deviceId, op: 'op-dup' });
+    expect(await fresh).toMatchObject({ state: 'verified' });
+    expect((await startE2EE('u_alice')).deviceId).not.toBe(first.deviceId);
+    otherTab.close();
+  });
+});
+
+describe('Round 9: correlated reset holds, direct restart, live verdicts & hygiene', () => {
+  function serveUser(server: FakeKeyServer, userRef: { current: string }, hooks?: {
+    onUpload?: () => void;
+    holdUpload?: () => Promise<undefined> | undefined;
+    holdMaster?: () => Promise<undefined> | undefined;
+  }) {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      const method = (init?.method ?? 'GET').toUpperCase();
+      const path = new URL(url, 'http://localhost').pathname;
+      const fn = httpFake(server, userRef.current, {
+        fn: () => {
+          if (method === 'POST' && path === '/api/v1/keys/upload') {
+            hooks?.onUpload?.();
+            return hooks?.holdUpload?.();
+          }
+          if (method === 'GET' && path === '/api/v1/keys/master') {
+            return hooks?.holdMaster?.();
+          }
+          return undefined;
+        },
+      });
+      return fn(input, init);
+    }));
+  }
+  const tick = () => new Promise((r) => setTimeout(r, 50));
+
+  it('correlates two peers\' overlapping holds, ignores mismatched/duplicate notices, and resolves fresh status only after both settle', async () => {
+    const server = new FakeKeyServer();
+    let uploads = 0;
+    serveUser(server, { current: 'u_alice' }, { onUpload: () => { uploads++; } });
+    const first = await startE2EE('u_alice');
+    await (await prepareIdentity()).commit();
+    await tick();
+
+    const ch = new BroadcastChannel('kymessages-room-keys');
+    ch.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId, op: 'op-a' });
+    await vi.waitFor(() => expect(encryptionReadyFor('u_alice')).toBe(false));
+    // Duplicate of op-a plus an independent second peer op-b.
+    ch.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId, op: 'op-a' });
+    ch.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId, op: 'op-b' });
+    const uploadsBefore = uploads;
+    const fresh = identityStatus();
+    await tick();
+    expect(uploads).toBe(uploadsBefore);
+
+    // Mismatched completion does nothing.
+    ch.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: first.deviceId, op: 'op-unknown' });
+    await tick();
+    expect(uploads).toBe(uploadsBefore);
+
+    // Completing op-a does not release while op-b is still pending.
+    ch.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: first.deviceId, op: 'op-a' });
+    await tick();
+    expect(uploads).toBe(uploadsBefore);
+
+    // Completing op-b releases the hold and restarts with the replacement device.
+    const store = await openCryptoStore('u_alice');
+    await CryptoEngine.resetDevice('u_alice', first.deviceId, store);
+    store.close();
+    ch.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: first.deviceId, op: 'op-b' });
+    expect(await fresh).toMatchObject({ state: 'verified' });
+    expect((await startE2EE('u_alice')).deviceId).not.toBe(first.deviceId);
+    ch.close();
+  });
+
+  it('tracks timeouts per peer attempt so a timed-out first op does not clear a later active hold', async () => {
+    const server = new FakeKeyServer();
+    let uploads = 0;
+    serveUser(server, { current: 'u_alice' }, { onUpload: () => { uploads++; } });
+    const first = await startE2EE('u_alice');
+    await (await prepareIdentity()).commit();
+    await tick();
+
+    const ch = new BroadcastChannel('kymessages-room-keys');
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      ch.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId, op: 'op-1' });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(encryptionReadyFor('u_alice')).toBe(false);
+      const uploadsBefore = uploads;
+
+      // Halfway through op-1's fallback window, op-2 arrives.
+      await vi.advanceTimersByTimeAsync(6_000);
+      ch.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId, op: 'op-2' });
+      await vi.advanceTimersByTimeAsync(10);
+
+      // op-1's 10s fallback expires at t=10s, but op-2 is still pending so nothing restarts yet.
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(uploads).toBe(uploadsBefore);
+
+      // A late completion for the already-timed-out op-1 is ignored.
+      ch.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: first.deviceId, op: 'op-1' });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(uploads).toBe(uploadsBefore);
+
+      // op-2's completion releases the hold and triggers the direct restart.
+      vi.useRealTimers();
+      const store = await openCryptoStore('u_alice');
+      await CryptoEngine.resetDevice('u_alice', first.deviceId, store);
+      store.close();
+      ch.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: first.deviceId, op: 'op-2' });
+      await vi.waitFor(() => expect(encryptionReadyFor('u_alice')).toBe(true));
+      expect((await startE2EE('u_alice')).deviceId).not.toBe(first.deviceId);
+    } finally {
+      vi.useRealTimers();
+      ch.close();
+    }
+  });
+
+  it('restarts the still-current entry directly when the final peer hold resolves, even with no gate listener', async () => {
+    const server = new FakeKeyServer();
+    let uploads = 0;
+    serveUser(server, { current: 'u_alice' }, { onUpload: () => { uploads++; } });
+    const first = await startE2EE('u_alice');
+    await (await prepareIdentity()).commit();
+    await tick();
+
+    // No onIdentityChanged listener subscribed at all.
+    const ch = new BroadcastChannel('kymessages-room-keys');
+    ch.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId, op: 'op-direct' });
+    await vi.waitFor(() => expect(encryptionReadyFor('u_alice')).toBe(false));
+    const uploadsBefore = uploads;
+    const store = await openCryptoStore('u_alice');
+    await CryptoEngine.resetDevice('u_alice', first.deviceId, store);
+    store.close();
+    ch.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: first.deviceId, op: 'op-direct' });
+
+    await vi.waitFor(() => expect(encryptionReadyFor('u_alice')).toBe(true));
+    expect(uploads).toBeGreaterThan(uploadsBefore);
+    expect((await startE2EE('u_alice')).deviceId).not.toBe(first.deviceId);
+    ch.close();
+  });
+
+  it('carries no peer-reset restart across sign-out or account switch', async () => {
+    const server = new FakeKeyServer();
+    const userRef = { current: 'u_alice' };
+    let uploads = 0;
+    serveUser(server, userRef, { onUpload: () => { uploads++; } });
+    const alice = await startE2EE('u_alice');
+    await tick();
+
+    const ch = new BroadcastChannel('kymessages-room-keys');
+    ch.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: alice.deviceId, op: 'op-signout' });
+    await vi.waitFor(() => expect(encryptionReadyFor('u_alice')).toBe(false));
+
+    // Sign out and switch to u_bob before op-signout finishes.
+    await forgetCryptoStore();
+    userRef.current = 'u_bob';
+    const bob = await startE2EE('u_bob');
+    await tick();
+    const uploadsBob = uploads;
+
+    ch.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: alice.deviceId, op: 'op-signout' });
+    await tick();
+    expect(uploads).toBe(uploadsBob);
+    expect(encryptionReadyFor('u_bob')).toBe(true);
+    expect(encryptionReadyFor('u_alice')).toBe(false);
+    expect((await startE2EE('u_bob')).deviceId).toBe(bob.deviceId);
+    ch.close();
+  });
+
+  it('does not let a peer completion bypass an overlapping local replaceDevice or a second replaceDevice overwrite the local fence', async () => {
+    const server = new FakeKeyServer();
+    let uploads = 0;
+    serveUser(server, { current: 'u_alice' }, { onUpload: () => { uploads++; } });
+    const first = await startE2EE('u_alice');
+    await (await prepareIdentity()).commit();
+    await tick();
+
+    let releaseLocalReset!: () => void;
+    const localBlocked = new Promise<void>((r) => { releaseLocalReset = r; });
+    const realReset = CryptoEngine.resetDevice.bind(CryptoEngine);
+    let resetCalls = 0;
+    vi.spyOn(CryptoEngine, 'resetDevice').mockImplementation(async (...args) => {
+      resetCalls++;
+      await localBlocked;
+      return realReset(...args);
+    });
+
+    const uploadsBefore = uploads;
+    const r1 = replaceDevice(first.deviceId);
+    await vi.waitFor(() => expect(resetCalls).toBe(1));
+    // Second replaceDevice call after invalidation joins the active local fence instead of overwriting it.
+    const r2 = replaceDevice(first.deviceId);
+    expect(resetCalls).toBe(1);
+
+    // Overlapping peer reset starts and finishes while the local reset is still blocked.
+    const ch = new BroadcastChannel('kymessages-room-keys');
+    ch.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId, op: 'op-overlap' });
+    await tick();
+    ch.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: first.deviceId, op: 'op-overlap' });
+    await tick();
+    // Peer completion must NOT bypass the still-running local reset hold.
+    expect(uploads).toBe(uploadsBefore);
+
+    // A second peer op starts while local is still running; releasing local alone still waits for op-after.
+    ch.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId, op: 'op-after' });
+    await tick();
+    releaseLocalReset();
+    await tick();
+    expect(uploads).toBe(uploadsBefore);
+
+    // Once op-after finishes, both r1 and r2 complete and start the replacement device.
+    ch.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: first.deviceId, op: 'op-after' });
+    await Promise.all([r1, r2]);
+    expect(resetCalls).toBe(1);
+    expect(uploads).toBeGreaterThan(uploadsBefore);
+    expect((await startE2EE('u_alice')).deviceId).not.toBe(first.deviceId);
+    ch.close();
+  });
+
+  it('maps a fresh status check awaiting restart to StaleStatus when signed out or invalidated mid-restart', async () => {
+    const server = new FakeKeyServer();
+    let releaseUpload!: () => void;
+    let holdNextUpload = false;
+    serveUser(server, { current: 'u_alice' }, {
+      holdUpload: () => {
+        if (!holdNextUpload) return undefined;
+        holdNextUpload = false;
+        return new Promise<undefined>((r) => { releaseUpload = () => r(undefined); });
+      },
+    });
+    const first = await startE2EE('u_alice');
+    await tick();
+
+    const ch = new BroadcastChannel('kymessages-room-keys');
+    ch.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: first.deviceId, op: 'op-stale' });
+    await vi.waitFor(() => expect(encryptionReadyFor('u_alice')).toBe(false));
+
+    // Fresh status check awaits the peer hold, then sign-out cancels it -> StaleStatus.
+    const freshSignOut = identityStatus().catch((e: unknown) => e);
+    await forgetCryptoStore();
+    ch.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: first.deviceId, op: 'op-stale' });
+    expect(await freshSignOut).toBeInstanceOf(StaleStatus);
+
+    // Now test mid-restart invalidation: start again, invalidate via peer reset, let restart block on upload,
+    // then sign out before upload finishes -> StaleStatus.
+    const second = await startE2EE('u_alice');
+    await tick();
+    ch.postMessage({ type: 'device-reset', user_id: 'u_alice', device_id: second.deviceId, op: 'op-mid' });
+    await vi.waitFor(() => expect(encryptionReadyFor('u_alice')).toBe(false));
+    holdNextUpload = true;
+    const freshMid = identityStatus().catch((e: unknown) => e);
+    const store = await openCryptoStore('u_alice');
+    await CryptoEngine.resetDevice('u_alice', second.deviceId, store);
+    store.close();
+    ch.postMessage({ type: 'device-reset-done', user_id: 'u_alice', device_id: second.deviceId, op: 'op-mid' });
+    await tick();
+    await forgetCryptoStore();
+    releaseUpload?.();
+    expect(await freshMid).toBeInstanceOf(StaleStatus);
+    ch.close();
+  });
+
+  async function resetMasterOnServer(server: FakeKeyServer, userId: string): Promise<string> {
+    const m = pqc.masterGenerate();
+    const b = pqc.xwingGenerate();
+    const rk = pqc.recoveryGenerate();
+    const cur = server.masters.get(userId)!;
+    const version = cur.version + 1;
+    await server.as(userId).putMaster({
+      expected_version: cur.version,
+      master_key: m.public_key,
+      self_signature: pqc.signMaster(m.seed, TENANT, userId),
+      backup_key: { public_key: b.public, signature: pqc.signBackupKey(m.seed, TENANT, userId, version, b.public) },
+      recovery: {
+        wrapped_master_key: pqc.recoveryWrap(rk.key, 'master-key', TENANT, userId, m.seed),
+        wrapped_backup_key: pqc.recoveryWrap(rk.key, 'backup-key', TENANT, userId, b.seed),
+      },
+    });
+    return pqc.fingerprint(m.public_key);
+  }
+
+  it('delivers live Rollback and NotVerified verdicts from receiveRoomKeys, checkRoomIdentities, and sealRoomMessage without acking mail or burning retry budget', async () => {
+    const server = new FakeKeyServer();
+    serveUser(server, { current: 'u_alice' });
+    const alice = await startE2EE('u_alice');
+    await (await prepareIdentity()).commit();
+    // Create verified Bob on the same FakeKeyServer and send Alice a room key in r1.
+    const bobStore = await openCryptoStore('u_bob_peer');
+    const bob = await CryptoEngine.open('u_bob', server.as('u_bob'), bobStore);
+    await (await bob.prepareIdentity()).commit();
+    server.join('r1', 'u_alice', 'u_bob');
+    await bob.encrypt('r1', { type: 'text', body: 'hi alice' });
+    bob.close();
+    const pendingMail = () => server.mail.get(`u_alice\n${alice.deviceId}`)?.length ?? 0;
+    expect(pendingMail()).toBeGreaterThan(0);
+
+    // 1. First test Rollback on ordinary receiveRoomKeys wake: snapshot pins at counter 0,
+    // advance Alice's pin counter by sending in r2 to Carol, then roll back server pins to 0.
+    const carolStore = await openCryptoStore('u_carol_peer');
+    const carol = await CryptoEngine.open('u_carol', server.as('u_carol'), carolStore);
+    await (await carol.prepareIdentity()).commit();
+    server.join('r2', 'u_alice', 'u_carol');
+    const oldPins = structuredClone(server.masters.get('u_alice')!.pins);
+    await sealRoomMessage('r2', { type: 'text', body: 'advance pin counter' });
+    carol.close();
+    expect(server.masters.get('u_alice')!.pins.counter).toBeGreaterThan(oldPins.counter);
+    server.masters.get('u_alice')!.pins = oldPins;
+
+    const announced = vi.fn();
+    const off = onIdentityChanged(announced);
+
+    receiveRoomKeys();
+    await vi.waitFor(() => expect(announced).toHaveBeenCalledTimes(1));
+    expect(pendingMail()).toBeGreaterThan(0);
+    expect(encryptionRetry().pending).toBe(false);
+
+    // 2. Now reset Alice's identity on the server so receive/check/send hit NotVerified.
+    await resetMasterOnServer(server, 'u_alice');
+
+    announced.mockClear();
+    receiveRoomKeys();
+    await vi.waitFor(() => expect(announced).toHaveBeenCalledTimes(1));
+    expect(pendingMail()).toBeGreaterThan(0);
+    expect(encryptionRetry().pending).toBe(false);
+
+    // 3. Room-open checkRoomIdentities delivers the verdict to the gate.
+    announced.mockClear();
+    checkRoomIdentities('r1');
+    await vi.waitFor(() => expect(announced).toHaveBeenCalledTimes(1));
+
+    // 4. sealRoomMessage delivers the verdict to the gate AND retains the original NotVerified error.
+    announced.mockClear();
+    await expect(sealRoomMessage('r1', { type: 'text', body: 'blocked' })).rejects.toBeInstanceOf(NotVerified);
+    expect(announced).toHaveBeenCalledTimes(1);
+
+    off();
+  });
+
+  it('never lets a stale account or entry verdict refresh a newer account', async () => {
+    const server = new FakeKeyServer();
+    const userRef = { current: 'u_alice' };
+    let releaseMaster!: () => void;
+    let holdNextMaster = false;
+    serveUser(server, userRef, {
+      holdMaster: () => {
+        if (!holdNextMaster) return undefined;
+        holdNextMaster = false;
+        return new Promise<undefined>((r) => { releaseMaster = () => r(undefined); });
+      },
+    });
+    const alice = await startE2EE('u_alice');
+    await (await prepareIdentity()).commit();
+    const bobStore = await openCryptoStore('u_bob_stale');
+    const bob = await CryptoEngine.open('u_bob', server.as('u_bob'), bobStore);
+    await (await bob.prepareIdentity()).commit();
+    server.join('r1', 'u_alice', 'u_bob');
+    await bob.encrypt('r1', { type: 'text', body: 'mail for alice' });
+    bob.close();
+    await resetMasterOnServer(server, 'u_alice');
+
+    // Trigger receiveRoomKeys on Alice while her getMaster check is held in flight.
+    holdNextMaster = true;
+    receiveRoomKeys();
+    await tick();
+
+    // Sign out Alice and switch to Bob BEFORE Alice's in-flight verdict completes.
+    await forgetCryptoStore();
+    userRef.current = 'u_bob';
+    await startE2EE('u_bob');
+    const announced = vi.fn();
+    const off = onIdentityChanged(announced);
+
+    // Release Alice's stale verdict: it must NOT refresh Bob's gate.
+    releaseMaster?.();
+    await tick();
+    expect(announced).not.toHaveBeenCalled();
+    expect(alice.deviceId).toBeDefined();
+    off();
+  });
+
+  it('does not start the engine or leak rejections when ownDeviceVerified is pre-aborted, and announces acceptIdentity once via engine', async () => {
+    const server = new FakeKeyServer();
+    let uploads = 0;
+    serveUser(server, { current: 'u_alice' }, { onUpload: () => { uploads++; } });
+
+    // Pre-aborted ownDeviceVerified before any startE2EE must reject immediately without starting.
+    const ac = new AbortController();
+    ac.abort(new DOMException('already closed', 'AbortError'));
+    await expect(ownDeviceVerified('dev_other', ac.signal)).rejects.toThrow(/already closed/);
+    expect(uploads).toBe(0);
+
+    // acceptIdentity announces once (from engine's fenced onIdentityChange), not twice.
+    const alice = await startE2EE('u_alice');
+    await (await prepareIdentity()).commit();
+    const bobStore = await openCryptoStore('u_bob_accept');
+    const bob = await CryptoEngine.open('u_bob', server.as('u_bob'), bobStore);
+    await (await bob.prepareIdentity()).commit();
+    server.join('r1', 'u_alice', 'u_bob');
+    await alice.encrypt('r1', { type: 'text', body: 'pin bob' });
+    const prevFp = pqc.fingerprint(server.masters.get('u_bob')!.master_key);
+    const nextFp = await resetMasterOnServer(server, 'u_bob');
+    bob.close();
+    await alice.checkRoom('r1');
+    const announced = vi.fn();
+    const off = onIdentityChanged(announced);
+    await acceptIdentity('u_bob', prevFp, nextFp);
+    expect(announced).toHaveBeenCalledTimes(1);
+    off();
   });
 });

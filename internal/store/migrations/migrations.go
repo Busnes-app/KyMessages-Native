@@ -301,6 +301,8 @@ ALTER TABLE mfa_challenges ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';`,
 	{Version: 65, Name: "guest_invite_binding", SQLite: guestInviteBindingSchema, Postgres: guestInviteBindingSchema},
 	{Version: 66, Name: "retained_attachment_versions", SQLite: retainedAttachmentVersionsSchema, Postgres: retainedAttachmentVersionsSchema},
 	{Version: 67, Name: "cells", SQLite: cellsSchema, Postgres: cellsSchema},
+	// E2EE E3: master keys, device cross-signatures, the key backup and QR pairings.
+	{Version: 68, Name: "e2ee_identity", SQLite: e2eeIdentitySQLite, Postgres: e2eeIdentityPostgres},
 }
 
 const tenantDirectorySchema = `

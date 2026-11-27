@@ -46,14 +46,14 @@ func (s *e2eeStore) UpsertDevice(ctx context.Context, d *E2EEDevice) error {
 func scanDevice(sc interface{ Scan(...any) error }) (*E2EEDevice, error) {
 	var d E2EEDevice
 	var created int64
-	if err := sc.Scan(&d.UserID, &d.DeviceID, &d.TenantID, &d.Curve25519, &d.Ed25519, &d.Signature, &created); err != nil {
+	if err := sc.Scan(&d.UserID, &d.DeviceID, &d.TenantID, &d.Curve25519, &d.Ed25519, &d.Signature, &d.MasterSignature, &d.MasterVersion, &created); err != nil {
 		return nil, err
 	}
 	d.CreatedAt = time.Unix(created, 0).UTC()
 	return &d, nil
 }
 
-const deviceColumns = `user_id, device_id, tenant_id, curve25519, ed25519, signature, created_at`
+const deviceColumns = `user_id, device_id, tenant_id, curve25519, ed25519, signature, master_signature, master_version, created_at`
 
 func (s *e2eeStore) GetDevice(ctx context.Context, userID, deviceID string) (*E2EEDevice, error) {
 	d, err := scanDevice(s.store.db.QueryRowContext(ctx, s.store.rebind(`SELECT `+deviceColumns+` FROM e2ee_devices WHERE user_id = ? AND device_id = ?`), userID, deviceID))

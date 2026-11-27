@@ -252,7 +252,7 @@ func TestE2EEQueryClaimAndMailStayInTheOrg(t *testing.T) {
 		t.Fatalf("bob removing his device = %d", c)
 	}
 	rec = doBearerJSON(t, srv, http.MethodPost, "/api/v1/keys/query", aliceTok, map[string]any{"user_ids": []string{bob.ID}}, nil)
-	if rec.Body.String() != `{"devices":{"`+bob.ID+`":[]}}`+"\n" {
+	if rec.Body.String() != `{"devices":{"`+bob.ID+`":[]},"master_keys":{},"tenant_id":"00000000-0000-4000-8000-00000000000a"}`+"\n" {
 		t.Fatalf("query after removal = %s", rec.Body.String())
 	}
 }

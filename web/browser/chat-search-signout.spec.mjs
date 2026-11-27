@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { ensureEncryption } from './identity.mjs';
 
 // Sign-out deletes the on-device search index in every tab, even a tab whose WebSocket never
 // hears the revocation: on a shared browser, nothing readable may stay behind. This test signs
@@ -15,8 +16,13 @@ async function openRoom(page, name) {
 
 async function run({ page, context }, testInfo, { broadcast }) {
   await page.goto('/');
-  const login = await page.request.post('/api/auth/login', { data: { username: 'admin', password: 'BrowserUpdated456!' } });
-  expect(login.ok()).toBe(true);
+  // The shared server allows 20 sign-ins a minute per client: wait out a 429, as the other specs do.
+  let login = await page.request.post('/api/auth/login', { data: { username: 'admin', password: 'BrowserUpdated456!' } });
+  for (let i = 0; i < 3 && login.status() === 429; i++) {
+    await page.waitForTimeout(1000 * (Number(login.headers()['retry-after']) || 20));
+    login = await page.request.post('/api/auth/login', { data: { username: 'admin', password: 'BrowserUpdated456!' } });
+  }
+  expect(login.status(), await login.text()).toBe(200);
   const csrf = (await context.cookies()).find((c) => c.name === 'ky_csrf').value;
   const headers = { 'X-CSRF-Token': csrf };
   const name = `signout-${broadcast ? 'b' : 'v'}-${testInfo.project.name}`;
@@ -27,6 +33,7 @@ async function run({ page, context }, testInfo, { broadcast }) {
   // Rooms are end-to-end encrypted: tab A writes the message through its composer.
   await page.goto('/');
   await openRoom(page, name);
+  await ensureEncryption(page);
   const composer = page.getByLabel('Message input');
   await expect(composer).toHaveAttribute('placeholder', `Message #${room.name}`);
   await composer.fill(`${word} browser note`);

@@ -20,6 +20,14 @@ export function plaintextLabel(msg: ChatMessage): string | null {
   return 'Sent before encryption';
 }
 
+/** Why a decrypted message's sender is not vouched for, or nothing when it is. */
+export function trustLabel(msg: ChatMessage): string | null {
+  if (msg.e2ee?.kind !== 'decrypted' || !msg.e2ee.trust) return null;
+  return msg.e2ee.trust === 'backup'
+    ? 'Restored from your key backup: the sender’s device could not be checked'
+    : 'Sent from a device its owner has not verified';
+}
+
 function messagePreviewText(msg: ChatMessage): string {
   if (msg.e2ee?.kind === 'waiting') return WAITING_TEXT;
   if (msg.e2ee?.kind === 'failed') return 'Message could not be decrypted';
@@ -141,6 +149,7 @@ export const MessageRow: React.FC<MessageRowProps> = ({
   const sealedShut = message.e2ee !== undefined && message.e2ee.kind !== 'decrypted';
   const canEdit = isSynced && !isDeleted && isOwn && !sealedShut;
   const plainNote = plaintextLabel(message);
+  const trustNote = trustLabel(message);
   const canDelete = isSynced && !isDeleted && (isOwn || canModerate);
   const authorLabel = message.sender_name || 'Unknown';
 
@@ -307,6 +316,7 @@ export const MessageRow: React.FC<MessageRowProps> = ({
               )
             )}
             {plainNote && <p className="chat-msg-e2ee-note">{plainNote}</p>}
+            {trustNote && <p className="chat-msg-e2ee-note is-unverified" data-testid="trust-note">{trustNote}</p>}
 
             {message.attachments.length > 0 && (
               <p className="chat-msg-e2ee-note">{message.attachments.length === 1 ? 'File not encrypted' : 'Files not encrypted'}</p>

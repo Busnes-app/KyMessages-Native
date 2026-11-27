@@ -1,0 +1,487 @@
+// The E3 identity screens (docs/superpowers/specs/2026-11-22-e2ee-design.md §3): the first
+// device's recovery key, verifying a new device (another device's code or the recovery key),
+// showing a code to verify another device, and the blocking warning when a member's identity
+// changed. All crypto runs in chat/e2ee.ts; nothing here sees a key.
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import QRCode from 'qrcode';
+import { ShieldAlert, ShieldCheck } from 'lucide-react';
+import {
+  acceptIdentity, encryptionRetry, identityChanges, identityStatus, joinVerification, offerVerification, onBackupStateChanged, onEncryptionPending, onIdentityChanged,
+  ownDeviceVerified, prepareIdentity, restoreIdentity, retryEncryptionNow, StaleStatus,
+} from '../../chat/e2ee';
+
+const POLL_MS = 1500;
+/** Consecutive failed polls (the network, the server) a screen rides out before giving up. */
+const POLL_RETRIES = 5;
+import { formatFingerprint, type IdentityChange, type IdentityStatus, type PairingJoin, type PairingOffer } from '../../crypto/identity';
+import { sleep } from '../../crypto/records';
+import { ChatDialog } from './ChatModals';
+
+const errText = (e: unknown, fallback: string) => (e instanceof Error && e.message ? e.message : fallback);
+
+function Alert({ text }: { text: string }) {
+  return text ? <div className="dr-alert dr-alert-error" role="alert" style={{ padding: '0.5rem 0.65rem', fontSize: '0.82rem' }}>{text}</div> : null;
+}
+
+/** A copy button that says so when the browser refuses. */
+function CopyButton({ text, label = 'Copy' }: { text: string; label?: string }) {
+  const [state, setState] = useState<'idle' | 'copied' | 'failed'>('idle');
+  const copy = async () => {
+    try {
+      if (!navigator.clipboard) throw new Error('no clipboard');
+      await navigator.clipboard.writeText(text);
+      setState('copied');
+    } catch {
+      setState('failed');
+    }
+  };
+  return (
+    <>
+      <button type="button" className="btn-secondary" onClick={() => void copy()}>{state === 'copied' ? 'Copied' : label}</button>
+      {state === 'failed' && <span role="alert">Copying failed. Select the text and copy it, or write it down.</span>}
+    </>
+  );
+}
+
+/** The first device: shows the recovery key once and uploads the identity only after "saved it". */
+export function SetUpEncryption({ reset = false, onDone, onClose }: { reset?: boolean; onDone: () => void; onClose: () => void }) {
+  const [prepared, setPrepared] = useState<{ recoveryKey: string; commit(): Promise<void> }>();
+  const [saved, setSaved] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  useEffect(() => {
+    let live = true;
+    prepareIdentity(reset).then((p) => live && setPrepared(p), (e: unknown) => live && setErr(errText(e, 'Encryption could not start.')));
+    // The key leaves memory with the screen.
+    return () => { live = false; setPrepared(undefined); };
+  }, [reset]);
+  const submit = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    if (!prepared || !saved) return;
+    setBusy(true);
+    setErr('');
+    try {
+      // A step-up refusal opens "Confirm it's you" and retries this same identity.
+      await prepared.commit();
+      onDone();
+    } catch (x) {
+      setErr(errText(x, 'The encryption identity could not be saved.'));
+      setBusy(false);
+    }
+  };
+  return (
+    <ChatDialog title={reset ? 'Reset your encryption identity' : 'Save your recovery key'} onClose={onClose} busy={busy} onSubmit={submit}>
+      <div className="chat-modal-body chat-scroll">
+        <Alert text={err} />
+        <p>
+          {reset
+            ? 'A new identity replaces the old one. Everyone you share rooms with will see that your identity changed, and history you cannot restore stays unreadable.'
+            : 'Your messages are end-to-end encrypted. This recovery key is the only way to read them on a new device if you have no other signed-in device. KyMessages cannot recover it for you.'}
+        </p>
+        {prepared ? (
+          <>
+            <code className="e2ee-recovery-key" aria-label="Recovery key" data-testid="recovery-key">{prepared.recoveryKey}</code>
+            <CopyButton text={prepared.recoveryKey} />
+          </>
+        ) : !err && <p>Generating keys…</p>}
+        <label className="chat-checkbox-row">
+          <input type="checkbox" checked={saved} onChange={(e) => setSaved(e.target.checked)} disabled={!prepared || busy} />
+          I saved my recovery key somewhere safe
+        </label>
+      </div>
+      <div className="chat-modal-foot">
+        <button type="button" className="btn-secondary" onClick={onClose} disabled={busy}>Not now</button>
+        <button type="submit" disabled={!prepared || !saved || busy}>{busy ? 'Saving…' : 'Continue'}</button>
+      </div>
+    </ChatDialog>
+  );
+}
+
+/**
+ * A new device: verify with another device's code, or with the recovery key. With a code, the
+ * user confirms the six digits match the other screen before this device takes any keys.
+ */
+export function VerifyThisDevice({ fingerprint, onDone, onClose, onReset }: { fingerprint: string; onDone: (restored: number) => void; onClose: () => void; onReset: () => void }) {
+  const [mode, setMode] = useState<'device' | 'recovery'>('device');
+  const [text, setText] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [join, setJoin] = useState<PairingJoin>();
+  const [waiting, setWaiting] = useState(false);
+  const abort = useRef<AbortController | undefined>(undefined);
+  useEffect(() => () => abort.current?.abort(), []);
+  const switchMode = (m: 'device' | 'recovery') => {
+    setMode(m);
+    setText(''); // a pasted recovery key never lingers in the other field
+    setErr('');
+  };
+
+  const submit = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    setErr('');
+    setBusy(true);
+    try {
+      if (mode === 'recovery') {
+        const n = await restoreIdentity(text);
+        setText('');
+        onDone(n);
+        return;
+      }
+      setJoin(await joinVerification(text));
+      setText('');
+    } catch (x) {
+      setErr(errText(x, 'This device could not be verified.'));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const confirm = async () => {
+    if (!join) return;
+    setWaiting(true);
+    abort.current = new AbortController();
+    try {
+      onDone(await join.finish(abort.current.signal));
+    } catch (x) {
+      if (abort.current?.signal.aborted) return;
+      setErr(errText(x, 'This device could not be verified.'));
+      setJoin(undefined);
+      setWaiting(false);
+    }
+  };
+  const close = () => {
+    abort.current?.abort();
+    void join?.cancel().catch(() => undefined);
+    setText('');
+    onClose();
+  };
+  return (
+    <ChatDialog title="Verify this device" onClose={close} busy={busy || waiting} onSubmit={join ? undefined : submit}>
+      <div className="chat-modal-body chat-scroll">
+        <Alert text={err} />
+        <p>Until this device is verified, it receives nothing sent to you and shares its own messages with no one. Your identity: <code>{formatFingerprint(fingerprint)}</code></p>
+        {join ? (
+          <div role="status">
+            <p>Your other device shows a code. Does it match this one exactly?</p>
+            <p className="e2ee-code" data-testid="comparison-code">{join.code}</p>
+            {waiting && <p>Waiting for your other device to approve…</p>}
+          </div>
+        ) : (
+          <>
+            <div className="chat-field" role="radiogroup" aria-label="How to verify">
+              <label className="chat-checkbox-row"><input type="radio" checked={mode === 'device'} onChange={() => switchMode('device')} /> Use a code from my other device</label>
+              <label className="chat-checkbox-row"><input type="radio" checked={mode === 'recovery'} onChange={() => switchMode('recovery')} /> Use my recovery key</label>
+            </div>
+            <div className="chat-field">
+              <label htmlFor="e2ee-verify-text">{mode === 'device' ? 'Verification code (the shield button, “Verify a device”, on a signed-in device)' : 'Recovery key'}</label>
+              <textarea id="e2ee-verify-text" value={text} onChange={(e) => setText(e.target.value)} rows={3} autoFocus spellCheck={false} autoComplete="off" />
+            </div>
+            <button type="button" className="btn-link" onClick={onReset} disabled={busy}>I lost my recovery key and every other device</button>
+          </>
+        )}
+      </div>
+      <div className="chat-modal-foot">
+        <button type="button" className="btn-secondary" onClick={close}>{join ? 'They do not match' : 'Not now'}</button>
+        {join
+          ? <button type="button" onClick={() => void confirm()} disabled={waiting}>{waiting ? 'Waiting…' : 'The codes match'}</button>
+          : <button type="submit" disabled={busy || !text.trim()}>{busy ? 'Checking…' : 'Verify'}</button>}
+      </div>
+    </ChatDialog>
+  );
+}
+
+/** On a verified device: the code to verify a new one, then its comparison code to approve. */
+export function VerifyAnotherDevice({ onClose }: { onClose: () => void }) {
+  const [offer, setOffer] = useState<PairingOffer>();
+  const [qr, setQr] = useState('');
+  const [joined, setJoined] = useState<{ code: string; device: string }>();
+  // sent: the keys went up; done: the new device then verified itself (signed and listed).
+  const [sent, setSent] = useState(false);
+  const [done, setDone] = useState(false);
+  const deadlineRef = useRef(0);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const offerRef = useRef<PairingOffer | undefined>(undefined);
+  // Aborted on close or unmount: in-flight requests are dropped and every wait below ends. Made
+  // per effect run, so a remount (StrictMode runs effects twice) does not start out aborted.
+  const stop = useRef(new AbortController());
+  useEffect(() => {
+    let live = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const controller = new AbortController();
+    stop.current = controller;
+    const signal = controller.signal;
+    void (async () => {
+      try {
+        const o = await offerVerification();
+        if (!live) return void o.cancel().catch(() => undefined);
+        // The server's lifetime, counted on this clock: the two clocks may disagree.
+        const deadline = Date.now() + o.expiresInMs;
+        deadlineRef.current = deadline;
+        offerRef.current = o;
+        setOffer(o);
+        // The copyable code works without the picture.
+        setQr(await QRCode.toDataURL(o.text, { margin: 1, width: 220 }).catch(() => ''));
+        let failures = 0;
+        // The code's lifetime ends a poll in flight too, not only the waits between polls.
+        const expiry = new AbortController();
+        const expire = setTimeout(() => expiry.abort(new DOMException('The code expired', 'TimeoutError')), o.expiresInMs);
+        controller.signal.addEventListener('abort', () => clearTimeout(expire), { once: true });
+        const watch = AbortSignal.any([signal, expiry.signal]);
+        const expired = () => setErr('The code expired. Close this and start again.');
+        const poll = async () => {
+          if (!live) return;
+          if (expiry.signal.aborted || Date.now() >= deadline) return expired();
+          try {
+            const j = await o.poll(watch);
+            failures = 0;
+            if (j) {
+              clearTimeout(expire);
+              return live && setJoined(j);
+            }
+          } catch (e) {
+            if (!live || signal.aborted) return;
+            if (expiry.signal.aborted) return expired();
+            if ((e as { status?: number }).status === 404 || ++failures > POLL_RETRIES) {
+              return live && setErr('The code expired or was used. Close this and start again.');
+            }
+          }
+          timer = setTimeout(() => void poll(), POLL_MS);
+        };
+        void poll();
+      } catch (e) {
+        if (live) setErr(errText(e, 'Verification could not start.'));
+      }
+    })();
+    return () => {
+      live = false;
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, []);
+  // Keys already sent stay with the pairing: the new device may still be fetching them, so
+  // closing then only stops watching.
+  const close = () => {
+    stop.current.abort();
+    if (!sent && !done) void offerRef.current?.cancel().catch(() => undefined);
+    onClose();
+  };
+  const approve = async () => {
+    const signal = stop.current.signal;
+    setBusy(true);
+    try {
+      await offer!.approve(signal);
+      setSent(true);
+    } catch (e) {
+      if (signal.aborted) return;
+      setErr(errText(e, 'The keys could not be sent.'));
+      setBusy(false);
+      return;
+    }
+    setBusy(false);
+    // Verified only once the new device has signed itself on and is listed, not on upload. Each
+    // lookup, and every wait, ends at the deadline or when this screen closes.
+    let failures = 0;
+    const until = Math.max(deadlineRef.current, Date.now()) + 60_000;
+    const watch = AbortSignal.any([signal, AbortSignal.timeout(until - Date.now())]);
+    while (!watch.aborted) {
+      try {
+        if (await ownDeviceVerified(joined!.device, watch)) {
+          if (!signal.aborted) setDone(true);
+          return;
+        }
+        failures = 0;
+      } catch {
+        if (watch.aborted || ++failures > POLL_RETRIES) break;
+      }
+      // One listener per wait, removed when it ends: none pile up on watch.
+      await sleep(POLL_MS, watch).catch(() => undefined);
+    }
+    if (!signal.aborted) setErr('The keys were sent, but the new device has not confirmed. Check it, or start again.');
+  };
+  return (
+    <ChatDialog title="Verify a device" onClose={close} busy={busy}>
+      <div className="chat-modal-body chat-scroll">
+        <Alert text={err} />
+        {done ? (
+          <p role="status"><ShieldCheck size={16} aria-hidden="true" /> The new device is verified.</p>
+        ) : sent ? (
+          <p role="status">Keys sent. Waiting for the new device to confirm… You can close this; the new device still gets them.</p>
+        ) : joined ? (
+          <div role="status">
+            <p>Does the new device show this code?</p>
+            <p className="e2ee-code" data-testid="comparison-code">{joined.code}</p>
+            <p>Approve only if it matches exactly. Approving gives that device your encryption keys.</p>
+          </div>
+        ) : offer ? (
+          <>
+            <p>On the new device, choose “Use a code from my other device” and scan or paste this code. It works once, for a few minutes.</p>
+            {qr && <img src={qr} alt="Verification QR code" width={220} height={220} />}
+            <code className="e2ee-recovery-key" data-testid="verification-code">{offer.text}</code>
+            <CopyButton text={offer.text} label="Copy code" />
+          </>
+        ) : !err && <p>Starting…</p>}
+      </div>
+      <div className="chat-modal-foot">
+        <button type="button" className="btn-secondary" onClick={close} disabled={busy}>{done || sent ? 'Close' : joined ? 'It does not match' : 'Cancel'}</button>
+        {joined && !sent && <button type="button" onClick={() => void approve()} disabled={busy}>{busy ? 'Sending…' : 'The codes match'}</button>}
+      </div>
+    </ChatDialog>
+  );
+}
+
+export type GateState = { state: 'loading' } | { state: 'error'; message: string } | IdentityStatus;
+
+/** This device's identity status, kept current once encryption is ready. */
+export function useIdentityStatus(ready: boolean): [GateState, () => void] {
+  const [gate, setGate] = useState<GateState>({ state: 'loading' });
+  const refresh = useCallback(() => {
+    identityStatus().then(setGate, (e: unknown) => {
+      // Asked of a device since replaced: not this page's answer (the new one announces itself).
+      if (e instanceof StaleStatus) return;
+      setGate({ state: 'error', message: errText(e, 'The encryption identity could not be checked.') });
+    });
+  }, []);
+  useEffect(() => {
+    if (!ready) return;
+    refresh();
+    const offIdentity = onIdentityChanged(refresh);
+    // A change in what the backup refused updates the notice alone: no status check, which
+    // would start the backup and restore work again.
+    const offBackup = onBackupStateChanged((full) => setGate((g) => (g.state === 'verified' && g.backupFull !== full ? { ...g, backupFull: full } : g)));
+    return () => { offIdentity(); offBackup(); };
+  }, [ready, refresh]);
+  return [gate, refresh];
+}
+
+/**
+ * While this account has no identity or this device is unverified, a banner (it never blocks
+ * the page) offers the setup or verification screen. An unverified device receives no room
+ * keys, so the banner stays until it is verified. A failed check says so, with Retry.
+ */
+export function EncryptionIdentityGate({ gate, refresh }: { gate: GateState; refresh: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [reset, setReset] = useState(false);
+  const retry = useEncryptionRetry();
+  // Encryption could not start yet (the module or the server unavailable): say so, with a retry.
+  if (gate.state === 'loading') return retry.pending ? <PendingBanner exhausted={retry.exhausted} /> : null;
+  if (gate.state === 'verified') {
+    const done = () => { setOpen(false); refresh(); };
+    return (
+      <>
+        {gate.problem && (
+          <div className="chat-banner chat-banner-error" role="alert">
+            <ShieldAlert size={16} aria-hidden="true" />
+            <span>
+              {gate.problem === 'fork'
+                ? 'The server showed two different lists of your devices. '
+                : 'The server showed an older list of your devices, or older pinned identities, than this device has seen. '}
+              Nothing is shared or signed over it. Resetting your identity starts a new one: messages on this device stay readable, and everyone you share rooms with will see that your identity changed.
+            </span>
+            <button type="button" className="btn-secondary" onClick={() => setOpen(true)}>Reset identity</button>
+          </div>
+        )}
+        {gate.backupFull && (
+          <div className="chat-banner chat-banner-info" role="status">
+            <ShieldAlert size={16} aria-hidden="true" />
+            <span>Your key backup is full: some messages are readable on this device but not backed up for a new one. They stay queued here.</span>
+          </div>
+        )}
+        {retry.pending && <PendingBanner exhausted={retry.exhausted} />}
+        {open && <SetUpEncryption reset onClose={() => setOpen(false)} onDone={done} />}
+      </>
+    );
+  }
+  if (gate.state === 'error') {
+    return (
+      <div className="chat-banner chat-banner-error" role="alert">
+        <ShieldAlert size={16} aria-hidden="true" />
+        <span>{gate.message}</span>
+        <button type="button" className="btn-secondary" onClick={refresh}>Retry</button>
+      </div>
+    );
+  }
+  const close = () => { setOpen(false); setReset(false); };
+  const done = () => { close(); refresh(); };
+  return (
+    <>
+      <div className="chat-banner chat-banner-info" role="status">
+        <ShieldAlert size={16} aria-hidden="true" />
+        <span>
+          {gate.state === 'none'
+            ? 'Set up encryption to read messages sent to you.'
+            : 'Verify this device to read messages sent to you. Until then nothing you send here can be read.'}
+          {gate.quarantined && ' This browser set aside the keys of an identity the server no longer lists; they are kept, not deleted.'}
+        </span>
+        <button type="button" className="btn-secondary" onClick={() => setOpen(true)}>
+          {gate.state === 'none' ? 'Set up encryption' : 'Verify this device'}
+        </button>
+      </div>
+      {open && (gate.state === 'none' || reset
+        ? <SetUpEncryption reset={reset} onClose={close} onDone={done} />
+        : <VerifyThisDevice fingerprint={gate.fingerprint} onClose={close} onReset={() => setReset(true)} onDone={done} />)}
+    </>
+  );
+}
+
+function useEncryptionRetry(): { pending: boolean; exhausted: boolean } {
+  const [retry, setRetry] = useState(encryptionRetry);
+  useEffect(() => {
+    setRetry(encryptionRetry());
+    return onEncryptionPending(() => setRetry(encryptionRetry()));
+  }, []);
+  return retry;
+}
+
+/** Encryption work (reading keys, the key backup, a restore) waits for a retry. */
+function PendingBanner({ exhausted }: { exhausted: boolean }) {
+  const [busy, setBusy] = useState(false);
+  const retry = () => {
+    setBusy(true);
+    void retryEncryptionNow().finally(() => setBusy(false));
+  };
+  return (
+    <div className={`chat-banner ${exhausted ? 'chat-banner-error' : 'chat-banner-info'}`} role="status" data-testid="encryption-pending">
+      <ShieldAlert size={16} aria-hidden="true" />
+      <span>
+        {exhausted
+          ? 'Some encryption work keeps failing: messages or the key backup are behind, and it is no longer retried by itself.'
+          : 'Some encryption work is waiting: messages or the key backup may be behind. It is retried by itself.'}
+      </span>
+      <button type="button" className="btn-secondary" onClick={retry} disabled={busy}>{busy ? 'Retrying…' : 'Retry now'}</button>
+    </div>
+  );
+}
+
+/** The blocking warning for members of a room whose identity changed since this device pinned it. */
+export function IdentityChangedBanner({ memberIds, nameOf }: { memberIds: string[]; nameOf: (userId: string) => string }) {
+  const [changes, setChanges] = useState<IdentityChange[]>([]);
+  const [err, setErr] = useState('');
+  useEffect(() => {
+    let live = true;
+    const load = () => void identityChanges().then((c) => live && setChanges(c), () => undefined);
+    load();
+    const off = onIdentityChanged(load);
+    return () => { live = false; off(); };
+  }, []);
+  const here = changes.filter((c) => memberIds.includes(c.user_id));
+  if (here.length === 0) return null;
+  return (
+    <>
+      {here.map((c) => (
+        <div key={c.user_id} className="chat-banner chat-banner-error" role="alert">
+          <ShieldAlert size={16} aria-hidden="true" />
+          <span>
+            {nameOf(c.user_id)}’s identity changed. Messages you send here are not shared with their devices until you accept the new identity.
+            {' '}Check the whole fingerprint with them first: <code data-testid="new-fingerprint">{formatFingerprint(c.fingerprint)}</code>
+          </span>
+          <CopyButton text={formatFingerprint(c.fingerprint)} label="Copy fingerprint" />
+          {/* Accepts exactly the fingerprint shown; if it changed meanwhile, nothing is accepted. */}
+          <button type="button" className="btn-secondary" onClick={() => acceptIdentity(c.user_id, c.previous, c.fingerprint).catch((e: unknown) => setErr(errText(e, 'Could not accept the identity.')))}>
+            Accept new identity
+          </button>
+        </div>
+      ))}
+      {err && <div className="chat-banner chat-banner-error" role="alert"><span>{err}</span></div>}
+    </>
+  );
+}

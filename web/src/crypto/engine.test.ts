@@ -2,12 +2,15 @@ import 'fake-indexeddb/auto';
 import { readFileSync } from 'node:fs';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { CryptoEngine, DeviceChanged, deviceSigned, oneTimeKeySigned, parseEnvelope, ROTATE_AFTER_MESSAGES, ROTATE_AFTER_MS, type SealedMessage } from './engine';
+import { StorageUnavailable } from './records';
 import { FakeKeyServer } from './fakeKeyServer';
 import { Account, GroupSession, loadCryptoSync } from './index';
+import { loadPQCFrom } from '../pqc/index';
 import { deleteCryptoStores, openCryptoStore } from './store';
 
-beforeAll(() => {
+beforeAll(async () => {
   loadCryptoSync(readFileSync('src/crypto/pkg/kycrypto_bg.wasm'));
+  await loadPQCFrom(readFileSync('src/pqc/pqc.wasm'));
 });
 
 const opened: CryptoEngine[] = [];
@@ -17,10 +20,28 @@ afterEach(async () => {
   await deleteCryptoStores();
 });
 
-async function device(server: FakeKeyServer, userId: string): Promise<CryptoEngine> {
-  const e = await CryptoEngine.open(userId, server.as(userId), await openCryptoStore(userId));
-  opened.push(e);
+// Each user's recovery key, so a test's later devices of that user verify as a person would.
+const recoveryKeys = new WeakMap<FakeKeyServer, Map<string, string>>();
+
+/** Gives e's user an identity (the first device) or verifies e with it (later devices). */
+async function verify(server: FakeKeyServer, e: CryptoEngine): Promise<CryptoEngine> {
+  const keys = recoveryKeys.get(server) ?? new Map<string, string>();
+  recoveryKeys.set(server, keys);
+  const status = await e.identityStatus();
+  if (status.state === 'none') {
+    const p = await e.prepareIdentity();
+    keys.set(e.userId, p.recoveryKey);
+    await p.commit();
+  } else if (status.state === 'unverified') {
+    await e.restoreIdentity(keys.get(e.userId)!);
+  }
   return e;
+}
+
+async function device(server: FakeKeyServer, userId: string, storeName = userId): Promise<CryptoEngine> {
+  const e = await CryptoEngine.open(userId, server.as(userId), await openCryptoStore(storeName));
+  opened.push(e);
+  return verify(server, e);
 }
 
 let nextId = 1;
@@ -226,6 +247,7 @@ describe('encrypted rooms between two client engines', () => {
     const aliceServer = server.as('u_alice');
     const alice = await CryptoEngine.open('u_alice', aliceServer, await openCryptoStore('u_alice'));
     opened.push(alice);
+    await verify(server, alice);
     const bob = await device(server, 'u_bob');
     const carol = await device(server, 'u_carol');
     server.join('r1', 'u_alice', 'u_bob', 'u_carol');
@@ -319,6 +341,7 @@ describe('encrypted rooms between two client engines', () => {
     const alice = await device(server, 'u_alice');
     const bobServer = server.as('u_bob');
     const bob = await CryptoEngine.open('u_bob', bobServer, await openCryptoStore('u_bob'));
+    await verify(server, bob);
     opened.push(bob);
     server.join('r1', 'u_alice', 'u_bob');
     const message = await send('r1', alice, 'read while upload stalls');
@@ -348,6 +371,7 @@ describe('encrypted rooms between two client engines', () => {
     const alice = await device(server, 'u_alice');
     const bobServer = server.as('u_bob');
     const bob = await CryptoEngine.open('u_bob', bobServer, await openCryptoStore('u_bob'));
+    await verify(server, bob);
     opened.push(bob);
     server.join('r1', 'u_alice', 'u_bob');
     const m1 = await send('r1', alice, 'acked later');
@@ -367,6 +391,7 @@ describe('encrypted rooms between two client engines', () => {
     await send('r1', alice, 'before');
     // Bob signs in on a second browser; no event tells alice.
     const laptop = await CryptoEngine.open('u_bob', server.as('u_bob'), await openCryptoStore('u_bob_laptop'));
+    await verify(server, laptop);
     opened.push(laptop);
     const m = await send('r1', alice, 'reaches the laptop');
     await laptop.receive();
@@ -424,6 +449,7 @@ describe('encrypted rooms between two client engines', () => {
     // A second browser for alice: a separate store, so a separate device.
     const aliceStore = await openCryptoStore('u_alice_laptop');
     const laptop = await CryptoEngine.open('u_alice', server.as('u_alice'), aliceStore);
+    await verify(server, laptop);
     opened.push(laptop);
     expect(laptop.deviceId).not.toBe(alice.deviceId);
     const m1 = await send('r1', alice, 'on every device');
@@ -529,14 +555,19 @@ describe('encrypted rooms between two client engines', () => {
     const alice = await device(server, 'u_alice');
     const bobServer = server.as('u_bob');
     const bob = await CryptoEngine.open('u_bob', bobServer, await openCryptoStore('u_bob'));
+    await verify(server, bob);
     opened.push(bob);
     server.join('r1', 'u_alice', 'u_bob');
     const m1 = await send('r1', alice, 'later');
     const query = bobServer.query;
+    // While the sender cannot be looked up, the mail stays queued: its key is not stored as
+    // unvouched because the lookup failed.
     bobServer.query = () => Promise.reject(new Error('offline'));
+    await expect(bob.receive()).rejects.toThrow();
+    expect(server.mail.get(`u_bob\n${bob.deviceId}`)).toHaveLength(1);
+    bobServer.query = query;
     await bob.receive();
     expect(await read(bob, m1)).toBe('later');
-    bobServer.query = query;
   });
 
   it('keeps a room key whose write fails in local storage, even after its one-time key is spent', async () => {
@@ -554,10 +585,12 @@ describe('encrypted rooms between two client engines', () => {
       return write(puts, deletes);
     };
     const bob = await CryptoEngine.open('u_bob', server.as('u_bob'), store);
+    await verify(server, bob);
     opened.push(bob);
     server.join('r1', 'u_alice', 'u_bob');
     const m1 = await send('r1', alice, 'kept for later'); // a pre-key message: spends a one-time key
-    expect(await bob.receive()).toEqual([]);
+    // The drain fails (so its retry comes), with the mail left queued.
+    await expect(bob.receive()).rejects.toThrow('quota exceeded');
     expect(server.mail.get(`u_bob\n${bob.deviceId}`)).toHaveLength(1);
     expect(await read(bob, m1)).toBe('waiting');
     expect(await bob.receive()).toHaveLength(1);
@@ -579,12 +612,130 @@ describe('encrypted rooms between two client engines', () => {
       return get(key);
     }) as typeof store.get;
     const bob = await CryptoEngine.open('u_bob', server.as('u_bob'), store);
+    await verify(server, bob);
     opened.push(bob);
     server.join('r1', 'u_alice', 'u_bob');
     const m1 = await send('r1', alice, 'read on retry'); // a pre-key message: spends a one-time key
-    expect(await bob.receive()).toEqual([]);
+    await expect(bob.receive()).rejects.toThrow('store closed');
     expect(server.mail.get(`u_bob\n${bob.deviceId}`)).toHaveLength(1);
     expect(await bob.receive()).toHaveLength(1);
     expect(await read(bob, m1)).toBe('read on retry');
+  });
+});
+
+describe('Round 5: a mailbox drain fails at the first item it could not store', () => {
+  it('acknowledges only the stored prefix, announces its key, keeps the rest and still fails', async () => {
+    const server = new FakeKeyServer();
+    const alice = await device(server, 'u_alice');
+    const store = await openCryptoStore('u_bob');
+    const write = store.write.bind(store);
+    let roomKeys = 0;
+    store.write = async (puts, deletes) => {
+      // The second room key's write fails as local storage does.
+      if (puts.some(([k]) => k.startsWith('in:')) && ++roomKeys === 2) throw new StorageUnavailable('IndexedDB transaction aborted');
+      return write(puts, deletes);
+    };
+    const bob = await CryptoEngine.open('u_bob', server.as('u_bob'), store);
+    await verify(server, bob);
+    opened.push(bob);
+    const announced: string[][] = [];
+    bob.onKeys((ids) => announced.push(ids));
+    for (const r of ['r1', 'r2', 'r3']) {
+      server.join(r, 'u_alice', 'u_bob');
+      await send(r, alice, `in ${r}`);
+    }
+    const box = () => server.mail.get(`u_bob\n${bob.deviceId}`) ?? [];
+    const queued = box().map((m) => m.id);
+    expect(queued).toHaveLength(3);
+    await expect(bob.receive()).rejects.toBeInstanceOf(StorageUnavailable);
+    expect(box().map((m) => m.id)).toEqual(queued.slice(1));
+    expect(announced).toHaveLength(1);
+    expect(announced[0]).toHaveLength(1);
+    // The retry stores the rest.
+    expect(await bob.receive()).toHaveLength(2);
+    expect(box()).toEqual([]);
+  });
+});
+
+describe('Round 6: which copy of a room key is in charge', () => {
+  it('lets a vouched copy supersede an unvouched one (also at an equal index), and never the reverse', async () => {
+    const server = new FakeKeyServer();
+    const alice = await device(server, 'u_alice');
+    // Bob's view of the server can be made to stop vouching for alice's device (her own view is
+    // unchanged, so she still may send).
+    let hideAlice = false;
+    const bobApi = server.as('u_bob');
+    const query = bobApi.query;
+    bobApi.query = async (ids, signal) => {
+      const r = await query(ids, signal);
+      if (hideAlice && r.devices.u_alice) r.devices.u_alice = r.devices.u_alice.map(({ master_signature: _, ...d }) => d);
+      return r;
+    };
+    const bob = await CryptoEngine.open('u_bob', bobApi, await openCryptoStore('u_bob'));
+    opened.push(bob);
+    await verify(server, bob);
+    server.join('r1', 'u_alice', 'u_bob');
+    type Rec = { first_index: number; verified?: boolean; from_backup?: boolean };
+    const bobRecords = async () => {
+      const s = await openCryptoStore('u_bob');
+      try {
+        return { primary: (await s.list<Rec>('in:'))[0][1], covers: (await s.list<Rec>('inb:')).map(([, v]) => v), queued: (await s.list('bq:')).length };
+      } finally {
+        s.close();
+      }
+    };
+    const patchPrimary = async (patch: Partial<Rec>) => {
+      const s = await openCryptoStore('u_bob');
+      const [[k, v]] = await s.list<Rec>('in:');
+      await s.write([[k, { ...v, ...patch }]]);
+      s.close();
+    };
+    // The next send shares the session with bob again, from alice's current index.
+    const reshare = async () => {
+      const s = await openCryptoStore('u_alice');
+      const out = (await s.get<{ shared: Record<string, string> }>('out:r1'))!;
+      delete out.shared[`u_bob\n${bob.deviceId}`];
+      await s.write([['out:r1', out]]);
+      s.close();
+    };
+    const body = async (m: SealedMessage) => {
+      const r = await bob.decrypt(m);
+      return r.state === 'decrypted' ? { body: r.inner.body, authenticated: r.authenticated } : r.state;
+    };
+    const m0 = await send('r1', alice, 'zero');
+    await bob.receive();
+    await send('r1', alice, 'one');
+
+    // An unvouched primary from index 0; a vouched copy from index 2 takes over from there.
+    await patchPrimary({ verified: false });
+    await reshare();
+    const m2 = await send('r1', alice, 'two');
+    await bob.receive();
+    let r = await bobRecords();
+    expect(r.primary).toMatchObject({ first_index: 2, verified: true });
+    expect(r.covers).toEqual([expect.objectContaining({ first_index: 0, verified: false })]);
+    expect(await body(m2)).toEqual({ body: 'two', authenticated: true });
+    expect(await body(m0)).toEqual({ body: 'zero', authenticated: false });
+
+    // At an equal index, too.
+    await patchPrimary({ verified: false, first_index: 3 });
+    await reshare();
+    const m3 = await send('r1', alice, 'three');
+    await bob.receive();
+    r = await bobRecords();
+    expect(r.primary).toMatchObject({ first_index: 3, verified: true });
+    expect(await body(m3)).toEqual({ body: 'three', authenticated: true });
+
+    // A copy from a device no longer vouched for, reaching earlier than the primary, never
+    // replaces it, and is no better a cover than the one kept.
+    hideAlice = true;
+    await patchPrimary({ first_index: 9 });
+    await reshare();
+    const m4 = await send('r1', alice, 'four');
+    await bob.receive();
+    r = await bobRecords();
+    expect(r.primary).toMatchObject({ first_index: 9, verified: true });
+    expect(r.covers).toEqual([expect.objectContaining({ first_index: 0 })]);
+    expect(await body(m4)).toEqual({ body: 'four', authenticated: true });
   });
 });

@@ -76,7 +76,7 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   `file:` directory. This permits read/write-only restoration of paths with reserved
   characters without accidentally opening a different database.
 - `UpdateProfile` writes only username, email, display name, role and status. SCIM and the KyIdentity webhook use it so a stale read cannot revert a concurrent password change or recovery-code redemption. `ListUsers` filters by one exact `UserFilter` field, and by `sso_provider` when `UserFilter.Provider` is set.
-- `DeleteUserSessions` deletes the user's sessions, MFA challenges and device pairings in one transaction (`deleteGrants`, shared with the password paths): a pending challenge or pairing would otherwise mint a session after a SCIM or directory revocation.
+- `DeleteUserSessions` deletes the user's sessions, MFA challenges, device pairings and E3 QR pairings (`e2ee_pairings`, pending or sealed) in one transaction (`deleteGrants`, shared with the password paths): a pending challenge or pairing would otherwise mint a session, or hand out the account's encryption keys, after a SCIM or directory revocation.
 - TOTP enrolment: `SetPendingTOTP` writes the encrypted secret only on a local account with TOTP off; `EnableTOTP` turns it on only if the stored secret is still the one confirmed, stores the recovery-code digests and deletes every grant in the same transaction; `DisableTOTP` clears secret and codes. Each is `ErrNotFound` from any other state. No migration: the columns exist since v1.
 - `CreateUser`, `CreateDirectoryUser` and `ApplyDirectoryProfile` check the username against every other row first (inside the directory transaction) and return `ErrUsernameTaken` (wraps `ErrAlreadyExists`) on both engines; a refused directory write rolls back with its event ID. A write that loses a race to a concurrent insert meets the UNIQUE constraint instead; `uniqueError` maps that engine error (SQLite `users.username`, Postgres `users_username_key`) to `ErrUsernameTaken` too, any other unique violation to `ErrAlreadyExists` (`unique_internal_test.go`).
 - `GetLocalUserByUsername` returns only `sso_provider = 'local'` rows, preferring an exact-case match. Usernames are unique only case-sensitively, so password login and `init-admin` must never resolve an SSO row.
@@ -97,6 +97,32 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   first locks the device row (`FOR UPDATE`) so concurrent uploads cannot both pass the cap. Mail has no
   cursor: `ToDevice` returns the oldest unacknowledged rows and `AckToDevice` deletes exactly the
   IDs named, because PostgreSQL IDs commit out of order. Migration 54 adds each mail row's sender device keys (`sender_curve25519`, `sender_ed25519`, `sender_signature`, copied at send time), so mail from a device deleted since stays verifiable; older rows carry empty keys, which clients refuse. Only public keys and ciphertext are stored.
+- Migration 68 (E3, `e2ee_identity.go`): `e2ee_master_keys` (one row per user: hybrid master
+  key, self-binding, X-Wing backup key and its signature, recovery-key wraps, sealed pin set and
+  counter, `version`), `e2ee_devices.master_signature`/`master_version`, `e2ee_key_backup`
+  (`(user, version, room, sender_key, session)`, the lowest `first_index` wins, capped per call
+  by session count and sealed bytes, bytewise `COLLATE "C"` key columns on PostgreSQL), the
+  master-signed device list columns with the reservation of its next epoch
+  (`device_list_reserved`, `_until`, `_epoch`), `backup_generation`, and `e2ee_pairings`
+  (QR pairings, unique per `(tenant_id, user_id)`, carrying the `master_version` they were opened
+  under). `PutMasterKey` is compare-and-swap on `version`; a first setup drops a row the user left
+  in another org; a replacement deletes the backup, pairings, pins and device list and clears
+  every cross-signature in the same transaction. Pin, device-list and backup writes and
+  `SignDevice` run `fenced`: they lock the master row at (tenant, user, version) and call the
+  caller's `Proof` with its key before writing, all in one transaction. `ReserveDeviceList` (fenced
+  on its `Proof` too) holds
+  the next epoch for one digest until it lapses and returns it (`E2EEReservation`; the same
+  digest keeps its epoch, another gets one above every epoch granted, and a refusal names the
+  holder's lapse); `PutDeviceList` publishes at exactly that epoch under a reservation of its
+  digest live by its `now()`, read after the master row is locked, ending it. `DeletePairingUnsealed` deletes only a pairing with nothing sealed. A backup
+  write must name the current `backup_generation`, which `DeleteBackup` bumps; every insert and
+  replacement must fit the caps, and the others are returned as `Refused` indexes. A
+  PostgreSQL schema test asserts the backup key columns collate `C`.
+  Backup reads and deletes name the tenant too. `CreatePairing` checks the version and the
+  initiator's cross-signature in its transaction. `ListMasterKeys` reads public columns only;
+  `PutPins` and `PutDeviceList` are compare-and-swap within the caller's org. Backup writes lock
+  the master row on PostgreSQL. `ConsumePairing` is one `DELETE … RETURNING`.
+  All four cascade from `users`; restore deletes pairings and keeps the rest.
 - `store.Open(ctx, cfg)` initializes and auto-migrates the configured database backend. On
   PostgreSQL `migrations.Run` holds `pg_advisory_lock(hashtext('kymessages:migrate'))` on one
   connection for the whole run and reads `schema_migrations` under it, so replicas starting

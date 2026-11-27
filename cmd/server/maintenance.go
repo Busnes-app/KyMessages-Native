@@ -84,6 +84,9 @@ func sweepE2EEMailbox(ctx context.Context, st store.Store) {
 	if err := st.E2EE().PruneToDevice(run, time.Now().Add(-api.E2EEMailboxTTL)); err != nil && ctx.Err() == nil {
 		log.Printf("[E2EE] to-device mailbox sweep failed: %v", err)
 	}
+	if err := st.E2EE().PrunePairings(run, time.Now()); err != nil && ctx.Err() == nil {
+		log.Printf("[E2EE] verification pairing sweep failed: %v", err)
+	}
 }
 
 // agentExpiryLoop revokes idle (90d) and inactive-owner bot tokens (api.Server.ExpireIdleAgents)

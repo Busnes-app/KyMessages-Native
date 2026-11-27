@@ -9,8 +9,10 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:browser": "playwright test",
-    "prebuild": "node src/ky-ui/check-vendor.mjs",
-    "pretest": "node src/ky-ui/check-vendor.mjs"
+    "prebuild": "node src/ky-ui/check-vendor.mjs && npm run build:crypto",
+    "pretest": "node src/ky-ui/check-vendor.mjs && npm run build:crypto",
+    "build:crypto": "bash ../scripts/build-crypto.sh",
+    "predev": "npm run build:crypto"
   },
   "dependencies": {
     "@base-ui/react": "1.9.0",
