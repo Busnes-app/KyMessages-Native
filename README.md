@@ -1,5 +1,8 @@
 # KyMessages
 
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/17196/badge)](https://www.bestpractices.dev/en/projects/17196/passing)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/Busnes-app/KyMessages-Native/badge)](https://scorecard.dev/viewer/?uri=github.com/Busnes-app/KyMessages-Native)
+
 Private team conversations, voice and video calls, and guest meetings on infrastructure you control.
 
 KyMessages is a native chat, calling, and operator console server built as a single Go binary with an embedded React/TypeScript Progressive Web App (PWA). It ships direct messages, group channels, threads, reactions, attachments, Web Push notifications, native bot/agent accounts, hybrid WebRTC calling with optional LiveKit SFU escalation, KyCalendar guest meetings, KyIdentity SSO/directory sync, SCIM 2.0, and encrypted KyRecovery backup capsules.
@@ -14,6 +17,11 @@ This native server supersedes the earlier Matrix-based `KyMessage-Server` archit
 - [Installer setup boundary](docs/INSTALLER_SETUP.md) — container-local `apply-setup` contract for KyQuickStart
 - [Agent skill](agent-skill/kymessages/SKILL.md) — `kymessages` skill for OpenClaw and Hermes Agent accounts
 - [Repository contracts](AGENTS.md) — DOX architecture, tenancy invariants, and verification gates
+- [Changelog](CHANGELOG.md) — changes for the first native release
+
+## Feedback and contributions
+
+File bugs and feature requests in [GitHub Issues](https://github.com/Busnes-app/KyMessages-Native/issues). Follow the [contributing guide](https://github.com/Busnes-app/.github/blob/main/CONTRIBUTING.md) when opening a pull request. Report vulnerabilities through the private channel in the [security policy](https://github.com/Busnes-app/KyMessages-Native/security/policy).
 
 ## Build and inspect locally
 
@@ -53,16 +61,20 @@ To create or reset the local administrator from a shell, run:
 
 ## Container image and Docker Compose
 
-`docker-compose.yml` runs the published container image `ghcr.io/busnes-app/kymessage-server:stable`. Each published release `vX.Y.Z` is also tagged `:X.Y.Z` with an SBOM and GitHub build provenance attestation after all CI jobs pass on the tagged commit. To pin a specific release by digest after verifying its attestation, set `KY_IMAGE` in `.env` (see the verification snippet in `docker-compose.yml`).
+Build the native server from this checkout until its first tagged release. The first native release will publish to `ghcr.io/busnes-app/kymessages`. The `kymessage-server` package holds the earlier Matrix-based images.
 
 Protect `.env` with mode `0600` and export `KY_ADMIN_PASSWORD` as above. The container never runs as root: create `./data` and `./backups` as your unprivileged user and set `KY_UID` and `KY_GID` in `.env` to your `id -u` and `id -g` (Compose refuses to start without them). The container drops all Linux capabilities, disables privilege escalation, and runs with a read-only root filesystem (only `./data`, `./backups`, and `/tmp` are writable).
 
+For a new `.env`, set `COMPOSE_FILE=docker-compose.yml:docker-compose.build.yml`. For an existing Compose chain, append `:docker-compose.build.yml` if it is absent. Then build and start the local image:
+
 ```sh
 mkdir -p data backups
-docker compose up -d
+docker compose up -d --build
 ```
 
 By default, Compose binds port `8080` to `127.0.0.1`.
+
+Base Compose can pull `ghcr.io/busnes-app/kymessages:stable` once the first stable native image is published and its GHCR package is public. Verify an anonymous pull before announcing that release. Each published release `vX.Y.Z` gets an immutable `:X.Y.Z` image and a GitHub build provenance attestation. Use the verification snippet in `docker-compose.yml` to pin a published native release by digest.
 
 ### Compose overlays
 

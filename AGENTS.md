@@ -8,9 +8,10 @@ SCIM 2.0, and encrypted KyRecovery backup capsules.
 - `kymessages` is the binary and local image name; `KY_APP_NAME` defaults to
   `KyMessages`. `internal/config.AppVersion` is shared by CLI and capsule paths.
   Preserve explicit legacy service names for existing pairing pins/capsules.
-- Compose is a loopback local preview by default and runs `ghcr.io/busnes-app/kymessage-server:stable`
-  (`KY_IMAGE` pins a verified digest); it never runs an upstream base image. The build overlay
-  builds `kymessages:local`, never pulled. The app never runs as root: the image's `USER` is 10001 (owning
+- Compose binds to loopback by default. Build `kymessages:local` with the build overlay until
+  the first native release. Base Compose and the release workflow use the owner-approved
+  `ghcr.io/busnes-app/kymessages` package (`KY_IMAGE` pins a verified digest). The retired
+  Matrix images use `kymessage-server`. The app never runs as root: the image's `USER` is 10001 (owning
   its own `/app/data` and `/app/backups`); Compose runs it as `KY_UID:KY_GID` (required, the
   owner of `./data` and `./backups`) with `cap_drop: [ALL]`, `no-new-privileges`,
   `read_only: true` and a `/tmp` tmpfs; `scripts/check-compose-proxy.sh` fails if any of that is lost.
