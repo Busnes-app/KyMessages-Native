@@ -26,7 +26,7 @@ jobs:
       attestations: write
       checks: read
     env:
-      IMAGE_NAME: ghcr.io/busnes-app/kymessage-server
+      IMAGE_NAME: ghcr.io/busnes-app/kymessages
     steps:
       # Red, not skipped: a skipped job is green and leaves a release with no image.
       - name: Validate release version

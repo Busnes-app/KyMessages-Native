@@ -6,9 +6,9 @@ single Go binary with an embedded React/TypeScript web application (PWA). Setup 
 [INSTALLER_SETUP.md](INSTALLER_SETUP.md). Reverse proxy and media networking:
 [Reverse_Proxy_Networking.md](Reverse_Proxy_Networking.md).
 
-Each release publishes an attested container image (`ghcr.io/busnes-app/kymessage-server` — or
-renamed upon release cutover). Historical Matrix-era specifications are archived under
-`docs/superpowers/`.
+Build native previews from source until the first release. Native releases publish attested
+container images at `ghcr.io/busnes-app/kymessages`. Historical Matrix-era specifications are
+archived under `docs/superpowers/`.
 
 ## Promise and audience
 
