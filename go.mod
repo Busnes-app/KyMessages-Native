@@ -5,10 +5,11 @@ go 1.27
 toolchain go1.27.4
 
 require (
-	github.com/Busnes-app/ky-primitives v0.11.0
+	github.com/Busnes-app/ky-primitives v0.12.0
 	github.com/coder/websocket v1.8.15
 	github.com/coreos/go-oidc/v3 v3.21.0
 	github.com/elimity-com/scim v0.0.0-20260728105928-2641426a1539
+	github.com/go-jose/go-jose/v4 v4.1.9
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.13.0
 	golang.org/x/oauth2 v0.38.0
@@ -19,7 +20,6 @@ require (
 
 require (
 	github.com/dustin/go-humanize v1.1.0 // indirect
-	github.com/go-jose/go-jose/v4 v4.1.9 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.3 // indirect

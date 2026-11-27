@@ -9,12 +9,11 @@ import (
 	"time"
 
 	"github.com/Busnes-app/ky_server_base/internal/config"
-	"github.com/coreos/go-oidc/v3/oidc"
 )
 
 const logoutEvent = "http://schemas.openid.net/event/backchannel-logout"
 
-// LogoutClaims has passed the issuer's RS256 signature and the logout-only profile.
+// LogoutClaims has passed the issuer's asymmetric signature (ML-DSA-65 or RS256) and the logout-only profile.
 type LogoutClaims struct {
 	Subject   string                     `json:"sub"`
 	OrgID     string                     `json:"org_id"`
@@ -45,11 +44,10 @@ func (k *KyIdentityClient) VerifyLogout(ctx context.Context, raw string) (*Logou
 	if err != nil {
 		return nil, err
 	}
-	provider, err := flow.getProvider(ctx)
-	if err != nil {
+	if _, err := flow.getProvider(ctx); err != nil {
 		return nil, err
 	}
-	token, err := provider.Verifier(&oidc.Config{ClientID: flow.clientID, SupportedSigningAlgs: []string{oidc.RS256}}).Verify(idpContext(ctx), raw)
+	token, err := flow.verifier.Verify(idpContext(ctx), raw)
 	if err != nil {
 		return nil, err
 	}
