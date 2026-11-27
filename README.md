@@ -17,7 +17,16 @@ This native server supersedes the earlier Matrix-based `KyMessage-Server` archit
 
 ## Build and inspect locally
 
-Use the Go version in `go.mod` and a Node version supported by the pinned frontend packages in `web/package.json`. The committed `web/dist` bundle is embedded into the Go binary; rebuild it after UI changes:
+Use the Go toolchain in `go.mod`, Node 26, and Rust from `web/crypto/rust-toolchain.toml`
+with its `wasm32-unknown-unknown` target. Install the pinned wrapper once with
+`cd web/crypto && cargo +1.99.0 install --locked wasm-bindgen-cli --version 0.2.130`.
+`make build` (also `make all`) builds both WebAssembly cores before embedding `web/dist` in the Go
+binary. `npm test`, `npm run build` and `npm run dev` in `web/` build the cores too. WASM files
+are generated and ignored, never committed; rebuild the frontend before a direct `go build`.
+The PQC core uses the pinned `ky-primitives/cmd/pqwasm` sources with a KyMessages identity adapter,
+so browser and server share the same encodings and crypto. Commit the remaining `web/dist`
+assets after frontend or core changes; CI checks their sync and distributes the complete build
+(including WASM) to server-test jobs:
 
 ```sh
 make all
@@ -29,7 +38,7 @@ To inspect the app and operator console with disposable local data, set a bootst
 ```sh
 read -r -s -p 'Bootstrap operator password: ' KY_ADMIN_PASSWORD
 export KY_ADMIN_PASSWORD
-KY_HOST=127.0.0.1 ./kymessages
+KY_HOST=127.0.0.1 KY_PUSH_ENABLED=false PUSH_RELAY_URL= APNS_RELAY_URL= ./kymessages
 ```
 
 Open `http://localhost:8080`. Replace the bootstrap password before privileged use, then enable two-factor authentication under **Settings > Account security**.
@@ -67,7 +76,7 @@ Compose overlays are combined via `COMPOSE_FILE` in `.env` — append new overla
 ## Capabilities overview
 
 - **Messaging and realtime:** Direct messages, group channels, threads, reactions, mentions, typing indicators, read receipts, file/image attachments with inline thumbnails, native WebSocket delivery (`/api/v1/ws`), and on-device encrypted IndexedDB message search.
-- **Encryption status:** Room messages and edits are end-to-end encrypted in the web client using vodozemac (Olm/Megolm) compiled to WebAssembly (`web/crypto`). Identity verification, bot devices, encrypted attachments, and call media encryption are still in progress, so releases do not yet carry an end-to-end encrypted release claim — see [docs/PRODUCT.md](docs/PRODUCT.md) for exact boundaries.
+- **Encryption status:** Room messages and edits are end-to-end encrypted in the web client using vodozemac (Olm/Megolm) compiled to WebAssembly (`web/crypto`). Post-quantum identity verification and recovery (E3) are built but unreleased; bot devices, encrypted attachments, and call media encryption remain in progress, so releases do not yet carry an end-to-end encrypted release claim — see [docs/PRODUCT.md](docs/PRODUCT.md) for exact boundaries.
 - **Voice, video, and meetings:** Direct P2P WebRTC signaling over `/api/v1/ws` works out of the box with no extra services. Configure `KY_LIVEKIT_*` for optional LiveKit SFU escalation in larger group calls. Pair with KyCalendar (through KyIdentity, or `KY_KYCALENDAR_URL` + `KY_KYCALENDAR_SECRET_FILE`) for KyCalendar meeting room sync and time-bounded external guest links (`/api/meet/{token}`) with host-approved lobby admission.
 - **Web Push notifications:** Installable PWA with RFC 8291/8292 Web Push delivery (`KY_PUSH_ENABLED=true` by default). Push payloads carry sender/room notification metadata only, never message text.
 - **Native agent accounts:** Admins can provision `agent-<name>` bot accounts owned by a team member under **Agents** in the operator console, issuing one-time `kybot_` bearer tokens alongside ready-to-use OpenClaw and Hermes Agent config blocks and the downloadable `kymessages` skill (`agent-skill/kymessages/`). Tokens unused for 90 days are revoked automatically, and agents follow their owner's KyIdentity offboarding state.

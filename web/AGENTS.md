@@ -30,12 +30,12 @@ Owns user interface components, service worker caching, PWA installation manifes
 - `Dashboard.tsx` (Overview) renders summary cards for Service health, Workspace directory, and Backups; each comes from its own route and fails alone, with its action calling `onNavigate('health'|'scim'|'backup')`.
 - `Settings.tsx` shows the `db_driver` from `/api/settings` and warns whenever it is not `sqlite` (the supported target is SQLite on one instance; Postgres gets no capsules); it never claims Postgres support (`Settings.test.tsx`). It mounts `BrandingPanel`: name (Save, "Use default (<KY_APP_NAME>)"), logo upload (`image/png`, refused over 1 MiB before sending) and reset, all through `adminFetch`; the preview is `/app-icon.png?v=<sha256>` or `?v=default`, never a `blob:` URL (CSP `img-src 'self' data:`); `onBrandingChanged` makes the shell re-read `/api/settings`.
 - `Health.tsx` lists components from `/api/admin/health` (`kymessages`, `database`, `postgres`, `livekit`) and embeds `NetworkCheck`. Versions render as text only; a `source` link is kept only when it is https under the `Busnes-app` or `postgres` GitHub repos. `Audit.tsx` is a read-only, paged (50) view of `/api/admin/audit` filtered by kind (`agents|auth|backup|branding|scim`); both validate DTOs with `dto.ts`.
-- `crypto/` wraps the end-to-end encryption core: `crypto/pkg` is the committed wasm-bindgen
+- `crypto/` wraps the end-to-end encryption core: `crypto/pkg` contains the generated wasm-bindgen
   build of `web/crypto` (vodozemac Olm/Megolm), never edited by hand; rebuild with
-  `web/crypto/build.sh`, which CI reproduces byte for byte. `loadCrypto()` is idempotent once it
+  `web/crypto/build.sh`, which CI checks for JS/type sync; WASM is generated and ignored. `loadCrypto()` is idempotent once it
   succeeds and retries after a failure.
-- `pqc/` is the post-quantum core: `pqc.wasm` and `wasm_exec.js` are `web/pqc-wasm/build.sh`
-  output (Go `internal/e2eeid` for `js/wasm`), never edited by hand; `loadPQC()` is idempotent
+- `pqc/` is the post-quantum core: `pqc.wasm` and `wasm_exec.js` are `scripts/build-pqwasm.sh`
+  output (shared `ky-primitives/cmd/pqwasm` with the `internal/e2eeid/pqwasm` wire adapter), never edited by hand; `loadPQC()` is idempotent
   and retries after a failure; `pqc.test.ts` runs `internal/e2eeid/testdata/vectors.json`.
 - E3 identity (`crypto/identity.ts`, used by `CryptoEngine`; spec §3.1): an unverified device
   trusts and pins no one. `verifiedDevices` gives room keys only to devices whose member's master
@@ -158,6 +158,8 @@ Owns user interface components, service worker caching, PWA installation manifes
 - `NetworkCheck.tsx` renders on the admin-only Health page: it fetches `/api/admin/network-check`, validates the DTO at the boundary (a malformed or failed response shows `Network check unavailable.`), aborts on unmount and lists five Pass/Warn marks: trusted proxy peer, trusted `X-Forwarded-Proto: https`, https `KY_APP_URL`, host match, and `KY_TRUSTED_PROXIES` naming only single addresses (`trusted_proxies_narrow`). Tested by `NetworkCheck.test.tsx`.
 
 ## Verification
+- Vitest bounds jsdom/real-crypto workers to two; run heavy native and browser suites separately on a loaded shared host.
+- `npm test`, `npm run build` and `npm run dev` generate both cores from pinned Go/Rust source; install wasm-bindgen-cli 0.2.130 first (README). No `.wasm` is tracked, including under dist.
 - Browser setup: build the frontend, run `go build -o .browser/server ./cmd/server` at the repo root, then `cd web && npx playwright install chromium firefox && npm run test:browser`. CI also installs browser OS dependencies.
 - `make test-web` or `cd web && npm ci && npm test`, then `npm run build` (vitest with jsdom; `src/test-setup.ts` stubs the jsdom `<dialog>` methods; `src/pages/Backup.test.tsx` renders the recovery screen against a stubbed status route). Commit `web/dist` after a build; CI diffs it.
 

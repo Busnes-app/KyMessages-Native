@@ -40,3 +40,7 @@ coverage.out
 # Matrix acceptance harness (scripts/matrix-acceptance.sh)
 scripts/matrix-acceptance/node_modules/
 scripts/matrix-acceptance/artifacts/
+
+# WebAssembly is built from pinned source for every frontend build/test.
+*.wasm
+web/.pqwasm-build.*/

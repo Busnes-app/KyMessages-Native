@@ -11,11 +11,11 @@ import (
 	"math"
 	"strconv"
 
-	"github.com/Busnes-app/ky_server_base/internal/pqc/hybridsig"
-	"github.com/Busnes-app/ky_server_base/internal/pqc/xwing"
+	"github.com/Busnes-app/ky-primitives/hybridsig"
+	"github.com/Busnes-app/ky-primitives/xwing"
 )
 
-// Call is the string API the browser reaches through web/pqc-wasm: every key, signature and
+// Call is the string API the browser reaches through the pqwasm identity adapter: every key, signature and
 // ciphertext is unpadded standard base64, pairing IDs and QR text are unpadded base64url, and
 // a result is a string, a bool or an object of strings. Native tests run the same table, so the
 // shared vectors (testdata/vectors.json) pin both builds to the same bytes.

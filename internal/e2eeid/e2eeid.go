@@ -2,7 +2,7 @@
 // docs/superpowers/specs/2026-11-22-e2ee-design.md, §3 and §9): the statements a user's hybrid
 // master key signs, its fingerprint, the recovery key and what it wraps, the key backup seal and
 // the two-layer QR secret transfer. The server and the browser run this same Go code (the
-// browser through web/pqc-wasm), so neither side re-implements an encoding.
+// browser through ky-primitives/cmd/pqwasm with the KyMessages adapter), so neither side re-implements an encoding.
 //
 // Every signed or authenticated field list goes through Fields, which length-prefixes each
 // field, so no two lists share bytes, and every use has its own versioned label.
@@ -21,8 +21,8 @@ import (
 	"slices"
 	"strconv"
 
-	"github.com/Busnes-app/ky_server_base/internal/pqc/hybridsig"
-	"github.com/Busnes-app/ky_server_base/internal/pqc/xwing"
+	"github.com/Busnes-app/ky-primitives/hybridsig"
+	"github.com/Busnes-app/ky-primitives/xwing"
 )
 
 // Labels. Each is a domain (signatures), an HKDF info or an HPKE info, never two of these.

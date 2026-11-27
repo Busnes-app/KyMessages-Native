@@ -14,11 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Busnes-app/ky-primitives/hybridsig"
+	"github.com/Busnes-app/ky-primitives/xwing"
 	"github.com/Busnes-app/ky_server_base/internal/api"
 	"github.com/Busnes-app/ky_server_base/internal/crypto"
 	"github.com/Busnes-app/ky_server_base/internal/e2eeid"
-	"github.com/Busnes-app/ky_server_base/internal/pqc/hybridsig"
-	"github.com/Busnes-app/ky_server_base/internal/pqc/xwing"
 	"github.com/Busnes-app/ky_server_base/internal/store"
 )
 

@@ -29,6 +29,19 @@ describe('pqc.wasm', () => {
     }
   });
 
+  it('loads the shared pqwasm command alongside the product adapter', () => {
+    const shared: unknown = Reflect.get(globalThis, 'pqwasm');
+    if (typeof shared !== 'object' || shared === null || !('xwingGenerate' in shared)
+      || typeof shared.xwingGenerate !== 'function') throw new Error('shared pqwasm did not start');
+    const key: unknown = shared.xwingGenerate();
+    if (typeof key !== 'object' || key === null || !('seed' in key) || !('publicKey' in key)
+      || !(key.seed instanceof Uint8Array) || !(key.publicKey instanceof Uint8Array)) {
+      throw new Error('invalid shared X-Wing key');
+    }
+    const raw = (b: Uint8Array) => btoa(String.fromCharCode(...b)).replace(/=+$/, '');
+    expect(pqc.xwingPublic(raw(key.seed))).toBe(raw(key.publicKey));
+  });
+
   it('signs with both halves and refuses either half alone', () => {
     const m = pqc.masterGenerate();
     const key = pqc.masterPublic(m.seed).key;

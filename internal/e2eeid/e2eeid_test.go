@@ -12,9 +12,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Busnes-app/ky-primitives/hybridsig"
+	"github.com/Busnes-app/ky-primitives/xwing"
 	"github.com/Busnes-app/ky_server_base/internal/e2eeid"
-	"github.com/Busnes-app/ky_server_base/internal/pqc/hybridsig"
-	"github.com/Busnes-app/ky_server_base/internal/pqc/xwing"
 )
 
 var update = flag.Bool("update", false, "regenerate testdata/vectors.json")

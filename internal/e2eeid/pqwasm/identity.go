@@ -1,10 +1,8 @@
 //go:build js && wasm
 
-// Command pqc-wasm is the browser's post-quantum code: internal/e2eeid (and through it
-// internal/pqc/xwing and internal/pqc/hybridsig) compiled to js/wasm, the same Go the server
-// runs (PQC Stack Plan Q3). It hands the loader's kyPQCReady its start generation (its first
-// argument) and a call(name, ...args) answering {ok: result} or {error: message}, also for a
-// call that panics. build.sh writes the committed web/src/pqc/pqc.wasm.
+// The identity adapter adds KyMessages' wire API to ky-primitives/cmd/pqwasm at build time.
+// Cryptographic primitives and the runtime entry point come from the pinned module; product
+// encodings stay in e2eeid, shared with the server. scripts/build-pqwasm.sh stages the sources.
 package main
 
 import (
@@ -14,7 +12,7 @@ import (
 	"github.com/Busnes-app/ky_server_base/internal/e2eeid"
 )
 
-func main() {
+func init() {
 	// The call is handed to the loader rather than set as a global: a start the loader gave up
 	// on must not replace a newer one when it finishes late.
 	call := js.FuncOf(func(_ js.Value, argv []js.Value) (result any) {
@@ -54,5 +52,4 @@ func main() {
 		gen = os.Args[1]
 	}
 	js.Global().Get("kyPQCReady").Invoke(gen, call)
-	select {}
 }

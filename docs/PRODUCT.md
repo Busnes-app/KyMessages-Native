@@ -48,9 +48,15 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
   ciphertext it cannot open. Bots (`kybot_` tokens) still post plaintext, shown as "Not encrypted
   (bot)"; older messages show "Sent before encryption"; files stay plaintext, shown as "File not
   encrypted", until E5; meeting guests cannot read members' messages. Not released: no encryption
-  release is published until E1-E5 ship together, and until E3 keys go to every device the server
-  lists for a member. Because the server cannot read an encrypted message, the `mentions`
-  notification mode does not fire for one.
+  release is published until E1-E5 ship together. E3 now shares room keys only with devices
+  signed by the member's pinned master identity and present on its signed device list;
+  an unverified device cannot send new encrypted messages. Because the server cannot read
+  an encrypted message, the `mentions` notification mode does not fire for one.
+- Unreleased E3 identity/recovery: hybrid ML-DSA-65 + Ed25519 master signatures, tenant-bound
+  device verification, colleague fingerprint pins, a recovery key, X-Wing sealed session-key
+  backups and two-layer QR device transfer. The server stores public keys and ciphertext only;
+  private master and backup seeds stay on verified devices, wrapped under the recovery key.
+  Native and browser crypto use ky-primitives v0.11.0; both browser cores build from source.
 - Native WebSocket fan-out (`/api/v1/ws`) with presence and immediate revocation disconnects.
 - File and image attachments stored on local disk (`KY_ATTACHMENTS_DIR`) with SHA-256 content
   hashing, per-upload/per-user/per-tenant quotas, inline image thumbnails, and encrypted backup
@@ -171,8 +177,8 @@ renamed upon release cutover). Historical Matrix-era specifications are archived
 
 - Matrix protocol / Synapse / MAS / Element Web / server-to-server federation (retired; see
   `docs/superpowers/` for historical records).
-- A released end-to-end encryption claim, for now: encrypted rooms (E2) are built, but identity
-  verification (E3), bot devices (E4), file encryption (E5) and calls (E6) are not, so no release
+- A released end-to-end encryption claim, for now: encrypted rooms (E2) and identity/recovery
+  (E3) are built, but bot devices (E4), file encryption (E5) and calls (E6) are not, so no release
   says "end-to-end encrypted" yet (`docs/superpowers/specs/2026-11-22-e2ee-design.md` §10).
   Bot messages, files and messages from before the upgrade are stored readable by the operator.
 - Call recording or third-party hosted calling SaaS.

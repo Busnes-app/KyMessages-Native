@@ -1,6 +1,6 @@
 // The browser's post-quantum code: internal/e2eeid (X-Wing, ML-DSA-65 + Ed25519, the recovery
 // key, the key backup seal and the QR transfer) compiled from Go to WebAssembly by
-// web/pqc-wasm/build.sh, the same code the server runs. pqc.wasm and wasm_exec.js are build
+// scripts/build-pqwasm.sh, the same code the server runs. pqc.wasm and wasm_exec.js are build
 // output; never edit them. Call loadPQC() before any export; it is idempotent.
 //
 // Keys, signatures and ciphertext are unpadded standard base64, pairing IDs and QR text are

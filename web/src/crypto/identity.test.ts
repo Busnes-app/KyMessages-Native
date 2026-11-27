@@ -477,7 +477,8 @@ describe('Round 2: device-list authority', () => {
     vi.spyOn(api, 'putDeviceList');
     const stubborn = await open(server, 'u_bob', 'bob_stubborn', { ...api, putDeviceList: async () => { throw new Conflict('409'); } });
     await expect(stubborn.restoreIdentity(rk)).rejects.toThrow(/kept changing/);
-  });
+    // Multiple real PQ signatures plus the bounded conflict retries can exceed 5 s on CI.
+  }, 15_000);
 
   it('does not put a retiring device back on the list', async () => {
     const server = new FakeKeyServer();
@@ -1296,14 +1297,19 @@ describe('Round 6: retry paths', () => {
     const put = api.putBackup;
     let n = 0;
     let unstall = () => {};
-    vi.spyOn(api, 'putBackup').mockImplementation(async (...a) => (++n === 2 ? new Promise<never>((_, reject) => { unstall = () => reject(new TypeError('network')); }) : put(...a)));
+    const stalled = new Promise<never>((_, reject) => { unstall = () => reject(new TypeError('network')); });
+    void stalled.catch(() => undefined); // cleanup can run before the second request arrives
+    vi.spyOn(api, 'putBackup').mockImplementation(async (...a) => (++n === 2 ? stalled : put(...a)));
     const full = vi.fn();
     alice.onBackupState(full);
     const work = alice.resumeWork().catch(() => undefined);
-    await vi.waitFor(() => expect(full).toHaveBeenCalledWith(true));
-    expect(n).toBe(2); // the second batch is still in flight
-    unstall(); // frees the per-user lock for later tests
-    await work;
+    try {
+      await vi.waitFor(() => expect(full).toHaveBeenCalledWith(true));
+      await vi.waitFor(() => expect(n).toBe(2)); // wait for the second batch to enter the stall
+    } finally {
+      unstall(); // always free the per-user lock, including on an assertion failure
+      await work;
+    }
   });
 });
 
@@ -1569,7 +1575,8 @@ describe('Round 7: from a consumed transfer to adoption', () => {
     expect(await p.join.finish()).toBeGreaterThanOrEqual(0);
     expect(p.consumed()).toBe(1);
     expect(await p.laptop.identityStatus()).toMatchObject({ state: 'verified' });
-  });
+    // Includes key setup, signing and two real network-retry waits; keep the product deadline.
+  }, 15_000);
 
   it('never writes seeds of an identity reset after the transfer was read', async () => {
     let afterConsume = false;

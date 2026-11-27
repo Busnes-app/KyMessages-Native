@@ -397,6 +397,8 @@ func TestTenancyModeFromEnv(t *testing.T) {
 	}
 
 	multiEnv := func(t *testing.T) {
+		// Configuration only: exercise the VAPID requirement even when test servers disable push.
+		t.Setenv("KY_PUSH_ENABLED", "true")
 		t.Setenv("KY_DATA_DIR", t.TempDir())
 		t.Setenv("KY_DB_DRIVER", "postgres")
 		t.Setenv("KY_DB_DSN", "postgres://user:pass@localhost:5432/testdb")

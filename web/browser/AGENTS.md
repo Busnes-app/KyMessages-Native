@@ -10,10 +10,10 @@ This directory owns test setup, disposable server launch and UI assertions. The 
 
 ## Local Contracts
 
-- Never reuse a development or production server. Launch the compiled `.browser/server` with a minimal environment and an owned temporary data directory; remove that directory on exit. `server.mjs [port] [captcha]` serves 5391 with captcha `none` for the main projects and 5392 with `pow` for the `captcha-pow` project (`captcha.spec.mjs`, Chromium), which `globalSetup` never touches.
+- Never reuse a development or production server. Launch the compiled `.browser/server` with a minimal environment and an owned temporary data directory; remove that directory on exit. `server.mjs [port] [captcha]` serves 5391 with captcha `none` for the main projects and 5392 with `pow` for the `captcha-pow` project (`captcha.spec.mjs`, Chromium), which `globalSetup` never touches. Set `KY_BROWSER_PORT` (1024–65534) to use another owned port pair when another suite is running; the PoW server uses that port plus one.
 - `captcha.spec.mjs` signs in through the real proof-of-work: one challenge fetch while idle, exactly one more after a wrong password, then the bootstrap password reaches "Change your password".
 - Find sign-in fields by label (`getByLabel('Username')`, `getByLabel('Password')`), not placeholder. Sign-in lands in chat; `openSettings` waits for the Conversation region, opens the room list when a narrow screen hides the rail, then uses the rail's Settings gear. A reload returns to chat.
-- Use loopback only, with `KY_APP_URL` matching the test origin. `server.mjs` sets `PUSH_RELAY_URL` and `APNS_RELAY_URL` empty, so a throwaway server reaches no push relay. Bootstrap credentials are disposable test values, not deployment defaults.
+- Use loopback only, with `KY_APP_URL` matching the test origin. `server.mjs` sets `KY_PUSH_ENABLED=false`, `PUSH_RELAY_URL` and `APNS_RELAY_URL` empty, so a throwaway server reaches no push relay. Bootstrap credentials are disposable test values, not deployment defaults.
 - Test light/dark at 390px and 1280px on Chromium, plus Firefox at light/1280 and dark/390, using real authentication and API state. Do not disable service workers, relax CSP/CSRF, or substitute mocked responses.
 - The backup flow pins the repository's synthetic public-key fixture and makes
   local sealed copies through the real API; no private recovery key or shares are

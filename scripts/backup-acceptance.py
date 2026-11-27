@@ -51,7 +51,8 @@ with tempfile.TemporaryDirectory(prefix='kymessages-backup-acceptance-') as scra
            'KY_APP_URL': origin, 'KY_DATA_DIR': str(data), 'KY_DB_DRIVER': 'sqlite',
            'KY_BACKUP_DIR': str(backups), 'KY_BACKUP_KEEP': '2',
            'KY_BACKUP_DEPOSIT_INTERVAL': '0', 'KY_ADMIN_PASSWORD': password,
-           'KY_CAPTCHA_PROVIDER': 'none'}
+           'KY_CAPTCHA_PROVIDER': 'none', 'KY_PUSH_ENABLED': 'false',
+           'PUSH_RELAY_URL': '', 'APNS_RELAY_URL': ''}
     cookies = http.cookiejar.CookieJar()
     http = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookies))
 
