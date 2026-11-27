@@ -21,6 +21,8 @@ import (
 	"github.com/google/uuid"
 )
 
+const minSigningSecretBytes = 32
+
 // Config encapsulates all runtime configuration for KyMessages.
 type Config struct {
 	InstallerSSO *applysetup.SSO   `json:"-"`
@@ -345,7 +347,9 @@ func loadFromEnv(tenancyMode string) (*Config, error) {
 		return nil, errors.New("KY_SESSION_SECRET is required when KY_TENANCY_MODE=multi (every replica must verify the others' challenges)")
 	}
 	if sessionSecret == "" {
-		sessionSecret = generateRandomHex(32)
+		sessionSecret = generateRandomHex(minSigningSecretBytes)
+	} else if len(sessionSecret) < minSigningSecretBytes {
+		return nil, fmt.Errorf("KY_SESSION_SECRET must be at least %d bytes", minSigningSecretBytes)
 	}
 
 	encryptionKey, ok, err := keyfile.FromEnv("KY_ENCRYPTION_KEY", 32)
@@ -594,6 +598,9 @@ func rtcFromEnv() (RTCConfig, error) {
 		}
 		if strings.ContainsFunc(apiKey, unicode.IsControl) || strings.ContainsFunc(apiSecret, unicode.IsControl) {
 			return RTCConfig{}, errors.New("LiveKit API credentials must not contain control characters")
+		}
+		if len(apiSecret) < minSigningSecretBytes {
+			return RTCConfig{}, fmt.Errorf("KY_LIVEKIT_API_SECRET or KY_LIVEKIT_API_SECRET_FILE must provide at least %d bytes", minSigningSecretBytes)
 		}
 	}
 

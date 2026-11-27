@@ -106,7 +106,7 @@ Key environment variables (see `internal/config/config.go` and `docker-compose.y
 | `KY_ENV` | `development` (default) or `production` (requires `KY_SESSION_SECRET` and `https://` `KY_APP_URL` unless `KY_COOKIE_SECURE=false`) |
 | `KY_HOST`, `KY_PORT` | Listen address and port (defaults `0.0.0.0` / `8080` in container; bind `127.0.0.1` for local preview) |
 | `KY_ADMIN_USERNAME`, `KY_ADMIN_PASSWORD` | Initial local operator account created on an empty database (`KY_ADMIN_USERNAME` defaults to `admin`; must be replaced before privileged use) |
-| `KY_SESSION_SECRET` | Durable signing secret for sessions (generate once with `openssl rand -hex 32`) |
+| `KY_SESSION_SECRET` | Proof-of-work signing secret. Use at least 32 bytes (generate with `openssl rand -hex 32`) |
 | `KY_COOKIE_SECURE` | Defaults to `true` in production or for `https://` `KY_APP_URL`; enables HSTS and `__Host-` cookie prefixes when `KY_COOKIE_DOMAIN` is unset |
 | `KY_TRUSTED_PROXIES` | Comma-separated `/32` IP addresses of the reverse proxy only (never a whole bridge subnet) |
 | `KY_DB_DRIVER` | `sqlite` (default, supported single-instance release target) or `postgres` (with PostgreSQL DSN) |
@@ -119,10 +119,14 @@ Key environment variables (see `internal/config/config.go` and `docker-compose.y
 | `KY_ATTACHMENTS_DIR`, `KY_MAX_UPLOAD_BYTES` | Attachment blob directory (default `<KY_DATA_DIR>/attachments`) and per-file upload cap (default 25 MiB, max 100 MiB) |
 | `KY_PUSH_ENABLED`, `KY_VAPID_PRIVATE_KEY`, `KY_VAPID_SUBJECT` | Web Push delivery (enabled by default; auto-generates `data/vapid.key` if unset) |
 | `KY_STUN_URLS` | Comma-separated `stun:`/`stuns:` URIs for WebRTC calls |
-| `KY_LIVEKIT_URL`, `KY_LIVEKIT_API_KEY`, `KY_LIVEKIT_API_SECRET` | Optional LiveKit SFU origin and credentials (`*_FILE` variants supported) |
+| `KY_LIVEKIT_URL`, `KY_LIVEKIT_API_KEY`, `KY_LIVEKIT_API_SECRET` | Optional LiveKit SFU origin and credentials (`*_FILE` variants supported). The secret needs at least 32 bytes after trimming whitespace |
 | `KY_KYCALENDAR_URL`, `KY_KYCALENDAR_SECRET_FILE` | Explicit KyCalendar pair (both or neither; default: KyIdentity's suite directory). Signs meeting sync (`/api/meetings/{id}`) and calendar chat/status |
 | `KY_BACKUP_DIR`, `KY_BACKUP_KEEP`, `KY_BACKUP_DEPOSIT_INTERVAL` | Local sealed capsule copies (keep newest 7, interval `24h` by default) |
 | `KY_BACKUP_ALLOW_PRIVATE_RECOVERY` | Opt-in for LAN KyRecovery destinations (`false` by default; HTTPS remains mandatory) |
+
+### Upgrading a preview
+
+Replace supplied signing secrets shorter than 32 bytes before upgrading. Generate a separate random value for each secret with `openssl rand -hex 32`. Keep `KY_SESSION_SECRET` identical across replicas. After rotation, refresh any sign-in or guest proof-of-work challenge already in progress. For LiveKit, update the matching secret on the SFU and in KyMessages, including the secret file if used.
 
 ## CLI subcommands
 
