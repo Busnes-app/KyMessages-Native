@@ -17,6 +17,7 @@ import (
 func TestConfigLoadDefaults(t *testing.T) {
 	t.Setenv("KY_APP_NAME", "")
 	t.Setenv("KY_DATA_DIR", t.TempDir())
+	t.Setenv("KY_SESSION_SECRET", "")
 	cfg, err := config.LoadFromEnv()
 	if err != nil {
 		t.Fatalf("failed to load config: %v", err)
@@ -34,6 +35,9 @@ func TestConfigLoadDefaults(t *testing.T) {
 	if cfg.Captcha.Provider != "pow" {
 		t.Errorf("expected default captcha provider pow, got %s", cfg.Captcha.Provider)
 	}
+	if len(cfg.Security.SessionSecret) != 64 {
+		t.Error("expected a hex-encoded 32-byte generated session secret")
+	}
 	if cfg.Backup.Dir != "" {
 		t.Errorf("expected empty default backup dir (sealed local copies off), got %q", cfg.Backup.Dir)
 	}
@@ -46,7 +50,7 @@ func TestPostgresRequiresAnExplicitDSN(t *testing.T) {
 		for _, env := range []string{"development", "production"} {
 			t.Setenv("KY_DATA_DIR", t.TempDir())
 			t.Setenv("KY_ENV", env)
-			t.Setenv("KY_SESSION_SECRET", "s")
+			t.Setenv("KY_SESSION_SECRET", strings.Repeat("s", 32))
 			t.Setenv("KY_DB_DRIVER", driver)
 			t.Setenv("KY_DB_DSN", "")
 			_, err := config.LoadFromEnv()
@@ -188,7 +192,7 @@ func TestCookieSecureFollowsTheAppURL(t *testing.T) {
 		{"", "https://chat.example.com", "false", false, false},
 	} {
 		t.Setenv("KY_DATA_DIR", t.TempDir())
-		t.Setenv("KY_SESSION_SECRET", "a-durable-secret-for-this-test")
+		t.Setenv("KY_SESSION_SECRET", strings.Repeat("s", 32))
 		t.Setenv("KY_ENV", tc.env)
 		t.Setenv("KY_APP_URL", tc.url)
 		t.Setenv("KY_COOKIE_SECURE", tc.secure)
@@ -253,11 +257,31 @@ func TestEmptyLegacyKySignOnEnvironmentIsIgnored(t *testing.T) {
 	}
 }
 
+func TestSessionSecretMinimumLength(t *testing.T) {
+	t.Setenv("KY_DATA_DIR", t.TempDir())
+	short := strings.Repeat("s", 31)
+	t.Setenv("KY_SESSION_SECRET", short)
+	if _, err := config.LoadFromEnv(); err == nil || !strings.Contains(err.Error(), "KY_SESSION_SECRET must be at least 32 bytes") || strings.Contains(err.Error(), short) {
+		t.Fatal("expected a length error that names KY_SESSION_SECRET without exposing its value")
+	}
+
+	secret := strings.Repeat("é", 16)
+	t.Setenv("KY_SESSION_SECRET", secret)
+	cfg, err := config.LoadFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Security.SessionSecret != secret {
+		t.Fatal("expected the supplied 32-byte secret")
+	}
+}
+
 func TestRTCConfigFromEnv(t *testing.T) {
 	t.Setenv("KY_DATA_DIR", t.TempDir())
 	t.Setenv("KY_LIVEKIT_URL", "wss://sfu.example.com")
 	t.Setenv("KY_LIVEKIT_API_KEY", "devkey")
-	t.Setenv("KY_LIVEKIT_API_SECRET", "devsecret")
+	secret := strings.Repeat("s", 32)
+	t.Setenv("KY_LIVEKIT_API_SECRET", secret)
 	t.Setenv("KY_STUN_URLS", "stun:stun.example.com:3478,stuns:stun.example.com:5349")
 
 	cfg, err := config.LoadFromEnv()
@@ -268,7 +292,7 @@ func TestRTCConfigFromEnv(t *testing.T) {
 		t.Fatalf("unexpected RTC config: %+v", cfg.RTC)
 	}
 	raw, err := json.Marshal(cfg.RTC)
-	if err != nil || bytes.Contains(raw, []byte("devsecret")) {
+	if err != nil || bytes.Contains(raw, []byte(secret)) {
 		t.Fatal("LiveKit secret serialized into JSON")
 	}
 	if len(cfg.RTC.STUNURLs) != 2 {
@@ -278,6 +302,41 @@ func TestRTCConfigFromEnv(t *testing.T) {
 	t.Setenv("KY_LIVEKIT_API_SECRET", "")
 	if _, err := config.LoadFromEnv(); err == nil {
 		t.Fatal("partial LiveKit config accepted")
+	}
+}
+
+func TestLiveKitSecretMinimumLength(t *testing.T) {
+	t.Setenv("KY_DATA_DIR", t.TempDir())
+	t.Setenv("KY_LIVEKIT_URL", "wss://sfu.example.com")
+	t.Setenv("KY_LIVEKIT_API_KEY", "devkey")
+	t.Setenv("KY_LIVEKIT_API_SECRET_FILE", "")
+	short := strings.Repeat("s", 31)
+
+	t.Setenv("KY_LIVEKIT_API_SECRET", short)
+	if _, err := config.LoadFromEnv(); err == nil || !strings.Contains(err.Error(), "KY_LIVEKIT_API_SECRET") || !strings.Contains(err.Error(), "32 bytes") || strings.Contains(err.Error(), short) {
+		t.Fatal("expected a LiveKit environment secret length error without exposing its value")
+	}
+
+	secretFile := filepath.Join(t.TempDir(), "livekit-secret")
+	t.Setenv("KY_LIVEKIT_API_SECRET_FILE", secretFile)
+	t.Setenv("KY_LIVEKIT_API_SECRET", strings.Repeat("e", 32))
+	if err := os.WriteFile(secretFile, []byte(short+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := config.LoadFromEnv(); err == nil || !strings.Contains(err.Error(), "KY_LIVEKIT_API_SECRET_FILE") || !strings.Contains(err.Error(), "32 bytes") || strings.Contains(err.Error(), short) {
+		t.Fatal("expected a LiveKit file secret length error after trimming whitespace")
+	}
+
+	secret := strings.Repeat("f", 32)
+	if err := os.WriteFile(secretFile, []byte(secret+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RTC.LiveKitAPISecret != secret {
+		t.Fatal("expected the trimmed file secret to override the environment value")
 	}
 }
 
