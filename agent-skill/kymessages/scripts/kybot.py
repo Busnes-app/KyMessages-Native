@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
 import hashlib
 import json
 import os
@@ -488,48 +489,66 @@ class Bot:
 
     # Messages
 
-    def open(self, m: dict) -> dict:
-        """One stored message, decrypted and checked as the browser checks it."""
+    def _inner(self, m: dict, body: str) -> tuple[dict | None, str | None, str | None]:
+        """Decrypts one envelope of m: (inner, replay slot, error). Claims nothing."""
+        env = json.loads(body)
+        if not isinstance(env, dict):
+            return None, None, "damaged"
+        rec = self.st["inbound"].get(f"{env.get('sender_key')}\n{env.get('session_id')}")
+        if not rec:
+            return None, None, "waiting for this message's key (run sync)"
+        if (rec["user"], rec["device"], rec["room_id"]) != (m.get("sender_id"), env.get("device_id"), m.get("room_id")):
+            return None, None, "this message did not come from the device it names, or belongs to another room"
+        try:
+            dec = vz.InboundGroupSession.from_pickle(rec["pickle"], self.st.key).decrypt(vz.MegolmMessage.from_base64(env["ciphertext"]))
+        except Exception:
+            return None, None, "could not be decrypted"
+        inner = json.loads(dec.plaintext)
+        if not isinstance(inner, dict) or not isinstance(inner.get("body", ""), str):
+            return None, None, "damaged"
+        if inner.get("room_id") != m.get("room_id") or (inner.get("type") == "edit" and inner.get("message_id") != m.get("id")):
+            return None, None, "encrypted for another room or message"
+        return inner, f"{env['sender_key']}\n{env['session_id']}\n{dec.message_index}", None
+
+    def opened(self, m: dict) -> tuple[dict, list[dict]]:
+        """One stored message, decrypted and checked as the browser checks it, with its file
+        descriptors. Any failure is this message's error alone."""
         base = {"id": m.get("id"), "room_id": m.get("room_id"), "sender_id": m.get("sender_id")}
         if m.get("encoding") != "e2ee_room_v1":
-            return {**base, "encrypted": False, "body": m.get("body", "")}
+            return {**base, "encrypted": False, "body": m.get("body", "")}, []
         try:
-            env = json.loads(m["body"])
-            rec = self.st["inbound"].get(f"{env['sender_key']}\n{env['session_id']}")
-        except (KeyError, ValueError, TypeError):
-            return {**base, "error": "damaged"}
-        if not rec:
-            return {**base, "error": "waiting for this message's key (run sync)"}
-        if (rec["user"], rec["device"], rec["room_id"]) != (m.get("sender_id"), env.get("device_id"), m.get("room_id")):
-            return {**base, "error": "this message did not come from the device it names, or belongs to another room"}
-        ig = vz.InboundGroupSession.from_pickle(rec["pickle"], self.st.key)
-        try:
-            dec = ig.decrypt(vz.MegolmMessage.from_base64(env["ciphertext"]))
-        except Exception:
-            return {**base, "error": "could not be decrypted"}
-        try:
-            inner = json.loads(dec.plaintext)
-            if not isinstance(inner, dict) or not isinstance(inner.get("body", ""), str):
-                raise ValueError
-        except ValueError:
-            return {**base, "error": "damaged"}
-        if inner.get("room_id") != m.get("room_id") or (inner.get("type") == "edit" and inner.get("message_id") != m.get("id")):
-            return {**base, "error": "encrypted for another room or message"}
-        seen = self.st["seen"]
-        slot = f"{env['sender_key']}\n{env['session_id']}\n{dec.message_index}"
-        if seen.setdefault(slot, m.get("id")) != m.get("id"):
-            return {**base, "error": "a replay of another message"}
-        out = {**base, "encrypted": True, "type": inner.get("type"), "body": inner.get("body", "")}
-        named = {a.get("id") for a in m.get("attachments") or []}
-        files = [f for f in inner.get("files") or [] if isinstance(f, dict)]
-        if files:
-            out["files"] = [{"attachment_id": f.get("attachment_id"), "name": f.get("name"), "mime_type": f.get("mime_type"),
-                             "size": f.get("size"), "available": f.get("attachment_id") in named} for f in files]
-        return out
+            inner, slot, err = self._inner(m, m["body"])
+            if err:
+                return {**base, "error": err}, []
+            files = inner.get("files")
+            orig = inner.get("original")
+            if inner.get("type") == "edit" and isinstance(orig, dict) and orig.get("kind") == "e5" and orig.get("files"):
+                # An E5 edit seals no file keys: they are in the message's first envelope, which
+                # must be this sender's message with the ref and file count the edit names.
+                first, _, err = self._inner(m, m.get("original_body") or "null")
+                if err or first.get("type") == "edit" or first.get("ref") != orig.get("ref") or not isinstance(first.get("files"), list) or len(first["files"]) != orig["files"]:
+                    return {**base, "encrypted": True, "type": "edit", "body": inner.get("body", ""), "error": "this message's files are not available"}, []
+                files = first["files"]
+            if files is not None and not isinstance(files, list):
+                return {**base, "error": "damaged"}, []
+            descs = [f for f in files or [] if isinstance(f, dict) and isinstance(f.get("attachment_id"), str)]
+            if self.st["seen"].setdefault(slot, m.get("id")) != m.get("id"):
+                return {**base, "error": "a replay of another message"}, []
+            named = {a.get("id") for a in m.get("attachments") or [] if isinstance(a, dict)}
+            out = {**base, "encrypted": True, "type": inner.get("type"), "body": inner.get("body", "")}
+            if descs:
+                out["files"] = [{"attachment_id": f["attachment_id"], "name": f.get("name"), "mime_type": f.get("mime_type"),
+                                 "size": f.get("size"), "available": f["attachment_id"] in named} for f in descs]
+            return out, descs
+        except (KeyError, ValueError, TypeError, AttributeError):
+            return {**base, "error": "damaged"}, []
+
+    def open(self, m: dict) -> dict:
+        return self.opened(m)[0]
 
     def read(self, room: str, limit: int) -> list[dict]:
         page = self.s.call("GET", f"/api/v1/rooms/{urllib.parse.quote(room)}/messages?limit={limit}")
-        out = [self.open(m) for m in page.get("messages", [])]
+        out = [self.open(m) for m in page.get("messages", []) if isinstance(m, dict)]
         self.st.save()
         return out
 
@@ -616,14 +635,11 @@ class Bot:
 
     def download(self, room: str, message_id: str, att: str) -> bytes:
         m = self.s.call("GET", f"/api/v1/rooms/{urllib.parse.quote(room)}/messages/{urllib.parse.quote(message_id)}")["message"]
-        opened = self.open(m)
+        opened, descs = self.opened(m)
         if "error" in opened:
             raise SystemExit(opened["error"])
-        env = json.loads(m["body"])
-        rec = self.st["inbound"][f"{env['sender_key']}\n{env['session_id']}"]
-        inner = json.loads(vz.InboundGroupSession.from_pickle(rec["pickle"], self.st.key).decrypt(vz.MegolmMessage.from_base64(env["ciphertext"])).plaintext)
-        d = next((f for f in inner.get("files") or [] if isinstance(f, dict) and f.get("attachment_id") == att), None)
-        if not d or att not in {a.get("id") for a in m.get("attachments") or []} or d.get("ciphertext_size", 0) > MAX_CIPHERTEXT:
+        d = next((f for f in descs if f["attachment_id"] == att), None)
+        if not d or att not in {a.get("id") for a in m.get("attachments") or []} or not isinstance(d.get("ciphertext_size"), int) or d["ciphertext_size"] > MAX_CIPHERTEXT:
             raise SystemExit("this message names no such file")
         return decrypt_blob(self.s.get_bytes(f"/api/v1/attachments/{urllib.parse.quote(att)}", d["ciphertext_size"]), d)
 
@@ -657,6 +673,9 @@ def main(argv: list[str] | None = None) -> None:
     url, token = os.environ.get("KYMESSAGES_SERVER_URL"), os.environ.get("KYMESSAGES_ACCESS_TOKEN")
     if not url or not token:
         raise SystemExit("set KYMESSAGES_SERVER_URL and KYMESSAGES_ACCESS_TOKEN (a kybot_ token)")
+    # One command at a time per state file: a sync and a send must not overwrite each other's keys.
+    lock = os.open(args.state + ".lock", os.O_WRONLY | os.O_CREAT, 0o600)
+    fcntl.flock(lock, fcntl.LOCK_EX)
     bot = Bot(Server(url, token), State(args.state))
     if args.cmd != "init" and "account" not in bot.st.d:
         raise SystemExit("run `kybot.py init` first")

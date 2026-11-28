@@ -31,7 +31,9 @@ device `scripts/kybot.py` with `scripts/requirements.txt`), `skill.go` (`go:embe
   signed list (a bot only through its owner's `kymessages.bot-devices.v1` list), lists only move
   forward, room keys only from such devices, a changed identity waits for `accept` (even if the
   server goes back to the old key). It also pins its org and each bot's owner on first sight;
-  room-key mail counts as shared only once delivered. Change both
+  room-key mail counts as shared only once delivered. A message that fails any check is that
+  message's error alone; an E5 edit's files come from the first envelope it names (`ref`, count).
+  One command runs at a time per state file (`<state>.lock`). Change both
   sides together.
 
 ## Verification

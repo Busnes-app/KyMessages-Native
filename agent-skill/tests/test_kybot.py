@@ -131,6 +131,13 @@ class FakeServer:
             return {"message": m}
         if p.endswith("/messages"):
             return {"messages": list(self.messages.get(parts[4], []))}
+        if "/messages/" in p and method == "PATCH":
+            m = next(m for m in self.messages[parts[4]] if m["id"] == parts[6])
+            # As the store: the first envelope of an e2ee message with files is kept once edited.
+            if m["attachments"] and not m.get("edited"):
+                m["original_body"] = m["body"]
+            m["body"], m["edited"] = body["body"], True
+            return {"message": m}
         if "/messages/" in p:
             return {"message": next(m for m in self.messages[parts[4]] if m["id"] == parts[6])}
         raise AssertionError(f"unexpected {method} {path}")
@@ -389,6 +396,45 @@ class Trust(unittest.TestCase):
         self.assertEqual(got[last["id"]]["body"], "three")
         self.assertEqual(got[bad["id"]]["error"], "damaged")
 
+    def post_inner(self, sender, inner, method="POST", mid=None):
+        """A message sender's device sealed with its room session, whatever inner says."""
+        g = vz_group(sender, "r1")
+        env = json.dumps({"alg": "megolm.v1", "sender_key": sender.account().curve25519_key.to_base64(), "device_id": sender.device_id,
+                          "session_id": g.session_id, "ciphertext": g.encrypt(json.dumps(inner).encode()).to_base64()})
+        sender.st["outbound"]["r1"]["pickle"] = g.pickle(sender.st.key)
+        path = "/api/v1/rooms/r1/messages" + (f"/{mid}" if mid else "")
+        return self.env.server.handle(sender.user_id, method, path, {"encoding": "e2ee_room_v1", "body": env}, None)["message"]
+
+    def test_malformed_file_metadata_fails_alone(self):
+        self.env.vouch("u_alice", "bot_helper", self.bot)
+        first = self.alice.send("r1", "one")
+        bad = [self.post_inner(self.alice, {"room_id": "r1", "type": "attachment", "body": "x", "files": f, "ref": "r"}) for f in ("nope", [{"attachment_id": 5}], [7])]
+        last = self.alice.send("r1", "three")
+        self.bot.sync()
+        got = {m["id"]: m for m in self.bot.read("r1", 50)}
+        self.assertEqual((got[first["id"]]["body"], got[last["id"]]["body"]), ("one", "three"))
+        self.assertEqual(got[bad[0]["id"]]["error"], "damaged")
+        self.assertNotIn("files", got[bad[1]["id"]])
+
+    def test_an_edited_messages_file_comes_from_its_first_envelope(self):
+        self.env.vouch("u_alice", "bot_helper", self.bot)
+        path = os.path.join(self.env.dir, "f.bin")
+        Path(path).write_bytes(b"first envelope file")
+        sent = self.bot.send("r1", "caption", file=path)
+        own = self.bot.opened(sent)
+        inner_ref = self.bot._inner(sent, sent["body"])[0]["ref"]
+        self.post_inner(self.bot, {"room_id": "r1", "type": "edit", "message_id": sent["id"], "body": "new caption",
+                                   "original": {"kind": "e5", "ref": inner_ref, "files": 1}}, method="PATCH", mid=sent["id"])
+        self.alice.sync()
+        att = sent["attachments"][0]["id"]
+        self.assertEqual(self.alice.download("r1", sent["id"], att), b"first envelope file")
+        # An edit naming another message's ref gets no files.
+        self.post_inner(self.bot, {"room_id": "r1", "type": "edit", "message_id": sent["id"], "body": "moved",
+                                   "original": {"kind": "e5", "ref": "ref_other", "files": 1}}, method="PATCH", mid=sent["id"])
+        with self.assertRaises(SystemExit):
+            self.alice.download("r1", sent["id"], att)
+        self.assertTrue(own[1])
+
     def test_a_failed_delivery_is_sent_again(self):
         self.env.vouch("u_alice", "bot_helper", self.bot)
         self.env.server.fail_to_device = 1
@@ -418,6 +464,38 @@ class Trust(unittest.TestCase):
 HAVE_CORE = bool(shutil.which("node")) and (ROOT / "web/src/crypto/pkg/kycrypto_bg.wasm").exists()
 if os.environ.get("KYBOT_REQUIRE_INTEROP") and not HAVE_CORE:
     raise SystemExit("KYBOT_REQUIRE_INTEROP: node and web/src/crypto/pkg (npm run build:crypto) are required")
+
+
+class Locking(unittest.TestCase):
+    def test_one_command_at_a_time_per_state_file(self):
+        import fcntl
+        import threading
+        d = tempfile.mkdtemp()
+        state = os.path.join(d, "s.json")
+        held = os.open(state + ".lock", os.O_WRONLY | os.O_CREAT, 0o600)
+        fcntl.flock(held, fcntl.LOCK_EX)
+        env = {"KYMESSAGES_SERVER_URL": "http://127.0.0.1:9", "KYMESSAGES_ACCESS_TOKEN": "kybot_x"}
+        old = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        done = threading.Event()
+
+        def run():
+            try:
+                kybot.main(["--state", state, "sync"])
+            except BaseException:
+                pass
+            done.set()
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        try:
+            self.assertFalse(done.wait(0.5), "a second command ran while the state was locked")
+            fcntl.flock(held, fcntl.LOCK_UN)
+            self.assertTrue(done.wait(10))
+        finally:
+            os.close(held)
+            for k, v in old.items():
+                os.environ.pop(k) if v is None else os.environ.__setitem__(k, v)
+            shutil.rmtree(d)
 
 
 @unittest.skipUnless(HAVE_CORE, "needs node and the built web crypto core")
