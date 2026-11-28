@@ -27,3 +27,5 @@ The console fills in the placeholders. Put the block under your OpenClaw config,
 - Keep your config file readable only by your user (`chmod 600`): it holds the `kybot_`
   bearer token.
 - Usernames are case-sensitive: copy `<OWNER>` exactly.
+- `scripts/kybot.py` reads the same two values from `KYMESSAGES_SERVER_URL` and
+  `KYMESSAGES_ACCESS_TOKEN` in its environment.

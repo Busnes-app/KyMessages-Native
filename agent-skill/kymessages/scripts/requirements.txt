@@ -1,0 +1,4 @@
+# The bot device bundle (kybot.py): vodozemac for Olm/Megolm, cryptography for ML-DSA-65,
+# Ed25519 and AES-256-GCM.
+vodozemac==0.10.0
+cryptography==50.0.2

@@ -58,6 +58,11 @@ async function vouch(owner: CryptoEngine, ...keep: CryptoEngine[]) {
 }
 
 describe('bots as devices (E4)', () => {
+  it('derives the code the bot shows exactly as the bundle does', () => {
+    // agent-skill/tests/test_kybot.py pins the same value.
+    expect(botDeviceCode({ device_id: 'BOTDEVICE1', curve25519: 'QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU', ed25519: 'MDEyMzQ1Njc4OWFiY2RlZmdoaWprbG1ub3BxcnN0dXY' }, 'bot_helper')).toBe('a375-b438-12e4-6bba-55a7');
+  });
+
   it('gives room keys to a bot device its owner vouched for, and to no other', async () => {
     const { server, alice, bob, bot } = await setup();
     await bob.encrypt('r1', { type: 'text', body: 'before vouching' });
