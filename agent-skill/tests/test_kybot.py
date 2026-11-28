@@ -45,7 +45,9 @@ class FakeServer:
 
     def __init__(self):
         self.tenant, self.fail_to_device, self.reads, self.ignore_after = TENANT, 0, 0, False
+        self.lose_upload, self.claims = 0, []
         self.devices, self.otks, self.mail, self.masters, self.bot_lists = {}, {}, {}, {}, {}
+        self.fallbacks, self.spent = {}, set()
         self.rooms, self.messages, self.blobs, self.next = {}, {}, {}, 1
 
     def as_(self, user):
@@ -72,11 +74,21 @@ class FakeServer:
                 k = body["device_keys"]
                 assert kybot.ed_verify(k["ed25519"], kybot.device_signed(user, body["device_id"], k["curve25519"], k["ed25519"]), k["signature"])
                 dev = self.devices[user][body["device_id"]] = {"device_id": body["device_id"], **k}
-            box = self.otks.setdefault((user, dev["device_id"]), [])
-            for k in body["one_time_keys"]:
+            d = (user, dev["device_id"])
+            box = self.otks.setdefault(d, [])
+            for k in body["one_time_keys"] + ([body["fallback_key"]] if "fallback_key" in body else []):
                 assert kybot.ed_verify(dev["ed25519"], kybot.otk_signed(user, dev["device_id"], k["key_id"], k["key"]), k["signature"])
-                box.append(k)
-            return {"one_time_key_count": len(box)}
+            for k in body["one_time_keys"]:
+                # As the store: a key ID keeps its first value, and a spent one never returns.
+                if (d, k["key_id"]) not in self.spent and all(x["key_id"] != k["key_id"] for x in box):
+                    box.append(k)
+            assert len(box) <= 100, "Too many one-time keys stored for this device"
+            if "fallback_key" in body:
+                self.fallbacks[d] = body["fallback_key"]
+            if self.lose_upload and body["one_time_keys"]:  # stored, but the response never arrives
+                self.lose_upload -= 1
+                raise SystemExit("POST /api/v1/keys/upload: connection reset")
+            return {"one_time_key_count": len(box), "has_fallback_key": d in self.fallbacks}
         if p == "/api/v1/keys/query":
             out = {"tenant_id": self.tenant, "devices": {}, "master_keys": {}, "bot_devices": {}}
             for u in body["user_ids"]:
@@ -89,11 +101,18 @@ class FakeServer:
                     out["master_keys"][lst["owner_id"]] = json.loads(json.dumps(self.masters[lst["owner_id"]]))
             return out
         if p == "/api/v1/keys/claim":
+            if not 1 <= len(body["devices"]) <= 100:
+                raise SystemExit("POST /api/v1/keys/claim: HTTP 400 Name 1 to 100 devices")
+            self.claims.append(len(body["devices"]))
             keys = []
             for d in body["devices"]:
-                box = self.otks.get((d["user_id"], d["device_id"]), [])
+                k = (d["user_id"], d["device_id"])
+                box = self.otks.get(k, [])
                 if box:
+                    self.spent.add((k, box[0]["key_id"]))
                     keys.append({**d, **box.pop(0), "fallback": False})
+                elif k in self.fallbacks:
+                    keys.append({**d, **self.fallbacks[k], "fallback": True})
             return {"keys": keys}
         if p == "/api/v1/to-device" and method == "PUT":
             if self.fail_to_device:
@@ -532,6 +551,67 @@ class Trust(unittest.TestCase):
         sent = self.alice.send("r1", "retried")
         self.bot.sync()
         self.assertEqual(self.bot.open(sent)["body"], "retried")
+
+    def test_more_than_100_devices_get_keys_through_bounded_claims(self):
+        # A room's members choose how many devices they have; the server claims 100 at most.
+        self.env.vouch("u_alice", "bot_helper", self.bot)
+        self.env.server.rooms["r1"].append("u_bob")
+        alices = [self.alice] + [self.env.person("u_alice") for _ in range(50)]
+        bobs = [self.env.person("u_bob") for _ in range(50)]
+        sent = self.bot.send("r1", "to everyone")
+        self.assertEqual(sorted(self.env.server.claims), [1, 100])
+        for d in (alices[0], alices[-1], bobs[0], bobs[-1]):
+            d.sync()
+            self.assertEqual(d.open(sent)["body"], "to everyone")
+
+    def test_a_device_whose_signed_key_the_core_refuses_is_skipped_alone(self):
+        self.env.vouch("u_alice", "bot_helper", self.bot)
+        self.env.server.rooms["r1"].append("u_bob")
+        bob = self.env.person("u_bob")
+        zero = kybot.b64(bytes(32))  # non-contributory: vodozemac refuses a session with it
+        self.env.server.otks[("u_bob", bob.device_id)] = [{"key_id": "AAAAAAAAAAA", "key": zero,
+            "signature": bob.account().sign(kybot.otk_signed("u_bob", bob.device_id, "AAAAAAAAAAA", zero)).to_base64()}]
+        sent = self.bot.send("r1", "still sent")
+        self.alice.sync()
+        self.assertEqual(self.alice.open(sent)["body"], "still sent")
+        self.assertEqual(self.env.mail_to(bob), 0)
+
+    def test_one_time_keys_survive_a_lost_upload_response(self):
+        # The server stores the bot's new keys, then the response (or the process) is lost.
+        self.env.vouch("u_alice", "bot_helper", self.bot)
+        self.env.server.otks[("bot_helper", self.bot.device_id)] = []
+        self.env.server.lose_upload = 1
+        with self.assertRaises(SystemExit):
+            self.bot.sync()
+        self.assertEqual(len(self.env.server.otks[("bot_helper", self.bot.device_id)]), kybot.OTK_TARGET)
+        sent = self.alice.send("r1", "to a published key")  # claims one of those keys
+        restarted = kybot.Bot(self.env.server.as_("bot_helper"), kybot.State(self.bot.st.path))
+        restarted.sync()
+        self.assertEqual(restarted.open(sent)["body"], "to a published key")
+
+    def test_drained_one_time_keys_leave_the_fallback_key(self):
+        self.env.vouch("u_alice", "bot_helper", self.bot)
+        for _ in range(kybot.OTK_TARGET):  # anyone in the org can claim them all
+            self.env.server.handle("u_mallory", "POST", "/api/v1/keys/claim", {"devices": [{"user_id": "bot_helper", "device_id": self.bot.device_id}]}, None)
+        sent = self.alice.send("r1", "through the fallback key")
+        self.bot.sync()
+        self.assertEqual(self.bot.open(sent)["body"], "through the fallback key")
+        # A fallback key the server retired (a restore) is replaced on the next sync.
+        k = ("bot_helper", self.bot.device_id)
+        old = self.env.server.fallbacks.pop(k)
+        self.bot.sync()
+        self.assertNotEqual(self.env.server.fallbacks[k]["key"], old["key"])
+
+    def test_an_oversized_message_is_refused_before_any_key_moves(self):
+        self.env.vouch("u_alice", "bot_helper", self.bot)
+        for text in ("a" * ((16 << 10) + 1), "\x01" * (16 << 10)):  # too long; under 16 KiB but escapes to over 32 KiB
+            with self.assertRaises(SystemExit):
+                self.bot.send("r1", text)
+        self.assertEqual((self.env.mail_to(self.alice), self.env.server.claims, self.env.server.messages), (0, [], {}))
+        self.assertEqual(self.bot.send("r1", "\u00e9" * (8 << 10))["room_id"], "r1")  # 16 KiB of UTF-8 still goes
+        with self.assertRaises(SystemExit) as cm:  # the server's page limit, as a usage error
+            kybot.main(["read", "r1", "--limit", "101"])
+        self.assertEqual(cm.exception.code, 2)
 
     def test_the_bot_reads_its_own_messages(self):
         self.env.vouch("u_alice", "bot_helper", self.bot)

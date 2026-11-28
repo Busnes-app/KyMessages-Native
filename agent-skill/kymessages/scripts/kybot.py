@@ -55,6 +55,7 @@ OTK_TARGET = 50
 CHUNK = 64 << 10
 ATT_LABEL = b"kymessages.attachment.v1"
 MAX_CIPHERTEXT = 100 << 20
+MAX_MESSAGE_BYTES, MAX_INNER_BYTES = 16 << 10, 32 << 10  # web/src/chat/e2ee.ts
 
 
 def b64(b: bytes) -> str:
@@ -281,19 +282,34 @@ class Bot:
         self.upload(acct, keys)
         return {"user_id": self.user_id, "device_id": self.device_id, "code": device_code(self.user_id, self.device_id, curve, ed)}
 
-    def upload(self, acct: vz.Account, device_keys: dict | None = None, count: int | None = None) -> None:
-        need = OTK_TARGET if count is None else max(0, OTK_TARGET - count)
-        if need:
-            acct.generate_one_time_keys(need)
-        otks = [{"key_id": k, "key": v.to_base64(), "signature": acct.sign(otk_signed(self.user_id, self.device_id, k, v.to_base64())).to_base64()}
-                for k, v in acct.one_time_keys.items()]
-        body = {"device_id": self.device_id, "one_time_keys": otks}
+    def publish(self, acct: vz.Account, device_keys: dict | None = None) -> dict:
+        """Uploads the account's unpublished keys, saved first: after a lost response or a crash
+        their private halves are still here, and the next upload sends the same keys again."""
+        sign = lambda k, v: {"key_id": k, "key": v.to_base64(), "signature": acct.sign(otk_signed(self.user_id, self.device_id, k, v.to_base64())).to_base64()}
+        body = {"device_id": self.device_id, "one_time_keys": [sign(k, v) for k, v in acct.one_time_keys.items()]}
+        for k, v in acct.fallback_key.items():
+            body["fallback_key"] = sign(k, v)
         if device_keys:
             body["device_keys"] = device_keys
-        self.s.call("POST", "/api/v1/keys/upload", body)
+        self.keep(acct)
+        self.st.save()
+        r = self.s.call("POST", "/api/v1/keys/upload", body)
         acct.mark_keys_as_published()
         self.keep(acct)
         self.st.save()
+        return r
+
+    def upload(self, acct: vz.Account, device_keys: dict | None = None, low: int = OTK_TARGET) -> None:
+        """Keeps a live fallback key on the server, and tops one-time keys up to OTK_TARGET once
+        fewer than low are left (as engine.ts publishKeys)."""
+        r = self.publish(acct, device_keys)
+        if r.get("has_fallback_key") is False:  # none yet, or retired by the server
+            acct.generate_fallback_key()
+            r = self.publish(acct)
+        count = r.get("one_time_key_count", 0)
+        if count < low:
+            acct.generate_one_time_keys(OTK_TARGET - count)
+            self.publish(acct)
 
     # Trust: who may have this bot's room keys, and whose room keys it believes
 
@@ -480,9 +496,7 @@ class Bot:
             self.st.save()  # ratchets and keys before the ack
             if done:
                 self.s.call("POST", "/api/v1/to-device/ack", {"device_id": self.device_id, "ids": done})
-        count = self.s.call("POST", "/api/v1/keys/upload", {"device_id": self.device_id, "one_time_keys": []})
-        if count.get("one_time_key_count", OTK_TARGET) < OTK_TARGET // 2:
-            self.upload(self.account(), count=count["one_time_key_count"])
+        self.upload(self.account(), low=OTK_TARGET // 2)
         return got
 
     def room_key(self, m: dict, trusted: set) -> str | None:
@@ -601,14 +615,19 @@ class Bot:
         out = self.st["outbound"][room]
         todo = [t for t in targets if out["shared"].get(f"{t['user_id']}\n{t['device_id']}") != t["curve25519"]]
         missing = [t for t in todo if not self.st["olm"].get(t["curve25519"])]
-        if missing:
-            byd = {(t["user_id"], t["device_id"]): t for t in missing}
-            acct = self.account()
-            for c in self.s.call("POST", "/api/v1/keys/claim", {"devices": [{"user_id": t["user_id"], "device_id": t["device_id"]} for t in missing]})["keys"]:
-                t = byd.get((c.get("user_id"), c.get("device_id")))
-                if t and ed_verify(t["ed25519"], otk_signed(t["user_id"], t["device_id"], c["key_id"], c["key"]), c["signature"]):
+        acct = self.account()
+        for i in range(0, len(missing), 100):  # the server's claim limit, as the browser batches
+            byd = {(t["user_id"], t["device_id"]): t for t in missing[i:i + 100]}
+            for c in self.s.call("POST", "/api/v1/keys/claim", {"devices": [{"user_id": u, "device_id": d} for u, d in byd]})["keys"]:
+                t = byd.get((c.get("user_id"), c.get("device_id"))) if isinstance(c, dict) else None
+                if not t or not all(isinstance(c.get(k), str) for k in ("key_id", "key", "signature")) \
+                        or not ed_verify(t["ed25519"], otk_signed(t["user_id"], t["device_id"], c["key_id"], c["key"]), c["signature"]):
+                    continue
+                try:
                     s = acct.create_outbound_session(vz.Curve25519PublicKey.from_base64(t["curve25519"]), vz.Curve25519PublicKey.from_base64(c["key"]))
-                    self.st["olm"].setdefault(t["curve25519"], []).append(s.pickle(self.st.key))
+                except Exception:
+                    continue  # a signed key the crypto core refuses skips only that device, as the browser
+                self.st["olm"].setdefault(t["curve25519"], []).append(s.pickle(self.st.key))
         acct = self.account()
         content = {"room_id": room, "session_id": g.session_id, "session_key": g.session_key.to_base64(), "device_id": self.device_id}
         msgs = []
@@ -633,10 +652,8 @@ class Bot:
             self.st.save()
 
     def send(self, room: str, text: str, file: str | None = None) -> dict:
-        members = [m["user_id"] for m in self.s.call("GET", f"/api/v1/rooms/{urllib.parse.quote(room)}").get("members", [])]
-        targets = self.trusted_devices(sorted(set(members) | {self.user_id}))
-        g = self.outbound(room, members, targets)
-        self.share(room, g, targets)
+        if len(text.encode()) > MAX_MESSAGE_BYTES:
+            raise SystemExit("message is too long (16 KiB at most)")
         ref = "ref_" + uuid.uuid4().hex
         files, att_ids = [], []
         if file:
@@ -648,7 +665,15 @@ class Bot:
             files.append(desc)
             att_ids.append(att)
         inner = {"room_id": room, "type": "attachment" if files else "text", "body": text, "files": files, "ref": ref}
-        ciphertext = g.encrypt(json.dumps(inner).encode()).to_base64()
+        # The server takes envelopes up to 48 KiB; checked before any key is shared or ratchet spent.
+        plain = json.dumps(inner, ensure_ascii=False).encode()  # UTF-8, as the browser measures it
+        if len(plain) > MAX_INNER_BYTES:
+            raise SystemExit("too much to send in one message")
+        members = [m["user_id"] for m in self.s.call("GET", f"/api/v1/rooms/{urllib.parse.quote(room)}").get("members", [])]
+        targets = self.trusted_devices(sorted(set(members) | {self.user_id}))
+        g = self.outbound(room, members, targets)
+        self.share(room, g, targets)
+        ciphertext = g.encrypt(plain).to_base64()
         self.st["outbound"][room]["pickle"] = g.pickle(self.st.key)
         self.st.save()
         env = {"alg": "megolm.v1", "sender_key": self.account().curve25519_key.to_base64(), "device_id": self.device_id, "session_id": g.session_id, "ciphertext": ciphertext}
@@ -699,6 +724,8 @@ def main(argv: list[str] | None = None) -> None:
     a = sub.add_parser("accept")
     a.add_argument("user")
     args = ap.parse_args(argv)
+    if args.cmd == "read" and not 1 <= args.limit <= 100:
+        ap.error("--limit must be 1 to 100 (the server's page limit)")
     url, token = os.environ.get("KYMESSAGES_SERVER_URL"), os.environ.get("KYMESSAGES_ACCESS_TOKEN")
     if not url or not token:
         raise SystemExit("set KYMESSAGES_SERVER_URL and KYMESSAGES_ACCESS_TOKEN (a kybot_ token)")

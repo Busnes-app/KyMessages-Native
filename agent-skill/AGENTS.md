@@ -31,7 +31,10 @@ device `scripts/kybot.py` with `scripts/requirements.txt`), `skill.go` (`go:embe
   signed list (a bot only through its owner's `kymessages.bot-devices.v1` list), lists only move
   forward, room keys only from such devices, a changed identity waits for `accept` (even if the
   server goes back to the old key). It also pins its org and each bot's owner on first sight;
-  room-key mail counts as shared only once delivered. A message that fails any check is that
+  room-key mail counts as shared only once delivered. It keeps the browser's server limits (100
+  per claim, query, send and mailbox page; 16 KiB text, 32 KiB sealed JSON) and its order: keys
+  are saved before they are published, and mail is acknowledged only after what it delivered is
+  saved. Like a browser it keeps a fallback key on the server. A message that fails any check is that
   message's error alone; an E5 edit's files come from the first envelope it names (`ref`, count).
   One command runs at a time per state file (`<state>.lock`). Change both
   sides together.
