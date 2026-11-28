@@ -188,3 +188,55 @@ func TestE2EEBotDevicesLapseWithTheOwnersIdentity(t *testing.T) {
 		t.Fatalf("after re-vouching = %+v", q.BotDevices)
 	}
 }
+
+// Entries the owner keeps unchanged from their list at expected_epoch need not be current
+// uploads, so a device the bot signed out of never blocks adding or removing another. New or
+// changed entries still must be.
+func TestE2EEBotDevicesKeepUnchangedEntriesOfGoneDevices(t *testing.T) {
+	srv, st, _ := setupTestServer(t)
+	alice, _ := createChatTestUser(t, st, "u_e4k_alice", "e4kalice", "user")
+	aliceTok := freshSession(t, st, alice)
+	const botID = "bot_e4k_helper"
+	botTok := createChatTestBot(t, st, botID, "agent-e4k", alice.ID)
+	aliceID := newIdentity(t, store.DefaultTenantID, alice.ID)
+	if rec := doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/master", aliceTok, aliceID.put(t, 0), nil); rec.Code != http.StatusOK {
+		t.Fatalf("identity = %d", rec.Code)
+	}
+	d1, d2, d3 := newTestDevice(t, botID, "BOTDEVICE1"), newTestDevice(t, botID, "BOTDEVICE2"), newTestDevice(t, botID, "BOTDEVICE3")
+	for _, d := range []*testDevice{d1, d2, d3} {
+		registerDevice(t, srv, botTok, d)
+	}
+	path := "/api/v1/keys/bots/" + botID + "/devices"
+	put := func(expected, epoch int64, devs ...*testDevice) int {
+		return doBearerJSON(t, srv, http.MethodPut, path, aliceTok, botList(t, aliceID, alice.ID, botID, expected, epoch, devs...), nil).Code
+	}
+	if c := put(0, 1, d1, d2); c != http.StatusOK {
+		t.Fatalf("first list = %d", c)
+	}
+	gone := func(d *testDevice) {
+		if rec := doBearerJSON(t, srv, http.MethodDelete, "/api/v1/keys/devices/"+d.id, botTok, nil, nil); rec.Code != http.StatusNoContent {
+			t.Fatalf("sign-out %s = %d", d.id, rec.Code)
+		}
+	}
+	gone(d1)
+	// A changed entry must still match an upload.
+	swapped := *d2
+	swapped.priv = newTestDevice(t, botID, "x").priv
+	if c := put(1, 2, d1, &swapped); c != http.StatusBadRequest {
+		t.Fatalf("a kept entry with other keys = %d, want 400", c)
+	}
+	if c := put(1, 2, d1, d2, d3); c != http.StatusOK {
+		t.Fatalf("adding while a vouched device is gone = %d", c)
+	}
+	// Two vouched devices gone: each is removed in turn while the other is kept.
+	gone(d2)
+	if c := put(2, 3, d2, d3); c != http.StatusOK {
+		t.Fatalf("removing one gone device = %d", c)
+	}
+	if c := put(3, 4, d3); c != http.StatusOK {
+		t.Fatalf("removing the other = %d", c)
+	}
+	if c := put(4, 5, d1, d3); c != http.StatusBadRequest {
+		t.Fatalf("adding a gone device back = %d, want 400", c)
+	}
+}

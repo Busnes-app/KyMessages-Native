@@ -36,8 +36,8 @@ type e2eeBotDevicesJSON struct {
 
 // PUT /api/v1/keys/bots/{id}/devices stores the device list of the caller's own bot {id} (its
 // user ID), signed by the caller's current master key: compare-and-swap on the epoch. Only the
-// bot's owner, signed in as a person, may write it; each device must be one the bot uploaded,
-// with exactly those keys.
+// bot's owner, signed in as a person, may write it; each new or changed device must be one the
+// bot uploaded, with exactly those keys.
 func (s *Server) handleE2EEPutBotDevices(w http.ResponseWriter, r *http.Request) {
 	user, tenantID, ok := s.e2eeCaller(w, r)
 	if !ok {
@@ -58,7 +58,28 @@ func (s *Server) handleE2EEPutBotDevices(w http.ResponseWriter, r *http.Request)
 		s.writeError(w, http.StatusBadRequest, "Invalid bot device list")
 		return
 	}
+	// An entry kept unchanged from the caller's list at expected_epoch may name a device the bot
+	// no longer uploads (signed out, or keys swapped): otherwise no other entry could change.
+	kept := map[e2eeid.BotDevice]bool{}
+	if req.ExpectedEpoch > 0 {
+		lists, err := s.store.E2EE().ListBotDevices(r.Context(), tenantID, []string{botID})
+		if err != nil {
+			s.writeError(w, http.StatusInternalServerError, "Failed to load the bot device list")
+			return
+		}
+		for _, l := range lists {
+			var prev []e2eeid.BotDevice
+			if l.OwnerUserID == user.ID && l.OwnerVersion == req.Version && l.Epoch == req.ExpectedEpoch && json.Unmarshal([]byte(l.Devices), &prev) == nil {
+				for _, d := range prev {
+					kept[d] = true
+				}
+			}
+		}
+	}
 	for _, d := range req.Devices {
+		if kept[d] {
+			continue
+		}
 		dev, err := s.store.E2EE().GetDevice(r.Context(), botID, d.DeviceID)
 		if err != nil || dev.TenantID != tenantID || dev.Curve25519 != d.Curve25519 || dev.Ed25519 != d.Ed25519 {
 			s.writeError(w, http.StatusBadRequest, "The bot has no such device")

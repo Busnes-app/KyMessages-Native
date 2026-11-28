@@ -4,7 +4,7 @@
 import { Conflict, deviceSigned, oneTimeKeySigned, type ClaimedKey, type DeviceKeys, type KeyServer, type Mail, type SignedKey } from './engine';
 import type { BackupEntry, BotDeviceList, MasterKeyRecord, OwnMaster } from './identity';
 import { verifyEd25519 } from './index';
-import { pqc } from '../pqc/index';
+import { pqc, type BotDevice } from '../pqc/index';
 
 export const TENANT = '00000000-0000-4000-8000-00000000000a';
 
@@ -268,6 +268,13 @@ export class FakeKeyServer {
         // As the server: expected 0 also replaces a list another owner identity signed.
         const stale = cur && (cur.owner_id !== userId || cur.version !== b.version);
         if (((stale && b.expected_epoch === 0) ? 0 : cur?.epoch ?? 0) !== b.expected_epoch || b.epoch <= b.expected_epoch) throw new Conflict('409');
+        // As the server: a new or changed entry must be an upload; one kept unchanged need not.
+        const same = (x: BotDevice, y: BotDevice) => x.device_id === y.device_id && x.curve25519 === y.curve25519 && x.ed25519 === y.ed25519;
+        for (const d of b.devices) {
+          if (!stale && b.expected_epoch > 0 && cur?.devices.some((p) => same(p, d))) continue;
+          const up = this.devices.get(botId)?.get(d.device_id);
+          if (!up || !same(up, d)) throw new Error('400 The bot has no such device');
+        }
         this.botLists.set(botId, { owner_id: userId, version: b.version, epoch: b.epoch, devices: structuredClone(b.devices), signature: b.signature });
       },
     };
