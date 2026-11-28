@@ -1,7 +1,7 @@
 import 'fake-indexeddb/auto';
 import { readFileSync } from 'node:fs';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { botDeviceCode, CryptoEngine, deviceSigned } from './engine';
+import { botDeviceCode, CryptoEngine, deviceSigned, IdentityConflict, type KeyServer } from './engine';
 import { Account } from './index';
 import { FakeKeyServer, TENANT } from './fakeKeyServer';
 import { loadCryptoSync } from './index';
@@ -206,5 +206,63 @@ describe('bots as devices (E4)', () => {
     server.botLists.set(BOT, { owner_id: 'u_alice', version: 1, epoch: 2, devices: evil, signature: pqc.signBotDevices(forged.seed, TENANT, 'u_alice', 1, BOT, 2, evil) });
     await alice.vouchForBot(BOT, 2, { add: view.uploaded.find((d) => d.device_id === second.deviceId)! });
     expect(server.botLists.get(BOT)!.devices).toEqual([keysOf(second)]);
+  });
+  it('trusts no device a lookup checked against an owner key it did not pin', async () => {
+    const { server, alice, bot } = await setup();
+    await vouch(alice, bot);
+    // A second bot of Alice's, and a colleague who has never seen Alice's key. The server answers
+    // the colleague's first batch with a forged key for Alice vouching for that bot, and the
+    // second batch with her real key vouching for the first.
+    const other = await botDevice(server, 'bot_second');
+    const mallory = pqc.masterGenerate();
+    const devices = [keysOf(other)];
+    const forgedList = { owner_id: 'u_alice', version: 1, epoch: 1, devices, signature: pqc.signBotDevices(mallory.seed, TENANT, 'u_alice', 1, 'bot_second', 1, devices) };
+    const forgedMaster = { version: 1, master_key: mallory.public_key, self_signature: pqc.signMaster(mallory.seed, TENANT, 'u_alice') };
+    let hostile = true;
+    const base = server.as('u_carol');
+    const api: KeyServer = {
+      ...base,
+      query: async (ids, signal) => {
+        const r = await base.query(ids, signal);
+        if (hostile && ids.includes('bot_second')) {
+          r.master_keys!.u_alice = forgedMaster;
+          r.bot_devices!.bot_second = forgedList;
+        }
+        return r;
+      },
+    };
+    const carol = await CryptoEngine.open('u_carol', api, await openCryptoStore('u_carol'));
+    opened.push(carol);
+    await (await carol.prepareIdentity()).commit();
+    // bot_second in the first batch of 100, bot_helper in the second.
+    server.join('r2', 'u_carol', 'bot_second', ...Array.from({ length: 98 }, (_, i) => `u_filler${i}`), BOT);
+    await expect(carol.encrypt('r2', { type: 'text', body: 'two keys for Alice' })).rejects.toThrow(IdentityConflict);
+    expect(mailTo(server, other)).toBe(0);
+    expect(mailTo(server, bot)).toBe(0);
+    // Nothing was pinned: once the server is consistent, Alice's real key vouches as before.
+    hostile = false;
+    await carol.encrypt('r2', { type: 'text', body: 'one key for Alice' });
+    expect(mailTo(server, bot)).toBe(1);
+    expect(mailTo(server, other)).toBe(0);
+  });
+
+  it('changes a list whose vouched devices the bot no longer uploads, one device at a time', async () => {
+    const { server, alice, bot } = await setup();
+    const second = await botDevice(server, BOT, 'second-store');
+    const third = await botDevice(server, BOT, 'third-store');
+    await vouch(alice, bot);
+    await vouch(alice, second);
+    const gone = (d: CryptoEngine) => server.devices.get(BOT)!.delete(d.deviceId);
+    gone(bot);
+    // Adding a device keeps the gone one's signed entry, which the server accepts unchanged.
+    await vouch(alice, third);
+    expect(server.botLists.get(BOT)!.devices).toHaveLength(3);
+    gone(second);
+    // Two gone devices, each removed in turn while the other is still kept.
+    await alice.vouchForBot(BOT, 3, { remove: bot.deviceId });
+    await alice.vouchForBot(BOT, 4, { remove: second.deviceId });
+    expect(server.botLists.get(BOT)!.devices).toEqual([keysOf(third)]);
+    // A gone device is never new again: adding it back is refused.
+    await expect(alice.vouchForBot(BOT, 5, { add: { ...keysOf(bot), code: botDeviceCode({ user_id: BOT, ...keysOf(bot) }) } })).rejects.toThrow(/no such device/);
   });
 });

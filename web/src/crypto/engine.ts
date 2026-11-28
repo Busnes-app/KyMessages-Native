@@ -272,6 +272,11 @@ export class NotVerified extends Error {
   }
 }
 
+/** A key query that showed one member with two master keys: nothing of theirs is trusted. */
+export class IdentityConflict extends Error {
+  constructor(userId: string) { super(`The server showed two encryption identities for ${userId} at once, so neither is trusted. Nothing was sent.`); }
+}
+
 export class DeviceChanged extends Error {
   constructor() { super('This browser device was replaced'); }
 }
@@ -522,7 +527,8 @@ export class CryptoEngine {
     const devicePins: [string, unknown][] = [];
     // Members seen for the first time: their devices wait until the synced pin set holds them.
     const sights = new Map<string, string>();
-    const proposed = new Map<string, { target: Target; pin?: [string, unknown] }[]>();
+    // Each with the fingerprint its devices were checked against.
+    const proposed: { user: string; fp: string; target: Target; pin?: [string, unknown] }[] = [];
     for (let i = 0; i < userIds.length; i += BATCH) {
       const batch = userIds.slice(i, i + BATCH);
       let listed: QueryResult;
@@ -539,7 +545,11 @@ export class CryptoEngine {
         const pinUser = bot ? bot.owner_id : userId;
         // No pinned, validly self-bound master key (or this device is unverified): none of this
         // member's devices gets keys.
+        const seen = sights.get(pinUser);
         const master = await this.identity.trustedMaster(pinUser, listed.master_keys?.[pinUser], listed.tenant_id, pins, sights);
+        // One lookup showing a first-seen member (or a bot's owner) with two keys: neither is
+        // picked, nothing is pinned or shared, and the caller sees why.
+        if (seen !== undefined && sights.get(pinUser) !== seen) throw new IdentityConflict(pinUser);
         if (!master) continue;
         const vouched = bot && (await this.identity.trustedBot(userId, pinUser, master, listed.tenant_id, bot));
         const trusted = (d: DeviceKeys) => {
@@ -560,7 +570,8 @@ export class CryptoEngine {
           if (!checked || !trusted(d as DeviceKeys)) continue;
           ok.push(checked);
         }
-        if (sights.has(pinUser)) proposed.set(pinUser, [...(proposed.get(pinUser) ?? []), ...ok]);
+        const fp = sights.get(pinUser);
+        if (fp !== undefined) for (const c of ok) proposed.push({ user: pinUser, fp, ...c });
         else for (const c of ok) {
           if (c.pin) devicePins.push(c.pin);
           out.push(c.target);
@@ -585,12 +596,11 @@ export class CryptoEngine {
       pinSyncFailed(e);
     }
     const later: [string, unknown][] = [...devicePins];
-    for (const [userId, ok] of proposed) {
-      if (!committed.has(userId)) continue;
-      for (const c of ok) {
-        if (c.pin) later.push(c.pin);
-        out.push(c.target);
-      }
+    for (const c of proposed) {
+      // Released only under exactly the fingerprint committed for its member.
+      if (!committed.has(c.user) || sights.get(c.user) !== c.fp) continue;
+      if (c.pin) later.push(c.pin);
+      out.push(c.target);
     }
     await this.store.write(later);
     this.identity.afterWrites();
