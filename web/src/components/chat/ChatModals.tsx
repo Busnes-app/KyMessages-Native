@@ -405,7 +405,7 @@ export const SearchModal: React.FC<SearchModalProps> = ({ userId, rooms, activeR
           keepHighlight
           items={hits}
           filter={null}
-          itemToStringValue={(hit: SearchHit) => hit.body}
+          itemToStringValue={(hit: SearchHit) => hit.body || (hit.files ?? []).join(', ')}
           value={query}
           onValueChange={(v, d) => {
             if (typed(d.reason)) setQuery(v);
@@ -463,7 +463,7 @@ export const SearchModal: React.FC<SearchModalProps> = ({ userId, rooms, activeR
                       <span>·</span>
                       <span>{formatTime(hit.created_at)}</span>
                     </div>
-                    <div className="chat-search-hit-body">{highlightQuery(hit.body, query)}</div>
+                    <div className="chat-search-hit-body">{highlightQuery(hit.body || (hit.files ?? []).join(', '), query)}</div>
                   </Autocomplete.Item>
                 );
               })}

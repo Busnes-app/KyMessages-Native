@@ -1,3 +1,4 @@
+import type { MessageFiles } from '../crypto/attachments';
 import { arr, bool, count, obj, oneOf, opt, str } from '../dto';
 
 export type RoomKind = 'dm' | 'channel' | 'meeting';
@@ -150,7 +151,17 @@ export interface ChatMessage {
   delivery: MessageDeliveryState;
   /** For e2ee_room_v1: the envelope as stored. `body` holds only decrypted text, never this. */
   envelope?: string;
+  /** For an edited e2ee_room_v1 message with files: the envelope it was first sent in, which holds them. */
+  original?: string;
   e2ee?: E2EEState;
+  /** From the decrypted message only, never the server: its encrypted files (keys included). */
+  files?: MessageFiles['files'];
+  filesState?: MessageFiles['filesState'];
+  plainIds?: MessageFiles['plainIds'];
+  /** What an edit of this message must carry (from its own envelope or latest edit). */
+  provenance?: MessageFiles['provenance'];
+  /** The sender's ID for this message, its idempotency key, sealed in the message. */
+  ref?: string;
 }
 
 export type CallMode = 'p2p_mesh' | 'sfu_livekit';
@@ -292,7 +303,7 @@ export type WsServerEvent =
   | { kind: 'hello'; userId: string }
   | { kind: 'pong' }
   | { kind: 'message.new'; roomId: string; seq: number; message?: ChatMessage; refetch: boolean }
-  | { kind: 'message.edit'; roomId: string; seq: number; message?: ChatMessage; refetch: boolean }
+  | { kind: 'message.edit'; roomId: string; seq: number; message?: ChatMessage; refetch: boolean; messageId?: string }
   | { kind: 'message.delete'; roomId: string; seq: number; messageId: string; deletedAt: number }
   | { kind: 'reaction.set'; roomId: string; messageId: string; userId: string; emoji: string; added: boolean }
   | { kind: 'room.member'; roomId: string; action: 'added' | 'removed' | 'role'; userId: string; role?: RoomRole }
@@ -417,6 +428,14 @@ export function parseAttachment(v: unknown): ChatAttachment {
   };
 }
 
+export const LOCAL_SEND_PREFIX = 'pending_';
+
+function wireMessageId(v: unknown): string {
+  const id = str(v, 128);
+  if (id.startsWith(LOCAL_SEND_PREFIX)) throw new Error('Server message uses a local send ID');
+  return id;
+}
+
 export function parseMessage(v: unknown): ChatMessage {
   const o = obj(v);
   const encoding = opt(o.encoding, (e) => oneOf(e, ENCODINGS)) ?? 'plain_v1';
@@ -424,7 +443,7 @@ export function parseMessage(v: unknown): ChatMessage {
   // Ciphertext never sits in body, so nothing that shows or indexes body can leak it.
   const sealed = encoding === 'e2ee_room_v1' && !opt(o.deleted_at, num);
   return {
-    id: str(o.id, 128),
+    id: wireMessageId(o.id),
     tenant_id: opt(o.tenant_id, (s) => str(s, 128)) ?? 'default',
     room_id: str(o.room_id, 128),
     seq: opt(o.seq, count) ?? 0,
@@ -434,6 +453,7 @@ export function parseMessage(v: unknown): ChatMessage {
     encoding,
     body: encoding === 'e2ee_room_v1' ? '' : body,
     ...(sealed ? { envelope: body, e2ee: { kind: 'waiting' } as E2EEState } : {}),
+    ...(sealed && typeof o.original_body === 'string' && o.original_body ? { original: str(o.original_body, 65536) } : {}),
     edited_at: opt(o.edited_at, num),
     deleted_at: opt(o.deleted_at, num),
     created_at: opt(o.created_at, num) ?? Date.now(),
@@ -682,7 +702,9 @@ export function parseWsEvent(raw: unknown): WsServerEvent | null {
         if (data !== undefined && data !== null) {
           const d = obj(data);
           if (d.refetch === true) {
-            return { kind: t, roomId, seq, refetch: true };
+            // Too large for the bus: the row is named so it can be fetched again exactly.
+            const messageId = opt(d.id, wireMessageId);
+            return t === 'message.edit' ? { kind: t, roomId, seq, refetch: true, messageId } : { kind: t, roomId, seq, refetch: true };
           }
           return { kind: t, roomId, seq, message: parseMessage(d), refetch: false };
         }
@@ -695,7 +717,7 @@ export function parseWsEvent(raw: unknown): WsServerEvent | null {
           kind: 'message.delete',
           roomId,
           seq,
-          messageId: str(d.id, 128),
+          messageId: wireMessageId(d.id),
           deletedAt: opt(d.deleted_at, num) ?? Date.now(),
         };
       }
@@ -705,7 +727,7 @@ export function parseWsEvent(raw: unknown): WsServerEvent | null {
         return {
           kind: 'reaction.set',
           roomId,
-          messageId: str(d.message_id, 128),
+          messageId: wireMessageId(d.message_id),
           userId: str(d.user_id, 128),
           emoji: str(d.emoji, 32),
           added: bool(d.added),

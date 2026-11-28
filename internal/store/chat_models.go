@@ -166,15 +166,18 @@ type AttachmentQuotaReservation struct {
 
 // Message is one ordered message inside a room.
 type Message struct {
-	ID             string            `json:"id"`
-	TenantID       string            `json:"tenant_id"`
-	RoomID         string            `json:"room_id"`
-	Seq            int64             `json:"seq"`
-	SenderID       string            `json:"sender_id"`
-	SenderName     string            `json:"sender_name,omitempty"`
-	ReplyToID      string            `json:"reply_to_id,omitempty"`
-	Encoding       string            `json:"encoding"`
-	Body           string            `json:"body"`
+	ID         string `json:"id"`
+	TenantID   string `json:"tenant_id"`
+	RoomID     string `json:"room_id"`
+	Seq        int64  `json:"seq"`
+	SenderID   string `json:"sender_id"`
+	SenderName string `json:"sender_name,omitempty"`
+	ReplyToID  string `json:"reply_to_id,omitempty"`
+	Encoding   string `json:"encoding"`
+	Body       string `json:"body"`
+	// OriginalBody is the envelope an edited e2ee message with attachments was first sent in: it
+	// carries the files' keys, which edits never repeat (E5).
+	OriginalBody   string            `json:"original_body,omitempty"`
 	EditedAt       *int64            `json:"edited_at,omitempty"`
 	DeletedAt      *int64            `json:"deleted_at,omitempty"`
 	IdempotencyKey string            `json:"-"`
@@ -294,9 +297,10 @@ type UpsertMeetingResult struct {
 
 // BlobRef names one attachment blob: its org and its key.
 type BlobRef struct {
-	ID       string // the attachment row, where known
-	TenantID string
-	Key      string
+	ID         string // the attachment row, where known
+	TenantID   string
+	Key        string
+	sweepClaim string
 }
 
 // CallLease is the fenced owner of one room, on the database clock.

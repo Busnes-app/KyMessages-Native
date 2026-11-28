@@ -23,12 +23,14 @@ var (
 	ErrE2EEVersion   = errors.New("encryption identity version is not current")
 	ErrAlreadyExists = errors.New("record already exists")
 	// ErrUsernameTaken: another account holds the username (exact case, as the column is unique).
-	ErrUsernameTaken                  = fmt.Errorf("username is taken: %w", ErrAlreadyExists)
-	ErrSessionExpired                 = errors.New("session expired")
-	ErrPairingExpired                 = errors.New("pairing session expired")
-	ErrRoomClosed                     = errors.New("room is closed")
-	ErrReplyNotFound                  = errors.New("reply target is not a message in this room")
-	ErrAttachmentInvalid              = errors.New("attachment not found, not owned by sender, or already attached")
+	ErrUsernameTaken     = fmt.Errorf("username is taken: %w", ErrAlreadyExists)
+	ErrSessionExpired    = errors.New("session expired")
+	ErrPairingExpired    = errors.New("pairing session expired")
+	ErrRoomClosed        = errors.New("room is closed")
+	ErrReplyNotFound     = errors.New("reply target is not a message in this room")
+	ErrAttachmentInvalid = errors.New("attachment not found, not owned by sender, or already attached")
+	// ErrAttachmentNotCommitted marks an upload failure before commit was attempted.
+	ErrAttachmentNotCommitted         = errors.New("attachment commit was not attempted")
 	ErrErasureOrgMismatch             = errors.New("erasure org mismatch")
 	ErrSubjectErased                  = errors.New("subject erased")
 	ErrAttachmentUploadQuotaExceeded  = errors.New("organization upload quota exceeded")
@@ -563,6 +565,9 @@ type ChatStore interface {
 	DeactivateForErasure(ctx context.Context, tenantID, userID string) error
 	EraseUser(ctx context.Context, tenantID string, user *User) ([]BlobRef, error)
 	PendingBlobDeletes(ctx context.Context, limit int) ([]BlobRef, error)
+	QueueUploadIntent(ctx context.Context, tenantID, key string, notBefore int64) error
+	QueueLateUploadCleanup(ctx context.Context, tenantID, key string) error
+	DuePendingBlobDeletes(ctx context.Context, limit int, now time.Time, lease time.Duration) ([]BlobRef, error)
 	ClearPendingBlobDeletes(ctx context.Context, refs []BlobRef) error
 	// AttachmentTenant returns the org of the attachment stored under blobKey.
 	AttachmentTenant(ctx context.Context, blobKey string) (string, error)

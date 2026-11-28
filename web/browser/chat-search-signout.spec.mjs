@@ -15,6 +15,7 @@ async function openRoom(page, name) {
 }
 
 async function run({ page, context }, testInfo, { broadcast }) {
+  testInfo.setTimeout(90_000); // Allow one full sign-in limiter window plus the test.
   await page.goto('/');
   // The shared server allows 20 sign-ins a minute per client: wait out a 429, as the other specs do.
   let login = await page.request.post('/api/auth/login', { data: { username: 'admin', password: 'BrowserUpdated456!' } });

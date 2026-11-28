@@ -68,13 +68,22 @@ func encodeNotifyPayload(ev Event) (string, error) {
 	if len(b) <= MaxNotifyBytes {
 		return string(b), nil
 	}
-	// Oversized payload: drop full body and signal clients to catch up by sequence number.
+	// Oversized payload: drop full body and signal clients to refetch. The message ID (and Seq)
+	// name the row, so an edit of a message a client already holds is fetched again exactly.
+	var msg struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(ev.Data, &msg)
+	data := map[string]any{"refetch": true}
+	if msg.ID != "" && len(msg.ID) <= 128 {
+		data["id"] = msg.ID
+	}
 	slim := Event{
 		Type:   ev.Type,
 		RoomID: ev.RoomID,
 		Seq:    ev.Seq,
 		UserID: ev.UserID,
-		Data:   json.RawMessage(`{"refetch":true}`),
+		Data:   MustMarshalData(data),
 	}
 	b, err = json.Marshal(slim)
 	if err != nil {

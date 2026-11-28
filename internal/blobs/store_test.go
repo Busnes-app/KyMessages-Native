@@ -58,7 +58,7 @@ func TestStorePutOpenDeleteAndSHA256(t *testing.T) {
 	payload := makePNG(t)
 	wantHash := sha256.Sum256(payload)
 
-	res, err := st.Put("default", "att_019a0000-0000-7000-8000-000000000001", bytes.NewReader(payload), 1024*1024)
+	res, err := st.Put("default", "att_019a0000-0000-7000-8000-000000000001", bytes.NewReader(payload), 1024*1024, blobs.PutOptions{})
 	if err != nil {
 		t.Fatalf("Put: %v", err)
 	}
@@ -108,16 +108,16 @@ func TestStoreEnforcesSizeAndKeyBounds(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := st.Put("default", "att_empty_0001", bytes.NewReader(nil), 1024); !errors.Is(err, blobs.ErrEmpty) {
+	if _, err := st.Put("default", "att_empty_0001", bytes.NewReader(nil), 1024, blobs.PutOptions{}); !errors.Is(err, blobs.ErrEmpty) {
 		t.Errorf("empty Put = %v, want ErrEmpty", err)
 	}
-	if _, err := st.Put("default", "att_large_0001", bytes.NewReader(make([]byte, 17)), 16); !errors.Is(err, blobs.ErrTooLarge) {
+	if _, err := st.Put("default", "att_large_0001", bytes.NewReader(make([]byte, 17)), 16, blobs.PutOptions{}); !errors.Is(err, blobs.ErrTooLarge) {
 		t.Errorf("oversized Put = %v, want ErrTooLarge", err)
 	}
 
 	badKeys := []string{"", "../etc/passwd", "a/b/c/d/e/f", "short", "att..evil1234", "att\x00null1234"}
 	for _, k := range badKeys {
-		if _, err := st.Put("default", k, strings.NewReader("hi"), 64); !errors.Is(err, blobs.ErrInvalidKey) {
+		if _, err := st.Put("default", k, strings.NewReader("hi"), 64, blobs.PutOptions{}); !errors.Is(err, blobs.ErrInvalidKey) {
 			t.Errorf("Put(%q) = %v, want ErrInvalidKey", k, err)
 		}
 		if _, _, err := st.Open("default", k, 1); !errors.Is(err, blobs.ErrInvalidKey) {
@@ -156,7 +156,7 @@ func TestStoreMIMESniffingAndXSSDowngrade(t *testing.T) {
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			key := "att_mime_test_" + string(rune('a'+i)) + "00001"
-			res, err := st.Put("default", key, bytes.NewReader(tc.body), 1024*1024)
+			res, err := st.Put("default", key, bytes.NewReader(tc.body), 1024*1024, blobs.PutOptions{})
 			if err != nil {
 				t.Fatalf("Put: %v", err)
 			}
@@ -167,6 +167,24 @@ func TestStoreMIMESniffingAndXSSDowngrade(t *testing.T) {
 				t.Errorf("IsInlineSafeImage(%q) = %v, want %v", res.MimeType, got, tc.wantInlineOK)
 			}
 		})
+	}
+}
+
+func TestStoreOpaqueUploadIsNeverSniffed(t *testing.T) {
+	st, err := blobs.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	png := makePNG(t)
+	res, err := st.Put("default", "att_opaque_00001", bytes.NewReader(png), 1024*1024, blobs.PutOptions{Opaque: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.MimeType != "application/octet-stream" || res.SizeBytes != int64(len(png)) {
+		t.Fatalf("opaque Put = %+v, want application/octet-stream of %d bytes", res, len(png))
+	}
+	if _, err := st.Put("default", "att_opaque_00002", bytes.NewReader(nil), 1024, blobs.PutOptions{Opaque: true}); !errors.Is(err, blobs.ErrEmpty) {
+		t.Fatalf("empty opaque Put = %v, want ErrEmpty", err)
 	}
 }
 

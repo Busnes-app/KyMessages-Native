@@ -35,7 +35,7 @@ func TestOrgLayoutKeepsOrgsApart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.Put(orgA, key, strings.NewReader("alpha"), 64); err != nil {
+	if _, err := st.Put(orgA, key, strings.NewReader("alpha"), 64, blobs.PutOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "orgs", orgA, "att", key)); err != nil {
@@ -48,7 +48,7 @@ func TestOrgLayoutKeepsOrgsApart(t *testing.T) {
 	if _, err := read(t, st, orgB, key); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("org B read org A's blob: %v", err)
 	}
-	if _, err := st.Put(orgB, key, strings.NewReader("beta"), 64); err != nil {
+	if _, err := st.Put(orgB, key, strings.NewReader("beta"), 64, blobs.PutOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := read(t, st, orgA, key); got != "alpha" {
@@ -56,7 +56,7 @@ func TestOrgLayoutKeepsOrgsApart(t *testing.T) {
 	}
 	// Bad org names never reach the filesystem.
 	for _, bad := range []string{"", "../x", "a/b", "ORG", strings.Repeat("a", 65)} {
-		if _, err := st.Put(bad, key, strings.NewReader("x"), 64); !errors.Is(err, blobs.ErrInvalidKey) {
+		if _, err := st.Put(bad, key, strings.NewReader("x"), 64, blobs.PutOptions{}); !errors.Is(err, blobs.ErrInvalidKey) {
 			t.Errorf("Put(%q) = %v", bad, err)
 		}
 		if err := st.DeletePrefix(bad); !errors.Is(err, blobs.ErrInvalidKey) {
@@ -96,7 +96,7 @@ func TestRelocationOfFlatBlobs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := flat.Put(orgA, key, strings.NewReader("old"), 64); err != nil {
+	if _, err := flat.Put(orgA, key, strings.NewReader("old"), 64, blobs.PutOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	st, err := blobs.NewOrgStore(dir)
@@ -162,7 +162,7 @@ func TestDeleteDuringRelocationLeavesNothing(t *testing.T) {
 	for _, relocateFirst := range []bool{true, false} {
 		dir := t.TempDir()
 		flat, _ := blobs.NewStore(dir)
-		if _, err := flat.Put(orgA, key, strings.NewReader("x"), 64); err != nil {
+		if _, err := flat.Put(orgA, key, strings.NewReader("x"), 64, blobs.PutOptions{}); err != nil {
 			t.Fatal(err)
 		}
 		st, _ := blobs.NewOrgStore(dir)
@@ -192,7 +192,7 @@ func TestReadDuringRelocationFindsTheBlob(t *testing.T) {
 	st, _ := blobs.NewOrgStore(dir)
 	for i := range 300 {
 		k := fmt.Sprintf("att_race_%08d", i)
-		if _, err := flat.Put(orgA, k, strings.NewReader("x"), 64); err != nil {
+		if _, err := flat.Put(orgA, k, strings.NewReader("x"), 64, blobs.PutOptions{}); err != nil {
 			t.Fatal(err)
 		}
 		done := make(chan error, 1)

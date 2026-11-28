@@ -743,8 +743,8 @@ func (s *Server) handleChatSendMessage(w http.ResponseWriter, r *http.Request) {
 		seenAtt[id] = struct{}{}
 		attIDs = append(attIDs, id)
 	}
-	if len(attIDs) > maxAttachmentsPerMessage {
-		s.writeError(w, http.StatusBadRequest, "At most 10 attachments per message")
+	if len(attIDs) > maxAttachmentIDsPerMessage {
+		s.writeError(w, http.StatusBadRequest, "At most 10 files (and their thumbnails) per message")
 		return
 	}
 	body := strings.TrimSpace(req.Body)
@@ -754,6 +754,11 @@ func (s *Server) handleChatSendMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	encoding, err := s.messageEncoding(w, user, sess, req.Encoding, body)
 	if err != nil {
+		return
+	}
+	// Only encrypted messages carry thumbnails as attachments of their own.
+	if encoding == store.MessageEncodingPlainV1 && len(attIDs) > maxAttachmentsPerMessage {
+		s.writeError(w, http.StatusBadRequest, "At most 10 attachments per message")
 		return
 	}
 	idemKey := strings.TrimSpace(req.IdempotencyKey)
@@ -816,6 +821,36 @@ func (s *Server) handleChatSendMessage(w http.ResponseWriter, r *http.Request) {
 type editMessageRequest struct {
 	Body     string `json:"body"`
 	Encoding string `json:"encoding"`
+}
+
+// GET /api/v1/rooms/{id}/messages/{mid}
+// One message, for a member, read from the primary like the membership check: a client refetching
+// the exact row a slim bus frame names must see the edit that frame announced, never a lagging copy.
+func (s *Server) handleChatGetMessage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	user, _, ok := s.currentUser(r)
+	if !ok {
+		s.writeError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+	tenantID, ok := s.requireUserTenant(w, r, user)
+	if !ok {
+		return
+	}
+	roomID := r.PathValue("id")
+	if _, ok := s.requireRoomMember(w, r, tenantID, roomID, user.ID); !ok {
+		return
+	}
+	msg, err := s.store.Chat().GetMessage(r.Context(), tenantID, roomID, r.PathValue("mid"))
+	if errors.Is(err, store.ErrNotFound) {
+		s.writeError(w, http.StatusNotFound, "Message not found")
+		return
+	}
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "Failed to load message")
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"message": msg})
 }
 
 // PATCH /api/v1/rooms/{id}/messages/{mid}

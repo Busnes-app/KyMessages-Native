@@ -182,6 +182,11 @@ func TestPostgresBusPayloadFallbackAndShards(t *testing.T) {
 	if !strings.Contains(slim, `"refetch":true`) || !strings.Contains(slim, `"seq":6`) {
 		t.Fatalf("unexpected slim fallback: %s", slim)
 	}
+	// An oversized edit names its message, so peers holding the row fetch it again.
+	slimEdit, err := encodeNotifyPayload(Event{Type: EventMessageEdit, RoomID: "r1", Seq: 3, Data: MustMarshalData(map[string]string{"id": "msg_edited", "body": hugeBody, "original_body": hugeBody})})
+	if err != nil || len(slimEdit) > MaxNotifyBytes || !strings.Contains(slimEdit, `"id":"msg_edited"`) || !strings.Contains(slimEdit, `"seq":3`) {
+		t.Fatalf("slim edit = %s (err=%v)", slimEdit, err)
+	}
 }
 
 // Phase 1 resource gate: 500 concurrent WebSockets + fan-out must stay well below 100 MiB heap.

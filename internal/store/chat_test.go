@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -429,7 +430,13 @@ func TestAttachmentQuotaAtomicConcurrencyAndReservationRelease(t *testing.T) {
 			go func(idx int) {
 				defer wg.Done()
 				<-start
+				id := fmt.Sprintf("att_pending_%d", idx)
+				if err := chat.QueueUploadIntent(ctx, "", id, time.Now().Add(time.Minute).UnixMilli()); err != nil {
+					errs <- err
+					return
+				}
 				att := &store.Attachment{
+					ID:         id,
 					RoomID:     room.ID,
 					UploaderID: "u_alice",
 					Filename:   fmt.Sprintf("p-%d.bin", idx),
@@ -491,7 +498,13 @@ func TestAttachmentQuotaAtomicConcurrencyAndReservationRelease(t *testing.T) {
 						_ = chat.ReleaseAttachmentQuota(ctx, store.DefaultTenantID, res.ID)
 						return
 					}
+					id := fmt.Sprintf("att_%s_%d", uploader, idx)
+					if err := chat.QueueUploadIntent(ctx, "", id, time.Now().Add(time.Minute).UnixMilli()); err != nil {
+						errs <- err
+						return
+					}
 					att := &store.Attachment{
+						ID:         id,
 						RoomID:     room.ID,
 						UploaderID: uploader,
 						Filename:   fmt.Sprintf("t-%s-%d.bin", uploader, idx),
@@ -528,4 +541,162 @@ func TestAttachmentQuotaAtomicConcurrencyAndReservationRelease(t *testing.T) {
 			t.Fatalf("accepted=%d totalUsed=%d, want 4 new uploads (total 3200)", accepted.Load(), totalUsed)
 		}
 	})
+}
+
+// An edit never writes into a deleted message: deleted before, or concurrently, the row stays a
+// tombstone with no body and no kept envelope.
+func TestChatStoreEditNeverRevivesATombstone(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	chat := st.Chat()
+	room := &store.Room{Kind: store.RoomKindChannel, Name: "tomb", CreatedBy: "u_alice"}
+	if err := chat.CreateRoom(ctx, room, nil); err != nil {
+		t.Fatal(err)
+	}
+	post := func(i int) *store.Message {
+		m, _, err := chat.CreateMessage(ctx, store.CreateMessageParams{RoomID: room.ID, SenderID: "u_alice", Encoding: store.MessageEncodingE2EERoomV1, Body: fmt.Sprintf("first %d", i)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	gone := post(0)
+	if _, err := chat.DeleteMessage(ctx, "", room.ID, gone.ID, "u_alice", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := chat.EditMessage(ctx, "", room.ID, gone.ID, "u_alice", "late edit", store.MessageEncodingE2EERoomV1); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("edit of a deleted message = %v, want ErrNotFound", err)
+	}
+	for i := 1; i <= 20; i++ {
+		m := post(i)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, _ = chat.DeleteMessage(ctx, "", room.ID, m.ID, "u_alice", false)
+		}()
+		go func() {
+			defer wg.Done()
+			if _, err := chat.EditMessage(ctx, "", room.ID, m.ID, "u_alice", "racing edit", store.MessageEncodingE2EERoomV1); err != nil && !errors.Is(err, store.ErrNotFound) {
+				t.Errorf("racing edit: %v", err)
+			}
+		}()
+		wg.Wait()
+	}
+	page, _, err := chat.ListMessages(ctx, store.MessagePageQuery{RoomID: room.ID, Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range page {
+		if m.DeletedAt == nil || m.Body != "" || m.OriginalBody != "" {
+			t.Fatalf("message %s after delete/edit race: deleted=%v body=%q original=%q", m.ID, m.DeletedAt != nil, m.Body, m.OriginalBody)
+		}
+	}
+}
+
+// Every edit moves edited_at forward, even within one millisecond, so clients order versions.
+func TestChatStoreEditsAreStrictlyOrdered(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	chat := st.Chat()
+	room := &store.Room{Kind: store.RoomKindChannel, Name: "order", CreatedBy: "u_alice"}
+	if err := chat.CreateRoom(ctx, room, []string{"u_bob"}); err != nil {
+		t.Fatal(err)
+	}
+	m, _, err := chat.CreateMessage(ctx, store.CreateMessageParams{RoomID: room.ID, SenderID: "u_alice", Encoding: store.MessageEncodingE2EERoomV1, Body: "v0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var last int64
+	for i := 1; i <= 5; i++ {
+		e, err := chat.EditMessage(ctx, "", room.ID, m.ID, "u_alice", fmt.Sprintf("v%d", i), store.MessageEncodingE2EERoomV1)
+		if err != nil || e.EditedAt == nil || *e.EditedAt <= last {
+			t.Fatalf("edit %d: %v, edited_at %v after %d", i, err, e, last)
+		}
+		last = *e.EditedAt
+	}
+	if _, err := chat.EditMessage(ctx, "", room.ID, m.ID, "u_bob", "not mine", store.MessageEncodingE2EERoomV1); !errors.Is(err, store.ErrForbidden) {
+		t.Fatalf("edit by another member = %v, want ErrForbidden", err)
+	}
+}
+
+// An upload's intent goes with its commit; a sweep that leased it first makes the late commit
+// refuse, so no row ever names a blob being erased. Staged removals are queued with the row.
+func TestChatStoreUploadIntentsAndQueuedRemovals(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	chat := st.Chat()
+	room := &store.Room{Kind: store.RoomKindChannel, Name: "intents", CreatedBy: "u_alice"}
+	if err := chat.CreateRoom(ctx, room, nil); err != nil {
+		t.Fatal(err)
+	}
+	att := func(key string) *store.Attachment {
+		return &store.Attachment{ID: key, BlobKey: key, RoomID: room.ID, UploaderID: "u_alice", Filename: "encrypted.bin", MimeType: "application/octet-stream", SizeBytes: 10, SHA256Hex: strings.Repeat("a", 64)}
+	}
+	future := time.Now().Add(time.Hour).UnixMilli()
+	past := time.Now().Add(-time.Second).UnixMilli()
+	due := func() []string {
+		t.Helper()
+		refs, err := chat.DuePendingBlobDeletes(ctx, 100, time.Now(), time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var keys []string
+		for _, r := range refs {
+			keys = append(keys, r.Key)
+		}
+		return keys
+	}
+
+	// In flight: not due, and its commit removes it.
+	if err := chat.QueueUploadIntent(ctx, "", "att_intent_ok", future); err != nil {
+		t.Fatal(err)
+	}
+	if keys := due(); len(keys) != 0 {
+		t.Fatalf("an in-flight intent is due: %v", keys)
+	}
+	if err := chat.CommitAttachmentWithQuota(ctx, "", att("att_intent_ok"), store.AttachmentQuotaLimits{}); err != nil {
+		t.Fatal(err)
+	}
+	if queued, _ := chat.PendingBlobDeletes(ctx, 100); len(queued) != 0 {
+		t.Fatalf("a committed upload is still queued: %v", queued)
+	}
+
+	// Crashed past its deadline: due, leased by the sweep, and a late commit refuses.
+	if err := chat.QueueUploadIntent(ctx, "", "att_intent_late", past); err != nil {
+		t.Fatal(err)
+	}
+	if keys := due(); len(keys) != 1 || keys[0] != "att_intent_late" {
+		t.Fatalf("due = %v, want the late intent", keys)
+	}
+	if keys := due(); len(keys) != 0 {
+		t.Fatalf("a leased intent was handed out twice: %v", keys)
+	}
+	if err := chat.CommitAttachmentWithQuota(ctx, "", att("att_intent_late"), store.AttachmentQuotaLimits{}); !errors.Is(err, store.ErrAttachmentInvalid) {
+		t.Fatalf("late commit = %v, want ErrAttachmentInvalid", err)
+	}
+
+	if err := chat.ClearPendingBlobDeletes(ctx, []store.BlobRef{{TenantID: store.DefaultTenantID, Key: "att_intent_late"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := chat.CommitAttachmentWithQuota(ctx, "", att("att_intent_late"), store.AttachmentQuotaLimits{}); !errors.Is(err, store.ErrAttachmentInvalid) {
+		t.Fatalf("commit after completed cleanup = %v, want ErrAttachmentInvalid", err)
+	}
+
+	// A staged removal is queued with the row, due at once.
+	if err := chat.QueueUploadIntent(ctx, "", "att_staged", future); err != nil {
+		t.Fatal(err)
+	}
+	if err := chat.CommitAttachmentWithQuota(ctx, "", att("att_staged"), store.AttachmentQuotaLimits{}); err != nil {
+		t.Fatal(err)
+	}
+	if key, err := chat.DeleteStagedAttachment(ctx, "", "att_staged", "u_alice"); err != nil || key != "att_staged" {
+		t.Fatalf("delete staged = %q %v", key, err)
+	}
+	if keys := due(); len(keys) != 1 || keys[0] != "att_staged" {
+		t.Fatalf("due = %v, want the staged removal", keys)
+	}
+	if err := chat.ClearPendingBlobDeletes(ctx, []store.BlobRef{{TenantID: store.DefaultTenantID, Key: "att_staged"}}); err != nil {
+		t.Fatal(err)
+	}
 }

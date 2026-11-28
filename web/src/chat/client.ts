@@ -1,5 +1,6 @@
 import { errorMessage, secureFetch } from '../api';
 import { arr, bool, count, obj, opt, str } from '../dto';
+import { sealedIds, type FileDescriptor, type Provenance } from '../crypto/attachments';
 import { openMessage, openMessages, sealRoomMessage } from './e2ee';
 import type { MessageState } from './searchIndex';
 import {
@@ -36,6 +37,12 @@ import {
   type WsStatus,
 } from './types';
 
+export class ChatRequestError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
+}
+
 async function apiJSON(input: string, init: RequestInit = {}, fallback = 'Request failed'): Promise<unknown> {
   const headers = new Headers(init.headers);
   if (init.body && !headers.has('Content-Type')) {
@@ -43,7 +50,7 @@ async function apiJSON(input: string, init: RequestInit = {}, fallback = 'Reques
   }
   const res = await secureFetch(input, { credentials: 'same-origin', ...init, headers });
   if (!res.ok) {
-    throw new Error(await errorMessage(res, fallback));
+    throw new ChatRequestError(res.status, await errorMessage(res, fallback));
   }
   return res.json();
 }
@@ -200,25 +207,14 @@ export async function fetchMessages(
   return { ...page, messages: await openMessages(page.messages) };
 }
 
-export async function uploadAttachment(
-  roomId: string,
-  file: File,
-  signal?: AbortSignal,
-): Promise<ChatAttachment> {
-  const form = new FormData();
-  form.append('file', file, file.name);
-  // Leave Content-Type unset so the browser supplies the multipart boundary; secureFetch adds X-CSRF-Token.
-  const res = await secureFetch(`/api/v1/rooms/${encodeURIComponent(roomId)}/attachments`, {
-    method: 'POST',
-    credentials: 'same-origin',
-    body: form,
-    signal,
-  });
-  if (!res.ok) {
-    throw new Error(await errorMessage(res, 'Could not upload file'));
-  }
-  const data = obj(await res.json());
-  return parseAttachment(data.attachment);
+/** One message, read from the primary: the exact row a slim edit frame names. */
+export async function fetchMessage(roomId: string, messageId: string, signal?: AbortSignal): Promise<ChatMessage> {
+  const data = obj(
+    await apiJSON(`/api/v1/rooms/${encodeURIComponent(roomId)}/messages/${encodeURIComponent(messageId)}`, { signal }, 'Could not load message'),
+  );
+  const m = parseMessage(data.message);
+  if (m.id !== messageId || m.room_id !== roomId) throw new Error('Unexpected message');
+  return openMessage(m);
 }
 
 // The caller's staged (unposted) uploads in a room, which still count against their quota.
@@ -243,16 +239,21 @@ export async function sendMessage(params: {
   roomId: string;
   body: string;
   replyToId?: string;
-  attachmentIds?: string[];
+  files?: FileDescriptor[];
   idempotencyKey: string;
 }): Promise<ChatMessage> {
-  const hasFiles = Boolean(params.attachmentIds && params.attachmentIds.length > 0);
-  // Rooms are end-to-end encrypted: the text, its kind and its reply target travel sealed. The
-  // server keeps reply_to_id as a pointer; files stay plaintext until E5.
+  const files = params.files ?? [];
+  const attachmentIds = sealedIds(files);
+  // Rooms are end-to-end encrypted: the text, its kind, its reply target and each file's key and
+  // name travel sealed. The server keeps reply_to_id and the attachment IDs as pointers. `files`
+  // is always present, even empty: the message vouches for every file it has. `ref` (the
+  // idempotency key, the same on a retry) is the ID its edits name.
   const envelope = await sealRoomMessage(params.roomId, {
-    type: params.replyToId ? 'reply' : hasFiles ? 'attachment' : 'text',
+    type: params.replyToId ? 'reply' : files.length > 0 ? 'attachment' : 'text',
     body: params.body,
     ...(params.replyToId ? { reply_to_id: params.replyToId } : {}),
+    ref: params.idempotencyKey,
+    files,
   });
   const data = obj(
     await apiJSON(
@@ -264,25 +265,31 @@ export async function sendMessage(params: {
           body: envelope,
           encoding: 'e2ee_room_v1',
           reply_to_id: params.replyToId || undefined,
-          attachment_ids:
-            params.attachmentIds && params.attachmentIds.length > 0 ? params.attachmentIds : undefined,
+          attachment_ids: attachmentIds.length > 0 ? attachmentIds : undefined,
           idempotency_key: params.idempotencyKey,
         }),
       },
       'Could not send message',
     ),
   );
-  return openMessage(parseMessage(data.message));
+  const m = parseMessage(data.message);
+  if (m.room_id !== params.roomId) throw new Error('Unexpected message');
+  return openMessage(m);
 }
 
-export async function editMessage(roomId: string, messageId: string, body: string, replyToId?: string): Promise<ChatMessage> {
-  // An edit is sealed too, names the message it replaces and keeps the reply it was.
-  const envelope = await sealRoomMessage(roomId, {
-    type: 'edit',
-    body,
-    message_id: messageId,
-    ...(replyToId ? { reply_to_id: replyToId } : {}),
-  });
+export async function editMessage(params: {
+  roomId: string;
+  messageId: string;
+  body: string;
+  replyToId?: string;
+  provenance: Provenance | undefined;
+}): Promise<ChatMessage> {
+  const { roomId, messageId, body, replyToId, provenance } = params;
+  // An edit is sealed too, names the message it replaces and keeps the reply it was. It never
+  // carries file keys: it goes to whoever is in the room now, and the server keeps the envelope the
+  // files were sent in (original_body). It names what that envelope must hold instead.
+  if (!provenance) throw new Error('This message cannot be edited here.');
+  const envelope = await sealRoomMessage(roomId, editInner(messageId, body, provenance, replyToId));
   const data = obj(
     await apiJSON(
       `/api/v1/rooms/${encodeURIComponent(roomId)}/messages/${encodeURIComponent(messageId)}`,
@@ -293,7 +300,17 @@ export async function editMessage(roomId: string, messageId: string, body: strin
       'Could not edit message',
     ),
   );
-  return openMessage(parseMessage(data.message));
+  const m = parseMessage(data.message);
+  if (m.room_id !== roomId || m.id !== messageId) throw new Error('Unexpected message');
+  return openMessage(m);
+}
+
+/**
+ * The sealed content of an edit: new text, and what the message's files are (its sender's ID and
+ * how many, or that it is from before E5), never their keys.
+ */
+export function editInner(messageId: string, body: string, original: Provenance, replyToId?: string) {
+  return { type: 'edit' as const, body, message_id: messageId, ...(replyToId ? { reply_to_id: replyToId } : {}), original };
 }
 
 export async function deleteMessage(roomId: string, messageId: string): Promise<ChatMessage> {

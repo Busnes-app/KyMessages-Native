@@ -3,6 +3,7 @@ package backup_test
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Busnes-app/ky_server_base/internal/backup"
+	"github.com/Busnes-app/ky_server_base/internal/blobs"
 	"github.com/Busnes-app/ky_server_base/internal/store"
 )
 
@@ -185,6 +187,48 @@ func TestMirrorAttachmentsIdempotentPrunesAndAuthenticates(t *testing.T) {
 	}
 	if _, err := backup.RestoreAttachments(tamperedDir, t.TempDir(), key); err == nil {
 		t.Fatal("RestoreAttachments succeeded on tampered ciphertext")
+	}
+}
+
+// An end-to-end encrypted upload is an ordinary blob to the mirror: it is sealed again under the
+// attachment key and restores byte for byte, still client ciphertext.
+func TestMirrorRestoresEncryptedAttachmentsByteForByte(t *testing.T) {
+	cfg, _ := payloadConfig(t)
+	cfg.Attachments.Dir = filepath.Join(t.TempDir(), "att")
+	cfg.Backup.Dir = filepath.Join(t.TempDir(), "bak")
+	st, err := blobs.NewStore(cfg.Attachments.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ciphertext := make([]byte, 70_000)
+	if _, err := rand.Read(ciphertext); err != nil {
+		t.Fatal(err)
+	}
+	const key = "att_019a0000-0000-7000-8000-000000000401"
+	if _, err := st.Put("default", key, bytes.NewReader(ciphertext), 1<<20, blobs.PutOptions{Opaque: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backup.Collect(context.Background(), cfg, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := backup.MirrorAttachmentsAt(context.Background(), cfg, time.Now(), backup.DefaultMirrorPruneRetention); err != nil || res.Copied != 1 {
+		t.Fatalf("mirror = (%+v, %v), want one copied", res, err)
+	}
+	mirrored, err := os.ReadFile(filepath.Join(backup.AttachmentMirrorDir(cfg), key+".enc"))
+	if err != nil || bytes.Contains(mirrored, ciphertext[:64]) {
+		t.Fatalf("mirror copy is not resealed (%v)", err)
+	}
+	attKey, err := backup.LoadAttachmentKey(cfg.Database.DataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored := t.TempDir()
+	if n, err := backup.RestoreAttachments(backup.AttachmentMirrorDir(cfg), restored, attKey); err != nil || n != 1 {
+		t.Fatalf("restore = (%d, %v), want (1, nil)", n, err)
+	}
+	got, err := os.ReadFile(filepath.Join(restored, key))
+	if err != nil || !bytes.Equal(got, ciphertext) {
+		t.Fatalf("restored ciphertext differs (%v)", err)
 	}
 }
 

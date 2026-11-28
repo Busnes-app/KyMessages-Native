@@ -30,6 +30,16 @@ describe('on-device search index', () => {
     expect((await index.search('friday')).map((h) => h.id)).toEqual([]);
   });
 
+  it('finds decrypted file names, and keeps names but never file keys', async () => {
+    const index = await searchIndexFor('u-alice');
+    const file = { attachment_id: 'att_1', key: 'KEYKEYKEY', name: 'Q3-forecast.xlsx' } as NonNullable<ChatMessage['files']>[number];
+    await index.put([msg('m1', 'r1', '', 1, { encoding: 'e2ee_room_v1', envelope: '{}', e2ee: { kind: 'decrypted' }, files: [file] })]);
+    const hits = await index.search('forecast');
+    expect(hits.map((h) => h.id)).toEqual(['m1']);
+    expect(hits[0].files).toEqual(['Q3-forecast.xlsx']);
+    expect(JSON.stringify(hits)).not.toContain('KEYKEYKEY');
+  });
+
   it('stores only ciphertext at rest and keeps each user apart', async () => {
     const alice = await searchIndexFor('u-alice');
     await alice.put([msg('m1', 'r1', 'quarterly secret plan', 1)]);

@@ -1,7 +1,7 @@
 import 'fake-indexeddb/auto';
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { abandonDevice, acceptIdentity, checkRoomIdentities, encryptionReadyFor, encryptionRetry, identityStatus, onIdentityChanged, StaleStatus, ownDeviceVerified, prepareIdentity, restoreIdentity, forgetCryptoStore, keyGeneration, NOT_YET, onRoomKeys, openMessage, receiveRoomKeys, replaceDevice, RETIRE_MS, retireDevice, retryable, retryEncryptionNow, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
+import { abandonDevice, acceptIdentity, checkRoomIdentities, encryptionReadyFor, encryptionRetry, identityStatus, onIdentityChanged, StaleStatus, ownDeviceVerified, prepareIdentity, restoreIdentity, forgetCryptoStore, keyGeneration, keysArrivedFor, NOT_YET, onRoomKeys, openMessage, receiveRoomKeys, replaceDevice, RETIRE_MS, retireDevice, retryable, retryEncryptionNow, sealRoomMessage, startE2EE, UNAVAILABLE } from './e2ee';
 import { CryptoEngine, EARLY, NotVerified } from '../crypto/engine';
 import { FakeKeyServer, TENANT } from '../crypto/fakeKeyServer';
 import { pqc } from '../pqc/index';
@@ -53,7 +53,12 @@ describe('the signed-in device', () => {
       return removed.has(body.device_id) ? json({ error: 'Unknown device' }, 404) : undefined;
     } });
     vi.stubGlobal('fetch', vi.fn(serve('u_alice')));
+
+    const beforeStartup = keyGeneration();
+    expect(keysArrivedFor(undefined, beforeStartup)).toBe(false);
     const first = await startE2EE('u_alice');
+    expect(keysArrivedFor(undefined, beforeStartup)).toBe(true);
+    expect(keysArrivedFor(undefined, keyGeneration())).toBe(false);
     // Registered once, self-signed, then stocked with 50 one-time keys.
     expect(uploads[0].device_keys).toBeTruthy();
     expect(uploads.reduce((n, u) => n + u.one_time_keys.length, 0)).toBe(50);
@@ -492,10 +497,91 @@ describe('the signed-in device', () => {
     expect(seen[0]).toBe('waiting');
   });
 
+  it('marks files the server did not attach, reads edited files from the original, and calls malformed ones damaged', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === '/api/v1/keys/upload') {
+        const req = JSON.parse(String(init?.body)) as { one_time_keys: unknown[] };
+        return json({ one_time_key_count: req.one_time_keys.length });
+      }
+      return json({ messages: [] });
+    }));
+    const e = await startE2EE('u_alice');
+    await vi.waitFor(async () => expect((await openMessage(parseMessage({ id: 'x', room_id: 'r1', sender_id: 'u_bob', encoding: 'plain_v1', body: 'p' }))).body).toBe('p'));
+    const desc = (id: string) => ({
+      attachment_id: id, v: 1, alg: 'A256GCM-STREAM', key: 'A'.repeat(43), nonce_prefix: 'A'.repeat(10),
+      chunk_size: 65536, sha256: 'a'.repeat(64), ciphertext_size: 26, size: 10, name: `${id}.txt`, mime_type: 'text/plain',
+    });
+    const att = (id: string) => ({ id, room_id: 'r1', filename: 'encrypted.bin' });
+    const m = parseMessage({
+      id: 'm1', room_id: 'r1', sender_id: 'u_bob', encoding: 'e2ee_room_v1', attachments: [att('att_a'), att('att_plain')],
+      body: '{"alg":"megolm.v1","sender_key":"k","device_id":"DEVICE0001","session_id":"s","ciphertext":"AAAA"}',
+    });
+    const decrypt = vi.spyOn(e, 'decrypt');
+    decrypt.mockResolvedValue({ state: 'decrypted', authenticated: true, restored: false, inner: { room_id: 'r1', type: 'attachment', body: '', ref: 'ref-m1-000001', files: [desc('att_a'), desc('att_elsewhere')] } });
+    const opened = await openMessage(m);
+    expect(opened.files?.map((f) => [f.attachment_id, f.missing ?? false])).toEqual([['att_a', false], ['att_elsewhere', true]]);
+    expect(opened.files?.[0].name).toBe('att_a.txt');
+    // An edit's files come from the envelope the message was first sent in, never from the edit.
+    const edited = { ...m, original: '{"alg":"megolm.v1","sender_key":"k","device_id":"DEVICE0001","session_id":"s0","ciphertext":"BBBB"}' };
+    decrypt.mockImplementation(async (sealed) => sealed.body === edited.original
+      ? { state: 'decrypted', authenticated: true, restored: false, inner: { room_id: 'r1', type: 'attachment', body: 'see file', ref: 'ref-m1-000001', files: [desc('att_a')] } }
+      : { state: 'decrypted', authenticated: true, restored: false, inner: { room_id: 'r1', type: 'edit', body: 'new caption', message_id: 'm1', original: { kind: 'e5', ref: 'ref-m1-000001', files: 1 } } });
+    const openedEdit = await openMessage(edited);
+    expect(openedEdit.body).toBe('new caption');
+    expect(openedEdit.files?.map((f) => f.attachment_id)).toEqual(['att_a']);
+    decrypt.mockImplementation(async (sealed) => sealed.body === edited.original
+      ? { state: 'failed', reason: 'This message was sent before this device could read the room.' }
+      : { state: 'decrypted', authenticated: true, restored: false, inner: { room_id: 'r1', type: 'edit', body: 'new caption', message_id: 'm1', original: { kind: 'e5', ref: 'ref-m1-000001', files: 1 } } });
+    const joiner = await openMessage(edited);
+    expect(joiner.body).toBe('new caption');
+    expect(joiner.files).toBeUndefined();
+    expect(joiner.filesState?.reason).toMatch(/before this device/);
+    decrypt.mockReset();
+    decrypt.mockResolvedValue({ state: 'decrypted', authenticated: true, restored: false, inner: { room_id: 'r1', type: 'attachment', body: '', ref: 'ref-m1-000001', files: [{ ...desc('att_a'), chunk_size: 1 }] } });
+    expect((await openMessage(m)).e2ee).toEqual({ kind: 'failed', reason: 'This message is damaged.' });
+  });
+
+  it('never opens (or claims) a kept original for a legacy, file-less or older edit', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === '/api/v1/keys/upload') {
+        const req = JSON.parse(String(init?.body)) as { one_time_keys: unknown[] };
+        return json({ one_time_key_count: req.one_time_keys.length });
+      }
+      return json({ messages: [] });
+    }));
+    const e = await startE2EE('u_alice');
+    await vi.waitFor(async () => expect((await openMessage(parseMessage({ id: 'x', room_id: 'r1', sender_id: 'u_bob', encoding: 'plain_v1', body: 'p' }))).body).toBe('p'));
+    // The server pairs each edit with another message's envelope as its "original".
+    const elsewhere = '{"alg":"megolm.v1","sender_key":"k","device_id":"DEVICE0001","session_id":"s_other","ciphertext":"CCCC"}';
+    const m = parseMessage({
+      id: 'm1', room_id: 'r1', sender_id: 'u_bob', encoding: 'e2ee_room_v1', original_body: elsewhere,
+      attachments: [{ id: 'att_old', room_id: 'r1', filename: 'old.pdf' }, { id: 'att_x', room_id: 'r1', filename: 'x.pdf' }],
+      body: '{"alg":"megolm.v1","sender_key":"k","device_id":"DEVICE0001","session_id":"s","ciphertext":"AAAA"}',
+    });
+    const decrypt = vi.spyOn(e, 'decrypt');
+    for (const original of [{ kind: 'legacy', rows: ['att_old'] }, { kind: 'e5', ref: 'ref-m1-000001', files: 0 }, undefined]) {
+      decrypt.mockReset();
+      decrypt.mockResolvedValue({ state: 'decrypted', authenticated: true, restored: false, inner: { room_id: 'r1', type: 'edit', body: 'caption', message_id: 'm1', ...(original ? { original } : {}) } });
+      const opened = await openMessage(m);
+      expect(opened.body).toBe('caption');
+      expect(decrypt).toHaveBeenCalledTimes(1);
+      expect(decrypt.mock.calls.some(([sealed]) => sealed.body === elsewhere)).toBe(false);
+    }
+    // Legacy: only its named row is plaintext; older edit: its rows are unavailable.
+    decrypt.mockResolvedValue({ state: 'decrypted', authenticated: true, restored: false, inner: { room_id: 'r1', type: 'edit', body: 'caption', message_id: 'm1', original: { kind: 'legacy', rows: ['att_old'] } } });
+    expect((await openMessage(m)).plainIds).toEqual(['att_old']);
+    decrypt.mockResolvedValue({ state: 'decrypted', authenticated: true, restored: false, inner: { room_id: 'r1', type: 'edit', body: 'caption', message_id: 'm1' } });
+    expect((await openMessage(m)).filesState).toBeDefined();
+    decrypt.mockReset();
+  });
+
   it('refuses text whose sealed form would exceed the server envelope limit, before sealing', async () => {
     // 10 KiB of control characters is under the 16 KiB text limit but escapes to 60 KiB of JSON.
     await expect(sealRoomMessage('r1', { type: 'text', body: '\u0001'.repeat(10 << 10) })).rejects.toThrow('Message is too long');
     await expect(sealRoomMessage('r1', { type: 'text', body: 'x'.repeat((16 << 10) + 1) })).rejects.toThrow('Message is too long');
+    // File descriptors count too, and say so instead of blaming the text.
+    const many = Array.from({ length: 10 }, (_, i) => ({ attachment_id: `att_${i}`, name: 'n'.repeat(2000), key: 'k'.repeat(43), sha256: 'a'.repeat(64) }));
+    await expect(sealRoomMessage('r1', { type: 'attachment', body: 'x'.repeat(16 << 10), files: many })).rejects.toThrow('send fewer files');
   });
 });
 

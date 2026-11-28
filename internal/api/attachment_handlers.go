@@ -7,7 +7,9 @@ import (
 	"io"
 	"log"
 	"mime"
+	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -20,9 +22,15 @@ import (
 
 const (
 	maxAttachmentsPerMessage = 10
+	// A message may also carry each file's encrypted thumbnail, itself an attachment.
+	maxAttachmentIDsPerMessage = 2 * maxAttachmentsPerMessage
+	// encryptedFilename is the only name an end-to-end encrypted upload has on the server.
+	encryptedFilename = "encrypted.bin"
 	// multipartEnvelopeOverhead leaves headroom for multipart boundaries and headers
 	// without allowing arbitrary request inflation beyond MaxUploadBytes.
 	multipartEnvelopeOverhead = 64 << 10
+	// The object store can spend two minutes publishing the blob after the body is read.
+	attachmentCommitGrace = 3 * time.Minute
 )
 
 // attachmentUploadDeadline is a minute plus the upload limit at 128 KiB/s (about 1 Mbit/s),
@@ -31,7 +39,8 @@ func attachmentUploadDeadline(maxBytes int64) time.Duration {
 	return time.Minute + time.Duration(maxBytes/(128<<10))*time.Second
 }
 
-var chatLimitUploads = chatLimit{"chat-uploads:", 30}
+// A file and its thumbnail are two uploads, so ten photos are twenty.
+var chatLimitUploads = chatLimit{"chat-uploads:", 60}
 
 func (s *Server) maxUploadBytes() int64 {
 	if s.config != nil && s.config.Attachments.MaxUploadBytes > 0 {
@@ -74,22 +83,38 @@ func isAttachmentUploadPath(path string) bool {
 	return roomID != "" && !strings.Contains(roomID, "/")
 }
 
-// POST /api/v1/rooms/{id}/attachments
-// Accepts multipart/form-data with a single "file" part, validates size, storage quotas,
-// and magic bytes, writes the blob under a server-generated flat key, and creates an
-// unattached attachment record owned by the uploader that can then be linked via
-// POST /api/v1/rooms/{id}/messages.
+// POST /api/v1/rooms/{id}/attachments[?encrypted=1]
+// Accepts multipart/form-data with a single "file" part, validates size and storage quotas,
+// writes the blob under a server-generated flat key, and creates an unattached attachment record
+// owned by the uploader that can then be linked via POST /api/v1/rooms/{id}/messages.
+// With encrypted=1 the file is client ciphertext (E5): it must be the only part, and it is stored
+// as application/octet-stream named encrypted.bin, never sniffed, whatever name the client sent.
+// Without it the bytes are sniffed as before; that plaintext path is for bot tokens only.
 func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Request) {
 	if s.blobs == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "Attachment storage unavailable")
 		return
 	}
-	user, _, ok := s.currentUser(r)
+	user, sess, ok := s.currentUser(r)
 	if !ok {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
 	if !s.allowChatAction(w, user.ID, chatLimitUploads) {
+		return
+	}
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	vals, flagged := query["encrypted"]
+	if err != nil || len(query) > 1 || (flagged && (len(vals) != 1 || vals[0] != "1")) || (len(query) == 1 && !flagged) {
+		s.writeError(w, http.StatusBadRequest, "The only upload parameter is encrypted=1")
+		return
+	}
+	encrypted := flagged
+	if !encrypted && !plaintextAllowed(user, sess) {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "Files are end-to-end encrypted: upload ciphertext with encrypted=1",
+			"code":  CodeE2EERequired,
+		})
 		return
 	}
 
@@ -128,7 +153,12 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Extend read deadline for larger uploads on real connections; ignored on httptest recorders.
-	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(attachmentUploadDeadline(maxBytes)))
+	uploadBudget := attachmentUploadDeadline(maxBytes)
+	responseBudget := uploadBudget + attachmentCommitGrace
+	now := time.Now()
+	controller := http.NewResponseController(w)
+	_ = controller.SetReadDeadline(now.Add(uploadBudget))
+	_ = controller.SetWriteDeadline(now.Add(responseBudget))
 	r.Body = http.MaxBytesReader(w, r.Body, maxBytes+multipartEnvelopeOverhead)
 
 	mr, err := r.MultipartReader()
@@ -159,6 +189,10 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 			break
 		}
 		_ = part.Close()
+		if encrypted {
+			s.writeError(w, http.StatusBadRequest, "An encrypted upload carries only its file")
+			return
+		}
 	}
 	if filePart == nil {
 		s.writeError(w, http.StatusBadRequest, "Missing file field in multipart upload")
@@ -171,7 +205,7 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 		requestedBytes = r.ContentLength
 	}
 	reserve := func() (*store.AttachmentQuotaReservation, error) {
-		return s.store.Chat().ReserveAttachmentQuota(r.Context(), tenantID, user.ID, requestedBytes, limits, attachmentUploadDeadline(maxBytes)+time.Minute)
+		return s.store.Chat().ReserveAttachmentQuota(r.Context(), tenantID, user.ID, requestedBytes, limits, responseBudget)
 	}
 	res, err := reserve()
 	// No usable grant, or less of it than this upload may need: report the org once and look
@@ -225,10 +259,27 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 	}
 
 	attID := "att_" + uuid.Must(uuid.NewV7()).String()
-	putRes, err := s.blobs.Put(tenantID, attID, filePart, res.ReservedBytes)
+	var body io.Reader = filePart
+	if encrypted {
+		rawFilename = encryptedFilename
+		// Nothing may follow the ciphertext either: the whole body is checked before the blob is
+		// put in place, so a refused upload never leaves one behind.
+		body = &soleFile{part: filePart, rest: mr}
+	}
+	// Durable before any byte is written: if this request dies between the blob and its row, the
+	// sweep erases the blob once the upload's deadline has passed (its commit removes the intent).
+	intentDue := time.Now().Add(responseBudget).UnixMilli()
+	if err := s.store.Chat().QueueUploadIntent(r.Context(), tenantID, attID, intentDue); err != nil {
+		s.writeError(w, http.StatusInternalServerError, "Failed to store uploaded file")
+		return
+	}
+	putRes, err := s.blobs.Put(tenantID, attID, body, res.ReservedBytes, blobs.PutOptions{Opaque: encrypted})
 	if err != nil {
+		s.abandonUpload(r.Context(), tenantID, attID)
 		var maxErr *http.MaxBytesError
 		switch {
+		case errors.Is(err, errTrailingPart):
+			s.writeError(w, http.StatusBadRequest, "An encrypted upload carries only its file")
 		case (errors.Is(err, blobs.ErrTooLarge) || errors.As(err, &maxErr)) && res.LimitingKind == store.AttachmentQuotaLimitPool:
 			s.writePoolError(w, store.ErrPoolFull)
 		case errors.Is(err, blobs.ErrTooLarge) || errors.As(err, &maxErr):
@@ -254,11 +305,25 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 		VersionID:  putRes.VersionID,
 	}
 	if err := s.store.Chat().CommitAttachmentWithQuota(r.Context(), res.ID, att, limits); err != nil {
-		_ = s.blobs.Erase(tenantID, putRes.Key)
+		if errors.Is(err, store.ErrAttachmentNotCommitted) {
+			// This refusal happened before the insert. Publication may have finished
+			// after an earlier sweep erased the key or found it absent.
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+			defer cancel()
+			if err := s.store.Chat().QueueLateUploadCleanup(ctx, tenantID, putRes.Key); err != nil {
+				log.Printf("[ATTACHMENTS] could not queue late upload %s: %v", putRes.Key, err)
+				if eraseErr := s.blobs.Erase(tenantID, putRes.Key); eraseErr != nil {
+					log.Printf("[ATTACHMENTS] late upload %s remains: %v", putRes.Key, eraseErr)
+				}
+			}
+		}
+		// Once Commit is attempted, the persisted intent decides cleanup.
 		if s.writePoolError(w, err) {
 			return
 		}
 		switch {
+		case errors.Is(err, store.ErrAttachmentInvalid):
+			s.writeError(w, http.StatusRequestTimeout, "The upload took too long; send the file again")
 		case errors.Is(err, store.ErrAttachmentUploadQuotaExceeded):
 			s.writeError(w, http.StatusRequestEntityTooLarge, "File exceeds organization upload limit")
 		case errors.Is(err, store.ErrAttachmentTenantQuotaExceeded):
@@ -276,6 +341,55 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 
 	w.Header().Set("Cache-Control", "no-store")
 	s.writeJSON(w, http.StatusCreated, map[string]any{"attachment": att})
+}
+
+var errTrailingPart = errors.New("encrypted upload has more than its file")
+
+// soleFile reads an encrypted upload's file part and, where that part ends, fails unless the
+// multipart body ends there too, so Put refuses the blob before committing it.
+type soleFile struct {
+	part io.Reader
+	rest *multipart.Reader
+}
+
+func (f *soleFile) Read(p []byte) (int, error) {
+	n, err := f.part.Read(p)
+	if errors.Is(err, io.EOF) {
+		// Another part is a refusal of its own; a failed read (the body over its size) stays that error.
+		switch _, next := f.rest.NextPart(); {
+		case next == nil:
+			return n, errTrailingPart
+		case !errors.Is(next, io.EOF):
+			return n, next
+		}
+	}
+	return n, err
+}
+
+// abandonUpload erases the blob of an upload that will not commit and drops its intent. If the
+// erase fails the intent stays queued, so the sweep erases the blob after the upload's deadline.
+func (s *Server) abandonUpload(ctx context.Context, tenantID, key string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	s.eraseQueued(ctx, []store.BlobRef{{TenantID: tenantID, Key: key}})
+}
+
+// eraseQueued erases blobs whose deletes are queued and clears the ones that went; a failure stays
+// queued for the next sweep.
+func (s *Server) eraseQueued(ctx context.Context, refs []store.BlobRef) {
+	var done []store.BlobRef
+	for _, ref := range refs {
+		if err := s.blobs.Erase(ref.TenantID, ref.Key); err != nil && !errors.Is(err, blobs.ErrInvalidKey) {
+			log.Printf("[ATTACHMENTS] blob %s not erased yet (queued for the sweep): %v", ref.Key, err)
+			continue
+		}
+		done = append(done, ref)
+	}
+	if len(done) > 0 {
+		if err := s.store.Chat().ClearPendingBlobDeletes(ctx, done); err != nil {
+			log.Printf("[ATTACHMENTS] erased blobs stay queued (the sweep clears them): %v", err)
+		}
+	}
 }
 
 // GET /api/v1/attachments/{id}
@@ -337,6 +451,9 @@ func (s *Server) handleChatDownloadAttachment(w http.ResponseWriter, r *http.Req
 		}
 	}
 
+	// Give an authorized transfer a bounded budget for opening and streaming the file.
+	streamBudget := 30*time.Second + time.Duration(att.SizeBytes/(64<<10))*time.Second
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(streamBudget))
 	f, _, err := s.blobs.Open(att.TenantID, att.BlobKey, att.SizeBytes)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) || errors.Is(err, blobs.ErrInvalidKey) {
@@ -436,8 +553,9 @@ func (s *Server) handleChatDeleteAttachment(w http.ResponseWriter, r *http.Reque
 		}
 		return
 	}
-	// Never sent: no retained copy is kept (§9.4 retains posted files).
-	_ = s.blobs.Erase(tenantID, blobKey)
+	// Never sent: no retained copy is kept (§9.4 retains posted files). Queued with the row's
+	// removal, so a failed erase is retried by the sweep.
+	s.eraseQueued(r.Context(), []store.BlobRef{{TenantID: tenantID, Key: blobKey}})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -450,11 +568,6 @@ func (s *Server) SweepOrphanAttachments(ctx context.Context, now time.Time) (int
 	if err := s.relocateFlatBlobs(ctx); err != nil && ctx.Err() == nil {
 		log.Printf("[ATTACHMENTS] flat blob relocation incomplete (retrying next sweep): %v", err)
 	}
-	if s.config.Tenancy.IsMultiTenant() {
-		if err := s.drainPendingBlobDeletes(ctx); err != nil && ctx.Err() == nil {
-			log.Printf("[ATTACHMENTS] queued blob deletes incomplete (retrying next sweep): %v", err)
-		}
-	}
 	cutoff := now.Add(-s.pendingAttachmentTTL()).UnixMilli()
 	deleted := 0
 	for {
@@ -462,13 +575,15 @@ func (s *Server) SweepOrphanAttachments(ctx context.Context, now time.Time) (int
 		if err != nil {
 			return deleted, err
 		}
-		for _, key := range keys {
-			_ = s.blobs.Erase(key.TenantID, key.Key) // never sent
-			deleted++
-		}
+		s.eraseQueued(ctx, keys) // never sent; queued with their rows' removal
+		deleted += len(keys)
 		if len(keys) < 200 {
 			break
 		}
+	}
+	// Every mode: staged removals and abandoned uploads that failed to erase, and (multi) erasures.
+	if err := s.drainPendingBlobDeletes(ctx, now); err != nil && ctx.Err() == nil {
+		log.Printf("[ATTACHMENTS] queued blob deletes incomplete (retrying next sweep): %v", err)
 	}
 	s.blobs.SweepStaleTemps(time.Hour)
 	return deleted, nil
@@ -554,8 +669,8 @@ func (s *Server) eraseUser(ctx context.Context, user *store.User, revoke func(co
 // drainPendingBlobDeletes finishes blob deletes an erasure committed but could not complete.
 // Each entry is tried on its own: successes are cleared, failures stay queued, and the batch is
 // a random sample, so a blob that keeps failing cannot hold back the others.
-func (s *Server) drainPendingBlobDeletes(ctx context.Context) error {
-	refs, err := s.store.Chat().PendingBlobDeletes(ctx, 500)
+func (s *Server) drainPendingBlobDeletes(ctx context.Context, now time.Time) error {
+	refs, err := s.store.Chat().DuePendingBlobDeletes(ctx, 500, now, 10*time.Minute)
 	if err != nil || len(refs) == 0 || s.blobs == nil {
 		return err
 	}

@@ -1,49 +1,93 @@
 import type { ChatMessage, ChatReactionSummary, ChatRoomSummary } from './types';
 
-function sameAttachmentIds(a: ChatMessage, b: ChatMessage): boolean {
-  if (a.attachments.length !== b.attachments.length) return false;
-  for (let i = 0; i < a.attachments.length; i++) {
-    if (a.attachments[i].id !== b.attachments[i].id) return false;
+// Messages known deleted, newest few thousand: a deletion that arrives before its message, or
+// before a history page or response still on its way, still wins when they land.
+const deleted = new Map<string, number>();
+const MAX_DELETED = 10_000;
+
+/** Remembers that a message was deleted, so no later copy of it shows its content again. */
+export function rememberDeleted(id: string, at: number): void {
+  deleted.delete(id);
+  deleted.set(id, at);
+  for (const old of deleted.keys()) {
+    if (deleted.size <= MAX_DELETED) break;
+    deleted.delete(old);
   }
-  return true;
 }
 
-/** Insert or replace a server-confirmed message, reconciling any optimistic pending copy. */
-export function upsertMessage(
-  list: ChatMessage[],
-  incoming: ChatMessage,
-  reconcileClientKey?: string,
-): ChatMessage[] {
-  const withoutOptimistic = reconcileClientKey
-    ? list.filter((m) => !(m.delivery.kind !== 'synced' && m.delivery.idempotencyKey === reconcileClientKey))
-    : list;
+/** Forgets every remembered deletion (sign-out). */
+export function forgetDeleted(): void {
+  deleted.clear();
+}
 
-  const idx = withoutOptimistic.findIndex((m) => m.id === incoming.id);
+/** A message as a tombstone: no text, files or keys of any kind. */
+export function tombstone(m: ChatMessage, at: number): ChatMessage {
+  return { ...m, body: '', attachments: [], files: undefined, filesState: undefined, plainIds: undefined, original: undefined, envelope: undefined, deleted_at: at };
+}
+
+const settle = (m: ChatMessage): ChatMessage => {
+  if (m.deleted_at !== undefined) rememberDeleted(m.id, m.deleted_at);
+  const at = deleted.get(m.id);
+  return at === undefined ? m : tombstone(m, at);
+};
+
+/** What the on-device search index holds of a message: a change means it is indexed again. */
+export function searchSignature(m: ChatMessage): string {
+  const names = (m.files ?? []).map((f) => f.name).join('\u0001');
+  return [m.body, m.edited_at ?? '', m.deleted_at ?? '', m.delivery.kind, m.e2ee?.kind ?? '', names].join('\u0000');
+}
+
+/**
+ * Which of two copies of one message to keep: a deletion always wins, and a copy older than the
+ * one held (an earlier edit, a stale page or response) never replaces it. The server orders a
+ * message's edits strictly (edited_at), so equal times are the same version.
+ */
+function keep(held: ChatMessage, incoming: ChatMessage): ChatMessage {
+  if (held.deleted_at && !incoming.deleted_at) return held;
+  if (!incoming.deleted_at && (held.edited_at ?? 0) > (incoming.edited_at ?? 0)) return held;
+  return incoming;
+}
+
+/**
+ * The one rule for confirming a send, whichever path its message arrives by (socket, REST, a page,
+ * a late key): an unsent copy (sending or failed) is resolved only by a synced message from the
+ * same sender that seals that send's idempotency key as its `ref`. A reply without it resolves nothing.
+ */
+export function resolvePending(list: ChatMessage[]): ChatMessage[] {
+  const confirmed = new Set(list.flatMap((m) => {
+    const key = confirmedSendKey(m);
+    return key === undefined ? [] : [key];
+  }));
+  if (confirmed.size === 0) return list;
+  const next = list.filter((m) => {
+    const key = pendingSendKey(m);
+    return key === undefined || !confirmed.has(key);
+  });
+  return next.length === list.length ? list : next;
+}
+
+const sendKey = (m: ChatMessage, ref: string) => `${m.room_id}\u0000${m.sender_id}\u0000${ref}`;
+const confirmedSendKey = (m: ChatMessage) => m.delivery.kind === 'synced' && m.ref ? sendKey(m, m.ref) : undefined;
+const pendingSendKey = (m: ChatMessage) => m.delivery.kind !== 'synced' ? sendKey(m, m.delivery.idempotencyKey) : undefined;
+
+export function confirmsSend(pending: ChatMessage, incoming: ChatMessage): boolean {
+  const key = pendingSendKey(pending);
+  return key !== undefined && key === confirmedSendKey(incoming);
+}
+
+/** Insert or replace a message, keeping deletions and newer edits, and confirming its send. */
+export function upsertMessage(list: ChatMessage[], incoming: ChatMessage): ChatMessage[] {
+  const arrived = settle(incoming);
+  const idx = list.findIndex((m) => m.id === arrived.id);
   let next: ChatMessage[];
   if (idx >= 0) {
-    next = [...withoutOptimistic];
-    next[idx] = {
-      ...incoming,
-      reactions: incoming.reactions.length > 0 ? incoming.reactions : withoutOptimistic[idx].reactions,
-    };
+    const held = list[idx];
+    next = [...list];
+    next[idx] = keep(held, arrived) === held ? held : { ...arrived, reactions: arrived.reactions.length > 0 ? arrived.reactions : held.reactions };
   } else {
-    // Also drop any pending optimistic message from the same sender with identical body and attachments when WS races ahead of REST.
-    const dupIdx = withoutOptimistic.findIndex(
-      (m) =>
-        m.delivery.kind === 'sending' &&
-        m.sender_id === incoming.sender_id &&
-        m.body === incoming.body &&
-        sameAttachmentIds(m, incoming),
-    );
-    if (dupIdx >= 0) {
-      next = [...withoutOptimistic];
-      next[dupIdx] = incoming;
-    } else {
-      next = [...withoutOptimistic, incoming];
-    }
+    next = [...list, arrived];
   }
-
-  return sortMessages(next);
+  return resolvePending(sortMessages(next));
 }
 
 /** Merge a batch of historical or catch-up messages without duplicates. */
@@ -53,10 +97,17 @@ export function mergeMessageBatch(existing: ChatMessage[], incoming: ChatMessage
   for (const m of existing) {
     byId.set(m.id, m);
   }
-  for (const m of incoming) {
-    byId.set(m.id, m);
+  for (const raw of incoming) {
+    const m = settle(raw);
+    const held = byId.get(m.id);
+    byId.set(m.id, held ? keep(held, m) : m);
   }
-  return sortMessages(Array.from(byId.values()));
+  return resolvePending(sortMessages(Array.from(byId.values())));
+}
+
+/** Replaces a history slice while preserving the local copies needed to retry or dismiss sends. */
+export function replaceMessageHistory(existing: ChatMessage[], incoming: ChatMessage[]): ChatMessage[] {
+  return mergeMessageBatch(existing.filter((m) => m.delivery.kind !== 'synced'), incoming);
 }
 
 function sortMessages(list: ChatMessage[]): ChatMessage[] {

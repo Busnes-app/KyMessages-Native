@@ -613,7 +613,7 @@ func (c *chatStore) UpdateReadCursor(ctx context.Context, tenantID, roomID, user
 // Messages & Reactions
 // ---------------------------------------------------------------------
 
-const messageColumns = `id, tenant_id, room_id, seq, sender_id, sender_name, reply_to_id, encoding, body, edited_at, deleted_at, idempotency_key, created_at`
+const messageColumns = `id, tenant_id, room_id, seq, sender_id, sender_name, reply_to_id, encoding, body, original_body, edited_at, deleted_at, idempotency_key, created_at`
 
 func scanMessage(row interface{ Scan(...any) error }) (*Message, error) {
 	var m Message
@@ -621,7 +621,7 @@ func scanMessage(row interface{ Scan(...any) error }) (*Message, error) {
 	var editedAt, deletedAt sql.NullInt64
 	err := row.Scan(
 		&m.ID, &m.TenantID, &m.RoomID, &m.Seq, &m.SenderID, &m.SenderName,
-		&replyTo, &m.Encoding, &m.Body, &editedAt, &deletedAt, &idemKey, &m.CreatedAt,
+		&replyTo, &m.Encoding, &m.Body, &m.OriginalBody, &editedAt, &deletedAt, &idemKey, &m.CreatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -957,17 +957,33 @@ func (c *chatStore) EditMessage(ctx context.Context, tenantID, roomID, messageID
 		return nil, ErrNotFound
 	}
 
-	editedAt := nowMilli()
-	if _, err := tx.ExecContext(ctx,
-		c.store.rebind(`UPDATE messages SET body = ?, encoding = ?, edited_at = ? WHERE tenant_id = ? AND room_id = ? AND id = ?`),
-		newBody, encoding, editedAt, tenantID, roomID, messageID,
-	); err != nil {
-		return nil, err
+	// One statement, so a concurrent delete or erase always wins: a tombstone is never written to.
+	// The first envelope of an encrypted message with files keeps their keys (an edit replaces only
+	// the text, so they are never sealed again for later room members). Only a genuine first
+	// envelope is kept: never one of a message edited before, whose body is already an edit.
+	// edited_at only moves forward, even for two edits in one millisecond, so clients can order
+	// every version; the sender is checked in the same statement.
+	now := nowMilli()
+	var editedAt int64
+	err = tx.QueryRowContext(ctx, c.store.rebind(`UPDATE messages SET body = ?, encoding = ?,
+		edited_at = CASE WHEN edited_at IS NOT NULL AND edited_at >= ? THEN edited_at + 1 ELSE ? END,
+		original_body = CASE WHEN original_body = '' AND edited_at IS NULL AND encoding = ?
+			AND EXISTS (SELECT 1 FROM attachments a WHERE a.tenant_id = messages.tenant_id AND a.room_id = messages.room_id AND a.message_id = messages.id)
+			THEN body ELSE original_body END
+		WHERE tenant_id = ? AND room_id = ? AND id = ? AND sender_id = ? AND deleted_at IS NULL
+		RETURNING original_body, edited_at`),
+		newBody, encoding, now, now, MessageEncodingE2EERoomV1, tenantID, roomID, messageID, actorID,
+	).Scan(&m.OriginalBody, &editedAt)
+	if errorsIs(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
 	}
-	if err := c.attachReactions(ctx, tx, []*Message{m}); err != nil {
+	if err != nil {
 		return nil, err
 	}
 	if err := c.attachAttachments(ctx, tx, []*Message{m}); err != nil {
+		return nil, err
+	}
+	if err := c.attachReactions(ctx, tx, []*Message{m}); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -1007,7 +1023,7 @@ func (c *chatStore) DeleteMessage(ctx context.Context, tenantID, roomID, message
 		deletedAt = *m.DeletedAt
 	} else {
 		if _, err := tx.ExecContext(ctx,
-			c.store.rebind(`UPDATE messages SET body = '', deleted_at = ? WHERE tenant_id = ? AND room_id = ? AND id = ?`),
+			c.store.rebind(`UPDATE messages SET body = '', original_body = '', deleted_at = ? WHERE tenant_id = ? AND room_id = ? AND id = ?`),
 			deletedAt, tenantID, roomID, messageID,
 		); err != nil {
 			return nil, err
@@ -1027,6 +1043,7 @@ func (c *chatStore) DeleteMessage(ctx context.Context, tenantID, roomID, message
 	}
 
 	m.Body = ""
+	m.OriginalBody = ""
 	m.DeletedAt = &deletedAt
 	m.Attachments = nil
 	return m, nil
@@ -1268,10 +1285,20 @@ func (c *chatStore) DeleteStagedAttachment(ctx context.Context, tenantID, attach
 	if n == 0 {
 		return "", ErrAttachmentInvalid
 	}
+	// Queued with the row's removal, so a failed blob delete is retried by the sweep.
+	if err := queueBlobDeleteTx(ctx, c, tx, tenantID, blobKey); err != nil {
+		return "", err
+	}
 	if err := tx.Commit(); err != nil {
 		return "", err
 	}
 	return blobKey, nil
+}
+
+// queueBlobDeleteTx queues an unposted upload's blob for deletion with its row's removal.
+func queueBlobDeleteTx(ctx context.Context, c *chatStore, tx *sql.Tx, tenantID, key string) error {
+	_, err := tx.ExecContext(ctx, c.store.rebind(`INSERT INTO pending_blob_deletes (tenant_id, blob_key, user_id, not_before) VALUES (?, ?, '', 0) ON CONFLICT (tenant_id, blob_key) DO NOTHING`), tenantID, key)
+	return err
 }
 
 func (c *chatStore) lockAttachmentQuotaTx(ctx context.Context, tx *sql.Tx, tenantID string) error {
@@ -1424,7 +1451,13 @@ func (c *chatStore) ReleaseAttachmentQuota(ctx context.Context, tenantID, reserv
 	return err
 }
 
-func (c *chatStore) CommitAttachmentWithQuota(ctx context.Context, reservationID string, a *Attachment, limits AttachmentQuotaLimits) error {
+func (c *chatStore) CommitAttachmentWithQuota(ctx context.Context, reservationID string, a *Attachment, limits AttachmentQuotaLimits) (err error) {
+	commitAttempted := false
+	defer func() {
+		if err != nil && !commitAttempted {
+			err = errors.Join(ErrAttachmentNotCommitted, err)
+		}
+	}()
 	a.TenantID = normalizeTenant(a.TenantID)
 	if a.ID == "" {
 		a.ID = "att_" + uuid.Must(uuid.NewV7()).String()
@@ -1488,6 +1521,19 @@ func (c *chatStore) CommitAttachmentWithQuota(ctx context.Context, reservationID
 		}
 	}
 
+	// Consuming the unclaimed intent fences the attachment insert against a sweep
+	// that has claimed or already erased this blob.
+	intent, err := tx.ExecContext(ctx, c.store.rebind(`DELETE FROM pending_blob_deletes WHERE tenant_id = ? AND blob_key = ? AND user_id = ''`), a.TenantID, a.BlobKey)
+	if err != nil {
+		return err
+	}
+	n, err := intent.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return ErrAttachmentInvalid
+	}
 	insQ := c.store.rebind(`
 		INSERT INTO attachments (id, tenant_id, room_id, message_id, uploader_id, blob_key, filename, mime_type, size_bytes, sha256_hex, created_at, version_id)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
@@ -1497,6 +1543,7 @@ func (c *chatStore) CommitAttachmentWithQuota(ctx context.Context, reservationID
 	); err != nil {
 		return uniqueError(err)
 	}
+	commitAttempted = true
 	return tx.Commit()
 }
 
@@ -1576,6 +1623,9 @@ func (c *chatStore) PurgeOrphanAttachments(ctx context.Context, olderThanMilli i
 			return nil, err
 		}
 		if n, err := res.RowsAffected(); err == nil && n == 1 {
+			if err := queueBlobDeleteTx(ctx, c, tx, item.TenantID, item.Key); err != nil {
+				return nil, err
+			}
 			deletedKeys = append(deletedKeys, item.BlobRef)
 		}
 	}

@@ -8,6 +8,8 @@ import {
   type ChatMessage,
 } from '../../chat/types';
 import { formatTime, initialsFor, isBotSender, isGuestSender, isWebhookSender } from '../../chat/state';
+import { sealedIds, type FileDescriptor, type Provenance, type SealedFile } from '../../crypto/attachments';
+import { SealedFiles } from './Attachments';
 
 const WAITING_TEXT = "Waiting for this message's key";
 
@@ -18,6 +20,65 @@ export function plaintextLabel(msg: ChatMessage): string | null {
   if (isGuestSender(msg.sender_id)) return 'Not encrypted (guest)';
   if (isWebhookSender(msg.sender_id)) return 'Not encrypted (webhook)';
   return 'Sent before encryption';
+}
+
+/** "Attachment: <name>" or "<n> attachments", naming encrypted files by their decrypted names. */
+export function attachmentSummary(msg: ChatMessage): string {
+  const names = [...(msg.files ?? []).map((f) => f.name), ...attachmentView(msg).plain.map((a) => a.filename)];
+  if (names.length === 1) return `Attachment: ${names[0]}`;
+  return names.length > 1 ? `${names.length} attachments` : '';
+}
+
+interface AttachmentView {
+  /** Encrypted files the message names and the server attached. */
+  sealed: SealedFile[];
+  /** Encrypted files the message names but the server did not attach. */
+  missing: SealedFile[];
+  /** Files this message has that cannot be read here (how many, when the message says), and why. */
+  unreadable?: { reason: string; expected?: number };
+  /** Uploads the server attached that the message does not name: never offered. */
+  unnamed: number;
+  /** Uploads of a message from before E5 (or a bot): plaintext, labelled as such. */
+  plain: ChatAttachment[];
+}
+
+/**
+ * What an edit of this message must seal, or undefined when no safe edit exists. Taken from the
+ * message's own (or latest edit's) envelope. A message the relay calls plaintext names no uploads
+ * on its own say: with uploads it is not offered for editing, without it edits as legacy.
+ */
+export function editProvenance(msg: ChatMessage): Provenance | undefined {
+  if (msg.encoding === 'plain_v1') return msg.attachments.length > 0 ? undefined : { kind: 'legacy', rows: [] };
+  return msg.provenance;
+}
+
+/**
+ * How a message's uploads may be shown. Only a message without a sealed file list (sent before E5,
+ * or plaintext) has plaintext uploads; an encrypted message not opened yet shows none, and one that
+ * names its files never shows an upload it does not name.
+ */
+export function attachmentView(msg: ChatMessage): AttachmentView {
+  const view: AttachmentView = { sealed: [], missing: [], unnamed: 0, plain: [] };
+  if (msg.encoding === 'e2ee_room_v1' && msg.e2ee?.kind !== 'decrypted') return view;
+  if (msg.files) {
+    const named = new Set(sealedIds(msg.files));
+    view.sealed = msg.files.filter((f) => !f.missing);
+    view.missing = msg.files.filter((f) => f.missing);
+    view.unnamed = msg.attachments.filter((a) => !named.has(a.id)).length;
+  } else if (msg.filesState) {
+    // Shown even when the server lists no rows: their absence is no evidence there are none.
+    view.unreadable = { reason: msg.filesState.reason, expected: msg.filesState.expected };
+  } else if (msg.plainIds) {
+    // A legacy edit vouches for these plaintext rows only: others are hidden, missing ones said.
+    const vouched = new Set(msg.plainIds);
+    view.plain = msg.attachments.filter((a) => vouched.has(a.id));
+    view.unnamed = msg.attachments.length - view.plain.length;
+    const missing = msg.plainIds.length - view.plain.length;
+    if (missing > 0) view.unreadable = { reason: "This message's files are not available.", expected: missing };
+  } else {
+    view.plain = msg.attachments;
+  }
+  return view;
 }
 
 /** Why a decrypted message's sender is not vouched for, or nothing when it is. */
@@ -31,10 +92,7 @@ export function trustLabel(msg: ChatMessage): string | null {
 function messagePreviewText(msg: ChatMessage): string {
   if (msg.e2ee?.kind === 'waiting') return WAITING_TEXT;
   if (msg.e2ee?.kind === 'failed') return 'Message could not be decrypted';
-  if (msg.body) return msg.body;
-  if (msg.attachments.length === 1) return `Attachment: ${msg.attachments[0].filename}`;
-  if (msg.attachments.length > 1) return `${msg.attachments.length} attachments`;
-  return '';
+  return msg.body || attachmentSummary(msg);
 }
 
 const QUICK_REACTIONS = ['👍', '❤️', '🎉', '👀'] as const;
@@ -106,6 +164,7 @@ interface MessageRowProps {
   onReply: (message: ChatMessage) => void;
   onJumpToMessage?: (seq: number) => void;
   onPreviewImage?: (attachment: ChatAttachment) => void;
+  onPreviewFile?: (file: FileDescriptor) => void;
   onToggleReaction: (messageId: string, emoji: string, currentlyReacted: boolean) => void;
   onEdit: (messageId: string, newBody: string) => Promise<void>;
   onDelete: (messageId: string) => Promise<void>;
@@ -126,6 +185,7 @@ export const MessageRow: React.FC<MessageRowProps> = ({
   onReply,
   onJumpToMessage,
   onPreviewImage,
+  onPreviewFile,
   onToggleReaction,
   onEdit,
   onDelete,
@@ -147,8 +207,13 @@ export const MessageRow: React.FC<MessageRowProps> = ({
   const isOwn = message.sender_id === currentUserId;
   // A message this device cannot read cannot be edited from it.
   const sealedShut = message.e2ee !== undefined && message.e2ee.kind !== 'decrypted';
-  const canEdit = isSynced && !isDeleted && isOwn && !sealedShut;
+  // No edit is offered where none could say what the message's files are.
+  const canEdit = isSynced && !isDeleted && isOwn && !sealedShut && editProvenance(message) !== undefined;
   const plainNote = plaintextLabel(message);
+  const files = attachmentView(message);
+  const sealedFiles = files.sealed;
+  const plainFiles = files.plain;
+  const shownFiles = sealedFiles.length + files.missing.length + (files.unreadable ? 1 : 0) + plainFiles.length;
   const trustNote = trustLabel(message);
   const canDelete = isSynced && !isDeleted && (isOwn || canModerate);
   const authorLabel = message.sender_name || 'Unknown';
@@ -308,7 +373,7 @@ export const MessageRow: React.FC<MessageRowProps> = ({
             ) : message.e2ee?.kind === 'failed' ? (
               <p className="chat-msg-locked is-error">Can't decrypt this message. {message.e2ee.reason}</p>
             ) : (
-              (message.body || message.attachments.length === 0) && (
+              (message.body || shownFiles === 0) && (
                 <div className="chat-msg-body">
                   {renderFormattedBody(message.body)}
                   {grouped && message.edited_at && <span className="chat-msg-edited"> (edited)</span>}
@@ -318,12 +383,44 @@ export const MessageRow: React.FC<MessageRowProps> = ({
             {plainNote && <p className="chat-msg-e2ee-note">{plainNote}</p>}
             {trustNote && <p className="chat-msg-e2ee-note is-unverified" data-testid="trust-note">{trustNote}</p>}
 
-            {message.attachments.length > 0 && (
-              <p className="chat-msg-e2ee-note">{message.attachments.length === 1 ? 'File not encrypted' : 'Files not encrypted'}</p>
+            {sealedFiles.length > 0 && <SealedFiles files={sealedFiles} onPreview={onPreviewFile} />}
+            {files.missing.length > 0 && (
+              <div className="chat-attachments" aria-label="Unavailable attachments">
+                {files.missing.map((f) => (
+                  <div key={f.attachment_id} className="chat-att-file is-unavailable">
+                    <span className="chat-att-file-icon" aria-hidden="true">
+                      <FileText size={16} />
+                    </span>
+                    <span className="chat-att-file-meta">
+                      <span className="chat-att-name" title={f.name}>{f.name}</span>
+                      <span className="chat-att-size">Attachment unavailable</span>
+                    </span>
+                  </div>
+                ))}
+              </div>
             )}
-            {message.attachments.length > 0 && (
-              <div className="chat-attachments" aria-label="Attachments">
-                {message.attachments.map((att) =>
+            {files.unreadable && (
+              <p className="chat-msg-e2ee-note">
+                {files.unreadable.expected === 1
+                  ? 'Attachment unavailable.'
+                  : files.unreadable.expected
+                    ? `${files.unreadable.expected} attachments unavailable.`
+                    : 'Attachments unavailable.'}{' '}
+                {files.unreadable.reason}
+              </p>
+            )}
+            {files.unnamed > 0 && (
+              <p className="chat-msg-e2ee-note is-error" role="note">
+                {files.unnamed === 1 ? 'An attachment' : `${files.unnamed} attachments`} this message does not include
+                {files.unnamed === 1 ? ' was' : ' were'} hidden: the server may have added {files.unnamed === 1 ? 'it' : 'them'}.
+              </p>
+            )}
+            {plainFiles.length > 0 && (
+              <p className="chat-msg-e2ee-note">{plainFiles.length === 1 ? 'File not encrypted' : 'Files not encrypted'}</p>
+            )}
+            {plainFiles.length > 0 && (
+              <div className="chat-attachments" aria-label="Unencrypted attachments">
+                {plainFiles.map((att) =>
                   isInlineImageAttachment(att) ? (
                     <div key={att.id} className="chat-att-image-card">
                       <button
