@@ -240,3 +240,42 @@ func TestE2EEBotDevicesKeepUnchangedEntriesOfGoneDevices(t *testing.T) {
 		t.Fatalf("adding a gone device back = %d, want 400", c)
 	}
 }
+
+// A bot device sends new mail only while its owner's current list vouches for it with its keys
+// (spec §8): not before vouching, not after removal.
+func TestE2EEBotSendsMailOnlyWhileVouched(t *testing.T) {
+	srv, st, _ := setupTestServer(t)
+	alice, _ := createChatTestUser(t, st, "u_e4m_alice", "e4malice", "user")
+	aliceTok := freshSession(t, st, alice)
+	const botID = "bot_e4m_helper"
+	botTok := createChatTestBot(t, st, botID, "agent-e4m", alice.ID)
+	aliceID := newIdentity(t, store.DefaultTenantID, alice.ID)
+	if rec := doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/master", aliceTok, aliceID.put(t, 0), nil); rec.Code != http.StatusOK {
+		t.Fatalf("identity = %d", rec.Code)
+	}
+	a1 := newTestDevice(t, alice.ID, "DEVICE_E4M_A1")
+	registerDevice(t, srv, aliceTok, a1)
+	d1 := newTestDevice(t, botID, "BOTDEVICE1")
+	registerDevice(t, srv, botTok, d1)
+	send := func() int {
+		return doBearerJSON(t, srv, http.MethodPut, "/api/v1/to-device", botTok, map[string]any{"device_id": d1.id, "messages": []map[string]string{
+			{"user_id": alice.ID, "device_id": a1.id, "type": "olm.v1", "content": "x"},
+		}}, nil).Code
+	}
+	if c := send(); c != http.StatusForbidden {
+		t.Fatalf("send before vouching = %d, want 403", c)
+	}
+	path := "/api/v1/keys/bots/" + botID + "/devices"
+	if rec := doBearerJSON(t, srv, http.MethodPut, path, aliceTok, botList(t, aliceID, alice.ID, botID, 0, 1, d1), nil); rec.Code != http.StatusOK {
+		t.Fatalf("owner's list = %d %s", rec.Code, rec.Body.String())
+	}
+	if c := send(); c != http.StatusOK {
+		t.Fatalf("send while vouched = %d", c)
+	}
+	if rec := doBearerJSON(t, srv, http.MethodPut, path, aliceTok, botList(t, aliceID, alice.ID, botID, 1, 2), nil); rec.Code != http.StatusOK {
+		t.Fatalf("removal = %d %s", rec.Code, rec.Body.String())
+	}
+	if c := send(); c != http.StatusForbidden {
+		t.Fatalf("send after removal = %d, want 403", c)
+	}
+}

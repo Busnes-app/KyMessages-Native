@@ -185,7 +185,13 @@ func TestE2EEQueryClaimAndMailStayInTheOrg(t *testing.T) {
 		t.Fatalf("second claim = %v (want the fallback key)", second)
 	}
 
-	// Mail: Alice reaches Bob's device; Carol's device (another org) is refused.
+	// Mail: Alice reaches Bob's device; Carol's device (another org) is refused. Only a device on
+	// its user's signed list sends mail.
+	aliceID := newIdentity(t, orgA, alice.ID)
+	if rec := doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/master", aliceTok, aliceID.put(t, 0), nil); rec.Code != http.StatusOK {
+		t.Fatalf("identity = %d %s", rec.Code, rec.Body.String())
+	}
+	aliceID.listDevices(t, srv, aliceTok, 1, devs[alice.ID].id)
 	send := func(toUser, toDevice string) int {
 		return doBearerJSON(t, srv, http.MethodPut, "/api/v1/to-device", aliceTok, map[string]any{"device_id": devs[alice.ID].id, "messages": []map[string]string{
 			{"user_id": toUser, "device_id": toDevice, "type": "olm.v1", "content": "ciphertext-for-" + toUser},

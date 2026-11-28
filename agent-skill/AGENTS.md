@@ -27,10 +27,14 @@ device `scripts/kybot.py` with `scripts/requirements.txt`), `skill.go` (`go:embe
   and `hash` follow `internal/e2eeid` (checked against `internal/e2eeid/testdata/vectors.json`),
   files follow A256GCM-STREAM v1 (`web/src/crypto/attachments.test.ts` vectors), and the device
   code follows `engine.ts` `botDeviceCode` (one vector pinned on both sides). Its trust rules are
-  the browser's: TOFU-pinned self-bound master keys, only cross-signed devices on the newest
+  the browser's, decided in one stage-then-commit step per lookup (`trusted_devices`, spec §8
+  invariants): TOFU-pinned self-bound master keys, only cross-signed devices on the newest
   signed list (a bot only through its owner's `kymessages.bot-devices.v1` list), lists only move
-  forward, room keys only from such devices, a changed identity waits for `accept` (even if the
-  server goes back to the old key). It also pins its org and each bot's owner on first sight;
+  forward, a changed identity waits for `accept` (even if the server goes back to the old key),
+  two keys for a first-seen user in one lookup refuse it. Room keys come only from such devices,
+  or from mail a device sent while listed (its send-time cross-signature under the final key,
+  owner decision 28 Nov 2026). `tests/trust_scenarios.json` is run by both `test_kybot.py` and
+  `web/src/crypto/trustScenarios.test.ts`. It also pins its org and each bot's owner on first sight;
   room-key mail counts as shared only once delivered. It keeps the browser's server limits (100
   per claim, query, send and mailbox page; 16 KiB text, 32 KiB sealed JSON) and its order: keys
   are saved before they are published, and mail is acknowledged only after what it delivered is

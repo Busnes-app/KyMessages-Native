@@ -113,6 +113,9 @@ admin.call("PUT", f"/api/v1/keys/bots/{info['user_id']}/devices", {"version": 1,
            "signature": m.sign(kybot.DOMAIN_BOT_DEVICES, kybot.bot_devices_msg(tenant, uid, 1, info["user_id"], 2, []))})
 owner.send(room, "after revocation")
 assert bot.sync() == [], "a revoked bot got a room key"
+# And it sends no new mail: the server takes none from a device off its signed list.
+expect_refused(bot_srv, "PUT", "/api/v1/to-device", {"device_id": info["device_id"], "messages": [
+    {"user_id": uid, "device_id": owner.device_id, "type": kybot.ROOM_KEY_TYPE, "content": "{}"}]}, 403)
 
 # Vouched again; the owner sends, then signs out (delists, then deletes its device) before the
 # bot syncs: the mail kept the device's cross-signature, so the bot still reads the message.

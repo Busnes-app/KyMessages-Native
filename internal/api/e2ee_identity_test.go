@@ -77,6 +77,26 @@ func (i *testIdentity) put(t *testing.T, expected int64) map[string]any {
 	}
 }
 
+// listDevices publishes ids as the identity's signed device list (version 1) at epoch, as a
+// client does: reserve the digest, then put the list.
+func (i *testIdentity) listDevices(t *testing.T, srv http.Handler, tok string, epoch int64, ids ...string) {
+	t.Helper()
+	digest := e2eeid.DeviceListDigest(ids)
+	reserve := map[string]any{"version": 1, "expected_epoch": epoch - 1, "digest": digest,
+		"signature": i.sign(t, e2eeid.DomainDeviceListReserve, e2eeid.DeviceListReserveMessage(i.tenant, i.user, 1, epoch-1, digest))}
+	if rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/keys/devices/list/reserve", tok, reserve, nil); rec.Code != http.StatusOK {
+		t.Fatalf("reserve list = %d %s", rec.Code, rec.Body.String())
+	}
+	msg, err := e2eeid.DeviceListMessage(i.tenant, i.user, 1, epoch, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	put := map[string]any{"version": 1, "expected_epoch": epoch - 1, "epoch": epoch, "device_ids": ids, "signature": i.sign(t, e2eeid.DomainDeviceList, msg)}
+	if rec := doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/devices/list", tok, put, nil); rec.Code != http.StatusOK {
+		t.Fatalf("put list = %d %s", rec.Code, rec.Body.String())
+	}
+}
+
 func (i *testIdentity) deviceSig(t *testing.T, d *testDevice, version int64) map[string]any {
 	t.Helper()
 	return map[string]any{"version": version, "signature": i.sign(t, e2eeid.DomainDevice, e2eeid.DeviceMessage(i.tenant, d.userID, d.id, d.curve, d.ed()))}
@@ -375,6 +395,16 @@ func TestE2EEDeviceCrossSignatureAndQuery(t *testing.T) {
 		t.Fatal("listed self-binding does not verify")
 	}
 
+	// Only a device on its user's current signed list sends new mail; once a list names it, it may.
+	sendA1 := func() int {
+		return doBearerJSON(t, srv, http.MethodPut, "/api/v1/to-device", aliceTok, map[string]any{"device_id": a1.id, "messages": []map[string]string{
+			{"user_id": bob.ID, "device_id": b1.id, "type": "olm.v1", "content": "x"},
+		}}, nil).Code
+	}
+	if c := sendA1(); c != http.StatusForbidden {
+		t.Fatalf("send from a cross-signed device no list names = %d, want 403", c)
+	}
+	aliceID.listDevices(t, srv, aliceTok, 1, a1.id)
 	// Mail keeps the sender device's cross-signature, so it stays verifiable after sign-out (below).
 	var crossSig any
 	for _, d := range q.Devices[alice.ID] {
@@ -382,10 +412,13 @@ func TestE2EEDeviceCrossSignatureAndQuery(t *testing.T) {
 			crossSig = d["master_signature"]
 		}
 	}
-	if c := doBearerJSON(t, srv, http.MethodPut, "/api/v1/to-device", aliceTok, map[string]any{"device_id": a1.id, "messages": []map[string]string{
-		{"user_id": bob.ID, "device_id": b1.id, "type": "olm.v1", "content": "x"},
-	}}, nil).Code; c != http.StatusOK {
+	if c := sendA1(); c != http.StatusOK {
 		t.Fatalf("send = %d", c)
+	}
+	// Removed from the list, the device sends nothing new; the mail it sent while listed stays.
+	aliceID.listDevices(t, srv, aliceTok, 2)
+	if c := sendA1(); c != http.StatusForbidden {
+		t.Fatalf("send from a delisted device = %d, want 403", c)
 	}
 
 	// A reset of alice's identity withdraws every cross-signature by the old key.

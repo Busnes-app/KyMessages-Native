@@ -46,6 +46,8 @@ class FakeServer:
     def __init__(self):
         self.tenant, self.fail_to_device, self.reads, self.ignore_after = TENANT, 0, 0, False
         self.lose_upload, self.claims = 0, []
+        self.honest = True  # False: takes mail from any device, as a hostile server could
+        self.query_hook = None  # (user_ids, answer) -> None: edits one batch's answer
         self.devices, self.otks, self.mail, self.masters, self.bot_lists = {}, {}, {}, {}, {}
         self.fallbacks, self.spent = {}, set()
         self.rooms, self.messages, self.blobs, self.next = {}, {}, {}, 1
@@ -63,6 +65,26 @@ class FakeServer:
                     raise ValueError("too large")
                 return data
         return S()
+
+    def listed(self, user, d):
+        """d is on user's current signed list (a bot's: its owner's, with the same keys)."""
+        if user.startswith("bot_"):
+            lst = self.bot_lists.get(user)
+            keys = {k: d[k] for k in ("device_id", "curve25519", "ed25519")}
+            return bool(lst) and self.masters.get(lst["owner_id"], {}).get("version") == lst["version"] and keys in lst["devices"]
+        return d["device_id"] in self.masters.get(user, {}).get("device_list", {}).get("device_ids", [])
+
+    def query(self, user_ids):
+        out = {"tenant_id": self.tenant, "devices": {}, "master_keys": {}, "bot_devices": {}}
+        for u in user_ids:
+            out["devices"][u] = [dict(d) for d in self.devices.get(u, {}).values()]
+            if u in self.masters:
+                out["master_keys"][u] = json.loads(json.dumps(self.masters[u]))
+            if u in self.bot_lists:
+                lst = self.bot_lists[u]
+                out["bot_devices"][u] = json.loads(json.dumps(lst))
+                out["master_keys"][lst["owner_id"]] = json.loads(json.dumps(self.masters[lst["owner_id"]]))
+        return out
 
     def handle(self, user, method, path, body, raw):
         p, _, q = path.partition("?")
@@ -90,15 +112,9 @@ class FakeServer:
                 raise SystemExit("POST /api/v1/keys/upload: connection reset")
             return {"one_time_key_count": len(box), "has_fallback_key": d in self.fallbacks}
         if p == "/api/v1/keys/query":
-            out = {"tenant_id": self.tenant, "devices": {}, "master_keys": {}, "bot_devices": {}}
-            for u in body["user_ids"]:
-                out["devices"][u] = [dict(d) for d in self.devices.get(u, {}).values()]
-                if u in self.masters:
-                    out["master_keys"][u] = json.loads(json.dumps(self.masters[u]))
-                if u in self.bot_lists:
-                    lst = self.bot_lists[u]
-                    out["bot_devices"][u] = json.loads(json.dumps(lst))
-                    out["master_keys"][lst["owner_id"]] = json.loads(json.dumps(self.masters[lst["owner_id"]]))
+            out = self.query(body["user_ids"])
+            if self.query_hook:  # a hostile server answering one batch differently
+                self.query_hook(body["user_ids"], out)
             return out
         if p == "/api/v1/keys/claim":
             if not 1 <= len(body["devices"]) <= 100:
@@ -119,6 +135,8 @@ class FakeServer:
                 self.fail_to_device -= 1
                 raise SystemExit("PUT /api/v1/to-device: HTTP 429")
             sender = self.devices[user][body["device_id"]]
+            if self.honest and not self.listed(user, sender):  # as the server: new mail only from a listed device
+                raise SystemExit("PUT /api/v1/to-device: HTTP 403 This device is not on its signed device list")
             for m in body["messages"]:
                 box = self.mail.setdefault((m["user_id"], m["device_id"]), [])
                 box.append({"id": self.next, "sender_user_id": user, "sender_device_id": body["device_id"], "sender_keys": dict(sender), "type": m["type"], "content": m["content"]})
@@ -282,7 +300,12 @@ class Trust(unittest.TestCase):
     def test_an_unvouched_bot_gets_no_keys_and_its_keys_are_refused(self):
         self.alice.send("r1", "secret")
         self.assertEqual(self.env.mail_to(self.bot), 0)
-        # The bot still shares with Alice (it trusts her), but her device trusts no unvouched bot.
+        # The server takes no mail from an unvouched bot device.
+        with self.assertRaises(SystemExit):
+            self.bot.send("r1", "hello")
+        # A hostile one does: the bot shares with Alice (it trusts her), but her device trusts no
+        # unvouched bot.
+        self.env.server.honest = False
         sent = self.bot.send("r1", "hello")
         self.assertEqual(self.alice.sync(), [])
         self.assertIn("error", self.alice.open(sent))
@@ -319,6 +342,7 @@ class Trust(unittest.TestCase):
         self.assertEqual(self.env.mail_to(rogue), 0)
 
     def test_a_device_off_the_list_gets_nothing_though_still_cross_signed(self):
+        self.env.vouch("u_alice", "bot_helper", self.bot)
         second = self.env.person("u_alice")
         self.bot.send("r1", "both listed")
         self.assertEqual(self.env.mail_to(second), 1)
@@ -351,7 +375,9 @@ class Trust(unittest.TestCase):
         mallory = self.env.device("u_mallory")  # no master key
         self.env.server.rooms["r1"].append("u_mallory")
         # Mallory's device shares with the bot regardless (her client trusts the bot's devices
-        # as the server lists them), then posts: the bot refuses the key and cannot read it.
+        # as the server lists them, and the server is hostile), then posts: the bot refuses the
+        # key and cannot read it.
+        self.env.server.honest = False
         q = mallory.s.call("POST", "/api/v1/keys/query", {"user_ids": ["bot_helper"]})
         targets = [mallory.check_device("bot_helper", d) for d in q["devices"]["bot_helper"]]
         g = mallory.outbound("r1", ["bot_helper"], targets)
@@ -359,6 +385,7 @@ class Trust(unittest.TestCase):
         self.assertEqual(self.bot.sync(), [])
 
     def test_a_changed_identity_stops_sharing_until_accepted(self):
+        self.env.vouch("u_alice", "bot_helper", self.bot)
         self.bot.send("r1", "first")  # pins Alice
         self.env.server.mail.clear()
         self.old_master = json.loads(json.dumps(self.env.server.masters["u_alice"]))
@@ -379,6 +406,7 @@ class Trust(unittest.TestCase):
 
     def change_identity(self):
         """Alice resets her identity on a new device and vouches for the bot again."""
+        self.env.vouch("u_alice", "bot_helper", self.bot)
         self.bot.send("r1", "pins Alice")
         self.env.server.mail.clear()
         self.env.identities["u_alice"] = Master()
@@ -418,6 +446,7 @@ class Trust(unittest.TestCase):
         self.assertEqual(self.env.server.reads, 2)
 
     def test_another_org_is_refused_before_any_trust_changes(self):
+        self.env.vouch("u_alice", "bot_helper", self.bot)
         self.bot.send("r1", "pins Alice and the org")
         pins = dict(self.bot.st["pins"])
         self.env.server.mail.clear()
@@ -491,6 +520,7 @@ class Trust(unittest.TestCase):
 
     def test_a_signed_out_device_the_master_never_signed_is_refused(self):
         self.env.vouch("u_alice", "bot_helper", self.bot)
+        self.env.server.honest = False  # an honest server takes no mail from an unlisted device
         for forged in (False, True):
             d = self.env.device("u_alice")  # never cross-signed or listed
             if forged:  # a cross-signature by some other key
@@ -632,6 +662,101 @@ class Trust(unittest.TestCase):
 HAVE_CORE = bool(shutil.which("node")) and (ROOT / "web/src/crypto/pkg/kycrypto_bg.wasm").exists()
 if os.environ.get("KYBOT_REQUIRE_INTEROP") and not HAVE_CORE:
     raise SystemExit("KYBOT_REQUIRE_INTEROP: node and web/src/crypto/pkg (npm run build:crypto) are required")
+
+
+SCENARIOS = json.loads((ROOT / "agent-skill" / "tests" / "trust_scenarios.json").read_text())["scenarios"]
+FILLERS = [f"a_fill_{i:02}" for i in range(99)]  # after a_dana, before every bot_: Dana alone in batch one
+
+
+def relist(env, user, ids):
+    """user's master key signs ids as their device list at the next epoch."""
+    m, rec = env.identities[user], env.server.masters[user]
+    epoch = rec["device_list"]["epoch"] + 1
+    rec["device_list"] = {"epoch": epoch, "device_ids": sorted(ids), "signature": m.sign(kybot.DOMAIN_DEVICE_LIST, kybot.device_list_msg(TENANT, user, 1, epoch, sorted(ids)))}
+
+
+class Scenarios(unittest.TestCase):
+    """trust_scenarios.json through kybot.py; web/src/crypto/trustScenarios.test.ts runs the same
+    table through the browser engine."""
+
+    def test_the_shared_table(self):
+        self.assertEqual(sorted(sc["name"] for sc in SCENARIOS), sorted(n[3:] for n in dir(self) if n.startswith("sc_")))
+        for sc in SCENARIOS:
+            with self.subTest(sc["name"]):
+                env = Env()
+                try:
+                    self.assertEqual(getattr(self, "sc_" + sc["name"])(env), sc["expect"])
+                finally:
+                    env.close()
+
+    def dana(self, env):
+        """Dana's two devices, her vouched bot (the sender here) and a room behind 99 fillers."""
+        d1, d2 = env.person("a_dana"), env.person("a_dana")
+        bot = env.device("bot_helper")
+        env.vouch("a_dana", "bot_helper", bot)
+        return d1, d2, bot
+
+    def sc_removal_seen_late(self, env):
+        d1, d2, bot = self.dana(env)
+        env.server.rooms["r"] = ["a_dana", *FILLERS, "bot_helper"]
+        old = json.loads(json.dumps(env.server.masters["a_dana"]))
+        relist(env, "a_dana", [d1.device_id])
+        env.server.query_hook = lambda ids, out: out["master_keys"].__setitem__("a_dana", json.loads(json.dumps(old))) if "a_dana" in ids else None
+        bot.send("r", "after the removal")
+        return {"d1_gets_key": env.mail_to(d1) > 0, "d2_gets_key": env.mail_to(d2) > 0}
+
+    def sc_identity_conflict_across_batches(self, env):
+        d1, _, bot = self.dana(env)
+        other = env.device("bot_other")
+        env.vouch("a_dana", "bot_other", other)
+        env.server.rooms["r"] = ["a_dana", *FILLERS, "bot_helper", "bot_other"]
+        bot.send("r", "pins Dana")
+        env.server.mail.clear()
+        del bot.st["outbound"]["r"]
+        mallory = Master()
+        forged = {"version": 1, "master_key": mallory.public, "self_signature": mallory.sign(kybot.DOMAIN_MASTER, kybot.master_self_msg(TENANT, "a_dana", mallory.public))}
+        env.server.query_hook = lambda ids, out: out["master_keys"].__setitem__("a_dana", forged) if "a_dana" not in ids else None
+        bot.send("r", "two keys for Dana")
+        return {"d1_gets_key": env.mail_to(d1) > 0, "bot_gets_key": env.mail_to(other) > 0}
+
+    def delisted(self, env, delayed):
+        d1, d2, bot = self.dana(env)
+        env.server.rooms["r"] = ["a_dana", "bot_helper"]
+        sent = None
+        if delayed:
+            sent = d2.send("r", "from d2")
+        relist(env, "a_dana", [d1.device_id])
+        if not delayed:
+            try:
+                sent = d2.send("r", "from d2")
+            except SystemExit:
+                pass
+        bot.sync()
+        return {"sent": sent is not None, "readable": sent is not None and bot.open(sent).get("body") == "from d2"}
+
+    def sc_delisted_fresh_mail(self, env):
+        return self.delisted(env, delayed=False)
+
+    def sc_delisted_delayed_mail(self, env):
+        return self.delisted(env, delayed=True)
+
+    # The security review's regressions (round 9).
+
+    def test_a_removal_a_later_batch_shows_wins(self):
+        env = Env()
+        self.addCleanup(env.close)
+        self.assertEqual(self.sc_removal_seen_late(env), {"d1_gets_key": True, "d2_gets_key": False})
+
+    def test_an_identity_blocked_by_a_later_batch_gets_no_room_key(self):
+        env = Env()
+        self.addCleanup(env.close)
+        self.assertEqual(self.sc_identity_conflict_across_batches(env), {"d1_gets_key": False, "bot_gets_key": False})
+        self.assertEqual({k: v for k, v in env.server.mail.items() if v}, {})  # no room key to anyone
+
+    def test_fresh_mail_from_a_cross_signed_delisted_device_is_refused(self):
+        env = Env()
+        self.addCleanup(env.close)
+        self.assertEqual(self.sc_delisted_fresh_mail(env), {"sent": False, "readable": False})
 
 
 class Locking(unittest.TestCase):

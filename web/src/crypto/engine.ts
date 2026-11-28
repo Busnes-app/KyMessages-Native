@@ -14,7 +14,7 @@
 // State lives in a CryptoStore and is re-read inside a lock for every operation, so several tabs
 // of one user can share a device without overwriting each other's ratchets.
 import { Account, GroupSession, InboundGroupSession, Session, verifyEd25519 } from './index';
-import { Identity, Rollback, validBotList, type BotDeviceList, type IdentityChange, type IdentityServer, type IdentityStatus, type MasterKeyRecord, type PairingJoin, type PairingOffer } from './identity';
+import { Identity, Rollback, validBotList, type BotDeviceList, type TrustedMaster, type IdentityChange, type IdentityServer, type IdentityStatus, type MasterKeyRecord, type PairingJoin, type PairingOffer } from './identity';
 import { pqc, type BotDevice, type Hybrid } from '../pqc/index';
 import { backupCoverKey, backupQueueKey, IdentityMoved, inboundKey, isObj, isStr, isTransient, parseJSON, seenKey, Transient, type InboundRecord } from './records';
 import type { CryptoStore } from './store';
@@ -507,8 +507,18 @@ export class CryptoEngine {
   // --- Devices ---
 
   /**
-   * The devices of userIds whose self-signature verifies and whose keys match what this device
-   * saw before, without this device. A device whose keys changed is dropped, never re-pinned.
+   * The devices of userIds this device trusts, without itself: one stage-then-commit trust
+   * decision, the same rules as agent-skill's kybot.py `trusted_devices` (spec §8):
+   * 1. Every lookup batch is collected before anything is decided.
+   * 2. Each user's final identity is the one master key every batch showed. A first-seen user
+   *    shown two keys fails the lookup (IdentityConflict); a pinned user shown another key, or
+   *    any record that does not verify, is blocked (a change waits for acceptance).
+   * 3. Each user's final device list is the newest signed one seen for that identity, checked
+   *    after every list seen has raised the mark: an older list counts for nothing, and a fork
+   *    or a refused newest list trusts no device.
+   * 4. A device is a recipient only when it is on its user's final list, cross-signed by the
+   *    final key (a bot: on the owner's final bot list with the same keys), and matches its pin.
+   * 5. Nothing is pinned or shared before 1–4; first sights wait for the synced pin set.
    */
   async verifiedDevices(userIds: string[], self?: { trusted: boolean }): Promise<Target[]> {
     // A pin sync that fails: seeds of an identity the server no longer publishes mean this device
@@ -521,65 +531,97 @@ export class CryptoEngine {
     }
     // One authenticated pin sync before the whole check; a failure fails the check.
     await this.identity.beforeTrust().catch(pinSyncFailed);
-    const out: Target[] = [];
-    // Change warnings (and what else trusting a member records), then device pins.
-    const pins: [string, unknown][] = [];
-    const devicePins: [string, unknown][] = [];
-    // Members seen for the first time: their devices wait until the synced pin set holds them.
-    const sights = new Map<string, string>();
-    // Each with the fingerprint its devices were checked against.
-    const proposed: { user: string; fp: string; target: Target; pin?: [string, unknown] }[] = [];
-    for (let i = 0; i < userIds.length; i += BATCH) {
-      const batch = userIds.slice(i, i + BATCH);
+
+    // 1. Collect every batch: each user's devices and bot list from the batch that named them,
+    // and every master key record any batch showed (a bot's owner comes with its list).
+    const ids = [...new Set(userIds)];
+    const devices = new Map<string, DeviceKeys[]>();
+    const botLists = new Map<string, unknown>();
+    const records = new Map<string, unknown[]>();
+    let tenant: string | undefined;
+    for (let i = 0; i < ids.length; i += BATCH) {
+      const batch = ids.slice(i, i + BATCH);
       let listed: QueryResult;
       try {
         listed = await this.server.query(batch);
       } catch (e) {
         throw new Transient(e instanceof Error ? e.message : 'Could not list devices');
       }
-      for (const userId of batch) {
-        // A bot has no key of its own: only its owner's signed list vouches for its devices (E4),
-        // so its trust waits on the owner's pin like the owner's own devices do.
-        const bot = isBotUser(userId) ? listed.bot_devices?.[userId] : undefined;
-        if (isBotUser(userId) && !validBotList(bot)) continue;
-        const pinUser = bot ? bot.owner_id : userId;
-        // No pinned, validly self-bound master key (or this device is unverified): none of this
-        // member's devices gets keys.
-        const seen = sights.get(pinUser);
-        const master = await this.identity.trustedMaster(pinUser, listed.master_keys?.[pinUser], listed.tenant_id, pins, sights);
-        // One lookup showing a first-seen member (or a bot's owner) with two keys: neither is
-        // picked, nothing is pinned or shared, and the caller sees why.
-        if (seen !== undefined && sights.get(pinUser) !== seen) throw new IdentityConflict(pinUser);
-        if (!master) continue;
-        const vouched = bot && (await this.identity.trustedBot(userId, pinUser, master, listed.tenant_id, bot));
-        const trusted = (d: DeviceKeys) => {
-          if (!vouched) return this.identity.deviceTrusted(master, listed.tenant_id, userId, d);
-          const v = vouched.get(d.device_id);
-          return v !== undefined && v.curve25519 === d.curve25519 && v.ed25519 === d.ed25519;
-        };
-        const ok: { target: Target; pin?: [string, unknown] }[] = [];
-        for (const d of listed.devices?.[userId] ?? []) {
-          if (userId === this.userId && isObj(d) && d.device_id === this.deviceId) {
-            // This device itself, with exactly its own keys, checked like any other (self
-            // reports it), never a target. Other keys under its ID are not this device.
-            if (self && d.curve25519 === this.curve25519 && d.ed25519 === this.ed25519 &&
-              (await this.checkDevice(userId, d)) && this.identity.deviceTrusted(master, listed.tenant_id, userId, d)) self.trusted = true;
-            continue;
-          }
-          const checked = await this.checkDevice(userId, d);
-          if (!checked || !trusted(d as DeviceKeys)) continue;
-          ok.push(checked);
+      if (tenant !== undefined && listed.tenant_id !== tenant) throw new Transient('The key server answered for another organization');
+      tenant = listed.tenant_id;
+      for (const u of batch) {
+        devices.set(u, listed.devices?.[u] ?? []);
+        if (isBotUser(u)) botLists.set(u, listed.bot_devices?.[u]);
+      }
+      if (isObj(listed.master_keys)) for (const [u, rec] of Object.entries(listed.master_keys)) records.set(u, [...(records.get(u) ?? []), rec]);
+    }
+    if (tenant === undefined) return [];
+    const tenantId = tenant;
+
+    // 2–3. Resolve each needed identity once, from every record seen. Warnings go into pins;
+    // first sights into sights.
+    const pins: [string, unknown][] = [];
+    const sights = new Map<string, string>();
+    const finals = new Map<string, TrustedMaster | undefined>();
+    const resolve = async (user: string): Promise<TrustedMaster | undefined> => {
+      if (finals.has(user)) return finals.get(user);
+      const recs = records.get(user) ?? [];
+      let blocked = recs.length === 0;
+      // Every record raises the list mark, in the order seen, and must name the same key.
+      for (const rec of recs) {
+        const seen = sights.get(user);
+        if (!(await this.identity.trustedMaster(user, rec, tenantId, pins, sights))) blocked = true;
+        if (seen !== undefined && sights.get(user) !== seen) throw new IdentityConflict(user);
+      }
+      // The newest list (the first of equals), checked against the mark all of them raised.
+      const final = blocked ? undefined : await this.identity.trustedMaster(user, recs.reduce((a, b) => (listEpoch(b) > listEpoch(a) ? b : a)), tenantId, pins, sights);
+      finals.set(user, final);
+      return final;
+    };
+
+    // 4. Derive recipients from final state only.
+    const out: Target[] = [];
+    const devicePins: [string, unknown][] = [];
+    // What depends on a first-seen member, with the fingerprint it was checked against.
+    const proposed: { user: string; fp: string; pins: [string, unknown][]; targets: Target[] }[] = [];
+    for (const userId of ids) {
+      // A bot has no key of its own: only its owner's final signed list vouches for its devices
+      // (E4), so its trust waits on the owner's pin like the owner's own devices do.
+      const bot = botLists.get(userId);
+      if (isBotUser(userId) && !validBotList(bot)) continue;
+      const pinUser = validBotList(bot) ? bot.owner_id : userId;
+      const master = await resolve(pinUser);
+      if (!master) continue;
+      const fp = sights.get(pinUser);
+      const staged = { user: pinUser, fp: fp ?? '', pins: [] as [string, unknown][], targets: [] as Target[] };
+      const vouched = validBotList(bot) && (await this.identity.trustedBot(userId, pinUser, master, tenantId, bot, staged.pins));
+      const trusted = (d: DeviceKeys) => {
+        if (!vouched) return this.identity.deviceTrusted(master, tenantId, userId, d);
+        const v = vouched.get(d.device_id);
+        return v !== undefined && v.curve25519 === d.curve25519 && v.ed25519 === d.ed25519;
+      };
+      for (const d of devices.get(userId) ?? []) {
+        if (userId === this.userId && isObj(d) && d.device_id === this.deviceId) {
+          // This device itself, with exactly its own keys, checked like any other (self
+          // reports it), never a target. Other keys under its ID are not this device.
+          if (self && d.curve25519 === this.curve25519 && d.ed25519 === this.ed25519 &&
+            (await this.checkDevice(userId, d)) && this.identity.deviceTrusted(master, tenantId, userId, d)) self.trusted = true;
+          continue;
         }
-        const fp = sights.get(pinUser);
-        if (fp !== undefined) for (const c of ok) proposed.push({ user: pinUser, fp, ...c });
-        else for (const c of ok) {
-          if (c.pin) devicePins.push(c.pin);
-          out.push(c.target);
-        }
+        const checked = await this.checkDevice(userId, d);
+        if (!checked || !trusted(d as DeviceKeys)) continue;
+        if (checked.pin) staged.pins.push(checked.pin);
+        staged.targets.push(checked.target);
+      }
+      if (fp !== undefined) proposed.push(staged);
+      else {
+        devicePins.push(...staged.pins);
+        out.push(...staged.targets);
       }
     }
-    // A send this device may not make pins nobody: the warnings it found are kept, the first
-    // sights (shared or this device's) wait for a send it may make.
+
+    // 5. Commit. A send this device may not make pins nobody: the warnings it found are kept,
+    // the first sights (shared or this device's) wait for a send it may make.
     if (self && !self.trusted) {
       await this.store.write(pins);
       this.identity.afterWrites();
@@ -599,8 +641,8 @@ export class CryptoEngine {
     for (const c of proposed) {
       // Released only under exactly the fingerprint committed for its member.
       if (!committed.has(c.user) || sights.get(c.user) !== c.fp) continue;
-      if (c.pin) later.push(c.pin);
-      out.push(c.target);
+      later.push(...c.pins);
+      out.push(...c.targets);
     }
     await this.store.write(later);
     this.identity.afterWrites();
@@ -1219,6 +1261,11 @@ export class CryptoEngine {
       session.free();
     }
   }
+}
+
+/** The epoch of a master key record's device list, 0 without one (for picking the newest). */
+function listEpoch(rec: unknown): number {
+  return isObj(rec) && isObj(rec.device_list) && typeof rec.device_list.epoch === 'number' ? rec.device_list.epoch : 0;
 }
 
 function lockName(userId: string): string {

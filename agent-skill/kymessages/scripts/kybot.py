@@ -328,51 +328,47 @@ class Bot:
         marks[key] = {"epoch": epoch, "digest": digest}
         return True
 
-    def trusted_master(self, user: str, rec, tenant: str) -> tuple[str, set[str]] | None:
-        """user's pinned, self-bound master key and the devices on its newest signed list."""
+    def trusted_master(self, user: str, rec, tenant: str, sights: dict) -> tuple[str, set[str]] | None:
+        """user's pinned (or, into sights, first-seen) self-bound master key, with the devices on
+        its signed list if that list is the newest seen (else none); a key other than the pin is
+        a change. None when the key is not trusted."""
         if not isinstance(rec, dict) or not isinstance(rec.get("version"), int) or rec["version"] < 1:
             return None
         key, ver = rec.get("master_key"), rec["version"]
         if not hybrid_verify(key, DOMAIN_MASTER, master_self_msg(tenant, user, key), rec.get("self_signature", "")):
             return None
         fp = fingerprint(key)
-        pins = self.st["pins"]
-        pin = pins.get(f"{tenant}:{user}")
-        if f"{tenant}:{user}" in self.st["changed"]:
+        k = f"{tenant}:{user}"
+        pin = self.st["pins"].get(k)
+        if k in self.st["changed"]:
             # A change waits for `accept`, whichever key the server shows next (the old one too).
-            self.st["changed"][f"{tenant}:{user}"] = fp if fp != pin else self.st["changed"][f"{tenant}:{user}"]
+            self.st["changed"][k] = fp if fp != pin else self.st["changed"][k]
             return None
         if pin is None:
-            pins[f"{tenant}:{user}"] = fp  # first sight
+            if sights.setdefault(user, fp) != fp:
+                raise SystemExit(f"the key server showed two identities for {user} in one lookup; refusing")
         elif pin != fp:
             print(f"warning: {user}'s encryption identity changed; nothing is shared with them until `kybot.py accept {user}`", file=sys.stderr)
-            self.st["changed"][f"{tenant}:{user}"] = fp
+            self.st["changed"][k] = fp
             return None
         dl = rec.get("device_list")
         ids: list[str] = []
         if dl is not None:
             ids = dl.get("device_ids") if isinstance(dl, dict) else None
             if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids) or not isinstance(dl.get("epoch"), int):
-                return None
+                return key, set()
             try:
                 msg = device_list_msg(tenant, user, ver, dl["epoch"], ids)
             except ValueError:
-                return None
+                return key, set()
             if not hybrid_verify(key, DOMAIN_DEVICE_LIST, msg, dl.get("signature", "")):
-                return None
+                return key, set()
         ok = self.observe(f"dlh:{tenant}:{user}:{fp}:{ver}", dl and dl["epoch"], dl and phash("kymessages.device-list", *ids))
-        return (key, set(ids)) if ok and dl else None
+        return (key, set(ids) if ok and dl else set())
 
-    def trusted_bot(self, bot: str, rec, q: dict, tenant: str) -> dict[str, dict] | None:
-        if not isinstance(rec, dict) or not isinstance(rec.get("owner_id"), str) or not isinstance(rec.get("devices"), list):
-            return None
-        # A bot's owner is pinned on first sight: no other member can vouch for it later.
-        owners = self.st["bot_owners"]
-        if owners.setdefault(f"{tenant}:{bot}", rec["owner_id"]) != rec["owner_id"]:
-            print(f"warning: the server names another owner for {bot}; it gets nothing", file=sys.stderr)
-            return None
-        owner = self.trusted_master(rec["owner_id"], q.get("master_keys", {}).get(rec["owner_id"]), tenant)
-        if not owner or not isinstance(rec.get("version"), int) or not isinstance(rec.get("epoch"), int):
+    def trusted_bot(self, bot: str, rec, owner_key: str, tenant: str) -> dict[str, dict] | None:
+        """The devices on the newest list bot's owner signed with owner_key (their final key)."""
+        if not isinstance(rec.get("version"), int) or not isinstance(rec.get("epoch"), int):
             return None
         devs = rec["devices"]
         if not all(isinstance(d, dict) and valid_key(d.get("curve25519")) and valid_key(d.get("ed25519")) and isinstance(d.get("device_id"), str) for d in devs):
@@ -381,28 +377,44 @@ class Bot:
             msg = bot_devices_msg(tenant, rec["owner_id"], rec["version"], bot, rec["epoch"], devs)
         except ValueError:
             return None
-        valid = hybrid_verify(owner[0], DOMAIN_BOT_DEVICES, msg, rec.get("signature", ""))
+        valid = hybrid_verify(owner_key, DOMAIN_BOT_DEVICES, msg, rec.get("signature", ""))
         flat = [v for d in devs for v in (d["device_id"], d["curve25519"], d["ed25519"])]
-        if not valid or not self.observe(f"blh:{tenant}:{bot}:{rec['owner_id']}:{fingerprint(owner[0])}", rec["epoch"], phash("kymessages.bot-devices", *flat)):
+        if not valid or not self.observe(f"blh:{tenant}:{bot}:{rec['owner_id']}:{fingerprint(owner_key)}", rec["epoch"], phash("kymessages.bot-devices", *flat)):
             return None
         return {d["device_id"]: d for d in devs}
 
-    def check_device(self, user: str, d) -> dict | None:
-        """d's self-signature verifies and its keys match what this bot saw before (never re-pinned)."""
+    def check_device(self, user: str, d, staged: dict | None = None) -> dict | None:
+        """d's self-signature verifies and its keys match what this bot saw before (never re-pinned).
+        A new pin goes into staged when given, else is kept at once."""
         if not isinstance(d, dict) or not all(isinstance(d.get(k), str) for k in ("device_id", "curve25519", "ed25519", "signature")):
             return None
         if not ed_verify(d["ed25519"], device_signed(user, d["device_id"], d["curve25519"], d["ed25519"]), d["signature"]):
             return None
-        pins = self.st["device_pins"]
         k = f"{user}\n{d['device_id']}"
-        if k in pins and pins[k] != [d["curve25519"], d["ed25519"]]:
+        pin = self.st["device_pins"].get(k)
+        if pin is not None and pin != [d["curve25519"], d["ed25519"]]:
             return None
-        pins[k] = [d["curve25519"], d["ed25519"]]
+        (self.st["device_pins"] if staged is None else staged)[k] = [d["curve25519"], d["ed25519"]]
         return {"user_id": user, "device_id": d["device_id"], "curve25519": d["curve25519"], "ed25519": d["ed25519"]}
 
     def trusted_devices(self, users: list[str], masters: dict | None = None) -> list[dict]:
-        """Devices of users this bot trusts; masters, if given, gets each person's trusted master key."""
-        out = []
+        """Devices of users this bot trusts; masters, if given, gets each person's final master key.
+
+        One stage-then-commit decision, the same rules as engine.ts `verifiedDevices` (spec §8):
+        1. Every lookup batch is collected before anything is decided.
+        2. Each user's final identity is the one master key every batch showed. A first-seen user
+           shown two keys fails the lookup; a pinned user shown another key, or any record that
+           does not verify, is blocked (a change waits for `accept`).
+        3. Each user's final device list is the newest signed one seen for that identity, checked
+           after every list seen has raised the mark: an older list counts for nothing, and a
+           fork or a refused newest list trusts no device.
+        4. A device is a recipient only when it is on its user's final list, cross-signed by the
+           final key (a bot: on the owner's final bot list with the same keys), and matches its pin.
+        5. Nothing is pinned or shared before 1-4.
+        """
+        users = list(dict.fromkeys(users))
+        # 1. Collect.
+        devices, bot_lists, records, tenant = {}, {}, {}, None
         for i in range(0, len(users), 100):
             batch = users[i:i + 100]
             q = self.s.call("POST", "/api/v1/keys/query", {"user_ids": batch})
@@ -410,25 +422,68 @@ class Bot:
             # The org is fixed at first contact: keys from another org are never this bot's peers.
             if not isinstance(tenant, str) or self.st.d.setdefault("tenant_id", tenant) != tenant:
                 raise SystemExit("the key server answered for another organization; refusing")
+            listed, bots, keys = q.get("devices"), q.get("bot_devices"), q.get("master_keys")
             for u in batch:
+                d = listed.get(u) if isinstance(listed, dict) else None
+                devices[u] = d if isinstance(d, list) else []
                 if u.startswith("bot_"):
-                    vouched = self.trusted_bot(u, (q.get("bot_devices") or {}).get(u), q, tenant)
-                    if vouched is None:
-                        continue
-                    trust = lambda d, v=vouched: d["device_id"] in v and [v[d["device_id"]]["curve25519"], v[d["device_id"]]["ed25519"]] == [d["curve25519"], d["ed25519"]]
-                else:
-                    m = self.trusted_master(u, q.get("master_keys", {}).get(u), tenant)
-                    if m is None:
-                        continue
-                    if masters is not None:
-                        masters[u] = m[0]
-                    trust = lambda d, m=m, u=u: d["device_id"] in m[1] and hybrid_verify(m[0], DOMAIN_DEVICE, device_msg(tenant, u, d["device_id"], d["curve25519"], d["ed25519"]), d.get("master_signature", ""))
-                for d in q.get("devices", {}).get(u, []):
-                    if u == self.user_id and isinstance(d, dict) and d.get("device_id") == self.device_id:
-                        continue
-                    t = self.check_device(u, d)
-                    if t and trust(d):
-                        out.append(t)
+                    bot_lists[u] = bots.get(u) if isinstance(bots, dict) else None
+            for u, rec in (keys.items() if isinstance(keys, dict) else ()):
+                records.setdefault(u, []).append(rec)
+        if tenant is None:
+            return []
+
+        # 2-3. Resolve each needed identity once, from every record seen.
+        sights: dict[str, str] = {}
+        finals: dict[str, tuple[str, set[str]] | None] = {}
+
+        def resolve(u: str) -> tuple[str, set[str]] | None:
+            if u not in finals:
+                recs = records.get(u, [])
+                seen = [self.trusted_master(u, rec, tenant, sights) for rec in recs]  # every list raises the mark
+                newest = max(recs, key=lambda r: (r.get("device_list") or {}).get("epoch", 0) if isinstance(r, dict) and isinstance(r.get("device_list"), dict) and isinstance(r["device_list"].get("epoch"), int) else 0, default=None)
+                finals[u] = self.trusted_master(u, newest, tenant, sights) if seen and all(seen) else None
+            return finals[u]
+
+        # 4. Derive recipients from final state only.
+        out, device_pins, owner_pins = [], {}, {}
+        for u in users:
+            if u.startswith("bot_"):
+                rec = bot_lists.get(u)
+                if not isinstance(rec, dict) or not isinstance(rec.get("owner_id"), str) or not isinstance(rec.get("devices"), list):
+                    continue
+                # A bot's owner is pinned on first sight: no other member can vouch for it later.
+                k = f"{tenant}:{u}"
+                if self.st["bot_owners"].get(k, rec["owner_id"]) != rec["owner_id"]:
+                    print(f"warning: the server names another owner for {u}; it gets nothing", file=sys.stderr)
+                    continue
+                owner = resolve(rec["owner_id"])
+                vouched = owner and self.trusted_bot(u, rec, owner[0], tenant)
+                if not vouched:
+                    continue
+                owner_pins[k] = rec["owner_id"]
+                trust = lambda d, v=vouched: d["device_id"] in v and [v[d["device_id"]]["curve25519"], v[d["device_id"]]["ed25519"]] == [d["curve25519"], d["ed25519"]]
+            else:
+                m = resolve(u)
+                if m is None:
+                    continue
+                if masters is not None:
+                    masters[u] = m[0]
+                trust = lambda d, m=m, u=u: d["device_id"] in m[1] and hybrid_verify(m[0], DOMAIN_DEVICE, device_msg(tenant, u, d["device_id"], d["curve25519"], d["ed25519"]), d.get("master_signature", ""))
+            for d in devices[u]:
+                if u == self.user_id and isinstance(d, dict) and d.get("device_id") == self.device_id:
+                    continue
+                staged: dict = {}
+                t = self.check_device(u, d, staged)
+                if t and trust(d):
+                    out.append(t)
+                    device_pins.update(staged)
+
+        # 5. Commit.
+        for u, fp in sights.items():
+            self.st["pins"][f"{tenant}:{u}"] = fp
+        self.st["bot_owners"].update(owner_pins)
+        self.st["device_pins"].update(device_pins)
         self.st.save()
         return out
 
@@ -474,20 +529,13 @@ class Bot:
             after = max(m["id"] for m in page)
             senders = sorted({m.get("sender_user_id") for m in page if isinstance(m.get("sender_user_id"), str)})
             masters: dict[str, str] = {}
-            trusted = {(t["user_id"], t["device_id"], t["curve25519"]) for t in self.trusted_devices(senders, masters)}
-            for m in page:
-                # A sender that signed out since is off the listing; the mail kept its device's
-                # cross-signature, which must verify under the sender's trusted master key.
-                sk, u = m.get("sender_keys"), m.get("sender_user_id")
-                if u in masters and isinstance(sk, dict) and all(isinstance(sk.get(k), str) for k in ("device_id", "curve25519", "ed25519", "master_signature")) \
-                        and hybrid_verify(masters[u], DOMAIN_DEVICE, device_msg(self.st.d["tenant_id"], u, sk["device_id"], sk["curve25519"], sk["ed25519"]), sk["master_signature"]):
-                    trusted.add((u, sk["device_id"], sk["curve25519"]))
+            current = {(t["user_id"], t["device_id"], t["curve25519"]) for t in self.trusted_devices(senders, masters)}
             done = []
             for m in page:
                 if self.awaiting_accept(m.get("sender_user_id")):
                     continue  # not decrypted, so its Olm session and one-time key wait too
                 try:
-                    sid = self.room_key(m, trusted)
+                    sid = self.room_key(m, current, masters)
                     if sid:
                         got.append(sid)
                 except Exception as e:  # mail that is itself bad or untrusted is dropped, as the browser does
@@ -499,7 +547,13 @@ class Bot:
         self.upload(self.account(), low=OTK_TARGET // 2)
         return got
 
-    def room_key(self, m: dict, trusted: set) -> str | None:
+    def room_key(self, m: dict, current: set, masters: dict[str, str]) -> str | None:
+        """The room key m carries, if its sender's device is on the sender's final signed list
+        (current), or the mail is delayed: owner decision 28 Nov 2026, a device removed since may
+        still deliver keys it sent while listed, by the cross-signature the server kept from send
+        time, which must verify under the sender's final master key (masters). An honest server
+        takes no new mail from a device off its list, so fresh mail through this path needs a
+        hostile server holding a removed device's keys: the accepted residual risk."""
         if m.get("type") != ROOM_KEY_TYPE:
             raise ValueError("unknown mail type")
         c = json.loads(m["content"])
@@ -508,7 +562,10 @@ class Bot:
         if not sender or c.get("algorithm") != "olm.v1" or c.get("sender_key") != sender["curve25519"] or c.get("type") not in (0, 1):
             raise ValueError("mail from an unverified device")
         p = json.loads(self.olm_decrypt(sender["curve25519"], c["type"], c["body"]))
-        if (sender["user_id"], sender["device_id"], sender["curve25519"]) not in trusted:
+        u = sender["user_id"]
+        if (u, sender["device_id"], sender["curve25519"]) not in current and not (
+                u in masters and isinstance(sk.get("master_signature"), str)
+                and hybrid_verify(masters[u], DOMAIN_DEVICE, device_msg(self.st.d["tenant_id"], u, sender["device_id"], sender["curve25519"], sender["ed25519"]), sk["master_signature"])):
             raise ValueError("room key from a device nobody vouches for")
         acct = self.account()
         me = (self.user_id, self.device_id, acct.ed25519_key.to_base64())

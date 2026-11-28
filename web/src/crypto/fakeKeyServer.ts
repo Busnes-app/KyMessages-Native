@@ -1,7 +1,7 @@
 // An in-memory stand-in for the key server (internal/api/e2ee_handlers.go) and room membership,
 // for engine tests. It checks the same signatures the real server checks, and lets a test play a
 // hostile server by editing what it stores.
-import { Conflict, deviceSigned, oneTimeKeySigned, type ClaimedKey, type DeviceKeys, type KeyServer, type Mail, type SignedKey } from './engine';
+import { Conflict, deviceSigned, isBotUser, oneTimeKeySigned, type ClaimedKey, type DeviceKeys, type KeyServer, type Mail, type SignedKey } from './engine';
 import type { BackupEntry, BotDeviceList, MasterKeyRecord, OwnMaster } from './identity';
 import { verifyEd25519 } from './index';
 import { pqc, type BotDevice } from '../pqc/index';
@@ -66,6 +66,13 @@ export class FakeKeyServer {
 
   oneTimeKeyCount(userId: string, deviceId: string): number {
     return this.oneTimeKeys.get(dk(userId, deviceId))?.length ?? 0;
+  }
+
+  /** Whether d is on userId's current signed list (a bot's: its owner's, with the same keys). */
+  listed(userId: string, d: DeviceKeys): boolean {
+    const l = this.botLists.get(userId);
+    if (isBotUser(userId)) return !!l && this.masters.get(l.owner_id)?.version === l.version && l.devices.some((v) => v.device_id === d.device_id && v.curve25519 === d.curve25519 && v.ed25519 === d.ed25519);
+    return this.masters.get(userId)?.device_list?.device_ids.includes(d.device_id) ?? false;
   }
 
   /** The API as userId's session sees it. */
@@ -244,6 +251,8 @@ export class FakeKeyServer {
       sendToDevice: async (deviceId, messages) => {
         const sender = this.devices.get(userId)?.get(deviceId);
         if (!sender) throw new Error('Unknown device');
+        // As the server: new mail only from a device on its user's current signed list.
+        if (!this.listed(userId, sender)) throw new Error('403 This device is not on its signed device list');
         for (const m of messages) {
           const id = dk(m.user_id, m.device_id);
           const box = this.mail.get(id) ?? [];

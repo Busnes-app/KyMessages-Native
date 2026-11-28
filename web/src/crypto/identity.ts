@@ -522,9 +522,9 @@ export class Identity {
    * The devices of bot botId that owner (the bot's owner's trusted master key) vouches for, on
    * the newest owner-signed list seen (E4): by device ID, with their keys. A list that is not
    * validly signed, older than one seen (a removal undone), forked, or missing once seen vouches
-   * for nothing.
+   * for nothing. A first-seen owner's pin goes into writes when given (staged), else is stored.
    */
-  async trustedBot(botId: string, ownerId: string, owner: TrustedMaster, tenantId: string, rec: unknown): Promise<Map<string, BotDevice>> {
+  async trustedBot(botId: string, ownerId: string, owner: TrustedMaster, tenantId: string, rec: unknown, writes?: [string, unknown][]): Promise<Map<string, BotDevice>> {
     const none = new Map<string, BotDevice>();
     // A bot's owner is pinned on first sight: the server cannot later name another member, whose
     // valid signature would then vouch for devices of its choosing.
@@ -537,7 +537,10 @@ export class Identity {
     // Marked per bot and owner identity: any version of that key, since the list names its version.
     const seen = await this.observeMark(botKey(tenantId, botId, ownerId, fp), valid ? { epoch: rec.epoch, digest: pqc.hash('kymessages.bot-devices', ...rec.devices.flatMap((d) => [d.device_id, d.curve25519, d.ed25519])) } : undefined);
     if (seen !== 'ok' || !valid) return none;
-    if (pinned === undefined) await this.ctx.store.write([[botOwnerKey(tenantId, botId), ownerId]]);
+    if (pinned === undefined) {
+      if (writes) writes.push([botOwnerKey(tenantId, botId), ownerId]);
+      else await this.ctx.store.write([[botOwnerKey(tenantId, botId), ownerId]]);
+    }
     return new Map(rec.devices.map((d) => [d.device_id, d]));
   }
 

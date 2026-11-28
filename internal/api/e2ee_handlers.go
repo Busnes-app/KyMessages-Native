@@ -7,10 +7,13 @@ import (
 	"errors"
 	"net/http"
 	"regexp"
+	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Busnes-app/ky_server_base/internal/chat"
+	"github.com/Busnes-app/ky_server_base/internal/e2eeid"
 	"github.com/Busnes-app/ky_server_base/internal/store"
 )
 
@@ -314,6 +317,15 @@ func (s *Server) handleE2EESendToDevice(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
+	// New mail only from a device on its user's current signed list (spec §8): mail it sent while
+	// listed stays deliverable, but a removed device cannot send more.
+	if listed, err := s.deviceListed(r, tenantID, user.ID, sender); err != nil {
+		s.writeError(w, http.StatusInternalServerError, "Failed to load the device list")
+		return
+	} else if !listed {
+		s.writeError(w, http.StatusForbidden, "This device is not on its signed device list")
+		return
+	}
 	msgs := make([]store.E2EEToDevice, 0, len(req.Messages))
 	recipients := map[string]struct{}{}
 	for _, m := range req.Messages {
@@ -344,6 +356,21 @@ func (s *Server) handleE2EESendToDevice(w http.ResponseWriter, r *http.Request) 
 		_ = s.chatHub.PublishUser(r.Context(), id, chat.Event{Type: chat.EventToDevice, UserID: id})
 	}
 	s.writeJSON(w, http.StatusOK, map[string]int{"sent": len(msgs)})
+}
+
+// deviceListed says whether d is on userID's current signed list: a person's device list, or
+// for a bot the list its owner signed, with the same keys.
+func (s *Server) deviceListed(r *http.Request, tenantID, userID string, d *store.E2EEDevice) (bool, error) {
+	if strings.HasPrefix(userID, "bot_") {
+		bots, _, err := s.botLists(r, tenantID, []string{userID})
+		return err == nil && slices.Contains(bots[userID].Devices, e2eeid.BotDevice{DeviceID: d.DeviceID, Curve25519: d.Curve25519, Ed25519: d.Ed25519}), err
+	}
+	ms, err := s.store.E2EE().ListMasterKeys(r.Context(), tenantID, []string{userID})
+	if err != nil || len(ms) != 1 {
+		return false, err
+	}
+	var ids []string
+	return json.Unmarshal([]byte(ms[0].DeviceList), &ids) == nil && slices.Contains(ids, d.DeviceID), nil
 }
 
 // GET /api/v1/to-device?device_id=[&after=] reads the caller's oldest unacknowledged device
