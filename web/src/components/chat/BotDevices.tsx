@@ -44,7 +44,16 @@ export function BotDevices({ onClose }: { onClose: () => void }) {
       setViews(await load());
       setTyped({});
     } catch (e) {
-      setErr(errText(e, 'The bot’s devices could not be changed.'));
+      // The list may have moved on (another tab): show the server's list and let the user
+      // retry against it, rather than resending a stale epoch forever.
+      const msg = errText(e, 'The bot’s devices could not be changed.');
+      setErr(msg);
+      try {
+        setViews(await load());
+        setErr(`${msg} The list below is up to date: check it and try again.`);
+      } catch {
+        // Keep the first error; the old list stays until the dialog is reopened.
+      }
     } finally {
       setBusy(false);
     }

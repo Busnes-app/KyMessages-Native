@@ -41,6 +41,24 @@ describe('BotDevices', () => {
     await waitFor(() => expect(fakeBots.vouched).toEqual(['BOTDEVICE2']));
   });
 
+  it('reloads the list after a conflict and vouches on the retry, never by itself', async () => {
+    render(<BotDevices onClose={() => undefined} />);
+    const [input1] = await screen.findAllByLabelText('Code your bot shows');
+    // Another tab vouches for BOTDEVICE2 behind this dialog's back.
+    fakeBots.vouched = ['BOTDEVICE2'];
+    fakeBots.epoch = 1;
+    fireEvent.change(input1, { target: { value: 'ab12-cd34-ef56-0011-2233' } });
+    fireEvent.click(screen.getAllByRole('button', { name: 'Vouch for this device' })[0]);
+    expect((await screen.findByRole('alert')).textContent).toMatch(/up to date: check it and try again/);
+    // The refreshed list is shown and nothing was retried without the user.
+    expect(await screen.findByRole('button', { name: 'Remove' })).toBeTruthy();
+    expect(fakeBots.vouched).toEqual(['BOTDEVICE2']);
+    expect(fakeBots.epoch).toBe(1);
+    fireEvent.click(screen.getByRole('button', { name: 'Vouch for this device' }));
+    await waitFor(() => expect(fakeBots.vouched).toEqual(['BOTDEVICE2', 'BOTDEVICE1']));
+    expect(fakeBots.epoch).toBe(2);
+  });
+
   it('says when the user owns no bots', async () => {
     fakeBots.bots = [];
     render(<BotDevices onClose={() => undefined} />);
