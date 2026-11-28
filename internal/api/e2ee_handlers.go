@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/Busnes-app/ky_server_base/internal/chat"
@@ -345,7 +346,8 @@ func (s *Server) handleE2EESendToDevice(w http.ResponseWriter, r *http.Request) 
 	s.writeJSON(w, http.StatusOK, map[string]int{"sent": len(msgs)})
 }
 
-// GET /api/v1/to-device?device_id= reads the caller's oldest unacknowledged device mail.
+// GET /api/v1/to-device?device_id=[&after=] reads the caller's oldest unacknowledged device
+// mail, above ID after if given (a client paging past mail it keeps for later).
 func (s *Server) handleE2EEToDevice(w http.ResponseWriter, r *http.Request) {
 	user, _, ok := s.e2eeCaller(w, r)
 	if !ok {
@@ -355,7 +357,16 @@ func (s *Server) handleE2EEToDevice(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	msgs, err := s.store.E2EE().ToDevice(r.Context(), user.ID, dev.DeviceID, e2eeMailboxPage)
+	var after int64
+	if v := r.URL.Query().Get("after"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
+			after = n
+		} else {
+			s.writeError(w, http.StatusBadRequest, "Invalid after")
+			return
+		}
+	}
+	msgs, err := s.store.E2EE().ToDevice(r.Context(), user.ID, dev.DeviceID, after, e2eeMailboxPage)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to read mail")
 		return

@@ -437,12 +437,25 @@ class Bot:
         sessions.append(s.pickle(self.st.key))
         return plain
 
+    def awaiting_accept(self, u) -> bool:
+        """u (or the owner vouching for bot u) has a changed identity waiting for `accept`."""
+        t = self.st.d.get("tenant_id")
+        owner = self.st["bot_owners"].get(f"{t}:{u}") if isinstance(u, str) and u.startswith("bot_") else u
+        return f"{t}:{owner}" in self.st["changed"]
+
     def sync(self) -> list[str]:
+        """Acknowledges only mail that was read or can never be: mail from a sender awaiting
+        `accept` is kept, undecrypted, and read by the first sync after it. A failed request or
+        state write stops before the ack."""
         got: list[str] = []
+        after = 0
         while True:
-            page = self.s.call("GET", "/api/v1/to-device?device_id=" + urllib.parse.quote(self.device_id))["messages"]
+            page = self.s.call("GET", f"/api/v1/to-device?device_id={urllib.parse.quote(self.device_id)}&after={after}")["messages"]
+            # Each page moves past the last; mail kept for later is never fetched twice per sync.
+            page = [m for m in page if isinstance(m, dict) and isinstance(m.get("id"), int) and m["id"] > after]
             if not page:
                 break
+            after = max(m["id"] for m in page)
             senders = sorted({m.get("sender_user_id") for m in page if isinstance(m.get("sender_user_id"), str)})
             masters: dict[str, str] = {}
             trusted = {(t["user_id"], t["device_id"], t["curve25519"]) for t in self.trusted_devices(senders, masters)}
@@ -453,15 +466,20 @@ class Bot:
                 if u in masters and isinstance(sk, dict) and all(isinstance(sk.get(k), str) for k in ("device_id", "curve25519", "ed25519", "master_signature")) \
                         and hybrid_verify(masters[u], DOMAIN_DEVICE, device_msg(self.st.d["tenant_id"], u, sk["device_id"], sk["curve25519"], sk["ed25519"]), sk["master_signature"]):
                     trusted.add((u, sk["device_id"], sk["curve25519"]))
+            done = []
             for m in page:
+                if self.awaiting_accept(m.get("sender_user_id")):
+                    continue  # not decrypted, so its Olm session and one-time key wait too
                 try:
                     sid = self.room_key(m, trusted)
                     if sid:
                         got.append(sid)
-                except Exception as e:  # a refused or unreadable mail is dropped, as the browser does
-                    print(f"refused mail {m.get('id')}: {e}", file=sys.stderr)
+                except Exception as e:  # mail that is itself bad or untrusted is dropped, as the browser does
+                    print(f"refused mail {m['id']}: {e}", file=sys.stderr)
+                done.append(m["id"])
             self.st.save()  # ratchets and keys before the ack
-            self.s.call("POST", "/api/v1/to-device/ack", {"device_id": self.device_id, "ids": [m["id"] for m in page]})
+            if done:
+                self.s.call("POST", "/api/v1/to-device/ack", {"device_id": self.device_id, "ids": done})
         count = self.s.call("POST", "/api/v1/keys/upload", {"device_id": self.device_id, "one_time_keys": []})
         if count.get("one_time_key_count", OTK_TARGET) < OTK_TARGET // 2:
             self.upload(self.account(), count=count["one_time_key_count"])

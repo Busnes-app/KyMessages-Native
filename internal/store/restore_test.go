@@ -119,7 +119,7 @@ func TestRestoreInvalidatesGrants(t *testing.T) {
 	if k, err := st.E2EE().ClaimOneTimeKey(ctx, "u", "D1"); err != nil || k.KeyID != "fb2" {
 		t.Fatalf("claim after a new fallback = %+v %v", k, err)
 	}
-	if mail, _ := st.E2EE().ToDevice(ctx, "u", "D1", 10); len(mail) != 0 {
+	if mail, _ := st.E2EE().ToDevice(ctx, "u", "D1", 0, 10); len(mail) != 0 {
 		t.Fatalf("restored to-device mail survived: %+v", mail)
 	}
 	if _, _, err := st.Sessions().ConsumeMFAChallenge(ctx, "challenge"); !errors.Is(err, store.ErrNotFound) {

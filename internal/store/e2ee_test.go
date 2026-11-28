@@ -227,26 +227,30 @@ func TestE2EEToDeviceMailbox(t *testing.T) {
 	if err := k.SendToDevice(ctx, []store.E2EEToDevice{msg("B1", "one"), msg("B2", "other device"), msg("B1", "two"), msg("B1", "three")}); err != nil {
 		t.Fatal(err)
 	}
-	got, err := k.ToDevice(ctx, "u-b", "B1", 2)
+	got, err := k.ToDevice(ctx, "u-b", "B1", 0, 2)
 	if err != nil || len(got) != 2 || got[0].Content != "one" || got[1].Content != "two" || got[0].SenderDeviceID != "A1" {
 		t.Fatalf("first page = %+v %v", got, err)
 	}
 	if err := k.AckToDevice(ctx, "u-b", "B1", []int64{got[0].ID, got[1].ID}); err != nil {
 		t.Fatal(err)
 	}
-	rest, _ := k.ToDevice(ctx, "u-b", "B1", 10)
+	rest, _ := k.ToDevice(ctx, "u-b", "B1", 0, 10)
 	if len(rest) != 1 || rest[0].Content != "three" {
 		t.Fatalf("after ack = %+v", rest)
 	}
+	// after pages past mail kept unacknowledged.
+	if past, _ := k.ToDevice(ctx, "u-b", "B1", rest[0].ID, 10); len(past) != 0 {
+		t.Fatalf("after %d = %+v", rest[0].ID, past)
+	}
 	// Another device's ack never touches B2's mail, and B2 sees only its own.
-	other, _ := k.ToDevice(ctx, "u-b", "B2", 10)
+	other, _ := k.ToDevice(ctx, "u-b", "B2", 0, 10)
 	if len(other) != 1 || other[0].Content != "other device" {
 		t.Fatalf("B2 = %+v", other)
 	}
 	if err := k.PruneToDevice(ctx, time.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if left, _ := k.ToDevice(ctx, "u-b", "B2", 10); len(left) != 0 {
+	if left, _ := k.ToDevice(ctx, "u-b", "B2", 0, 10); len(left) != 0 {
 		t.Fatalf("pruned mail left: %+v", left)
 	}
 }

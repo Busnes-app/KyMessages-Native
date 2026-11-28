@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"strconv"
 	"testing"
 
 	"github.com/Busnes-app/ky_server_base/internal/api"
@@ -216,6 +217,16 @@ func TestE2EEQueryClaimAndMailStayInTheOrg(t *testing.T) {
 	}
 	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &mail) != nil || len(mail.Messages) != 1 || mail.Messages[0].Content != "ciphertext-for-"+bob.ID {
 		t.Fatalf("bob's mail = %d %s", rec.Code, rec.Body.String())
+	}
+	// after pages past mail the client keeps unacknowledged; a bad after is refused.
+	path := "/api/v1/to-device?device_id=" + devs[bob.ID].id + "&after="
+	if rec := doBearerJSON(t, srv, http.MethodGet, path+strconv.FormatInt(mail.Messages[0].ID, 10), bobTok, nil, nil); rec.Body.String() != `{"messages":[]}`+"\n" {
+		t.Fatalf("after its ID = %s", rec.Body.String())
+	}
+	for _, bad := range []string{"-1", "x"} {
+		if c := doBearerJSON(t, srv, http.MethodGet, path+bad, bobTok, nil, nil).Code; c != http.StatusBadRequest {
+			t.Fatalf("after=%s = %d", bad, c)
+		}
 	}
 	if c := doBearerJSON(t, srv, http.MethodPost, "/api/v1/to-device/ack", bobTok, map[string]any{"device_id": devs[bob.ID].id, "ids": []int64{mail.Messages[0].ID}}, nil).Code; c != http.StatusNoContent {
 		t.Fatalf("ack = %d", c)

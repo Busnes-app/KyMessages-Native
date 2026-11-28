@@ -215,10 +215,10 @@ func (s *e2eeStore) SendToDevice(ctx context.Context, msgs []E2EEToDevice) error
 	return tx.Commit()
 }
 
-func (s *e2eeStore) ToDevice(ctx context.Context, userID, deviceID string, limit int) ([]E2EEToDevice, error) {
+func (s *e2eeStore) ToDevice(ctx context.Context, userID, deviceID string, after int64, limit int) ([]E2EEToDevice, error) {
 	rows, err := s.store.db.QueryContext(ctx, s.store.rebind(`
 		SELECT id, tenant_id, recipient_user, recipient_device, sender_user, sender_device, sender_curve25519, sender_ed25519, sender_signature, sender_master_signature, type, content, created_at
-		FROM e2ee_to_device WHERE recipient_user = ? AND recipient_device = ? ORDER BY id LIMIT ?`), userID, deviceID, limit)
+		FROM e2ee_to_device WHERE recipient_user = ? AND recipient_device = ? AND id > ? ORDER BY id LIMIT ?`), userID, deviceID, after, limit)
 	if err != nil {
 		return nil, err
 	}

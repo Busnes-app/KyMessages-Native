@@ -44,7 +44,7 @@ class FakeServer:
     """The key server, room membership and messages, as internal/api serves them."""
 
     def __init__(self):
-        self.tenant, self.fail_to_device = TENANT, 0
+        self.tenant, self.fail_to_device, self.reads, self.ignore_after = TENANT, 0, 0, False
         self.devices, self.otks, self.mail, self.masters, self.bot_lists = {}, {}, {}, {}, {}
         self.rooms, self.messages, self.blobs, self.next = {}, {}, {}, 1
 
@@ -106,8 +106,10 @@ class FakeServer:
                 self.next += 1
             return {}
         if p == "/api/v1/to-device":
-            dev = q.split("=", 1)[1]
-            return {"messages": list(self.mail.get((user, dev), []))[:100]}
+            self.reads += 1
+            args = dict(a.split("=", 1) for a in q.split("&"))
+            after = 0 if self.ignore_after else int(args.get("after", 0))
+            return {"messages": [m for m in self.mail.get((user, args["device_id"]), []) if m["id"] > after][:100]}
         if p == "/api/v1/to-device/ack":
             k = (user, body["device_id"])
             self.mail[k] = [m for m in self.mail.get(k, []) if m["id"] not in body["ids"]]
@@ -355,6 +357,46 @@ class Trust(unittest.TestCase):
         self.bot.accept("u_alice")
         self.bot.send("r1", "accepted")
         self.assertEqual(self.env.mail_to(newer), 1)
+
+    def change_identity(self):
+        """Alice resets her identity on a new device and vouches for the bot again."""
+        self.bot.send("r1", "pins Alice")
+        self.env.server.mail.clear()
+        self.env.identities["u_alice"] = Master()
+        del self.env.server.masters["u_alice"]
+        newer = self.env.person("u_alice")
+        self.env.vouch("u_alice", "bot_helper", self.bot)
+        return newer
+
+    def test_room_keys_awaiting_accept_are_kept_and_read_after_it(self):
+        newer = self.change_identity()
+        sent = newer.send("r1", "after my reset")
+        self.assertEqual(self.bot.sync(), [])
+        self.assertEqual(self.env.mail_to(self.bot), 1)  # kept, not acknowledged
+        self.assertIn("error", self.bot.open(sent))
+        self.bot.accept("u_alice")
+        self.assertEqual(len(self.bot.sync()), 1)
+        self.assertEqual(self.env.mail_to(self.bot), 0)
+        self.assertEqual(self.bot.open(sent)["body"], "after my reset")
+
+    def test_a_page_of_kept_mail_neither_loops_nor_blocks_later_mail(self):
+        newer = self.change_identity()
+        newer.send("r1", "kept")
+        box = self.env.server.mail[(self.bot.user_id, self.bot.device_id)]
+        for _ in range(150):  # more than a page of mail awaiting accept
+            box.append({**box[0], "id": self.env.server.next})
+            self.env.server.next += 1
+        carol = self.env.person("u_carol")
+        self.env.server.rooms["r1"].append("u_carol")
+        sent = carol.send("r1", "behind the kept mail")
+        self.bot.sync()
+        self.assertEqual(self.bot.open(sent)["body"], "behind the kept mail")
+        self.assertEqual(self.env.mail_to(self.bot), 151)
+        self.assertLessEqual(self.env.server.reads, 3)
+        # A server that ignores `after` gets one read of the kept page, not a loop.
+        self.env.server.ignore_after, self.env.server.reads = True, 0
+        self.bot.sync()
+        self.assertEqual(self.env.server.reads, 2)
 
     def test_another_org_is_refused_before_any_trust_changes(self):
         self.bot.send("r1", "pins Alice and the org")
