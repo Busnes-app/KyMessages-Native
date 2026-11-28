@@ -711,7 +711,7 @@ type sendMessageRequest struct {
 
 // POST /api/v1/rooms/{id}/messages
 func (s *Server) handleChatSendMessage(w http.ResponseWriter, r *http.Request) {
-	user, sess, ok := s.currentUser(r)
+	user, _, ok := s.currentUser(r)
 	if !ok {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
@@ -752,13 +752,8 @@ func (s *Server) handleChatSendMessage(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "Message body must be 1 to 16384 bytes (or include at least one attachment)")
 		return
 	}
-	encoding, err := s.messageEncoding(w, user, sess, req.Encoding, body)
+	encoding, err := s.messageEncoding(w, req.Encoding, body)
 	if err != nil {
-		return
-	}
-	// Only encrypted messages carry thumbnails as attachments of their own.
-	if encoding == store.MessageEncodingPlainV1 && len(attIDs) > maxAttachmentsPerMessage {
-		s.writeError(w, http.StatusBadRequest, "At most 10 attachments per message")
 		return
 	}
 	idemKey := strings.TrimSpace(req.IdempotencyKey)
@@ -855,7 +850,7 @@ func (s *Server) handleChatGetMessage(w http.ResponseWriter, r *http.Request) {
 
 // PATCH /api/v1/rooms/{id}/messages/{mid}
 func (s *Server) handleChatEditMessage(w http.ResponseWriter, r *http.Request) {
-	user, sess, ok := s.currentUser(r)
+	user, _, ok := s.currentUser(r)
 	if !ok {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
@@ -883,7 +878,7 @@ func (s *Server) handleChatEditMessage(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "Message body must be 1 to 16384 bytes")
 		return
 	}
-	encoding, err := s.messageEncoding(w, user, sess, req.Encoding, body)
+	encoding, err := s.messageEncoding(w, req.Encoding, body)
 	if err != nil {
 		return
 	}

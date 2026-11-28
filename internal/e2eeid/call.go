@@ -211,6 +211,16 @@ func deviceListMsg(_ *hybridsig.PublicKey, a []string) ([]byte, error) {
 	return DeviceListMessage(a[0], a[1], v, e, ids)
 }
 
+func botDevicesMsg(_ *hybridsig.PublicKey, a []string) ([]byte, error) {
+	v, err1 := strconv.ParseInt(a[2], 10, 64)
+	e, err2 := strconv.ParseInt(a[4], 10, 64)
+	var devs []BotDevice
+	if err1 != nil || err2 != nil || v < 1 || e < 1 || json.Unmarshal([]byte(a[5]), &devs) != nil {
+		return nil, errArg
+	}
+	return BotDevicesMessage(a[0], a[1], v, a[3], e, devs)
+}
+
 func xwPub(v string) (xwing.PublicKey, error) {
 	b, err := dec(v)
 	if err != nil {
@@ -334,6 +344,11 @@ var calls = map[string]call{
 	"signDeviceList": {6, signWith(DomainDeviceList, deviceListMsg)},
 	// verifyDeviceList(public_key, tenant, user, version, epoch, device_ids_json, signature)
 	"verifyDeviceList": {7, verifyWith(DomainDeviceList, deviceListMsg)},
+	// signBotDevices(seed, tenant, owner, version, bot, epoch, devices JSON
+	// [{device_id, curve25519, ed25519}] sorted by device_id)
+	"signBotDevices": {7, signWith(DomainBotDevices, botDevicesMsg)},
+	// verifyBotDevices(public_key, tenant, owner, version, bot, epoch, devices JSON, signature)
+	"verifyBotDevices": {8, verifyWith(DomainBotDevices, botDevicesMsg)},
 	// signDeviceListReserve(seed, tenant, user, version, expected_epoch, digest) and
 	// verifyDeviceListReserve(public_key, tenant, user, version, expected_epoch, digest, signature).
 	"signDeviceListReserve":   {6, signWith(DomainDeviceListReserve, deviceListReserveMsg)},

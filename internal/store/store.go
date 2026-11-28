@@ -173,6 +173,24 @@ type E2EEStore interface {
 	ConsumePairing(ctx context.Context, tenantID, userID, id, newDevice string, now time.Time) (*E2EEPairing, error)
 	DeletePairing(ctx context.Context, tenantID, userID, id string) error
 	PrunePairings(ctx context.Context, now time.Time) error
+
+	// ListBotDevices reads the owner-signed device lists of the named bots in tenantID.
+	ListBotDevices(ctx context.Context, tenantID string, botIDs []string) ([]E2EEBotDevices, error)
+	// PutBotDevices stores b at b.Epoch once proof accepts it against the owner's master key at
+	// b.OwnerVersion (read and locked in the same transaction), while the bot's list is at epoch
+	// expected (0: none); ErrE2EEVersion otherwise. The epoch only rises, whoever signs.
+	PutBotDevices(ctx context.Context, b *E2EEBotDevices, expected int64, proof Proof) error
+	// DeleteUserDevices removes every device of userID, with its keys and mail.
+	DeleteUserDevices(ctx context.Context, userID string) error
+}
+
+// E2EEBotDevices is the device list a bot's owner signed with their master key (E4): Devices is
+// the JSON array of {device_id, curve25519, ed25519}, sorted by device ID.
+type E2EEBotDevices struct {
+	TenantID, BotUserID, OwnerUserID string
+	OwnerVersion, Epoch              int64
+	Devices, Signature               string
+	UpdatedAt                        time.Time
 }
 
 // E2EEMasterKey is a user's encryption identity: the hybrid master public key and its

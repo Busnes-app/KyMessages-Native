@@ -125,24 +125,31 @@ func TestEnvelopeShapeIsChecked(t *testing.T) {
 	}
 }
 
-func TestBotTokensKeepPlaintextUntilE4(t *testing.T) {
+// E4 ends the plaintext transition: a bot token is refused plain_v1 like everyone (spec §10),
+// and posts envelopes as a device.
+func TestBotTokensAreRefusedPlaintextSinceE4(t *testing.T) {
 	srv, _, botToken, msgs := encryptedRoomFixture(t)
 
-	rec := botDo(t, srv, botToken, "POST", msgs, map[string]any{"body": "build passed"})
+	for name, body := range map[string]map[string]any{
+		"omitted encoding": {"body": "build passed"},
+		"plain_v1":         {"body": "build passed", "encoding": "plain_v1"},
+	} {
+		rec := botDo(t, srv, botToken, "POST", msgs, body)
+		if rec.Code != http.StatusBadRequest || refusalCode(t, rec.Body.Bytes()) != api.CodeE2EERequired {
+			t.Fatalf("%s: bot plain send = %d %s, want 400 e2ee_required", name, rec.Code, rec.Body.String())
+		}
+	}
+	rec := botDo(t, srv, botToken, "POST", msgs, sealed("build passed", nil))
 	if rec.Code != http.StatusCreated {
-		t.Fatalf("bot plain send = %d %s", rec.Code, rec.Body.String())
+		t.Fatalf("bot envelope send = %d %s", rec.Code, rec.Body.String())
 	}
 	var sent sentMessage
 	_ = json.Unmarshal(rec.Body.Bytes(), &sent)
-	if sent.Message.Encoding != store.MessageEncodingPlainV1 || sent.Message.Body != "build passed" {
+	if sent.Message.Encoding != store.MessageEncodingE2EERoomV1 {
 		t.Fatalf("bot message = %+v", sent.Message)
 	}
-	if rec := botDo(t, srv, botToken, "PATCH", msgs+"/"+sent.Message.ID, map[string]any{"body": "build passed (2)", "encoding": "plain_v1"}); rec.Code != http.StatusOK {
-		t.Fatalf("bot plain edit = %d %s", rec.Code, rec.Body.String())
-	}
-	// The bot's plaintext keeps today's 16 KiB limit.
-	if rec := botDo(t, srv, botToken, "POST", msgs, map[string]any{"body": strings.Repeat("x", 16<<10+1)}); rec.Code != http.StatusBadRequest {
-		t.Fatalf("oversized bot message = %d, want 400", rec.Code)
+	if rec := botDo(t, srv, botToken, "PATCH", msgs+"/"+sent.Message.ID, map[string]any{"body": "build passed (2)", "encoding": "plain_v1"}); rec.Code != http.StatusBadRequest {
+		t.Fatalf("bot plain edit = %d %s, want 400", rec.Code, rec.Body.String())
 	}
 }
 

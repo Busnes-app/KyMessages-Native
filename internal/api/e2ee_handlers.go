@@ -209,10 +209,17 @@ func (s *Server) handleE2EEQuery(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		masters, err = s.store.E2EE().ListMasterKeys(r.Context(), tenantID, req.UserIDs)
 	}
+	var bots map[string]e2eeBotDevicesJSON
+	var owners []store.E2EEMasterKey
+	if err == nil {
+		bots, owners, err = s.botLists(r, tenantID, req.UserIDs)
+	}
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to load devices")
 		return
 	}
+	// A bot's owner's master key comes with its list, so a client can check the owner's signature.
+	masters = append(masters, owners...)
 	version := map[string]int64{}
 	masterOut := map[string]e2eeMasterJSON{}
 	for i := range masters {
@@ -231,7 +238,11 @@ func (s *Server) handleE2EEQuery(w http.ResponseWriter, r *http.Request) {
 		}
 		out[d.UserID] = append(out[d.UserID], j)
 	}
-	s.writeJSON(w, http.StatusOK, map[string]any{"tenant_id": tenantID, "devices": out, "master_keys": masterOut})
+	resp := map[string]any{"tenant_id": tenantID, "devices": out, "master_keys": masterOut}
+	if len(bots) > 0 {
+		resp["bot_devices"] = bots
+	}
+	s.writeJSON(w, http.StatusOK, resp)
 }
 
 // POST /api/v1/keys/claim takes one one-time key per named device, to start Olm sessions.

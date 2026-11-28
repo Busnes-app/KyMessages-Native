@@ -35,18 +35,20 @@ const (
 	// reservation is never a published list and a list never a reservation.
 	DomainDeviceListReserve = "kymessages.device-list-reserve.v1"
 	DomainPinsWrite         = "kymessages.pins-write.v1"
-	DomainBackupWrite       = "kymessages.backup-write.v1"
-	labelFingerprint        = "kymessages.master-fingerprint.v1"
-	labelRecovery           = "kymessages.recovery.v1"
-	LabelRecoveryMKey       = "kymessages.recovery.v1/master-key"
-	LabelRecoveryBKey       = "kymessages.recovery.v1/backup-key"
-	labelRecoveryCode       = "kymessages.recovery-key.v1"
-	InfoBackup              = "kymessages.backup.v1"
-	InfoQRTransfer          = "kymessages.qr-transfer.v1"
-	infoQRInner             = "kymessages.qr-transfer.v1/inner"
-	labelQRCode             = "kymessages.qr-transfer.v1/code"
-	labelPins               = "kymessages.pins.v1"
-	labelBackupMAC          = "kymessages.backup.v1/mac"
+	// DomainBotDevices signs the devices of a bot its owner vouches for (E4).
+	DomainBotDevices  = "kymessages.bot-devices.v1"
+	DomainBackupWrite = "kymessages.backup-write.v1"
+	labelFingerprint  = "kymessages.master-fingerprint.v1"
+	labelRecovery     = "kymessages.recovery.v1"
+	LabelRecoveryMKey = "kymessages.recovery.v1/master-key"
+	LabelRecoveryBKey = "kymessages.recovery.v1/backup-key"
+	labelRecoveryCode = "kymessages.recovery-key.v1"
+	InfoBackup        = "kymessages.backup.v1"
+	InfoQRTransfer    = "kymessages.qr-transfer.v1"
+	infoQRInner       = "kymessages.qr-transfer.v1/inner"
+	labelQRCode       = "kymessages.qr-transfer.v1/code"
+	labelPins         = "kymessages.pins.v1"
+	labelBackupMAC    = "kymessages.backup.v1/mac"
 )
 
 const (
@@ -135,6 +137,27 @@ func DeviceListMessage(tenantID, userID string, version, epoch int64, deviceIDs 
 	fields := [][]byte{s(hybridsig.Alg), s(tenantID), s(userID), s(strconv.FormatInt(version, 10)), s(strconv.FormatInt(epoch, 10))}
 	for _, id := range deviceIDs {
 		fields = append(fields, s(id))
+	}
+	return Fields(fields...), nil
+}
+
+// BotDevice is one device of a bot, as its owner's master key vouches for it.
+type BotDevice struct {
+	DeviceID   string `json:"device_id"`
+	Curve25519 string `json:"curve25519"`
+	Ed25519    string `json:"ed25519"`
+}
+
+// BotDevicesMessage is what an owner's master key signs to vouch for its bot's devices at one
+// epoch (E4): the devices and their keys, sorted by distinct device ID. As with a device list,
+// clients trust only the newest list they have seen, so a device the owner removed stays removed.
+func BotDevicesMessage(tenantID, ownerID string, version int64, botID string, epoch int64, devices []BotDevice) ([]byte, error) {
+	fields := [][]byte{s(hybridsig.Alg), s(tenantID), s(ownerID), s(strconv.FormatInt(version, 10)), s(botID), s(strconv.FormatInt(epoch, 10))}
+	for i, d := range devices {
+		if i > 0 && devices[i-1].DeviceID >= d.DeviceID {
+			return nil, ErrDeviceList
+		}
+		fields = append(fields, s(d.DeviceID), s(d.Curve25519), s(d.Ed25519))
 	}
 	return Fields(fields...), nil
 }

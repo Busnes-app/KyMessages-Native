@@ -306,6 +306,8 @@ ALTER TABLE mfa_challenges ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';`,
 	// E2EE E5: kept original bodies of edited encrypted messages with files, staged blob deletes.
 	{Version: 69, Name: "message_original_body", SQLite: originalBodySchema, Postgres: originalBodySchema},
 	{Version: 70, Name: "blob_delete_intents", SQLite: blobDeleteIntentsSchema, Postgres: blobDeleteIntentsSchema},
+	// E2EE E4: the device list each bot's owner signed.
+	{Version: 71, Name: "e2ee_bot_devices", SQLite: e2eeBotsSchema, Postgres: e2eeBotsSchema},
 }
 
 const tenantDirectorySchema = `

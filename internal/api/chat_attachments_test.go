@@ -56,7 +56,7 @@ func doMultipartUpload(t *testing.T, handler http.Handler, path, bearer, fieldNa
 	return doPlainUpload(t, handler, path, bearer, fieldName, filename, data)
 }
 
-// doPlainUpload uploads bytes the server may sniff: only bot tokens may do this.
+// doPlainUpload uploads without encrypted=1, which the server refuses from everyone since E4.
 func doPlainUpload(t *testing.T, handler http.Handler, path, bearer, fieldName, filename string, data []byte) *httptest.ResponseRecorder {
 	t.Helper()
 	var body bytes.Buffer
@@ -95,8 +95,8 @@ func createChatTestBot(t *testing.T, st store.Store, id, username, ownerID strin
 	return tok
 }
 
-// Plaintext files (a bot's, or any uploaded before E5) keep their sniffed type, inline images and
-// sanitized names.
+// Uploads (a bot's too, since E4) are opaque ciphertext: staged for the uploader only, served to
+// members as attachments with strict headers, and removed with their message.
 func TestChatAttachmentsUploadLinkDownloadAndCleanup(t *testing.T) {
 	srv, st, cfg := setupTestServer(t)
 	startChatBus(t, srv)
@@ -158,7 +158,11 @@ func TestChatAttachmentsUploadLinkDownloadAndCleanup(t *testing.T) {
 	if len(largePNG) <= 1<<20 {
 		t.Fatalf("expected largePNG > 1 MiB, got %d bytes", len(largePNG))
 	}
-	upRec := doPlainUpload(t, srv, "/api/v1/rooms/"+roomID+"/attachments", botTok, "file", "../../evil/design.png", largePNG)
+	// Since E4 a bot's plaintext upload is refused like anyone's; it uploads ciphertext.
+	if r := doPlainUpload(t, srv, "/api/v1/rooms/"+roomID+"/attachments", botTok, "file", "design.png", largePNG); r.Code != http.StatusBadRequest || !strings.Contains(r.Body.String(), "e2ee_required") {
+		t.Fatalf("bot plaintext upload = %d %s, want 400 e2ee_required", r.Code, r.Body.String())
+	}
+	upRec := doMultipartUpload(t, srv, "/api/v1/rooms/"+roomID+"/attachments", botTok, "file", "../../evil/design.png", largePNG)
 	if upRec.Code != http.StatusCreated {
 		t.Fatalf("upload large PNG = %d: %s", upRec.Code, upRec.Body.String())
 	}
@@ -169,7 +173,7 @@ func TestChatAttachmentsUploadLinkDownloadAndCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	att := upResp.Attachment
-	if att.Filename != "design.png" || att.MimeType != "image/png" || att.SizeBytes != int64(len(largePNG)) {
+	if att.Filename != "encrypted.bin" || att.MimeType != "application/octet-stream" || att.SizeBytes != int64(len(largePNG)) {
 		t.Fatalf("unexpected uploaded attachment metadata: %+v", att)
 	}
 
@@ -202,8 +206,8 @@ func TestChatAttachmentsUploadLinkDownloadAndCleanup(t *testing.T) {
 
 	// The bot sends an attachment-only message (empty body allowed when attachment_ids is non-empty).
 	sendRec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+roomID+"/messages", botTok, map[string]any{
-		"body":           "",
-		"encoding":       "plain_v1",
+		"body":           testEnvelope(""),
+		"encoding":       "e2ee_room_v1",
 		"attachment_ids": []string{att.ID},
 	}, nil)
 	if sendRec.Code != http.StatusCreated {
@@ -219,7 +223,8 @@ func TestChatAttachmentsUploadLinkDownloadAndCleanup(t *testing.T) {
 		t.Fatalf("message missing linked attachment: %+v", msgResp.Message)
 	}
 
-	// Bob can now download it inline with strict security headers; Charlie still gets 404.
+	// Bob can now download it with strict security headers, never inline (ciphertext); Charlie
+	// still gets 404.
 	reqBobInline := httptest.NewRequest(http.MethodGet, "/api/v1/attachments/"+att.ID+"?inline=1", nil)
 	reqBobInline.Header.Set("Authorization", "Bearer "+bobTok)
 	recBobInline := httptest.NewRecorder()
@@ -227,11 +232,11 @@ func TestChatAttachmentsUploadLinkDownloadAndCleanup(t *testing.T) {
 	if recBobInline.Code != http.StatusOK {
 		t.Fatalf("bob download inline = %d", recBobInline.Code)
 	}
-	if got := recBobInline.Header().Get("Content-Type"); got != "image/png" {
-		t.Errorf("Content-Type = %q, want image/png", got)
+	if got := recBobInline.Header().Get("Content-Type"); got != "application/octet-stream" {
+		t.Errorf("Content-Type = %q, want application/octet-stream", got)
 	}
-	if got := recBobInline.Header().Get("Content-Disposition"); !strings.HasPrefix(got, "inline;") {
-		t.Errorf("Content-Disposition = %q, want inline", got)
+	if got := recBobInline.Header().Get("Content-Disposition"); !strings.HasPrefix(got, "attachment;") {
+		t.Errorf("Content-Disposition = %q, want attachment", got)
 	}
 	if got := recBobInline.Header().Get("X-Content-Type-Options"); got != "nosniff" {
 		t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
@@ -304,7 +309,7 @@ func TestChatAttachmentsXSSDowngradeAndMaxUploadCap(t *testing.T) {
 
 	// SVG XSS payload must downgrade to application/octet-stream and NEVER serve inline even with ?inline=1.
 	svg := []byte(`<svg xmlns="http://www.w3.org/2000/svg" onload="alert(document.cookie)"></svg>`)
-	upSVG := doPlainUpload(t, srv, "/api/v1/rooms/"+roomID+"/attachments", botTok, "file", "xss.svg", svg)
+	upSVG := doMultipartUpload(t, srv, "/api/v1/rooms/"+roomID+"/attachments", botTok, "file", "xss.svg", svg)
 	if upSVG.Code != http.StatusCreated {
 		t.Fatalf("upload svg = %d: %s", upSVG.Code, upSVG.Body.String())
 	}
@@ -1007,19 +1012,9 @@ func TestChatAttachmentsRefusedUploadsReleaseEverything(t *testing.T) {
 		t.Fatalf("upload after refusals = %d: %s (a reservation was not released)", rec.Code, rec.Body.String())
 	}
 
-	var ids []string
-	for i := 0; i < 11; i++ {
-		var a struct {
-			Attachment store.Attachment `json:"attachment"`
-		}
-		_ = json.Unmarshal(doPlainUpload(t, srv, up, botTok, "file", "b.txt", []byte(fmt.Sprintf("bot %d", i))).Body.Bytes(), &a)
-		ids = append(ids, a.Attachment.ID)
-	}
-	if rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room+"/messages", botTok, map[string]any{"body": "files", "encoding": "plain_v1", "attachment_ids": ids}, nil); rec.Code != http.StatusBadRequest {
-		t.Fatalf("plaintext message with 11 attachments = %d, want 400", rec.Code)
-	}
-	if rec := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room+"/messages", botTok, map[string]any{"body": "files", "encoding": "plain_v1", "attachment_ids": ids[:10]}, nil); rec.Code != http.StatusCreated {
-		t.Fatalf("plaintext message with 10 attachments = %d: %s", rec.Code, rec.Body.String())
+	// Since E4 nobody uploads plaintext, bots included.
+	if rec := doPlainUpload(t, srv, up, botTok, "file", "b.txt", []byte("bot")); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "e2ee_required") {
+		t.Fatalf("bot plaintext upload = %d %s, want 400 e2ee_required", rec.Code, rec.Body.String())
 	}
 }
 
@@ -1033,16 +1028,22 @@ func TestChatLegacyAttachmentEditsKeepNoOriginal(t *testing.T) {
 	_, aliceTok := createChatTestUser(t, st, "u_leg_alice", "legalice", "user")
 	botTok := createChatTestBot(t, st, "u_leg_bot", "legbot", "u_leg_alice")
 	room := roomOf(t, doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms", aliceTok, map[string]any{"kind": store.RoomKindChannel, "name": "legacy", "member_ids": []string{"u_leg_bot"}}, nil))
-	var up struct {
-		Attachment store.Attachment `json:"attachment"`
+	// The bot posted it before E4, when its plaintext was still accepted.
+	ctx := context.Background()
+	att := &store.Attachment{RoomID: room, UploaderID: "u_leg_bot", Filename: "report.txt", MimeType: "text/plain", SizeBytes: 16}
+	if err := st.Chat().CreateAttachment(ctx, att); err != nil {
+		t.Fatal(err)
 	}
-	_ = json.Unmarshal(doPlainUpload(t, srv, "/api/v1/rooms/"+room+"/attachments", botTok, "file", "report.txt", []byte("plaintext report")).Body.Bytes(), &up)
-	var posted struct {
-		Message store.Message `json:"message"`
+	var posted struct{ Message *store.Message }
+	var err error
+	posted.Message, _, err = st.Chat().CreateMessage(ctx, store.CreateMessageParams{TenantID: store.DefaultTenantID, RoomID: room, SenderID: "u_leg_bot", Encoding: store.MessageEncodingPlainV1, Body: "report", AttachmentIDs: []string{att.ID}})
+	if err != nil {
+		t.Fatal(err)
 	}
-	_ = json.Unmarshal(doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room+"/messages", botTok, map[string]any{"body": "report", "encoding": "plain_v1", "attachment_ids": []string{up.Attachment.ID}}, nil).Body.Bytes(), &posted)
+	if rec := doBearerJSON(t, srv, http.MethodPatch, "/api/v1/rooms/"+room+"/messages/"+posted.Message.ID, botTok, map[string]any{"body": "report v2", "encoding": "plain_v1"}, nil); rec.Code != http.StatusBadRequest {
+		t.Fatalf("plaintext edit = %d, want 400", rec.Code)
+	}
 	for i, edit := range []map[string]any{
-		{"body": "report v2", "encoding": "plain_v1"},
 		{"body": testEnvelope("report v3"), "encoding": "e2ee_room_v1"},
 		{"body": testEnvelope("report v4"), "encoding": "e2ee_room_v1"},
 	} {
