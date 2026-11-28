@@ -567,7 +567,9 @@ export class CryptoEngine {
       if (finals.has(user)) return finals.get(user);
       const recs = records.get(user) ?? [];
       let blocked = recs.length === 0;
-      // Every record raises the list mark, in the order seen, and must name the same key.
+      // Every record raises the list mark, in the order seen, and must name the same key. Only an
+      // identity problem blocks: a refused list (older, forked) still answers the key, with no
+      // devices, so the newest list below decides.
       for (const rec of recs) {
         const seen = sights.get(user);
         if (!(await this.identity.trustedMaster(user, rec, tenantId, pins, sights))) blocked = true;

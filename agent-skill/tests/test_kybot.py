@@ -705,6 +705,15 @@ class Scenarios(unittest.TestCase):
         bot.send("r", "after the removal")
         return {"d1_gets_key": env.mail_to(d1) > 0, "d2_gets_key": env.mail_to(d2) > 0}
 
+    def sc_stale_list_in_later_batch(self, env):
+        d1, d2, bot = self.dana(env)
+        env.server.rooms["r"] = ["a_dana", *FILLERS, "bot_helper"]
+        old = json.loads(json.dumps(env.server.masters["a_dana"]))
+        relist(env, "a_dana", [d1.device_id])
+        env.server.query_hook = lambda ids, out: out["master_keys"].__setitem__("a_dana", json.loads(json.dumps(old))) if "a_dana" not in ids else None
+        bot.send("r", "after the removal")
+        return {"d1_gets_key": env.mail_to(d1) > 0, "d2_gets_key": env.mail_to(d2) > 0}
+
     def sc_identity_conflict_across_batches(self, env):
         d1, _, bot = self.dana(env)
         other = env.device("bot_other")

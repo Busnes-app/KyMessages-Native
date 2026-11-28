@@ -440,7 +440,9 @@ class Bot:
         def resolve(u: str) -> tuple[str, set[str]] | None:
             if u not in finals:
                 recs = records.get(u, [])
-                seen = [self.trusted_master(u, rec, tenant, sights) for rec in recs]  # every list raises the mark
+                # Every list raises the mark; only an identity problem blocks (a refused list still
+                # answers the key, with no devices), so the newest list decides.
+                seen = [self.trusted_master(u, rec, tenant, sights) for rec in recs]
                 newest = max(recs, key=lambda r: (r.get("device_list") or {}).get("epoch", 0) if isinstance(r, dict) and isinstance(r.get("device_list"), dict) and isinstance(r["device_list"].get("epoch"), int) else 0, default=None)
                 finals[u] = self.trusted_master(u, newest, tenant, sights) if seen and all(seen) else None
             return finals[u]

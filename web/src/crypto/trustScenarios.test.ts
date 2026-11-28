@@ -90,6 +90,17 @@ const scenarios: Record<string, () => Promise<Record<string, boolean>>> = {
     await erin.encrypt('r', { type: 'text', body: 'after the removal' });
     return { d1_gets_key: mailTo(d1) > 0, d2_gets_key: mailTo(d2) > 0 };
   },
+  async stale_list_in_later_batch() {
+    const { server, d1, d2, erin, mailTo, setHook } = await world();
+    server.join('r', 'a_dana', ...FILLERS, BOT, 'a_erin');
+    const old = masterView(server, 'a_dana');
+    await d1.delistDevices([d2.deviceId]);
+    // The batch naming Dana gets her new list; the later one, with her bot, the old one.
+    setHook((ids, r) => { if (!ids.includes('a_dana')) r.master_keys!.a_dana = structuredClone(old); });
+    server.mail.clear();
+    await erin.encrypt('r', { type: 'text', body: 'after the removal' });
+    return { d1_gets_key: mailTo(d1) > 0, d2_gets_key: mailTo(d2) > 0 };
+  },
   async identity_conflict_across_batches() {
     const { server, d1, bot, erin, mailTo, setHook } = await world();
     server.join('r', 'a_dana', ...FILLERS, BOT, 'a_erin');
