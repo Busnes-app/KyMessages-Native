@@ -163,9 +163,11 @@ When the user requests a durable behavior change, record it here or in the relev
   holds public keys and Olm ciphertext only; devices sign `api.E2EEDeviceSigned` and
   `api.E2EEOneTimeKeySigned` strings, which clients verify again. Encrypted rooms (E2): the web
   client (`web/src/crypto/engine.ts`, `web/src/chat/e2ee.ts`) sends only `e2ee_room_v1`; the
-  server refuses `plain_v1` from everything but `kybot_` tokens (`api.CodeE2EERequired`), and the
-  CSP's one script exception is `'wasm-unsafe-eval'` for the crypto cores. No release is published
-  while E2 is merged and E4-E5 are not (spec §10).
+  server refuses `plain_v1` and plaintext uploads from everyone, bots included (E4,
+  `api.CodeE2EERequired`), and the CSP's one script exception is `'wasm-unsafe-eval'` for the
+  crypto cores. Bots are devices (E4): `agent-skill/kymessages/scripts/kybot.py`, trusted only
+  through their owner's master-signed device list (`kymessages.bot-devices.v1`). No release is
+  published before the hostile review of E1-E5 (spec §10, §11).
 - E3 identity and recovery is post-quantum (spec §3.1, §9.1; PQC Stack Plan ky-primitives#80):
   `ky-primitives/{xwing,hybridsig}` v0.11.0 and `internal/e2eeid` run natively on the server.
   `scripts/build-pqwasm.sh` builds the pinned shared `cmd/pqwasm` command with the product wire
