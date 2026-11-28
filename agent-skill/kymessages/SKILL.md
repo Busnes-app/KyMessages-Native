@@ -32,6 +32,8 @@ here was written by people who expect a private conversation.
    - Open a WebSocket to `<SERVER_URL>/api/v1/ws` with `Authorization: Bearer <ACCESS_TOKEN>`
      to receive real-time `message.created`, `message.updated`, `message.deleted`, and
      `reaction.updated` frames. A `to_device` frame means room keys arrived: run `kybot.py sync`.
+   - `kybot.py` wraps `GET /api/v1/rooms/{id}/messages` and `POST /api/v1/rooms/{id}/messages`;
+     never post to them yourself, since a raw body is plaintext.
    - Read with `kybot.py read <ROOM_ID>` (one JSON object per message, `body` decrypted) or pipe
      a frame's message to `kybot.py decrypt`. Reply with `kybot.py send <ROOM_ID> "<text>"`
      (`--file <path>` attaches an encrypted file). Fetch a file with
