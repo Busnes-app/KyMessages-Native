@@ -270,6 +270,16 @@ describe('MessageRow', () => {
       expect(screen.getByText('Not encrypted (webhook)')).toBeTruthy();
     });
 
+    it('marks a bot\'s message from a device its owner vouched for, and no other', () => {
+      row({ ...sealed, sender_id: 'bot_1', sender_name: 'Triage Bot' });
+      expect(screen.getByText('Bot, verified by its owner')).toBeTruthy();
+      cleanup();
+      row({ ...sealed, sender_id: 'bot_1', sender_name: 'Triage Bot', e2ee: { kind: 'decrypted', trust: 'unverified' } });
+      expect(screen.queryByText('Bot, verified by its owner')).toBeNull();
+      expect(screen.getByText('Bot')).toBeTruthy();
+      expect(screen.getByTestId('trust-note').textContent).toMatch(/not verified/);
+    });
+
     it('shows a decrypted message without a label, but marks its files as not encrypted', () => {
       row(sealed);
       expect(screen.getByText('Ship it')).toBeTruthy();

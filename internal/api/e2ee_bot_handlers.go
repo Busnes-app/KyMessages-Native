@@ -80,6 +80,34 @@ func (s *Server) handleE2EEPutBotDevices(w http.ResponseWriter, r *http.Request)
 	}
 }
 
+// GET /api/v1/bots lists the caller's active bots, whose devices the caller may vouch for.
+func (s *Server) handleOwnBots(w http.ResponseWriter, r *http.Request) {
+	user, _, ok := s.currentUser(r)
+	if !ok {
+		s.writeError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+	type bot struct {
+		UserID      string `json:"user_id"`
+		Username    string `json:"username"`
+		DisplayName string `json:"display_name"`
+	}
+	out := []bot{}
+	if user.Role != "bot" {
+		agents, err := s.store.Agents().ListAgentsByOwner(r.Context(), user.ID)
+		if err != nil {
+			s.writeError(w, http.StatusInternalServerError, "Failed to load bots")
+			return
+		}
+		for _, a := range agents {
+			if a.TokenState == store.AgentTokenActive {
+				out = append(out, bot{a.UserID, a.Username, a.DisplayName})
+			}
+		}
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"bots": out})
+}
+
 // ownsBot reports whether a person (never a bot token) owns the active agent whose user is botID.
 func (s *Server) ownsBot(r *http.Request, user *store.User, botID string) bool {
 	if user.Role == "bot" {

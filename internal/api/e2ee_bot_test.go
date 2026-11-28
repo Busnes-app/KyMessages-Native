@@ -71,6 +71,19 @@ func TestE2EEBotDevicesAreVouchedByTheirOwner(t *testing.T) {
 	d1, d2 := newTestDevice(t, botID, "BOTDEVICE1"), newTestDevice(t, botID, "BOTDEVICE2")
 	registerDevice(t, srv, botTok, d1)
 	registerDevice(t, srv, botTok, d2)
+	var own struct {
+		Bots []struct {
+			UserID string `json:"user_id"`
+		} `json:"bots"`
+	}
+	decodeBody(t, doBearerJSON(t, srv, http.MethodGet, "/api/v1/bots", aliceTok, nil, nil).Body.Bytes(), &own)
+	if len(own.Bots) != 1 || own.Bots[0].UserID != botID {
+		t.Fatalf("owner's bots = %+v", own)
+	}
+	decodeBody(t, doBearerJSON(t, srv, http.MethodGet, "/api/v1/bots", bobTok, nil, nil).Body.Bytes(), &own)
+	if len(own.Bots) != 0 {
+		t.Fatalf("bob sees bots he does not own: %+v", own)
+	}
 	unknown := newTestDevice(t, botID, "BOTDEVICE9")
 	swapped := *d1
 	swapped.priv = newTestDevice(t, botID, "x").priv

@@ -197,3 +197,22 @@ export function setFakePending(pending: boolean, exhausted = false): void {
 export const offerVerification = async () => ({ text: 'x'.repeat(108), expiresInMs: 180_000, poll: async (): Promise<{ code: string; device: string } | undefined> => undefined, approve: async () => undefined, cancel: async () => undefined });
 export const ownDeviceVerified = async (_deviceId: string, _signal?: AbortSignal) => true;
 export const joinVerification = async () => ({ code: '123456', finish: async () => 0, cancel: async () => undefined });
+
+// Bots (E4): one owned bot whose devices a test sets; vouching records the list.
+export const fakeBots = {
+  bots: [] as { user_id: string; username: string; display_name: string }[],
+  uploaded: [] as { device_id: string; curve25519: string; ed25519: string; code: string }[],
+  vouched: [] as string[],
+  epoch: 0,
+};
+export const ownBots = async () => fakeBots.bots;
+export const botDevices = async () => ({
+  uploaded: fakeBots.uploaded,
+  vouched: fakeBots.uploaded.filter((d) => fakeBots.vouched.includes(d.device_id)),
+  epoch: fakeBots.epoch,
+});
+export const vouchForBot = async (_bot: string, expected: number, devices: { device_id: string }[]) => {
+  if (expected !== fakeBots.epoch) throw new Error('The bot device list changed; reload it');
+  fakeBots.vouched = devices.map((d) => d.device_id);
+  fakeBots.epoch++;
+};

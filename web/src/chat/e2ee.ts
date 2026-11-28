@@ -8,7 +8,7 @@ import { Conflict, CryptoEngine, DeviceChanged, EARLY, type ClaimedKey, type Dev
 import type { BackupEntry, DeviceList, IdentityChange, IdentityStatus, MasterKeyRecord, OwnMaster, PairingJoin, PairingOffer } from '../crypto/identity';
 import { loadCrypto } from '../crypto/index';
 import { expectOriginal, messageFiles, needsOriginal, type OpenedEnvelope } from '../crypto/attachments';
-import { ensurePQC, loadPQC, type Hybrid } from '../pqc/index';
+import { ensurePQC, loadPQC, type BotDevice, type Hybrid } from '../pqc/index';
 import { isTransient, Transient } from '../crypto/records';
 import { type CryptoStore, deleteCryptoStores, openCryptoStore, storedDevices } from '../crypto/store';
 import { parseRoomDetail, type ChatMessage, type E2EEState } from './types';
@@ -701,6 +701,27 @@ export async function joinVerification(text: string): Promise<PairingJoin> {
   const j = await e.joinVerification(text);
   return { ...j, finish: async (signal) => { const n = await j.finish(signal); done(); return n; } };
 }
+
+/** A bot the signed-in user owns (GET /api/v1/bots), whose devices they may vouch for (E4). */
+export interface OwnBot {
+  user_id: string;
+  username: string;
+  display_name: string;
+}
+
+export async function ownBots(): Promise<OwnBot[]> {
+  return arr(obj(await call('/api/v1/bots', 'GET')).bots).map((v) => {
+    const o = obj(v);
+    return { user_id: str(o.user_id, 128), username: str(o.username, 128), display_name: str(o.display_name, 256) };
+  });
+}
+
+/** The bot's uploaded devices with their codes, and the ones this user's signed list vouches for. */
+export const botDevices = (botId: string) => engine().then((e) => e.botDevices(botId));
+
+/** Vouches for exactly these devices of the user's bot (none: revokes them all). */
+export const vouchForBot = (botId: string, expectedEpoch: number, devices: (BotDevice & { code: string })[]) =>
+  engine().then((e) => e.vouchForBot(botId, expectedEpoch, devices));
 
 export const identityChanges = (): Promise<IdentityChange[]> => identityEngine().then(({ e }) => e.identityChanges());
 
