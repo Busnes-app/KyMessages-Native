@@ -384,7 +384,8 @@ class Bot:
         pins[k] = [d["curve25519"], d["ed25519"]]
         return {"user_id": user, "device_id": d["device_id"], "curve25519": d["curve25519"], "ed25519": d["ed25519"]}
 
-    def trusted_devices(self, users: list[str]) -> list[dict]:
+    def trusted_devices(self, users: list[str], masters: dict | None = None) -> list[dict]:
+        """Devices of users this bot trusts; masters, if given, gets each person's trusted master key."""
         out = []
         for i in range(0, len(users), 100):
             batch = users[i:i + 100]
@@ -403,6 +404,8 @@ class Bot:
                     m = self.trusted_master(u, q.get("master_keys", {}).get(u), tenant)
                     if m is None:
                         continue
+                    if masters is not None:
+                        masters[u] = m[0]
                     trust = lambda d, m=m, u=u: d["device_id"] in m[1] and hybrid_verify(m[0], DOMAIN_DEVICE, device_msg(tenant, u, d["device_id"], d["curve25519"], d["ed25519"]), d.get("master_signature", ""))
                 for d in q.get("devices", {}).get(u, []):
                     if u == self.user_id and isinstance(d, dict) and d.get("device_id") == self.device_id:
@@ -441,7 +444,15 @@ class Bot:
             if not page:
                 break
             senders = sorted({m.get("sender_user_id") for m in page if isinstance(m.get("sender_user_id"), str)})
-            trusted = {(t["user_id"], t["device_id"], t["curve25519"]) for t in self.trusted_devices(senders)}
+            masters: dict[str, str] = {}
+            trusted = {(t["user_id"], t["device_id"], t["curve25519"]) for t in self.trusted_devices(senders, masters)}
+            for m in page:
+                # A sender that signed out since is off the listing; the mail kept its device's
+                # cross-signature, which must verify under the sender's trusted master key.
+                sk, u = m.get("sender_keys"), m.get("sender_user_id")
+                if u in masters and isinstance(sk, dict) and all(isinstance(sk.get(k), str) for k in ("device_id", "curve25519", "ed25519", "master_signature")) \
+                        and hybrid_verify(masters[u], DOMAIN_DEVICE, device_msg(self.st.d["tenant_id"], u, sk["device_id"], sk["curve25519"], sk["ed25519"]), sk["master_signature"]):
+                    trusted.add((u, sk["device_id"], sk["curve25519"]))
             for m in page:
                 try:
                     sid = self.room_key(m, trusted)
@@ -540,7 +551,7 @@ class Bot:
                 out["files"] = [{"attachment_id": f["attachment_id"], "name": f.get("name"), "mime_type": f.get("mime_type"),
                                  "size": f.get("size"), "available": f["attachment_id"] in named} for f in descs]
             return out, descs
-        except (KeyError, ValueError, TypeError, AttributeError):
+        except (KeyError, ValueError, TypeError, AttributeError, RecursionError):  # RecursionError: deeply nested JSON
             return {**base, "error": "damaged"}, []
 
     def open(self, m: dict) -> dict:

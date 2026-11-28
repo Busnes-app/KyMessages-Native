@@ -206,9 +206,9 @@ func (s *e2eeStore) SendToDevice(ctx context.Context, msgs []E2EEToDevice) error
 	}
 	defer func() { _ = tx.Rollback() }()
 	now := time.Now().Unix()
-	q := s.store.rebind(`INSERT INTO e2ee_to_device (tenant_id, recipient_user, recipient_device, sender_user, sender_device, sender_curve25519, sender_ed25519, sender_signature, type, content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	q := s.store.rebind(`INSERT INTO e2ee_to_device (tenant_id, recipient_user, recipient_device, sender_user, sender_device, sender_curve25519, sender_ed25519, sender_signature, sender_master_signature, type, content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	for _, m := range msgs {
-		if _, err := tx.ExecContext(ctx, q, m.TenantID, m.RecipientUserID, m.RecipientDeviceID, m.SenderUserID, m.SenderDeviceID, m.SenderCurve25519, m.SenderEd25519, m.SenderSignature, m.Type, m.Content, now); err != nil {
+		if _, err := tx.ExecContext(ctx, q, m.TenantID, m.RecipientUserID, m.RecipientDeviceID, m.SenderUserID, m.SenderDeviceID, m.SenderCurve25519, m.SenderEd25519, m.SenderSignature, m.SenderMasterSignature, m.Type, m.Content, now); err != nil {
 			return err
 		}
 	}
@@ -217,7 +217,7 @@ func (s *e2eeStore) SendToDevice(ctx context.Context, msgs []E2EEToDevice) error
 
 func (s *e2eeStore) ToDevice(ctx context.Context, userID, deviceID string, limit int) ([]E2EEToDevice, error) {
 	rows, err := s.store.db.QueryContext(ctx, s.store.rebind(`
-		SELECT id, tenant_id, recipient_user, recipient_device, sender_user, sender_device, sender_curve25519, sender_ed25519, sender_signature, type, content, created_at
+		SELECT id, tenant_id, recipient_user, recipient_device, sender_user, sender_device, sender_curve25519, sender_ed25519, sender_signature, sender_master_signature, type, content, created_at
 		FROM e2ee_to_device WHERE recipient_user = ? AND recipient_device = ? ORDER BY id LIMIT ?`), userID, deviceID, limit)
 	if err != nil {
 		return nil, err
@@ -227,7 +227,7 @@ func (s *e2eeStore) ToDevice(ctx context.Context, userID, deviceID string, limit
 	for rows.Next() {
 		var m E2EEToDevice
 		var created int64
-		if err := rows.Scan(&m.ID, &m.TenantID, &m.RecipientUserID, &m.RecipientDeviceID, &m.SenderUserID, &m.SenderDeviceID, &m.SenderCurve25519, &m.SenderEd25519, &m.SenderSignature, &m.Type, &m.Content, &created); err != nil {
+		if err := rows.Scan(&m.ID, &m.TenantID, &m.RecipientUserID, &m.RecipientDeviceID, &m.SenderUserID, &m.SenderDeviceID, &m.SenderCurve25519, &m.SenderEd25519, &m.SenderSignature, &m.SenderMasterSignature, &m.Type, &m.Content, &created); err != nil {
 			return nil, err
 		}
 		m.CreatedAt = time.Unix(created, 0).UTC()

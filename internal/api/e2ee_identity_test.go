@@ -375,6 +375,19 @@ func TestE2EEDeviceCrossSignatureAndQuery(t *testing.T) {
 		t.Fatal("listed self-binding does not verify")
 	}
 
+	// Mail keeps the sender device's cross-signature, so it stays verifiable after sign-out (below).
+	var crossSig any
+	for _, d := range q.Devices[alice.ID] {
+		if d["device_id"] == a1.id {
+			crossSig = d["master_signature"]
+		}
+	}
+	if c := doBearerJSON(t, srv, http.MethodPut, "/api/v1/to-device", aliceTok, map[string]any{"device_id": a1.id, "messages": []map[string]string{
+		{"user_id": bob.ID, "device_id": b1.id, "type": "olm.v1", "content": "x"},
+	}}, nil).Code; c != http.StatusOK {
+		t.Fatalf("send = %d", c)
+	}
+
 	// A reset of alice's identity withdraws every cross-signature by the old key.
 	if rec := doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/master", aliceTok, newIdentity(t, orgA, alice.ID).put(t, 1), nil); rec.Code != http.StatusOK {
 		t.Fatalf("reset = %d", rec.Code)
@@ -385,6 +398,19 @@ func TestE2EEDeviceCrossSignatureAndQuery(t *testing.T) {
 	}
 	if c := sign(aliceTok, a1.id, aliceID.deviceSig(t, a1, 1)); c != http.StatusConflict {
 		t.Fatalf("signature by the replaced master key = %d", c)
+	}
+	// The mail sent before the reset still carries the cross-signature after sign-out.
+	if c := doBearerJSON(t, srv, http.MethodDelete, "/api/v1/keys/devices/"+a1.id, aliceTok, nil, nil).Code; c != http.StatusNoContent {
+		t.Fatalf("sign-out = %d", c)
+	}
+	var mail struct {
+		Messages []struct {
+			SenderKeys map[string]any `json:"sender_keys"`
+		}
+	}
+	decodeBody(t, doBearerJSON(t, srv, http.MethodGet, "/api/v1/to-device?device_id="+b1.id, bobTok, nil, nil).Body.Bytes(), &mail)
+	if len(mail.Messages) != 1 || crossSig == nil || mail.Messages[0].SenderKeys["master_signature"] != crossSig {
+		t.Fatalf("mail from a signed-out cross-signed device = %+v, want master_signature %v", mail.Messages, crossSig)
 	}
 }
 

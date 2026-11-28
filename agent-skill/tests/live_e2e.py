@@ -113,4 +113,19 @@ admin.call("PUT", f"/api/v1/keys/bots/{info['user_id']}/devices", {"version": 1,
            "signature": m.sign(kybot.DOMAIN_BOT_DEVICES, kybot.bot_devices_msg(tenant, uid, 1, info["user_id"], 2, []))})
 owner.send(room, "after revocation")
 assert bot.sync() == [], "a revoked bot got a room key"
+
+# Vouched again; the owner sends, then signs out (delists, then deletes its device) before the
+# bot syncs: the mail kept the device's cross-signature, so the bot still reads the message.
+admin.call("PUT", f"/api/v1/keys/bots/{info['user_id']}/devices", {"version": 1, "expected_epoch": 2, "epoch": 3, "devices": devs,
+           "signature": m.sign(kybot.DOMAIN_BOT_DEVICES, kybot.bot_devices_msg(tenant, uid, 1, info["user_id"], 3, devs))})
+late = owner.send(room, "sent before sign-out")
+digest = kybot.phash("kymessages.device-list")
+r2 = admin.call("POST", "/api/v1/keys/devices/list/reserve", {"version": 1, "expected_epoch": r["epoch"], "digest": digest,
+                "signature": m.sign("kymessages.device-list-reserve.v1", kybot.fields(*(v.encode() for v in (kybot.ALG, tenant, uid, "1", str(r["epoch"]), digest))))})
+admin.call("PUT", "/api/v1/keys/devices/list", {"version": 1, "expected_epoch": r["epoch"], "epoch": r2["epoch"], "device_ids": [],
+           "signature": m.sign(kybot.DOMAIN_DEVICE_LIST, kybot.device_list_msg(tenant, uid, 1, r2["epoch"], []))})
+admin.call("DELETE", f"/api/v1/keys/devices/{owner.device_id}")
+assert bot.sync(), "the bot dropped a room key from a device that signed out"
+got = [x for x in bot.read(room, 20) if x["id"] == late["id"]][0]
+assert got.get("body") == "sent before sign-out", got
 print("live e2e: all checks passed")

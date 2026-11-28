@@ -274,6 +274,7 @@ type E2EEToDevice struct {
 	// The sender device's self-signed public keys when it sent the mail.
 	SenderCurve25519, SenderEd25519 string
 	SenderSignature                 string
+	SenderMasterSignature           string // its master cross-signature then, if verified
 	Type, Content                   string
 	CreatedAt                       time.Time
 }

@@ -331,7 +331,7 @@ func (s *Server) handleE2EESendToDevice(w http.ResponseWriter, r *http.Request) 
 		}
 		msgs = append(msgs, store.E2EEToDevice{TenantID: tenantID, RecipientUserID: m.UserID, RecipientDeviceID: m.DeviceID,
 			SenderUserID: user.ID, SenderDeviceID: sender.DeviceID,
-			SenderCurve25519: sender.Curve25519, SenderEd25519: sender.Ed25519, SenderSignature: sender.Signature,
+			SenderCurve25519: sender.Curve25519, SenderEd25519: sender.Ed25519, SenderSignature: sender.Signature, SenderMasterSignature: sender.MasterSignature,
 			Type: m.Type, Content: m.Content})
 		recipients[m.UserID] = struct{}{}
 	}
@@ -364,8 +364,8 @@ func (s *Server) handleE2EEToDevice(w http.ResponseWriter, r *http.Request) {
 		ID             int64  `json:"id"`
 		SenderUserID   string `json:"sender_user_id"`
 		SenderDeviceID string `json:"sender_device_id"`
-		// The sender device's self-signed keys at send time, so mail from a device signed out
-		// since stays verifiable.
+		// The sender device's self-signed keys (and master cross-signature) at send time, so
+		// mail from a device signed out since stays verifiable.
 		SenderKeys e2eeDeviceJSON `json:"sender_keys"`
 		Type       string         `json:"type"`
 		Content    string         `json:"content"`
@@ -373,7 +373,7 @@ func (s *Server) handleE2EEToDevice(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]mail, len(msgs))
 	for i, m := range msgs {
-		out[i] = mail{m.ID, m.SenderUserID, m.SenderDeviceID, e2eeDeviceJSON{DeviceID: m.SenderDeviceID, Curve25519: m.SenderCurve25519, Ed25519: m.SenderEd25519, Signature: m.SenderSignature}, m.Type, m.Content, m.CreatedAt.UnixMilli()}
+		out[i] = mail{m.ID, m.SenderUserID, m.SenderDeviceID, e2eeDeviceJSON{DeviceID: m.SenderDeviceID, Curve25519: m.SenderCurve25519, Ed25519: m.SenderEd25519, Signature: m.SenderSignature, MasterSignature: m.SenderMasterSignature}, m.Type, m.Content, m.CreatedAt.UnixMilli()}
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	s.writeJSON(w, http.StatusOK, map[string]any{"messages": out})

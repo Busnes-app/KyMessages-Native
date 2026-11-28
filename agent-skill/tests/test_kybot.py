@@ -396,6 +396,52 @@ class Trust(unittest.TestCase):
         self.assertEqual(got[last["id"]]["body"], "three")
         self.assertEqual(got[bad["id"]]["error"], "damaged")
 
+    def test_a_recursion_bomb_fails_alone(self):
+        self.env.vouch("u_alice", "bot_helper", self.bot)
+        first = self.alice.send("r1", "one")
+        g = vz_group(self.alice, "r1")
+        bomb = b"[" * 100000 + b"]" * 100000  # json.loads raises RecursionError
+        bad = self.env.server.handle("u_alice", "POST", "/api/v1/rooms/r1/messages", {"encoding": "e2ee_room_v1", "body": json.dumps({
+            "alg": "megolm.v1", "sender_key": self.alice.account().curve25519_key.to_base64(), "device_id": self.alice.device_id,
+            "session_id": g.session_id, "ciphertext": g.encrypt(bomb).to_base64()})}, None)["message"]
+        self.alice.st["outbound"]["r1"]["pickle"] = g.pickle(self.alice.st.key)
+        last = self.alice.send("r1", "three")
+        self.bot.sync()
+        got = {m["id"]: m for m in self.bot.read("r1", 50)}
+        self.assertEqual(got[first["id"]]["body"], "one")
+        self.assertEqual(got[last["id"]]["body"], "three")
+        self.assertEqual(got[bad["id"]]["error"], "damaged")
+        self.assertEqual([m["id"] for m in got.values() if "error" in m], [bad["id"]])
+
+    def sign_out(self, d):
+        """d signs out, as the browser does: off Alice's signed list, then its row deleted."""
+        m, rec = self.env.identities["u_alice"], self.env.server.masters["u_alice"]
+        del self.env.server.devices["u_alice"][d.device_id]
+        ids, epoch = sorted(self.env.server.devices["u_alice"]), rec["device_list"]["epoch"] + 1
+        rec["device_list"] = {"epoch": epoch, "device_ids": ids, "signature": m.sign(kybot.DOMAIN_DEVICE_LIST, kybot.device_list_msg(TENANT, "u_alice", 1, epoch, ids))}
+
+    def test_room_keys_from_a_device_signed_out_since_are_read(self):
+        self.env.vouch("u_alice", "bot_helper", self.bot)
+        phone = self.env.person("u_alice")
+        sent = phone.send("r1", "sent before sign-out")
+        self.sign_out(phone)
+        self.bot.sync()
+        self.assertEqual(self.bot.open(sent)["body"], "sent before sign-out")
+
+    def test_a_signed_out_device_the_master_never_signed_is_refused(self):
+        self.env.vouch("u_alice", "bot_helper", self.bot)
+        for forged in (False, True):
+            d = self.env.device("u_alice")  # never cross-signed or listed
+            if forged:  # a cross-signature by some other key
+                dev = self.env.server.devices["u_alice"][d.device_id]
+                dev["master_signature"] = Master().sign(kybot.DOMAIN_DEVICE, kybot.device_msg(TENANT, "u_alice", d.device_id, dev["curve25519"], dev["ed25519"]))
+            sent = d.send("r1", "from an unsigned device")
+            self.assertEqual(self.env.mail_to(self.bot), 1)
+            self.sign_out(d)
+            self.assertEqual(self.bot.sync(), [])
+            self.assertEqual(self.env.mail_to(self.bot), 0)
+            self.assertIn("error", self.bot.open(sent))
+
     def post_inner(self, sender, inner, method="POST", mid=None):
         """A message sender's device sealed with its room session, whatever inner says."""
         g = vz_group(sender, "r1")
