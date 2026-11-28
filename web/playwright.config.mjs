@@ -13,10 +13,6 @@ const server = (port, captcha) => ({
   gracefulShutdown: { signal: 'SIGTERM', timeout: 10000 },
 });
 
-// KY_BROWSER_PORT moves both disposable servers (it and the next port), so two checkouts can
-// run the suite at once.
-const port = Number(process.env.KY_BROWSER_PORT || 5391);
-
 export default defineConfig({
   testDir: './browser',
   testMatch: '*.spec.mjs',
