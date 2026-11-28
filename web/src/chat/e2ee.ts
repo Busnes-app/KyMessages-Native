@@ -4,7 +4,7 @@
 import { adminFetch, errorMessage } from '../api';
 import { arr, bool, obj, str } from '../dto';
 import { keepStorage } from '../persist';
-import { Conflict, CryptoEngine, DeviceChanged, EARLY, type ClaimedKey, type DeviceKeys, type KeyServer, type Mail, type RoomInner } from '../crypto/engine';
+import { Conflict, CryptoEngine, DeviceChanged, EARLY, type ClaimedKey, type DeviceKeys, type KeyServer, type Mail, type QueryResult, type RoomInner } from '../crypto/engine';
 import type { BackupEntry, DeviceList, IdentityChange, IdentityStatus, MasterKeyRecord, OwnMaster, PairingJoin, PairingOffer } from '../crypto/identity';
 import { loadCrypto } from '../crypto/index';
 import { expectOriginal, messageFiles, needsOriginal, type OpenedEnvelope } from '../crypto/attachments';
@@ -108,6 +108,8 @@ const keyServer = (signal: AbortSignal): KeyServer => ({
     const masters = res.master_keys === undefined ? {} : obj(res.master_keys);
     const out: Record<string, DeviceKeys[]> = {};
     const master_keys: Record<string, MasterKeyRecord> = {};
+    // Bots' lists stay as sent: the engine checks them (validBotList) and their owners' signatures.
+    const bot_devices = res.bot_devices === undefined ? {} : obj(res.bot_devices);
     for (const id of userIds) {
       out[id] = arr(devices[id] ?? []).flatMap((d) => {
         try {
@@ -116,13 +118,16 @@ const keyServer = (signal: AbortSignal): KeyServer => ({
           return [];
         }
       });
+    }
+    // The named users' master keys, and those of the bots' owners that came with them.
+    for (const id of new Set([...userIds, ...Object.keys(masters).slice(0, 2 * userIds.length)])) {
       try {
         if (masters[id] !== undefined) master_keys[id] = masterRecord(masters[id]);
       } catch {
         // A malformed master key is no master key: none of that user's devices gets room keys.
       }
     }
-    return { tenant_id: str(res.tenant_id, 128), devices: out, master_keys };
+    return { tenant_id: str(res.tenant_id, 128), devices: out, master_keys, bot_devices: bot_devices as QueryResult['bot_devices'] };
   },
   async claim(devices) {
     return arr(obj(await call('/api/v1/keys/claim', 'POST', { devices }, signal)).keys).flatMap((v): ClaimedKey[] => {
@@ -158,6 +163,9 @@ const keyServer = (signal: AbortSignal): KeyServer => ({
   },
   async ack(deviceId, ids) {
     await call('/api/v1/to-device/ack', 'POST', { device_id: deviceId, ids }, signal);
+  },
+  async putBotDevices(botId, body) {
+    await call(`/api/v1/keys/bots/${encodeURIComponent(botId)}/devices`, 'PUT', body, signal);
   },
   async roomMembers(roomId) {
     return parseRoomDetail(await call(`/api/v1/rooms/${encodeURIComponent(roomId)}`, 'GET', undefined, signal)).members.map((m) => m.user_id);

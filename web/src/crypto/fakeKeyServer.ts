@@ -2,7 +2,7 @@
 // for engine tests. It checks the same signatures the real server checks, and lets a test play a
 // hostile server by editing what it stores.
 import { Conflict, deviceSigned, oneTimeKeySigned, type ClaimedKey, type DeviceKeys, type KeyServer, type Mail, type SignedKey } from './engine';
-import type { BackupEntry, MasterKeyRecord, OwnMaster } from './identity';
+import type { BackupEntry, BotDeviceList, MasterKeyRecord, OwnMaster } from './identity';
 import { verifyEd25519 } from './index';
 import { pqc } from '../pqc/index';
 
@@ -33,6 +33,9 @@ export class FakeKeyServer {
    * was taken at, the epoch it grants and when it lapses. */
   readonly reservations = new Map<string, { digest: string; epoch: number; granted: number; until: number }>();
   reservationMs = 30_000;
+  /** Each bot's owner (the agents table) and the list the owner signed (E4). */
+  readonly botOwners = new Map<string, string>();
+  readonly botLists = new Map<string, BotDeviceList>();
   /** The backup's session cap, as the server's E2EEBackupMaxSessions. */
   backupCap = 2000;
   private nextMail = 1;
@@ -104,7 +107,15 @@ export class FakeKeyServer {
           const m = this.masters.get(u);
           if (m) master_keys[u] = { version: m.version, master_key: m.master_key, self_signature: m.self_signature, ...(m.device_list ? { device_list: structuredClone(m.device_list) } : {}) };
         }
-        return { tenant_id: TENANT, devices, master_keys };
+        const bot_devices: Record<string, BotDeviceList> = {};
+        for (const u of userIds) {
+          const l = this.botLists.get(u);
+          const owner = l && this.masters.get(l.owner_id);
+          if (!l || owner?.version !== l.version) continue;
+          bot_devices[u] = structuredClone(l);
+          master_keys[l.owner_id] = { version: owner.version, master_key: owner.master_key, self_signature: owner.self_signature, ...(owner.device_list ? { device_list: structuredClone(owner.device_list) } : {}) };
+        }
+        return { tenant_id: TENANT, devices, master_keys, bot_devices };
       },
       getMaster: async () => {
         const m = this.masters.get(userId);
@@ -247,6 +258,15 @@ export class FakeKeyServer {
         this.mail.set(id, (this.mail.get(id) ?? []).filter((m) => !ids.includes(m.id)));
       },
       roomMembers: async (roomId) => [...(this.rooms.get(roomId) ?? [])],
+      putBotDevices: async (botId, b) => {
+        // As the server: only the bot's owner, signed by their current master key, epoch CAS.
+        if (this.botOwners.get(botId) !== userId) throw new Error('No such bot');
+        const m = this.masters.get(userId);
+        if (!m || m.version !== b.version) throw new Conflict('409');
+        if (!pqc.verifyBotDevices(m.master_key, TENANT, userId, b.version, botId, b.epoch, b.devices, b.signature)) throw new Error('The bot device list is not validly signed');
+        if ((this.botLists.get(botId)?.epoch ?? 0) !== b.expected_epoch || b.epoch <= b.expected_epoch) throw new Conflict('409');
+        this.botLists.set(botId, { owner_id: userId, version: b.version, epoch: b.epoch, devices: structuredClone(b.devices), signature: b.signature });
+      },
     };
   }
 }

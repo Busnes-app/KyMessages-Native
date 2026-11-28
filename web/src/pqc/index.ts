@@ -163,6 +163,17 @@ export interface BackupRef {
   first_index: number;
 }
 
+/** One device of a bot, as its owner vouches for it (E4). */
+export interface BotDevice {
+  device_id: string;
+  curve25519: string;
+  ed25519: string;
+}
+
+// Exactly these fields in this order, so the Go side reads the list the signature is over.
+const botDevicesJSON = (devices: BotDevice[]) =>
+  JSON.stringify(devices.map((d) => ({ device_id: d.device_id, curve25519: d.curve25519, ed25519: d.ed25519 })));
+
 export interface MasterKeyPair {
   seed: string;
   public_key: Hybrid;
@@ -196,6 +207,11 @@ export const pqc = {
     pqcCall<Hybrid>('signDeviceList', seed, tenant, user, String(version), String(epoch), JSON.stringify(deviceIds)),
   verifyDeviceList: (k: Hybrid, tenant: string, user: string, version: number, epoch: number, deviceIds: string[], s: Hybrid) =>
     pqcCall<boolean>('verifyDeviceList', k, tenant, user, String(version), String(epoch), JSON.stringify(deviceIds), s),
+  /** An owner's master key over their bot's devices and keys at an epoch (E4), sorted by device ID. */
+  signBotDevices: (seed: string, tenant: string, owner: string, version: number, bot: string, epoch: number, devices: BotDevice[]) =>
+    pqcCall<Hybrid>('signBotDevices', seed, tenant, owner, String(version), bot, String(epoch), botDevicesJSON(devices)),
+  verifyBotDevices: (k: Hybrid, tenant: string, owner: string, version: number, bot: string, epoch: number, devices: BotDevice[], s: Hybrid) =>
+    pqcCall<boolean>('verifyBotDevices', k, tenant, owner, String(version), bot, String(epoch), botDevicesJSON(devices), s),
   /** A reservation of the next device list epoch, for the list with this digest (its own domain). */
   signDeviceListReserve: (seed: string, tenant: string, user: string, version: number, expectedEpoch: number, digest: string) =>
     pqcCall<Hybrid>('signDeviceListReserve', seed, tenant, user, String(version), String(expectedEpoch), digest),
