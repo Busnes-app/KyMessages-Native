@@ -730,20 +730,30 @@ export class CryptoEngine {
   }
 
   /**
-   * Vouches for exactly these devices of the user's bot (an empty list revokes them all), signed
-   * by this device's master key at the epoch after expectedEpoch. Each device is named with the
-   * code the owner compared, so a device the server swapped in since is refused.
+   * Changes the user's signed list for their bot by one device, signed by this device's master
+   * key at the epoch after expectedEpoch: add (named with the code the owner compared, so keys the
+   * server swapped in since are refused) replaces any entry under its ID; remove drops one. Every
+   * other entry is copied from the newest list this device verifies, never from uploaded keys.
    */
-  async vouchForBot(botId: string, expectedEpoch: number, devices: (BotDevice & { code: string })[]): Promise<void> {
-    for (const d of devices) if (botDeviceCode(d, botId) !== d.code) throw new Error('A device does not match its code.');
-    const list = devices.map(({ device_id, curve25519, ed25519 }) => ({ device_id, curve25519, ed25519 }))
-      .sort((a, b) => (a.device_id < b.device_id ? -1 : a.device_id > b.device_id ? 1 : 0));
+  async vouchForBot(botId: string, expectedEpoch: number, change: { add?: BotDevice & { code: string }; remove?: string }): Promise<void> {
+    const { add, remove } = change;
+    if (add && botDeviceCode(add, botId) !== add.code) throw new Error('A device does not match its code.');
     await this.locked(async () => {
+      const listed = await this.server.query([botId]);
+      const rec = listed.bot_devices?.[botId];
+      const mine = validBotList(rec) && rec.owner_id === this.userId ? rec : undefined;
+      if ((mine?.epoch ?? 0) !== expectedEpoch) throw new Error('The bot device list changed; reload it.');
+      const master = mine && (await this.identity.trustedMaster(this.userId, listed.master_keys?.[this.userId], listed.tenant_id, [], new Map()));
+      const kept = master ? await this.identity.trustedBot(botId, this.userId, master, listed.tenant_id, mine) : new Map<string, BotDevice>();
+      if (remove !== undefined) kept.delete(remove);
+      if (add) kept.set(add.device_id, { device_id: add.device_id, curve25519: add.curve25519, ed25519: add.ed25519 });
+      const list = [...kept.values()].map(({ device_id, curve25519, ed25519 }) => ({ device_id, curve25519, ed25519 }))
+        .sort((a, b) => (a.device_id < b.device_id ? -1 : a.device_id > b.device_id ? 1 : 0));
       const epoch = expectedEpoch + 1;
       const { version, signature } = await this.identity.signBotDevices(botId, epoch, list);
       await this.server.putBotDevices(botId, { version, expected_epoch: expectedEpoch, epoch, devices: list, signature });
-      const listed = await this.server.query([botId]);
-      await this.identity.publishedBotList(botId, listed.tenant_id, epoch, list);
+      const after = await this.server.query([botId]);
+      await this.identity.publishedBotList(botId, after.tenant_id, epoch, list);
     });
   }
 

@@ -1,7 +1,8 @@
 import 'fake-indexeddb/auto';
 import { readFileSync } from 'node:fs';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { botDeviceCode, CryptoEngine } from './engine';
+import { botDeviceCode, CryptoEngine, deviceSigned } from './engine';
+import { Account } from './index';
 import { FakeKeyServer, TENANT } from './fakeKeyServer';
 import { loadCryptoSync } from './index';
 import { loadPQCFrom, pqc } from '../pqc/index';
@@ -50,11 +51,14 @@ async function setup() {
   return { server, alice, bob, bot };
 }
 
-/** The owner vouches for exactly what the server shows them, having matched every code. */
-async function vouch(owner: CryptoEngine, ...keep: CryptoEngine[]) {
+/** The owner vouches for d as the server shows it, having matched its code; no d revokes all. */
+async function vouch(owner: CryptoEngine, d?: CryptoEngine) {
   const view = await owner.botDevices(BOT);
-  const devices = view.uploaded.filter((d) => keep.some((k) => k.deviceId === d.device_id));
-  await owner.vouchForBot(BOT, view.epoch, devices);
+  if (!d) {
+    for (const [i, v] of view.vouched.entries()) await owner.vouchForBot(BOT, view.epoch + i, { remove: v.device_id });
+    return;
+  }
+  await owner.vouchForBot(BOT, view.epoch, { add: view.uploaded.find((u) => u.device_id === d.deviceId)! });
 }
 
 describe('bots as devices (E4)', () => {
@@ -89,7 +93,7 @@ describe('bots as devices (E4)', () => {
     const other = await botDevice(server, 'bot_other');
     server.botOwners.set('bot_other', 'u_alice');
     const view = await alice.botDevices('bot_other');
-    await alice.vouchForBot('bot_other', 0, view.uploaded);
+    await alice.vouchForBot('bot_other', 0, { add: view.uploaded[0] });
     server.botLists.set(BOT, { ...server.botLists.get('bot_other')!, devices: [keysOf(bot)] });
     await bob.encrypt('r1', { type: 'text', body: 'list moved between bots' });
     expect(mailTo(server, bot)).toBe(0);
@@ -125,7 +129,7 @@ describe('bots as devices (E4)', () => {
     const evil = await botDevice(server, BOT, 'mallory-bot');
     server.botOwners.set(BOT, 'u_mallory');
     const view = await mallory.botDevices(BOT);
-    await mallory.vouchForBot(BOT, 0, view.uploaded.filter((d) => d.device_id === evil.deviceId));
+    await mallory.vouchForBot(BOT, 0, { add: view.uploaded.find((d) => d.device_id === evil.deviceId)! });
     expect(server.botLists.get(BOT)!.owner_id).toBe('u_mallory');
     await bob.memberLeft('r1');
     await bob.encrypt('r1', { type: 'text', body: 'after the owner swap' });
@@ -164,6 +168,43 @@ describe('bots as devices (E4)', () => {
     const view = await alice.botDevices(BOT);
     const shown = view.uploaded.find((d) => d.device_id === bot.deviceId)!;
     expect(shown.code).toBe(botDeviceCode({ user_id: BOT, ...keysOf(bot) }));
-    await expect(alice.vouchForBot(BOT, view.epoch, [{ ...shown, ed25519: evil.ed25519 }])).rejects.toThrow(/code/);
+    await expect(alice.vouchForBot(BOT, view.epoch, { add: { ...shown, ed25519: evil.ed25519 } })).rejects.toThrow(/code/);
+  });
+
+  it('never signs keys the server swapped in under a vouched device ID when another device changes', async () => {
+    const { server, alice, bob, bot } = await setup();
+    await vouch(alice, bot);
+    // The server swaps the vouched device's keys for its own (self-signed, as any upload is);
+    // Alice's browser has no pin for the bot's device.
+    const acct = new Account();
+    const swapped = { curve25519: acct.curve25519, ed25519: acct.ed25519, signature: acct.sign(deviceSigned(BOT, bot.deviceId, acct.curve25519, acct.ed25519)) };
+    acct.free();
+    Object.assign(server.devices.get(BOT)!.get(bot.deviceId)!, swapped);
+    const view = await alice.botDevices(BOT);
+    expect(view.uploaded.find((d) => d.device_id === bot.deviceId)!.ed25519).toBe(swapped.ed25519);
+    expect(view.vouched).toEqual([keysOf(bot)]);
+    // Alice vouches for a second device, then removes it: the first keeps its signed keys.
+    const second = await botDevice(server, BOT, 'second-store');
+    await vouch(alice, second);
+    expect(server.botLists.get(BOT)!.devices).toEqual([keysOf(bot), keysOf(second)].sort((a, b) => (a.device_id < b.device_id ? -1 : 1)));
+    await alice.vouchForBot(BOT, 2, { remove: second.deviceId });
+    expect(server.botLists.get(BOT)!.devices).toEqual([keysOf(bot)]);
+    await bob.encrypt('r1', { type: 'text', body: 'swapped keys' });
+    // Nobody shares with the swapped keys either.
+    expect(mailTo(server, bot)).toBe(0);
+  });
+
+  it('signs the kept entries only from a list that verifies, and refuses a stale epoch', async () => {
+    const { server, alice, bot } = await setup();
+    await vouch(alice, bot);
+    const second = await botDevice(server, BOT, 'second-store');
+    const view = await alice.botDevices(BOT);
+    await expect(alice.vouchForBot(BOT, 0, { add: view.uploaded.find((d) => d.device_id === second.deviceId)! })).rejects.toThrow(/changed/);
+    // A list the server forged (not Alice's signature) vouches for nothing, so nothing of it is kept.
+    const forged = pqc.masterGenerate();
+    const evil = [{ device_id: 'EVILDEVICE', curve25519: bot.curve25519, ed25519: bot.ed25519 }];
+    server.botLists.set(BOT, { owner_id: 'u_alice', version: 1, epoch: 2, devices: evil, signature: pqc.signBotDevices(forged.seed, TENANT, 'u_alice', 1, BOT, 2, evil) });
+    await alice.vouchForBot(BOT, 2, { add: view.uploaded.find((d) => d.device_id === second.deviceId)! });
+    expect(server.botLists.get(BOT)!.devices).toEqual([keysOf(second)]);
   });
 });

@@ -719,9 +719,9 @@ export async function ownBots(): Promise<OwnBot[]> {
 /** The bot's uploaded devices with their codes, and the ones this user's signed list vouches for. */
 export const botDevices = (botId: string) => engine().then((e) => e.botDevices(botId));
 
-/** Vouches for exactly these devices of the user's bot (none: revokes them all). */
-export const vouchForBot = (botId: string, expectedEpoch: number, devices: (BotDevice & { code: string })[]) =>
-  engine().then((e) => e.vouchForBot(botId, expectedEpoch, devices));
+/** Adds (code compared) or removes one device of the user's bot; the rest stay as signed. */
+export const vouchForBot = (botId: string, expectedEpoch: number, change: { add?: BotDevice & { code: string }; remove?: string }) =>
+  engine().then((e) => e.vouchForBot(botId, expectedEpoch, change));
 
 export const identityChanges = (): Promise<IdentityChange[]> => identityEngine().then(({ e }) => e.identityChanges());
 

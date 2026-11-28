@@ -198,21 +198,19 @@ export const offerVerification = async () => ({ text: 'x'.repeat(108), expiresIn
 export const ownDeviceVerified = async (_deviceId: string, _signal?: AbortSignal) => true;
 export const joinVerification = async () => ({ code: '123456', finish: async () => 0, cancel: async () => undefined });
 
-// Bots (E4): one owned bot whose devices a test sets; vouching records the list.
+// Bots (E4): one owned bot whose uploads and signed list a test sets; vouching edits the list.
+type FakeBotDevice = { device_id: string; curve25519: string; ed25519: string };
 export const fakeBots = {
   bots: [] as { user_id: string; username: string; display_name: string }[],
-  uploaded: [] as { device_id: string; curve25519: string; ed25519: string; code: string }[],
-  vouched: [] as string[],
+  uploaded: [] as (FakeBotDevice & { code: string })[],
+  vouched: [] as FakeBotDevice[],
   epoch: 0,
 };
 export const ownBots = async () => fakeBots.bots;
-export const botDevices = async () => ({
-  uploaded: fakeBots.uploaded,
-  vouched: fakeBots.uploaded.filter((d) => fakeBots.vouched.includes(d.device_id)),
-  epoch: fakeBots.epoch,
-});
-export const vouchForBot = async (_bot: string, expected: number, devices: { device_id: string }[]) => {
+export const botDevices = async () => ({ uploaded: fakeBots.uploaded, vouched: fakeBots.vouched, epoch: fakeBots.epoch });
+export const vouchForBot = async (_bot: string, expected: number, { add, remove }: { add?: FakeBotDevice; remove?: string }) => {
   if (expected !== fakeBots.epoch) throw new Error('The bot device list changed; reload it');
-  fakeBots.vouched = devices.map((d) => d.device_id);
+  const keep = fakeBots.vouched.filter((d) => d.device_id !== remove && d.device_id !== add?.device_id);
+  fakeBots.vouched = add ? [...keep, { device_id: add.device_id, curve25519: add.curve25519, ed25519: add.ed25519 }] : keep;
   fakeBots.epoch++;
 };
