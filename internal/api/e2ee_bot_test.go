@@ -166,12 +166,25 @@ func TestE2EEBotDevicesLapseWithTheOwnersIdentity(t *testing.T) {
 	if rec := doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/bots/"+botID+"/devices", aliceTok, botList(t, aliceID, alice.ID, botID, 0, 1, d1), nil); rec.Code != http.StatusOK {
 		t.Fatalf("owner's list = %d %s", rec.Code, rec.Body.String())
 	}
-	if rec := doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/master", aliceTok, newIdentity(t, store.DefaultTenantID, alice.ID).put(t, 1), nil); rec.Code != http.StatusOK {
+	reset := newIdentity(t, store.DefaultTenantID, alice.ID)
+	if rec := doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/master", aliceTok, reset.put(t, 1), nil); rec.Code != http.StatusOK {
 		t.Fatalf("reset = %d %s", rec.Code, rec.Body.String())
 	}
 	var q botQuery
 	decodeBody(t, doBearerJSON(t, srv, http.MethodPost, "/api/v1/keys/query", aliceTok, map[string]any{"user_ids": []string{botID}}, nil).Body.Bytes(), &q)
 	if len(q.BotDevices) != 0 {
 		t.Fatalf("a list signed by the replaced key is still served: %+v", q.BotDevices)
+	}
+	// The owner's new identity vouches again from epoch 1, as their client sees no list.
+	body := botList(t, reset, alice.ID, botID, 0, 1, d1)
+	body["version"] = 2
+	msg, _ := e2eeid.BotDevicesMessage(store.DefaultTenantID, alice.ID, 2, botID, 1, []e2eeid.BotDevice{{DeviceID: d1.id, Curve25519: d1.curve, Ed25519: d1.ed()}})
+	body["signature"] = reset.sign(t, e2eeid.DomainBotDevices, msg)
+	if rec := doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/bots/"+botID+"/devices", aliceTok, body, nil); rec.Code != http.StatusOK {
+		t.Fatalf("vouching after a reset = %d %s", rec.Code, rec.Body.String())
+	}
+	decodeBody(t, doBearerJSON(t, srv, http.MethodPost, "/api/v1/keys/query", aliceTok, map[string]any{"user_ids": []string{botID}}, nil).Body.Bytes(), &q)
+	if l := q.BotDevices[botID]; l.Epoch != 1 || len(l.Devices) != 1 {
+		t.Fatalf("after re-vouching = %+v", q.BotDevices)
 	}
 }

@@ -178,7 +178,8 @@ type E2EEStore interface {
 	ListBotDevices(ctx context.Context, tenantID string, botIDs []string) ([]E2EEBotDevices, error)
 	// PutBotDevices stores b at b.Epoch once proof accepts it against the owner's master key at
 	// b.OwnerVersion (read and locked in the same transaction), while the bot's list is at epoch
-	// expected (0: none); ErrE2EEVersion otherwise. The epoch only rises, whoever signs.
+	// expected; ErrE2EEVersion otherwise. expected 0 writes a first list or replaces one another
+	// owner identity (owner or version) signed; within one identity the epoch only rises.
 	PutBotDevices(ctx context.Context, b *E2EEBotDevices, expected int64, proof Proof) error
 	// DeleteUserDevices removes every device of userID, with its keys and mail.
 	DeleteUserDevices(ctx context.Context, userID string) error

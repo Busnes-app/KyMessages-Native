@@ -321,6 +321,10 @@ class Bot:
         fp = fingerprint(key)
         pins = self.st["pins"]
         pin = pins.get(f"{tenant}:{user}")
+        if f"{tenant}:{user}" in self.st["changed"]:
+            # A change waits for `accept`, whichever key the server shows next (the old one too).
+            self.st["changed"][f"{tenant}:{user}"] = fp if fp != pin else self.st["changed"][f"{tenant}:{user}"]
+            return None
         if pin is None:
             pins[f"{tenant}:{user}"] = fp  # first sight
         elif pin != fp:
@@ -344,6 +348,11 @@ class Bot:
 
     def trusted_bot(self, bot: str, rec, q: dict, tenant: str) -> dict[str, dict] | None:
         if not isinstance(rec, dict) or not isinstance(rec.get("owner_id"), str) or not isinstance(rec.get("devices"), list):
+            return None
+        # A bot's owner is pinned on first sight: no other member can vouch for it later.
+        owners = self.st["bot_owners"]
+        if owners.setdefault(f"{tenant}:{bot}", rec["owner_id"]) != rec["owner_id"]:
+            print(f"warning: the server names another owner for {bot}; it gets nothing", file=sys.stderr)
             return None
         owner = self.trusted_master(rec["owner_id"], q.get("master_keys", {}).get(rec["owner_id"]), tenant)
         if not owner or not isinstance(rec.get("version"), int) or not isinstance(rec.get("epoch"), int):
@@ -379,7 +388,10 @@ class Bot:
         for i in range(0, len(users), 100):
             batch = users[i:i + 100]
             q = self.s.call("POST", "/api/v1/keys/query", {"user_ids": batch})
-            tenant = q["tenant_id"]
+            tenant = q.get("tenant_id")
+            # The org is fixed at first contact: keys from another org are never this bot's peers.
+            if not isinstance(tenant, str) or self.st.d.setdefault("tenant_id", tenant) != tenant:
+                raise SystemExit("the key server answered for another organization; refusing")
             for u in batch:
                 if u.startswith("bot_"):
                     vouched = self.trusted_bot(u, (q.get("bot_devices") or {}).get(u), q, tenant)
@@ -495,7 +507,12 @@ class Bot:
             dec = ig.decrypt(vz.MegolmMessage.from_base64(env["ciphertext"]))
         except Exception:
             return {**base, "error": "could not be decrypted"}
-        inner = json.loads(dec.plaintext)
+        try:
+            inner = json.loads(dec.plaintext)
+            if not isinstance(inner, dict) or not isinstance(inner.get("body", ""), str):
+                raise ValueError
+        except ValueError:
+            return {**base, "error": "damaged"}
         if inner.get("room_id") != m.get("room_id") or (inner.get("type") == "edit" and inner.get("message_id") != m.get("id")):
             return {**base, "error": "encrypted for another room or message"}
         seen = self.st["seen"]
@@ -526,6 +543,10 @@ class Bot:
                 return g
         g = vz.GroupSession()
         self.st["outbound"][room] = {"pickle": g.pickle(self.st.key), "created": time.time(), "shared": {}}
+        # This bot reads its own messages too.
+        own = vz.InboundGroupSession(g.session_key)
+        self.st["inbound"][f"{self.account().curve25519_key.to_base64()}\n{g.session_id}"] = {
+            "pickle": own.pickle(self.st.key), "room_id": room, "user": self.user_id, "device": self.device_id, "first_index": own.first_known_index}
         return g
 
     def share(self, room: str, g: vz.GroupSession, targets: list[dict]) -> None:
@@ -552,12 +573,16 @@ class Bot:
                        "recipient_user_id": t["user_id"], "recipient_device_id": t["device_id"], "recipient_ed25519": t["ed25519"], "content": content}
             typ, ct = s.encrypt(json.dumps(payload).encode()).to_parts()
             pickles[-1] = s.pickle(self.st.key)
-            msgs.append({"user_id": t["user_id"], "device_id": t["device_id"], "type": ROOM_KEY_TYPE,
-                         "content": json.dumps({"algorithm": "olm.v1", "sender_key": acct.curve25519_key.to_base64(), "type": typ, "body": b64(ct)})})
-            out["shared"][f"{t['user_id']}\n{t['device_id']}"] = t["curve25519"]
+            msgs.append(({"user_id": t["user_id"], "device_id": t["device_id"], "type": ROOM_KEY_TYPE,
+                          "content": json.dumps({"algorithm": "olm.v1", "sender_key": acct.curve25519_key.to_base64(), "type": typ, "body": b64(ct)})}, t))
         self.st.save()  # ratchets before anything leaves
         for i in range(0, len(msgs), 100):
-            self.s.call("PUT", "/api/v1/to-device", {"device_id": self.device_id, "messages": msgs[i:i + 100]})
+            batch = msgs[i:i + 100]
+            self.s.call("PUT", "/api/v1/to-device", {"device_id": self.device_id, "messages": [m for m, _ in batch]})
+            # Shared only once delivered: a failed send is sent again next time.
+            for _, t in batch:
+                out["shared"][f"{t['user_id']}\n{t['device_id']}"] = t["curve25519"]
+            self.st.save()
 
     def send(self, room: str, text: str, file: str | None = None) -> dict:
         members = [m["user_id"] for m in self.s.call("GET", f"/api/v1/rooms/{urllib.parse.quote(room)}").get("members", [])]

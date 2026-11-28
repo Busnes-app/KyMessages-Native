@@ -44,6 +44,7 @@ class FakeServer:
     """The key server, room membership and messages, as internal/api serves them."""
 
     def __init__(self):
+        self.tenant, self.fail_to_device = TENANT, 0
         self.devices, self.otks, self.mail, self.masters, self.bot_lists = {}, {}, {}, {}, {}
         self.rooms, self.messages, self.blobs, self.next = {}, {}, {}, 1
 
@@ -77,7 +78,7 @@ class FakeServer:
                 box.append(k)
             return {"one_time_key_count": len(box)}
         if p == "/api/v1/keys/query":
-            out = {"tenant_id": TENANT, "devices": {}, "master_keys": {}, "bot_devices": {}}
+            out = {"tenant_id": self.tenant, "devices": {}, "master_keys": {}, "bot_devices": {}}
             for u in body["user_ids"]:
                 out["devices"][u] = [dict(d) for d in self.devices.get(u, {}).values()]
                 if u in self.masters:
@@ -95,6 +96,9 @@ class FakeServer:
                     keys.append({**d, **box.pop(0), "fallback": False})
             return {"keys": keys}
         if p == "/api/v1/to-device" and method == "PUT":
+            if self.fail_to_device:
+                self.fail_to_device -= 1
+                raise SystemExit("PUT /api/v1/to-device: HTTP 429")
             sender = self.devices[user][body["device_id"]]
             for m in body["messages"]:
                 box = self.mail.setdefault((m["user_id"], m["device_id"]), [])
@@ -223,6 +227,11 @@ class Vectors(unittest.TestCase):
 BOT_CODE_VECTOR = "a375-b438-12e4-6bba-55a7"
 
 
+def vz_group(bot, room):
+    import vodozemac as vz
+    return vz.GroupSession.from_pickle(bot.st["outbound"][room]["pickle"], bot.st.key)
+
+
 class Trust(unittest.TestCase):
     def setUp(self):
         self.env = Env()
@@ -323,14 +332,77 @@ class Trust(unittest.TestCase):
 
     def test_a_changed_identity_stops_sharing_until_accepted(self):
         self.bot.send("r1", "first")  # pins Alice
+        self.env.server.mail.clear()
+        self.old_master = json.loads(json.dumps(self.env.server.masters["u_alice"]))
         self.env.identities["u_alice"] = Master()
         del self.env.server.masters["u_alice"]
         newer = self.env.person("u_alice")
         self.bot.send("r1", "after the change")
         self.assertEqual(self.env.mail_to(newer), 0)
+        # The server going back to the old identity does not lift the block.
+        changed = self.env.server.masters["u_alice"]
+        self.env.server.masters["u_alice"] = self.old_master
+        self.bot.send("r1", "old identity restored")
+        self.env.server.masters["u_alice"] = changed
+        self.assertEqual(self.env.mail_to(self.alice), 0)
         self.bot.accept("u_alice")
         self.bot.send("r1", "accepted")
         self.assertEqual(self.env.mail_to(newer), 1)
+
+    def test_another_org_is_refused_before_any_trust_changes(self):
+        self.bot.send("r1", "pins Alice and the org")
+        pins = dict(self.bot.st["pins"])
+        self.env.server.mail.clear()
+        self.env.server.tenant = "00000000-0000-4000-8000-00000000000b"
+        with self.assertRaises(SystemExit):
+            self.bot.send("r1", "elsewhere")
+        self.assertEqual(self.bot.st["pins"], pins)
+        self.assertEqual(self.env.mail_to(self.alice), 0)
+
+    def test_a_bots_owner_is_pinned(self):
+        carol = self.env.person("u_carol")
+        self.env.server.rooms["r1"].append("u_carol")
+        self.env.vouch("u_alice", "bot_helper", self.bot)
+        carol.send("r1", "pins Alice as the bot's owner")
+        self.assertEqual(self.env.mail_to(self.bot), 1)
+        # The server names Mallory, a real colleague, who signs a list with her own device.
+        self.env.person("u_mallory")
+        rogue = self.env.device("bot_helper")
+        del self.env.server.bot_lists["bot_helper"]
+        self.env.vouch("u_mallory", "bot_helper", rogue, epoch=1)
+        del carol.st["outbound"]["r1"]
+        carol.send("r1", "after the owner swap")
+        self.assertEqual(self.env.mail_to(rogue), 0)
+
+    def test_a_malformed_message_fails_alone(self):
+        self.env.vouch("u_alice", "bot_helper", self.bot)
+        first = self.alice.send("r1", "one")
+        g = vz_group(self.alice, "r1")
+        bad = self.env.server.handle("u_alice", "POST", "/api/v1/rooms/r1/messages", {"encoding": "e2ee_room_v1", "body": json.dumps({
+            "alg": "megolm.v1", "sender_key": self.alice.account().curve25519_key.to_base64(), "device_id": self.alice.device_id,
+            "session_id": g.session_id, "ciphertext": g.encrypt(b"not json").to_base64()})}, None)["message"]
+        self.alice.st["outbound"]["r1"]["pickle"] = g.pickle(self.alice.st.key)
+        last = self.alice.send("r1", "three")
+        self.bot.sync()
+        got = {m["id"]: m for m in self.bot.read("r1", 50)}
+        self.assertEqual(got[first["id"]]["body"], "one")
+        self.assertEqual(got[last["id"]]["body"], "three")
+        self.assertEqual(got[bad["id"]]["error"], "damaged")
+
+    def test_a_failed_delivery_is_sent_again(self):
+        self.env.vouch("u_alice", "bot_helper", self.bot)
+        self.env.server.fail_to_device = 1
+        with self.assertRaises(SystemExit):
+            self.alice.send("r1", "lost")
+        self.assertEqual(self.env.mail_to(self.bot), 0)
+        sent = self.alice.send("r1", "retried")
+        self.bot.sync()
+        self.assertEqual(self.bot.open(sent)["body"], "retried")
+
+    def test_the_bot_reads_its_own_messages(self):
+        self.env.vouch("u_alice", "bot_helper", self.bot)
+        sent = self.bot.send("r1", "my own words")
+        self.assertEqual([m["body"] for m in self.bot.read("r1", 10) if m["id"] == sent["id"]], ["my own words"])
 
     def test_files_are_encrypted_both_ways(self):
         self.env.vouch("u_alice", "bot_helper", self.bot)

@@ -44,8 +44,13 @@ func (s *e2eeStore) PutBotDevices(ctx context.Context, b *E2EEBotDevices, expect
 		var res sql.Result
 		var err error
 		if expected == 0 {
+			// A first list, or one replacing a list another identity signed (the owner reset
+			// theirs, or the bot changed hands): clients mark lists per owner identity, so the
+			// epoch starts over.
 			res, err = tx.ExecContext(ctx, s.store.rebind(`INSERT INTO e2ee_bot_devices (bot_user_id, tenant_id, owner_user_id, owner_version, epoch, devices, signature, updated_at)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (bot_user_id) DO NOTHING`),
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (bot_user_id) DO UPDATE SET tenant_id = excluded.tenant_id, owner_user_id = excluded.owner_user_id,
+					owner_version = excluded.owner_version, epoch = excluded.epoch, devices = excluded.devices, signature = excluded.signature, updated_at = excluded.updated_at
+				WHERE e2ee_bot_devices.owner_user_id <> excluded.owner_user_id OR e2ee_bot_devices.owner_version <> excluded.owner_version`),
 				b.BotUserID, b.TenantID, b.OwnerUserID, b.OwnerVersion, b.Epoch, b.Devices, b.Signature, now)
 		} else {
 			res, err = tx.ExecContext(ctx, s.store.rebind(`UPDATE e2ee_bot_devices SET owner_user_id = ?, owner_version = ?, epoch = ?, devices = ?, signature = ?, updated_at = ?

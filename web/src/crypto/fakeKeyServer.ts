@@ -264,7 +264,10 @@ export class FakeKeyServer {
         const m = this.masters.get(userId);
         if (!m || m.version !== b.version) throw new Conflict('409');
         if (!pqc.verifyBotDevices(m.master_key, TENANT, userId, b.version, botId, b.epoch, b.devices, b.signature)) throw new Error('The bot device list is not validly signed');
-        if ((this.botLists.get(botId)?.epoch ?? 0) !== b.expected_epoch || b.epoch <= b.expected_epoch) throw new Conflict('409');
+        const cur = this.botLists.get(botId);
+        // As the server: expected 0 also replaces a list another owner identity signed.
+        const stale = cur && (cur.owner_id !== userId || cur.version !== b.version);
+        if (((stale && b.expected_epoch === 0) ? 0 : cur?.epoch ?? 0) !== b.expected_epoch || b.epoch <= b.expected_epoch) throw new Conflict('409');
         this.botLists.set(botId, { owner_id: userId, version: b.version, epoch: b.epoch, devices: structuredClone(b.devices), signature: b.signature });
       },
     };

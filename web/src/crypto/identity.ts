@@ -196,6 +196,7 @@ const changeKey = (userId: string) => `mchg:${userId}`;
 const listKey = (tenantId: string, userId: string, fingerprint: string, version: number) => `dlh:${tenantId}:${userId}:${fingerprint}:${version}`;
 /** The newest owner-signed list seen for one bot, per owner identity (E4). */
 const botKey = (tenantId: string, botId: string, ownerId: string, fingerprint: string) => `blh:${tenantId}:${botId}:${ownerId}:${fingerprint}`;
+const botOwnerKey = (tenantId: string, botId: string) => `bown:${tenantId}:${botId}`;
 const RETIRING = 'identity:retiring';
 const BACKUP_BATCH = 100;
 const BACKUP_PAGE_MAX = 200;
@@ -525,6 +526,10 @@ export class Identity {
    */
   async trustedBot(botId: string, ownerId: string, owner: TrustedMaster, tenantId: string, rec: unknown): Promise<Map<string, BotDevice>> {
     const none = new Map<string, BotDevice>();
+    // A bot's owner is pinned on first sight: the server cannot later name another member, whose
+    // valid signature would then vouch for devices of its choosing.
+    const pinned = await this.ctx.store.get<string>(botOwnerKey(tenantId, botId));
+    if (pinned !== undefined && pinned !== ownerId) return none;
     const fp = pqc.fingerprint(owner.key);
     const valid = validBotList(rec) && rec.owner_id === ownerId;
     if (valid && !memo(['bot', tenantId, ownerId, String(rec.version), botId, String(rec.epoch), JSON.stringify(rec.devices), owner.key, rec.signature],
@@ -532,6 +537,7 @@ export class Identity {
     // Marked per bot and owner identity: any version of that key, since the list names its version.
     const seen = await this.observeMark(botKey(tenantId, botId, ownerId, fp), valid ? { epoch: rec.epoch, digest: pqc.hash('kymessages.bot-devices', ...rec.devices.flatMap((d) => [d.device_id, d.curve25519, d.ed25519])) } : undefined);
     if (seen !== 'ok' || !valid) return none;
+    if (pinned === undefined) await this.ctx.store.write([[botOwnerKey(tenantId, botId), ownerId]]);
     return new Map(rec.devices.map((d) => [d.device_id, d]));
   }
 

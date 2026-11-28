@@ -29,7 +29,9 @@ device `scripts/kybot.py` with `scripts/requirements.txt`), `skill.go` (`go:embe
   code follows `engine.ts` `botDeviceCode` (one vector pinned on both sides). Its trust rules are
   the browser's: TOFU-pinned self-bound master keys, only cross-signed devices on the newest
   signed list (a bot only through its owner's `kymessages.bot-devices.v1` list), lists only move
-  forward, room keys only from such devices, a changed identity waits for `accept`. Change both
+  forward, room keys only from such devices, a changed identity waits for `accept` (even if the
+  server goes back to the old key). It also pins its org and each bot's owner on first sight;
+  room-key mail counts as shared only once delivered. Change both
   sides together.
 
 ## Verification

@@ -116,6 +116,22 @@ describe('bots as devices (E4)', () => {
     expect(mailTo(server, bot)).toBe(1);
   });
 
+  it('pins a bot’s owner, so the server cannot name another member to vouch for it', async () => {
+    const { server, alice, bob, bot } = await setup();
+    await vouch(alice, bot);
+    await bob.encrypt('r1', { type: 'text', body: 'pins Alice as the owner' });
+    // Mallory, a real colleague with a valid identity, signs a list for the bot with her device.
+    const mallory = await person(server, 'u_mallory');
+    const evil = await botDevice(server, BOT, 'mallory-bot');
+    server.botOwners.set(BOT, 'u_mallory');
+    const view = await mallory.botDevices(BOT);
+    await mallory.vouchForBot(BOT, 0, view.uploaded.filter((d) => d.device_id === evil.deviceId));
+    expect(server.botLists.get(BOT)!.owner_id).toBe('u_mallory');
+    await bob.memberLeft('r1');
+    await bob.encrypt('r1', { type: 'text', body: 'after the owner swap' });
+    expect(mailTo(server, evil)).toBe(0);
+  });
+
   it('never lets the server add a device to a bot', async () => {
     const { server, alice, bob, bot } = await setup();
     await vouch(alice, bot);
