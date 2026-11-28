@@ -19,6 +19,7 @@ import {
   PhoneOff,
   Search,
   Send,
+  ShieldCheck,
   Video,
   X,
 } from 'lucide-react';
@@ -96,8 +97,9 @@ import { ChatSidebar } from '../components/chat/ChatSidebar';
 import { MessageRow, attachmentSummary, attachmentView, editProvenance } from '../components/chat/MessageRow';
 import { RoomDetailsDrawer, type DrawerTab } from '../components/chat/RoomDetailsDrawer';
 import { CreateChannelModal, SearchModal, StartDMModal } from '../components/chat/ChatModals';
+import { EncryptionIdentityGate, IdentityChangedBanner, useIdentityStatus, VerifyAnotherDevice } from '../components/chat/EncryptionIdentity';
 import { searchIndexFor } from '../chat/searchIndex';
-import { keyGeneration, keysArrivedFor, onRoomKeys, openMessages, receiveRoomKeys, retryable, roomMemberLeft, startE2EE } from '../chat/e2ee';
+import { checkRoomIdentities, encryptionReadyFor, keyGeneration, keysArrivedFor, onEncryptionPending, onRoomKeys, openMessages, receiveRoomKeys, retryable, roomMemberLeft, startE2EE } from '../chat/e2ee';
 import { CallAudioLayer, CallStage } from '../components/chat/CallStage';
 import { HybridCallController, type HybridCallSnapshot } from '../rtc/hybridCall';
 
@@ -121,12 +123,13 @@ interface ChatProps {
   onActiveCallChange?: (summary: ActiveCallSummary | null) => void;
 }
 
-type ActiveModal = 'none' | 'new-channel' | 'new-dm' | 'search';
+type ActiveModal = 'none' | 'new-channel' | 'new-dm' | 'search' | 'verify-device';
 
 // What a row says about its encryption state; a retry replaces the row only when this changes.
-const e2eeLabel = (m: ChatMessage) => (m.e2ee?.kind === 'failed' ? `failed:${m.e2ee.reason}` : m.e2ee?.kind ?? '');
-// A read message whose files' key had not arrived: opened again as keys arrive.
-// Opened again only once the key to that files' session may have arrived since it was opened.
+const e2eeLabel = (m: ChatMessage) =>
+  m.e2ee?.kind === 'failed' ? `failed:${m.e2ee.reason}` : m.e2ee?.kind === 'decrypted' ? `decrypted:${m.e2ee.trust ?? ''}` : m.e2ee?.kind ?? '';
+// A read message whose files' key had not arrived: opened again only once the key to that files'
+// session may have arrived since it was opened.
 const filesRetry = (m: ChatMessage) =>
   m.e2ee?.kind === 'decrypted' && m.filesState?.gen !== undefined && keysArrivedFor(m.filesState.session, m.filesState.gen);
 
@@ -152,6 +155,8 @@ const isMac =
   typeof navigator !== 'undefined' && /mac|iphone|ipad|ipod/i.test(navigator.platform || navigator.userAgent);
 const SEARCH_HINT = isMac ? '⌘K' : 'Ctrl+K';
 
+const E2EE_START_ERROR = 'Encryption could not start in this browser, so messages cannot be sent or read.';
+
 export const Chat: React.FC<ChatProps> = ({
   appName,
   user,
@@ -164,7 +169,25 @@ export const Chat: React.FC<ChatProps> = ({
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
   const [bannerError, setBannerError] = useState('');
+  // This browser's encryption device started: the identity screens may ask the server.
+  const [e2eeReady, setE2eeReady] = useState(false);
+  const [identity, refreshIdentity] = useIdentityStatus(e2eeReady);
   const [currentUser, setCurrentUser] = useState<ChatCurrentUser | null>(null);
+  // Readiness follows the signed-in user's device, however it got running: the first start, a
+  // retry after a failed one, or a replacement. Once it runs, the start-up error goes (only it).
+  useEffect(() => {
+    const userId = currentUser?.id;
+    if (!userId) return;
+    const check = () => {
+      const ready = encryptionReadyFor(userId);
+      setE2eeReady(ready);
+      if (ready) setBannerError((b) => (b === E2EE_START_ERROR ? '' : b));
+    };
+    check();
+    const offKeys = onRoomKeys(check);
+    const offRetry = onEncryptionPending(check);
+    return () => { offKeys(); offRetry(); };
+  }, [currentUser?.id]);
   const [tenantName, setTenantName] = useState('KyMessages');
   const [rooms, setRooms] = useState<ChatRoomSummary[]>([]);
   const [directory, setDirectory] = useState<ChatDirectoryUser[]>([]);
@@ -579,6 +602,8 @@ export const Chat: React.FC<ChatProps> = ({
       const detail = await fetchRoomDetail(roomId);
       if (activeRoomIdRef.current === roomId) {
         setRoomDetail(detail);
+        // A reader who never sends still sees a member's identity change.
+        checkRoomIdentities(roomId);
       }
     } catch (e) {
       setBannerError(e instanceof Error ? e.message : 'Could not load room details');
@@ -1010,8 +1035,10 @@ export const Chat: React.FC<ChatProps> = ({
         ]);
         if (cancelled) return;
         // Start this browser's encryption device before any room's messages are opened.
-        void startE2EE(boot.user.id).catch(() => {
-          if (!cancelled) setBannerError('Encryption could not start in this browser, so messages cannot be sent or read.');
+        void startE2EE(boot.user.id).then(() => {
+          if (!cancelled) setE2eeReady(true);
+        }, () => {
+          if (!cancelled && !encryptionReadyFor(boot.user.id)) setBannerError(E2EE_START_ERROR);
         });
         setCurrentUser(boot.user);
         setTenantName(boot.tenant.display_name || 'KyMessages');
@@ -2148,6 +2175,17 @@ export const Chat: React.FC<ChatProps> = ({
                 >
                   <Search size={17} />
                 </button>
+                {identity.state === 'verified' && (
+                  <button
+                    type="button"
+                    className="chat-icon-btn"
+                    title="Verify another of your devices"
+                    aria-label="Verify a device"
+                    onClick={() => setModal('verify-device')}
+                  >
+                    <ShieldCheck size={17} />
+                  </button>
+                )}
                 <button
                   type="button"
                   className={drawerOpen ? 'chat-header-panel-btn active' : 'chat-header-panel-btn'}
@@ -2173,6 +2211,13 @@ export const Chat: React.FC<ChatProps> = ({
               </div>
             </header>
 
+            <EncryptionIdentityGate gate={identity} refresh={refreshIdentity} />
+            {e2eeReady && roomDetail && roomDetail.room.id === activeRoom.id && (
+              <IdentityChangedBanner
+                memberIds={roomDetail.members.map((m) => m.user_id)}
+                nameOf={(id) => directory.find((u) => u.id === id)?.display_name || directory.find((u) => u.id === id)?.username || 'A member'}
+              />
+            )}
             {bannerError && (
               <div className="chat-banner chat-banner-error" role="alert">
                 <span>{bannerError}</span>
@@ -2673,6 +2718,8 @@ export const Chat: React.FC<ChatProps> = ({
                 <span>{bannerError}</span>
               </div>
             )}
+            {/* Setting up or verifying this device needs no room. */}
+            <EncryptionIdentityGate gate={identity} refresh={refreshIdentity} />
 
             <div className="chat-empty-stage">
               <MessageSquarePlus size={36} style={{ color: 'var(--accent)' }} aria-hidden="true" />
@@ -2689,6 +2736,12 @@ export const Chat: React.FC<ChatProps> = ({
                 <button type="button" className="btn-secondary" onClick={() => setModal('new-dm')}>
                   New direct message
                 </button>
+                {identity.state === 'verified' && (
+                  <button type="button" className="btn-secondary" onClick={() => setModal('verify-device')}>
+                    <ShieldCheck size={15} aria-hidden="true" />
+                    Verify a device
+                  </button>
+                )}
               </div>
             </div>
           </>
@@ -2727,6 +2780,7 @@ export const Chat: React.FC<ChatProps> = ({
         />
       )}
 
+      {modal === 'verify-device' && <VerifyAnotherDevice onClose={() => setModal('none')} />}
       {modal === 'new-channel' && (
         <CreateChannelModal
           directory={directory}

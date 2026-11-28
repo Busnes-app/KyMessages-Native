@@ -48,9 +48,6 @@ func newMultiTenantTestServer(t *testing.T) (*api.Server, store.Store, *config.C
 		SSO: config.SSOConfig{
 			KyIdentityHMACSecret: testMultiTenantHMAC,
 		},
-		RTC: config.RTCConfig{
-			MeetingSyncSecret: testMultiTenantHMAC,
-		},
 		Tenancy: config.TenancyConfig{
 			Mode:       config.TenancyMulti,
 			StaffOrgID: testStaffOrg,
@@ -398,30 +395,20 @@ func TestMultiTenantDirectoryAdminsOnlyFromStaffOrg(t *testing.T) {
 }
 
 func TestMultiTenantKyCalendarMeetingSync(t *testing.T) {
-	srv, st, _ := newMultiTenantTestServer(t)
+	srv, _, st, _ := newReplicas(t, withKyCalendar)
 
 	alice, _ := createOrgUser(t, st, "usr_cal_alice", "calalice", "user", "00000000-0000-4000-8000-00000000000a")
 	carol, _ := createOrgUser(t, st, "usr_cal_carol", "calcarol", "user", "00000000-0000-4000-8000-00000000000b")
 
-	signedReq := func(method, path string, payload any) *httptest.ResponseRecorder {
-		raw, _ := json.Marshal(payload)
-		req := httptest.NewRequest(method, path, bytes.NewReader(raw))
-		req.Header.Set("Content-Type", "application/json")
-		h, err := syncauth.Sign([]byte(testMultiTenantHMAC), time.Now(), "meeting.sync", uuid.NewString(), raw)
-		if err != nil {
-			t.Fatal(err)
-		}
-		h.Apply(req)
-		rec := httptest.NewRecorder()
-		srv.ServeHTTP(rec, req)
-		return rec
+	signedReq := func(method, path string, payload map[string]any) *httptest.ResponseRecorder {
+		return calSigned(srv, testMultiTenantHMAC, method, path, payload)
 	}
 
 	now := time.Now().UTC().Truncate(time.Second)
 	// Missing org_id must be rejected in multi-tenant mode.
 	rec := signedReq(http.MethodPut, "/api/meetings/ext-1", map[string]any{
-		"title":         "Missing Org",
-		"organizer_sub": alice.SSOSubject,
+		"title": "Missing Org",
+		"sub":   alice.SSOSubject,
 		"windows": []map[string]string{{
 			"start": now.Format(time.RFC3339),
 			"end":   now.Add(time.Hour).Format(time.RFC3339),
@@ -433,10 +420,10 @@ func TestMultiTenantKyCalendarMeetingSync(t *testing.T) {
 
 	// Valid org_id creates meeting scoped to org-alpha and ignores cross-org attendees.
 	rec = signedReq(http.MethodPut, "/api/meetings/ext-1", map[string]any{
-		"org_id":        "00000000-0000-4000-8000-00000000000a",
-		"title":         "Alpha Standup",
-		"organizer_sub": alice.SSOSubject,
-		"member_subs":   []string{alice.SSOSubject, carol.SSOSubject},
+		"org_id":      "00000000-0000-4000-8000-00000000000a",
+		"title":       "Alpha Standup",
+		"sub":         alice.SSOSubject,
+		"member_subs": []string{alice.SSOSubject, carol.SSOSubject},
 		"windows": []map[string]string{{
 			"start": now.Format(time.RFC3339),
 			"end":   now.Add(time.Hour).Format(time.RFC3339),

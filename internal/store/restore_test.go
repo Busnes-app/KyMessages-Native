@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -73,6 +74,19 @@ func TestRestoreInvalidatesGrants(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
 	roomID, _, agentID := seedGrants(t, st)
+	// E3: the identity and key backup are the point of a restore; a QR pairing is a grant.
+	if err := st.E2EE().PutMasterKey(ctx, &store.E2EEMasterKey{TenantID: store.DefaultTenantID, UserID: "u", MasterKey: "mk", SelfSignature: "ss", BackupKey: "bk", BackupSignature: "bs", RecoveryMaster: "rm", RecoveryBackup: "rb"}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.E2EE().PutBackupSessions(ctx, store.DefaultTenantID, "u", 1, 0, []store.E2EEBackupSession{{RoomID: "r", SenderKey: "k", SessionID: "s", Sealed: "x"}}, 10, 1<<20, func(string) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.E2EE().SignDevice(ctx, store.DefaultTenantID, "u", "D1", 1, "sig", func(string, *store.E2EEDevice) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.E2EE().CreatePairing(ctx, &store.E2EEPairing{ID: "qr", TenantID: store.DefaultTenantID, UserID: "u", InitiatorDevice: "D1", MasterVersion: 1, ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
 	for range 2 { // Repeating offline preparation is harmless.
 		if err := st.InvalidateRestoredGrants(ctx); err != nil {
 			t.Fatal(err)
@@ -129,6 +143,15 @@ func TestRestoreInvalidatesGrants(t *testing.T) {
 	}
 	if _, err := st.Audit().LatestAuditRecord(ctx, "restore.grants_invalidated"); err != nil {
 		t.Fatal("no audit row", err)
+	}
+	if _, err := st.E2EE().GetPairing(ctx, store.DefaultTenantID, "u", "qr", time.Now()); !errors.Is(err, store.ErrNotFound) {
+		t.Fatal("QR pairing survived restore", err)
+	}
+	if m, err := st.E2EE().GetMasterKey(ctx, "u"); err != nil || m.MasterKey != "mk" {
+		t.Fatalf("master key lost in restore: %+v %v", m, err)
+	}
+	if rows, err := st.E2EE().ListBackupSessions(ctx, store.DefaultTenantID, "u", 1, store.E2EEBackupCursor{}, 10); err != nil || len(rows) != 1 {
+		t.Fatalf("key backup lost in restore: %+v %v", rows, err)
 	}
 }
 
@@ -202,5 +225,151 @@ func TestRestoreInvalidatesGuestSessions(t *testing.T) {
 	}
 	if _, err := gs.ByID(ctx, "g1", now, time.Hour); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("ByID after restore: %v", err)
+	}
+}
+
+// Restoring a <24h backup must not trust its pre-restore KyIdentity sync timestamp,
+// active customer org admission, or cached storage pool grant, while preserving
+// tenancy.mode, tenancy.staff_org_id, the default/staff/deleted org states, pool_seq
+// fences, and permanent erased_subjects tombstones.
+func TestRestoreInvalidatesTenancySyncAndPoolGrants(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "restore-tenancy.db")
+	st, err := store.Open(ctx, config.DatabaseConfig{Driver: "sqlite", DSN: dbPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	const (
+		staffOrg    = "00000000-0000-4000-8000-000000000001"
+		customerOrg = "00000000-0000-4000-8000-000000000002"
+		deletedOrg  = "00000000-0000-4000-8000-000000000003"
+	)
+	nowSec := strconv.FormatInt(time.Now().Unix(), 10)
+	for k, v := range map[string]string{
+		store.TenancyModeSettingKey:     "multi",
+		store.TenancyStaffOrgSettingKey: staffOrg,
+		"tenancy.kyidentity_synced_at":  nowSec,
+		"tenancy.full_sync_at":          nowSec,
+		"tenancy.orgs_revision":         "42",
+		"tenancy.erased_revision":       "7",
+	} {
+		if err := st.Settings().SetSetting(ctx, k, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, entry := range []store.TenantDirectoryEntry{
+		{TenantID: staffOrg, Revision: 5, Status: store.TenantStatusActive, Enabled: true, Valid: true},
+		{TenantID: customerOrg, Revision: 10, Status: store.TenantStatusActive, Enabled: true, Valid: true,
+			Quotas: store.TenantQuotas{MaxUploadBytes: 4096, MaxPendingUserBytes: 8192}},
+		{TenantID: deletedOrg, Revision: 12, Status: store.TenantStatusDeleted, Enabled: false, Valid: true},
+	} {
+		if _, err := st.Chat().EnsureTenant(ctx, entry.TenantID); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.Chat().ApplyTenantDirectory(ctx, entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seq, _, err := st.Chat().NextPoolReport(ctx, customerOrg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Chat().SetPoolGrant(ctx, customerOrg, seq, 128, 1<<20, time.Now().Add(time.Hour).UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Chat().RememberErasedSubject(ctx, "sub-erased-before-backup", customerOrg); err != nil {
+		t.Fatal(err)
+	}
+
+	// Idempotent across repeated offline runs.
+	for range 2 {
+		if err := st.InvalidateRestoredGrants(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, key := range []string{
+		"tenancy.kyidentity_synced_at",
+		"tenancy.full_sync_at",
+		"tenancy.orgs_revision",
+		"tenancy.erased_revision",
+	} {
+		if v, err := st.Settings().GetSetting(ctx, key); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("setting %s survived restore: %q %v", key, v, err)
+		}
+	}
+	if mode, err := st.Settings().GetSetting(ctx, store.TenancyModeSettingKey); err != nil || mode != "multi" {
+		t.Fatalf("tenancy.mode = %q %v, want multi", mode, err)
+	}
+	if staff, err := st.Settings().GetSetting(ctx, store.TenancyStaffOrgSettingKey); err != nil || staff != staffOrg {
+		t.Fatalf("tenancy.staff_org_id = %q %v, want %s", staff, err, staffOrg)
+	}
+
+	for _, tc := range []struct {
+		id   string
+		want string
+	}{
+		{staffOrg, store.TenantStatusActive},
+		{customerOrg, store.TenantStatusSuspended},
+		{deletedOrg, store.TenantStatusDeleted},
+	} {
+		got, err := st.Chat().GetTenant(ctx, tc.id)
+		if err != nil {
+			t.Fatalf("GetTenant(%s): %v", tc.id, err)
+		}
+		if got.Status != tc.want {
+			t.Fatalf("tenant %s status = %q, want %q", tc.id, got.Status, tc.want)
+		}
+	}
+
+	// Stale customer org cannot reserve attachment quota before fresh sync, and its cached
+	// pool grant is cleared independently of tenant status.
+	if _, err := st.Chat().ReserveAttachmentQuota(ctx, customerOrg, "u1", 64, store.AttachmentQuotaLimits{Pool: true, ActiveUploader: true}, time.Minute); !errors.Is(err, store.ErrForbidden) {
+		t.Fatalf("ReserveAttachmentQuota(ActiveUploader) on stale org = %v, want ErrForbidden", err)
+	}
+	if _, err := st.Chat().ReserveAttachmentQuota(ctx, customerOrg, "u1", 64, store.AttachmentQuotaLimits{Pool: true}, time.Minute); !errors.Is(err, store.ErrPoolUnavailable) {
+		t.Fatalf("ReserveAttachmentQuota(Pool) on stale org = %v, want ErrPoolUnavailable", err)
+	}
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	var defaultStatus string
+	if err := db.QueryRow(`SELECT status FROM tenants WHERE id = ?`, store.DefaultTenantID).Scan(&defaultStatus); err != nil {
+		t.Fatal(err)
+	}
+	if defaultStatus != store.TenantStatusActive {
+		t.Fatalf("default tenant stored status = %q, want active", defaultStatus)
+	}
+	var poolSeq int64
+	var ceiling, expires, reported sql.NullInt64
+	if err := db.QueryRow(`SELECT pool_seq, pool_ceiling_bytes, pool_expires_at, pool_reported_bytes FROM tenants WHERE id = ?`, customerOrg).
+		Scan(&poolSeq, &ceiling, &expires, &reported); err != nil {
+		t.Fatal(err)
+	}
+	if poolSeq != seq {
+		t.Fatalf("pool_seq = %d, want preserved %d", poolSeq, seq)
+	}
+	if ceiling.Valid || expires.Valid || reported.Valid {
+		t.Fatalf("cached pool grant survived restore: ceiling=%v expires=%v reported=%v", ceiling, expires, reported)
+	}
+
+	// Permanent erasure tombstone must remain intact and continue blocking re-provisioning.
+	var erased int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM erased_subjects WHERE subject = ? AND org_id = ?`, "sub-erased-before-backup", customerOrg).Scan(&erased); err != nil {
+		t.Fatal(err)
+	}
+	if erased != 1 {
+		t.Fatalf("erased_subjects count = %d, want 1", erased)
+	}
+	if err := st.Users().CreateUser(ctx, &store.User{
+		ID: "usr_revive", Username: "revive", Role: "user", Status: "active",
+		SSOProvider: "kyidentity", SSOSubject: "sub-erased-before-backup", OrgID: customerOrg,
+	}); !errors.Is(err, store.ErrSubjectErased) {
+		t.Fatalf("CreateUser for erased subject after restore = %v, want ErrSubjectErased", err)
 	}
 }

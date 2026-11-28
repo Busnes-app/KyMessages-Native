@@ -19,8 +19,8 @@ const server = spawn(fileURLToPath(new URL('../../.browser/server', import.meta.
     KY_ADMIN_PASSWORD: 'BrowserInitial123!', KY_CAPTCHA_PROVIDER: captcha,
     // Disposable, like the passwords: chat-pickers.spec.mjs adds teammates through SCIM.
     KY_SCIM_TOKEN: 'browser-regression-scim-token',
-    // Never reach a real push relay from a throwaway server.
-    PUSH_RELAY_URL: '', APNS_RELAY_URL: '',
+    // A throwaway server reaches no push relay, whatever the host shell sets.
+    KY_PUSH_ENABLED: 'false', PUSH_RELAY_URL: '', APNS_RELAY_URL: '',
   },
   stdio: 'inherit',
 });

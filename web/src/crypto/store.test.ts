@@ -1,6 +1,7 @@
 import 'fake-indexeddb/auto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { deleteCryptoStores, openCryptoStore } from './store';
+import { isTransient, StorageUnavailable } from './records';
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -55,5 +56,24 @@ describe('crypto store deletion', () => {
   it('rejects when the browser cannot list its databases', async () => {
     vi.spyOn(indexedDB, 'databases').mockRejectedValue(new DOMException('listing refused', 'UnknownError'));
     await expect(deleteCryptoStores()).rejects.toThrow('listing refused');
+  });
+});
+
+describe('the storage boundary', () => {
+  it('types an aborted transaction as storage unavailable, which is retried, not bad data', async () => {
+    const store = await openCryptoStore('u_abort');
+    const put = IDBObjectStore.prototype.put;
+    vi.spyOn(IDBObjectStore.prototype, 'put').mockImplementation(function (this: IDBObjectStore, ...args: Parameters<IDBObjectStore['put']>) {
+      const r = put.apply(this, args);
+      this.transaction.abort(); // as the browser does on quota or a closing database
+      return r;
+    });
+    const err = await store.write([['k', 'v']]).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(StorageUnavailable);
+    expect(isTransient(err)).toBe(true);
+    vi.restoreAllMocks();
+    expect(await store.get('k')).toBeUndefined();
+    store.close();
+    await deleteCryptoStores();
   });
 });

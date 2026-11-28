@@ -1,25 +1,21 @@
 package api_test
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/Busnes-app/ky-primitives/syncauth"
 	"github.com/Busnes-app/ky_server_base/internal/api"
 	"github.com/Busnes-app/ky_server_base/internal/auth"
 	"github.com/Busnes-app/ky_server_base/internal/config"
 	"github.com/Busnes-app/ky_server_base/internal/crypto"
 	"github.com/Busnes-app/ky_server_base/internal/store"
 	"github.com/Busnes-app/ky_server_base/internal/testdb"
-	"github.com/google/uuid"
 )
 
 const (
@@ -43,7 +39,6 @@ func newReplicasWithStore(t *testing.T, decorate func(store.Store) store.Store, 
 		Database: config.DatabaseConfig{DataDir: t.TempDir()},
 		Security: config.SecurityConfig{SessionTTL: time.Hour, SessionSecret: "replica-shared-session-secret-0123456789"},
 		SSO:      config.SSOConfig{KyIdentityHMACSecret: testMultiTenantHMAC},
-		RTC:      config.RTCConfig{MeetingSyncSecret: testMultiTenantHMAC},
 		Tenancy:  config.TenancyConfig{Mode: config.TenancyMulti, StaffOrgID: testStaffOrg},
 	}
 	for _, o := range opts {
@@ -135,18 +130,9 @@ type replicaMeeting struct {
 func putMeeting(t *testing.T, srv http.Handler, id, org, organizerSub string) replicaMeeting {
 	t.Helper()
 	now := time.Now().UTC()
-	raw, _ := json.Marshal(map[string]any{"org_id": org, "title": "Shared " + org[len(org)-2:], "organizer_sub": organizerSub,
+	rec := calSigned(srv, testMultiTenantHMAC, http.MethodPut, "/api/meetings/"+id, map[string]any{"org_id": org, "title": "Shared " + org[len(org)-2:], "sub": organizerSub,
 		"member_subs": []string{organizerSub}, "guests": []map[string]string{{"key": "client"}},
 		"windows": []map[string]string{{"start": now.Add(-time.Minute).Format(time.RFC3339), "end": now.Add(time.Hour).Format(time.RFC3339)}}})
-	req := httptest.NewRequest(http.MethodPut, "/api/meetings/"+id, bytes.NewReader(raw))
-	req.Header.Set("Content-Type", "application/json")
-	h, err := syncauth.Sign([]byte(testMultiTenantHMAC), time.Now(), "meeting.sync", uuid.NewString(), raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	h.Apply(req)
-	rec := httptest.NewRecorder()
-	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("PUT meeting %s for %s = %d: %s", id, org, rec.Code, rec.Body.String())
 	}
@@ -183,7 +169,7 @@ func guestMessages(srv http.Handler, token, secret string) int {
 
 // A guest knocks on one replica, is listed and admitted on the other, and is recognised on both.
 func TestReplicasShareGuestSessions(t *testing.T) {
-	a, b, st, _ := newReplicas(t)
+	a, b, st, _ := newReplicas(t, withKyCalendar)
 	host, hostTok := createOrgUser(t, st, "usr_rep_host", "rephost", "user", replicaOrgA)
 	m := putMeeting(t, a, "shared-1", replicaOrgA, host.SSOSubject)
 	guestID, secret := guestKnock(t, a, m.token)
@@ -212,13 +198,7 @@ func TestReplicasShareGuestSessions(t *testing.T) {
 		t.Fatalf("new session on a = %d, want 403", code)
 	}
 	// Closing the meeting on one replica ends the session on both.
-	raw := []byte(`{"org_id":"` + replicaOrgA + `"}`)
-	req := httptest.NewRequest(http.MethodDelete, "/api/meetings/shared-1", bytes.NewReader(raw))
-	req.Header.Set("Content-Type", "application/json")
-	h, _ := syncauth.Sign([]byte(testMultiTenantHMAC), time.Now(), "meeting.close", uuid.NewString(), raw)
-	h.Apply(req)
-	rr := httptest.NewRecorder()
-	a.ServeHTTP(rr, req)
+	rr := calSigned(a, testMultiTenantHMAC, http.MethodDelete, "/api/meetings/shared-1", map[string]any{"org_id": replicaOrgA})
 	if rr.Code != http.StatusOK {
 		t.Fatalf("close = %d: %s", rr.Code, rr.Body.String())
 	}
@@ -230,7 +210,7 @@ func TestReplicasShareGuestSessions(t *testing.T) {
 // Two orgs hold the same meeting ID: each gets its own meeting, room and lobby, and nothing
 // one org does reaches the other's guest.
 func TestTwoOrgsShareAMeetingIDButNothingElse(t *testing.T) {
-	a, b, st, _ := newReplicas(t)
+	a, b, st, _ := newReplicas(t, withKyCalendar)
 	hostA, tokA := createOrgUser(t, st, "usr_rep_ha", "repha", "user", replicaOrgA)
 	hostB, tokB := createOrgUser(t, st, "usr_rep_hb", "rephb", "user", replicaOrgB)
 	ma := putMeeting(t, a, "same-id", replicaOrgA, hostA.SSOSubject)

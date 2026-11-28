@@ -4,6 +4,8 @@
 // only wrapped by a non-extractable AES-GCM key that never leaves this database. Signing out
 // deletes the database.
 
+import { StorageUnavailable } from './records';
+
 const DB_PREFIX = 'kymessages-crypto-';
 const KV = 'kv';
 
@@ -15,6 +17,12 @@ export interface CryptoStore {
   write(puts: [string, unknown][], deletes?: string[]): Promise<void>;
   /** Stores value under key unless one is there; returns what is stored afterwards. */
   putIfAbsent<T>(key: string, value: T): Promise<T>;
+  /**
+   * Reads key and writes next(current) in one transaction (nothing when it returns current
+   * itself), so concurrent tabs and unlocked paths cannot interleave; returns what is stored.
+   * next must be synchronous.
+   */
+  update<T>(key: string, next: (current: T | undefined) => T | undefined): Promise<T | undefined>;
   /** The 32-byte key vodozemac encrypts pickles under. */
   pickleKey(): Promise<Uint8Array>;
   close(): void;
@@ -25,9 +33,10 @@ export interface CryptoStore {
 // How long a delete waits for other tabs to let go before reporting failure.
 const DELETE_TIMEOUT_MS = 5_000;
 
-// Storage failures always reject with a DOMException (an aborted transaction may carry no error
-// of its own), so callers can tell them from unreadable data and keep the work for a retry.
-const storageError = (e: DOMException | null, what: string) => e ?? new DOMException(what, 'AbortError');
+// Storage failures always reject as StorageUnavailable, an aborted request or transaction
+// included (it may carry no error of its own, or an AbortError), so callers tell them from
+// unreadable data and keep the work for a retry.
+const storageError = (e: DOMException | null, what: string) => new StorageUnavailable(e ? `${what}: ${e.name} ${e.message}` : what, { cause: e });
 
 function req<T>(r: IDBRequest<T>): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -93,6 +102,16 @@ class IdbCryptoStore implements CryptoStore {
     if (found === undefined) store.put(value, key);
     await done(tx);
     return found === undefined ? value : found;
+  }
+
+  async update<T>(key: string, next: (current: T | undefined) => T | undefined): Promise<T | undefined> {
+    const tx = this.db.transaction(KV, 'readwrite');
+    const store = tx.objectStore(KV);
+    const current = (await req(store.get(key))) as T | undefined;
+    const value = next(current);
+    if (value !== current && value !== undefined) store.put(value, key);
+    await done(tx);
+    return value ?? current;
   }
 
   pickleKey(): Promise<Uint8Array> {

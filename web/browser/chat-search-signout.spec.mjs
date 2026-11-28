@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { ensureEncryption } from './identity.mjs';
 
 // Sign-out deletes the on-device search index in every tab, even a tab whose WebSocket never
 // hears the revocation: on a shared browser, nothing readable may stay behind. This test signs
@@ -33,6 +34,7 @@ async function run({ page, context }, testInfo, { broadcast }) {
   // Rooms are end-to-end encrypted: tab A writes the message through its composer.
   await page.goto('/');
   await openRoom(page, name);
+  await ensureEncryption(page);
   const composer = page.getByLabel('Message input');
   await expect(composer).toHaveAttribute('placeholder', `Message #${room.name}`);
   await composer.fill(`${word} browser note`);

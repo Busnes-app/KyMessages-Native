@@ -485,4 +485,19 @@ describe('MessageRow', () => {
       expect(made).not.toHaveBeenCalled();
     });
   });
+
+  it('says when a decrypted message’s sender is not vouched for, grouped or not', () => {
+    const props = {
+      currentUserId: 'u_bob', canModerate: false, onReply: vi.fn(), onToggleReaction: vi.fn(),
+      onEdit: vi.fn().mockResolvedValue(undefined), onDelete: vi.fn().mockResolvedValue(undefined),
+      onRetryFailed: vi.fn(), onDismissFailed: vi.fn(),
+    };
+    const sealed = { ...baseMsg, encoding: 'e2ee_room_v1' as const, body: 'hello' };
+    const { rerender } = render(<MessageRow {...props} grouped={false} message={{ ...sealed, e2ee: { kind: 'decrypted', trust: 'backup' } }} />);
+    expect(screen.getByTestId('trust-note').textContent).toMatch(/Restored from your key backup/);
+    rerender(<MessageRow {...props} grouped message={{ ...sealed, e2ee: { kind: 'decrypted', trust: 'unverified' } }} />);
+    expect(screen.getByTestId('trust-note').textContent).toMatch(/not verified/);
+    rerender(<MessageRow {...props} grouped message={{ ...sealed, e2ee: { kind: 'decrypted' } }} />);
+    expect(screen.queryByTestId('trust-note')).toBeNull();
+  });
 });

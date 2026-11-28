@@ -22,8 +22,8 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
 - Native user INSERT/reactivation triggers refuse fenced org-bound subjects, including installer and delayed directory writes. PostgreSQL user creation and erasure share an identity advisory lock; updates serialize on the existing account row. SQLite acquires its writer before erasure binding reads. Single-mode org-less accounts keep their existing behavior. A stale directory event is acknowledged without provisioning; tombstones survive revision resets and event replay.
 
 - Migration 62 adds `tenant_directory`, the verified per-app org snapshot. `ApplyTenantDirectory` serializes with upload admission and grant issuance, rejects conflicting same-revision snapshots, ignores older revisions and keeps deletion terminal. Non-active snapshots queue durable grant cleanup; a newer active snapshot cannot restore access before cleanup completes. Org-bound multi-mode grants and uploads need an active, enabled, valid snapshot at least as new as the tenant lifecycle revision. ID-token/user-event tenant creation alone confers no access.
-- Migration 68 adds `messages.original_body`. `EditMessage` is one `UPDATE … WHERE deleted_at IS NULL RETURNING original_body`, so a concurrent delete or erasure always wins (no row: `ErrNotFound`). The update keeps the current body as `original_body` only for an `e2ee_room_v1` message with attachments that was never edited: a genuine first envelope, which holds the files' keys, since edits never repeat them. Plaintext and already-edited rows (pre-E5) keep none. `DeleteMessage` and erasure clear it (`TestChatStoreEditNeverRevivesATombstone`). The update also names the sender, and `edited_at` only moves forward (one more than the last when within a millisecond), so every version is ordered (`TestChatStoreEditsAreStrictlyOrdered`).
-- Migration 69 adds `pending_blob_deletes.not_before`. Unattributed entries (`user_id` empty) are upload intents (`QueueUploadIntent`, exactly one unclaimed intent consumed in the same transaction as `CommitAttachmentWithQuota` inserts the attachment) and staged removals (`DeleteStagedAttachment`, `PurgeOrphanAttachments`, queued with the row). `DuePendingBlobDeletes` returns due entries, leasing unattributed ones (`user_id` holds a unique `~sweep:` claim, `not_before` the lease end). Only the matching claim can clear a leased entry. A commit whose intent is leased or gone refuses with `ErrAttachmentInvalid`. `ErrAttachmentNotCommitted` identifies failures before the transaction attempted commit, including quota and authorization refusals. `QueueLateUploadCleanup` makes those published blobs eligible for a fresh sweep. Erasure entries keep their person and are never leased (`TestChatStoreUploadIntentsAndQueuedRemovals`, `TestChatUploadCommitWaitsForSweepClaim`).
+- Migration 69 adds `messages.original_body`. `EditMessage` is one `UPDATE … WHERE deleted_at IS NULL RETURNING original_body`, so a concurrent delete or erasure always wins (no row: `ErrNotFound`). The update keeps the current body as `original_body` only for an `e2ee_room_v1` message with attachments that was never edited: a genuine first envelope, which holds the files' keys, since edits never repeat them. Plaintext and already-edited rows (pre-E5) keep none. `DeleteMessage` and erasure clear it (`TestChatStoreEditNeverRevivesATombstone`). The update also names the sender, and `edited_at` only moves forward (one more than the last when within a millisecond), so every version is ordered (`TestChatStoreEditsAreStrictlyOrdered`).
+- Migration 70 adds `pending_blob_deletes.not_before`. Unattributed entries (`user_id` empty) are upload intents (`QueueUploadIntent`, exactly one unclaimed intent consumed in the same transaction as `CommitAttachmentWithQuota` inserts the attachment) and staged removals (`DeleteStagedAttachment`, `PurgeOrphanAttachments`, queued with the row). `DuePendingBlobDeletes` returns due entries, leasing unattributed ones (`user_id` holds a unique `~sweep:` claim, `not_before` the lease end). Only the matching claim can clear a leased entry. A commit whose intent is leased or gone refuses with `ErrAttachmentInvalid`. `ErrAttachmentNotCommitted` identifies failures before the transaction attempted commit, including quota and authorization refusals. `QueueLateUploadCleanup` makes those published blobs eligible for a fresh sweep. Erasure entries keep their person and are never leased (`TestChatStoreUploadIntentsAndQueuedRemovals`, `TestChatUploadCommitWaitsForSweepClaim`).
 - Migration 67 adds `tenant_directory.home_region` and `served_cells` (`SetServedCells`, replaced at each multi start). `directoryReady`/`cellServedSQL` add the C5 cell check to readiness, upload admission and `ApplyTenantDirectory` (an unserved cell is effective `suspended`, with a pending revocation); `served_cells` empty means no cells configured (single mode, tests); the staff org (`tenancy.staff_org_id`) is served by every cell under its own stored region. `home_region` is immutable once set: a differing value is `ErrInvalidInput` at any revision, while an empty one (a pre-67 snapshot) is filled in even at the same revision. `PoolUsages` reports only ready orgs. `TenantHomeRegion` feeds the S3 key prefix.
 - Per-org `max_upload_bytes` and `max_pending_user_bytes` narrow install safety limits under the quota lock, at reservation and commit. SQLite acquires its writer before quota reads, avoiding concurrent deferred read-to-write upgrades; PostgreSQL keeps the per-tenant advisory lock.
 
@@ -64,7 +64,13 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
 - `InvalidateRestoredGrants` runs only on an offline restored database: atomically
   delete sessions, MFA challenges, device pairings, push subscriptions and meeting guest
   sessions (a restored admission would readmit a removed guest), revoke active agent
-  tokens, and audit `restore.grants_invalidated`. Users sign in again.
+  tokens, clear KyIdentity tenancy sync freshness/cursors (`tenancy.kyidentity_synced_at`,
+  `tenancy.full_sync_at`, `tenancy.orgs_revision`, `tenancy.erased_revision`), mark active
+  customer `tenants` `suspended` until a fresh KyIdentity sync re-admits them (leaving
+  `default`, `tenancy.staff_org_id`, terminal `deleted` rows, and immutable `erased_subjects`
+  tombstones intact), clear cached storage pool grants (`pool_ceiling_bytes`,
+  `pool_expires_at`, `pool_reported_bytes`, preserving `pool_seq` and `pool_required_seq`),
+  and audit `restore.grants_invalidated`. Users sign in again.
 - Migrations 5–12 and 17–19 built the retired messaging stack; migration 21 drops its tables
   (children first), `messaging.*` audit rows and the three `messages_*` backup settings, and
   is idempotent. Migrations are append-only: keep their SQL.
@@ -72,7 +78,7 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   `file:` directory. This permits read/write-only restoration of paths with reserved
   characters without accidentally opening a different database.
 - `UpdateProfile` writes only username, email, display name, role and status. SCIM and the KyIdentity webhook use it so a stale read cannot revert a concurrent password change or recovery-code redemption. `ListUsers` filters by one exact `UserFilter` field, and by `sso_provider` when `UserFilter.Provider` is set.
-- `DeleteUserSessions` deletes the user's sessions, MFA challenges and device pairings in one transaction (`deleteGrants`, shared with the password paths): a pending challenge or pairing would otherwise mint a session after a SCIM or directory revocation.
+- `DeleteUserSessions` deletes the user's sessions, MFA challenges, device pairings and E3 QR pairings (`e2ee_pairings`, pending or sealed) in one transaction (`deleteGrants`, shared with the password paths): a pending challenge or pairing would otherwise mint a session, or hand out the account's encryption keys, after a SCIM or directory revocation.
 - TOTP enrolment: `SetPendingTOTP` writes the encrypted secret only on a local account with TOTP off; `EnableTOTP` turns it on only if the stored secret is still the one confirmed, stores the recovery-code digests and deletes every grant in the same transaction; `DisableTOTP` clears secret and codes. Each is `ErrNotFound` from any other state. No migration: the columns exist since v1.
 - `CreateUser`, `CreateDirectoryUser` and `ApplyDirectoryProfile` check the username against every other row first (inside the directory transaction) and return `ErrUsernameTaken` (wraps `ErrAlreadyExists`) on both engines; a refused directory write rolls back with its event ID. A write that loses a race to a concurrent insert meets the UNIQUE constraint instead; `uniqueError` maps that engine error (SQLite `users.username`, Postgres `users_username_key`) to `ErrUsernameTaken` too, any other unique violation to `ErrAlreadyExists` (`unique_internal_test.go`).
 - `GetLocalUserByUsername` returns only `sso_provider = 'local'` rows, preferring an exact-case match. Usernames are unique only case-sensitively, so password login and `init-admin` must never resolve an SSO row.
@@ -93,6 +99,32 @@ Owns data models, store interfaces (`UserStore`, `SessionStore`, `DeviceStore`, 
   first locks the device row (`FOR UPDATE`) so concurrent uploads cannot both pass the cap. Mail has no
   cursor: `ToDevice` returns the oldest unacknowledged rows and `AckToDevice` deletes exactly the
   IDs named, because PostgreSQL IDs commit out of order. Migration 54 adds each mail row's sender device keys (`sender_curve25519`, `sender_ed25519`, `sender_signature`, copied at send time), so mail from a device deleted since stays verifiable; older rows carry empty keys, which clients refuse. Only public keys and ciphertext are stored.
+- Migration 68 (E3, `e2ee_identity.go`): `e2ee_master_keys` (one row per user: hybrid master
+  key, self-binding, X-Wing backup key and its signature, recovery-key wraps, sealed pin set and
+  counter, `version`), `e2ee_devices.master_signature`/`master_version`, `e2ee_key_backup`
+  (`(user, version, room, sender_key, session)`, the lowest `first_index` wins, capped per call
+  by session count and sealed bytes, bytewise `COLLATE "C"` key columns on PostgreSQL), the
+  master-signed device list columns with the reservation of its next epoch
+  (`device_list_reserved`, `_until`, `_epoch`), `backup_generation`, and `e2ee_pairings`
+  (QR pairings, unique per `(tenant_id, user_id)`, carrying the `master_version` they were opened
+  under). `PutMasterKey` is compare-and-swap on `version`; a first setup drops a row the user left
+  in another org; a replacement deletes the backup, pairings, pins and device list and clears
+  every cross-signature in the same transaction. Pin, device-list and backup writes and
+  `SignDevice` run `fenced`: they lock the master row at (tenant, user, version) and call the
+  caller's `Proof` with its key before writing, all in one transaction. `ReserveDeviceList` (fenced
+  on its `Proof` too) holds
+  the next epoch for one digest until it lapses and returns it (`E2EEReservation`; the same
+  digest keeps its epoch, another gets one above every epoch granted, and a refusal names the
+  holder's lapse); `PutDeviceList` publishes at exactly that epoch under a reservation of its
+  digest live by its `now()`, read after the master row is locked, ending it. `DeletePairingUnsealed` deletes only a pairing with nothing sealed. A backup
+  write must name the current `backup_generation`, which `DeleteBackup` bumps; every insert and
+  replacement must fit the caps, and the others are returned as `Refused` indexes. A
+  PostgreSQL schema test asserts the backup key columns collate `C`.
+  Backup reads and deletes name the tenant too. `CreatePairing` checks the version and the
+  initiator's cross-signature in its transaction. `ListMasterKeys` reads public columns only;
+  `PutPins` and `PutDeviceList` are compare-and-swap within the caller's org. Backup writes lock
+  the master row on PostgreSQL. `ConsumePairing` is one `DELETE … RETURNING`.
+  All four cascade from `users`; restore deletes pairings and keeps the rest.
 - `store.Open(ctx, cfg)` initializes and auto-migrates the configured database backend. On
   PostgreSQL `migrations.Run` holds `pg_advisory_lock(hashtext('kymessages:migrate'))` on one
   connection for the whole run and reads `schema_migrations` under it, so replicas starting

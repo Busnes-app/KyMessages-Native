@@ -24,7 +24,7 @@ out=$(docker run --rm --network none --user "$(id -u):$(id -g)" -v "$work/seal.k
   -e KY_TENANCY_MODE=multi -e KY_DB_DRIVER=postgres -e KY_DB_DSN=postgres://ky@127.0.0.1/ky \
   -e KY_STAFF_ORG_ID=00000000-0000-4000-8000-000000000001 -e KY_CELLS=e2e-1 \
   -e KY_SESSION_SECRET=release-check-session-secret-0123456789 \
-  -e KY_ENCRYPTION_KEY="$(printf 'ab%.0s' {1..32})" -e KY_PUSH_ENABLED=false \
+  -e KY_ENCRYPTION_KEY="$(printf 'ab%.0s' {1..32})" -e KY_PUSH_ENABLED=false -e PUSH_RELAY_URL= -e APNS_RELAY_URL= \
   -e KY_KYIDENTITY_ISSUER=https://id.e2e.test \
   -e KY_ATTACHMENTS_S3_ENDPOINT=https://objects.e2e.test -e KY_ATTACHMENTS_S3_REGION=us-east-2 \
   -e KY_ATTACHMENTS_S3_BUCKET=kymessages -e KY_ATTACHMENTS_S3_ACCESS_KEY=release-check \

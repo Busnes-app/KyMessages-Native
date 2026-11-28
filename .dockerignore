@@ -29,3 +29,8 @@
 
 # The frontend stage builds its own assets; never overlay stale embedded output.
 /web/dist/
+
+# Each frontend build regenerates these from pinned sources.
+**/*.wasm
+/web/crypto/target/
+/web/.pqwasm-build.*/

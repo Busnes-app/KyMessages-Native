@@ -1,5 +1,11 @@
 import { defineConfig } from '@playwright/test';
 
+// Separate concurrent suite runs before binding their disposable servers.
+const port = Number(process.env.KY_BROWSER_PORT ?? 5391);
+if (!Number.isInteger(port) || port < 1024 || port > 65534) {
+  throw new Error('KY_BROWSER_PORT must be an integer from 1024 to 65534');
+}
+
 const server = (port, captcha) => ({
   command: `node browser/server.mjs ${port} ${captcha}`,
   url: `http://127.0.0.1:${port}`,

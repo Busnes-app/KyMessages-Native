@@ -1,15 +1,34 @@
 # Multi-stage build for kymessages
 
+# Pinned build toolchains; no generated WebAssembly is stored in the repository.
+FROM golang:1.27.4-alpine@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280 AS go-toolchain
+FROM rust:1.100.0-alpine@sha256:8d0e82abfdf9a38071e07cabc5afba4ddbe077631a80e4e742a760c38beadc33 AS rust-toolchain
+
 # Stage 1: Build React PWA Frontend
 FROM node:26-alpine@sha256:6bd9ab43c0ec0190ca7b2d193906cb8b7edf6e7f4afa43ddeccd6452710bffb5 AS frontend-builder
+COPY --from=go-toolchain /usr/local/go /usr/local/go
+COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo
+COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup
+ENV CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup
+ENV PATH="/usr/local/go/bin:/usr/local/cargo/bin:$PATH"
+RUN apk add --no-cache bash build-base
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
 WORKDIR /app/web
+COPY web/crypto/rust-toolchain.toml ./crypto/
+# wasm-bindgen-cli's locked buf_redux/multipart dependencies emit future-Rust warnings.
+# These are build-tool dependencies only; product Rust passes clippy with -D warnings.
+RUN cd crypto && cargo +1.99.0 install --locked wasm-bindgen-cli --version 0.2.130
 COPY web/package*.json ./
 RUN npm ci
 COPY web/ ./
+COPY scripts/build-crypto.sh scripts/build-pqwasm.sh /app/scripts/
+COPY internal/e2eeid /app/internal/e2eeid
 RUN npm run build
 
 # Stage 2: Build Go Standalone Binary
-FROM golang:1.27.4-alpine@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280 AS backend-builder
+FROM go-toolchain AS backend-builder
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download

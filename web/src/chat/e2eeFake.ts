@@ -7,7 +7,8 @@ import type { ChatMessage } from './types';
 
 export const UNAVAILABLE = 'Encryption is not available in this browser yet.';
 export const NOT_YET = 'This message could not be opened yet.';
-export const retryable = (reason: string) => reason === UNAVAILABLE || reason === NOT_YET;
+export const EARLY = 'This message was sent before this device could read the room.';
+export const retryable = (reason: string) => reason === UNAVAILABLE || reason === NOT_YET || reason === EARLY;
 export const MAX_MESSAGE_BYTES = 16 << 10;
 export const MAX_INNER_BYTES = 32 << 10;
 
@@ -52,9 +53,27 @@ export function resetFakeE2EE(): void {
   sessionGen.clear();
   keys.add('s_own');
   unavailable = false;
+  started = true;
+  fakeIdentity = { state: 'verified', fingerprint: 'f'.repeat(64), restoring: false, backupFull: false };
+  fakeChanges = [];
+  fakePending = { pending: false, exhausted: false };
 }
 
-export const startE2EE = async () => ({});
+// The device starts unless a test says it failed; a later retry can bring it up (setFakeStarted).
+let started = true;
+export const startE2EE = async () => {
+  if (!started) throw new Error('The post-quantum module did not load');
+  return {};
+};
+export const encryptionReadyFor = () => started;
+/** Fails (false) or brings up (true) the device, announcing it as a real start-up does. */
+export function setFakeStarted(v: boolean): void {
+  started = v;
+  if (v) {
+    keyGen++;
+    for (const fn of listeners) fn();
+  }
+}
 export const receiveRoomKeys = () => undefined;
 export const roomMemberLeft = () => undefined;
 export const retireDevice = () => ({
@@ -71,6 +90,8 @@ export function onRoomKeys(fn: () => void): () => void {
 }
 
 export async function sealRoomMessage(roomId: string, inner: Omit<RoomInner, 'room_id'>): Promise<string> {
+  // As the engine: a device that is not verified does not send.
+  if (fakeIdentity.state !== 'verified') throw new Error('Set up encryption or verify this device to send encrypted messages.');
   return fakeEnvelope({ ...inner, room_id: roomId });
 }
 
@@ -122,3 +143,57 @@ export function holdFakeOpens(): () => void {
 export function openMessages(list: ChatMessage[]): Promise<ChatMessage[]> {
   return Promise.all(list.map(openMessage));
 }
+
+// Identity (E3): page tests see a verified device with no identity changes unless they say so.
+type FakeIdentity = { state: 'none'; quarantined: boolean } | { state: 'unverified'; fingerprint: string; quarantined: boolean } |
+  { state: 'verified'; fingerprint: string; restoring: boolean; backupFull: boolean; problem?: 'rollback' | 'fork' };
+let fakeIdentity: FakeIdentity = { state: 'verified', fingerprint: 'f'.repeat(64), restoring: false, backupFull: false };
+let fakeChanges: { user_id: string; fingerprint: string; previous: string }[] = [];
+const identityListeners = new Set<() => void>();
+export function setFakeIdentity(s: typeof fakeIdentity, changes: typeof fakeChanges = []): void {
+  fakeIdentity = s;
+  fakeChanges = changes;
+  for (const fn of identityListeners) fn();
+}
+export class StaleStatus extends Error {}
+export const identityStatus = async () => fakeIdentity;
+export const identityChanges = async () => fakeChanges;
+export const onIdentityChanged = (fn: () => void) => {
+  identityListeners.add(fn);
+  return () => identityListeners.delete(fn);
+};
+export async function acceptIdentity(userId: string, previous: string, fingerprint: string): Promise<void> {
+  if (!fakeChanges.some((c) => c.user_id === userId && c.previous === previous && c.fingerprint === fingerprint)) throw new Error('This identity changed again.');
+  fakeChanges = fakeChanges.filter((c) => c.user_id !== userId);
+  for (const fn of identityListeners) fn();
+}
+export const prepareIdentity = async () => ({ recoveryKey: 'ABCD '.repeat(14).trim(), commit: async () => setFakeIdentity({ state: 'verified', fingerprint: 'f'.repeat(64), restoring: false, backupFull: false }) });
+export const restoreIdentity = async () => 0;
+export const checkRoomIdentities = () => undefined;
+let fakePending = { pending: false, exhausted: false };
+const pendingListeners = new Set<() => void>();
+export const encryptionRetry = () => fakePending;
+export const onBackupStateChanged = (fn: (full: boolean) => void) => {
+  backupListeners.add(fn);
+  return () => backupListeners.delete(fn);
+};
+const backupListeners = new Set<(full: boolean) => void>();
+/** Says the backup started or stopped refusing sessions, as the engine does. */
+export function setFakeBackupFull(full: boolean): void {
+  for (const fn of backupListeners) fn(full);
+}
+export const onEncryptionPending = (fn: () => void) => {
+  pendingListeners.add(fn);
+  return () => pendingListeners.delete(fn);
+};
+export async function retryEncryptionNow(): Promise<void> {
+  setFakePending(false);
+}
+/** Makes encryption work wait for a retry (exhausted: the automatic retries ran out). */
+export function setFakePending(pending: boolean, exhausted = false): void {
+  fakePending = { pending, exhausted };
+  for (const fn of pendingListeners) fn();
+}
+export const offerVerification = async () => ({ text: 'x'.repeat(108), expiresInMs: 180_000, poll: async (): Promise<{ code: string; device: string } | undefined> => undefined, approve: async () => undefined, cancel: async () => undefined });
+export const ownDeviceVerified = async (_deviceId: string, _signal?: AbortSignal) => true;
+export const joinVerification = async () => ({ code: '123456', finish: async () => 0, cancel: async () => undefined });

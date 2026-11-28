@@ -100,7 +100,7 @@ attachment downloads return 404.
     `tenancy.mode=multi`, preserve it for a release that supports multi-tenant startup.
   - Use the restored `data/encryption.key`; remove any stale `KY_ENCRYPTION_KEY` override that
     disagrees with it.
-  - If using LiveKit SFU (`KY_LIVEKIT_*`) or KyCalendar meeting sync (`KY_MEETING_SYNC_SECRET`),
+  - If using LiveKit SFU (`KY_LIVEKIT_*`) or an explicit KyCalendar pair (`KY_KYCALENDAR_URL`, `KY_KYCALENDAR_SECRET_FILE`),
     restore those environment variables before starting. Active calls are not restored across
     restarts; members can rejoin rooms immediately.
   - Keep restored key files private (`0600`) and data directories `0700`.
@@ -133,12 +133,19 @@ Multi mode runs several replicas on one PostgreSQL database. The capsule schedul
   server cannot detect a PostgreSQL restore, and every replica re-reads KyIdentity's org and
   erased lists in full before it serves, so deletions and erasures the restore undid are applied
   again. A replica refuses to start when KyIdentity cannot answer and the restored database's
-  last recorded sync (`tenancy.kyidentity_synced_at`) is older than 24 hours.
-- **Restored grants.** A restored database still holds sessions, pairings and bot tokens that
-  were revoked after its restore point. Before starting any replica, run
+  last recorded sync (`tenancy.kyidentity_synced_at`) is absent or older than 24 hours.
+- **Restored grants.** A restored database still holds sessions, pairings, bot tokens, cached
+  storage pool grants, active customer org flags, and a pre-restore `tenancy.kyidentity_synced_at`
+  timestamp that may be newer than 24 hours. Before starting any replica, run
   `kymessages invalidate-grants` once with the same environment. It does what `restore` does for
   a capsule: deletes sessions, MFA challenges, device pairings, push subscriptions and meeting
-  guest sessions, ends active calls, revokes bot tokens, and audits `restore.grants_invalidated`. Users sign in again.
+  guest sessions, ends active calls, revokes bot tokens, clears KyIdentity sync freshness and
+  cursors (`tenancy.kyidentity_synced_at`, `tenancy.full_sync_at`, `tenancy.orgs_revision`,
+  `tenancy.erased_revision`), marks active customer orgs suspended until a fresh KyIdentity sync
+  completes (leaving the default/staff orgs, deleted org tombstones, and `erased_subjects`
+  intact), clears cached storage pool ceilings/expiry (preserving `pool_seq` and
+  `pool_required_seq`), and audits `restore.grants_invalidated`. Even a backup younger than 24
+  hours therefore fails closed offline until KyIdentity answers. Users sign in again.
   Then review the audit trail and KyIdentity for offboarding and org changes after the restore
   point, as above.
 

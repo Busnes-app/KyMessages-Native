@@ -21,6 +21,8 @@ import (
 	"github.com/google/uuid"
 )
 
+const minSigningSecretBytes = 32
+
 // Config encapsulates all runtime configuration for KyMessages.
 type Config struct {
 	InstallerSSO *applysetup.SSO   `json:"-"`
@@ -162,14 +164,13 @@ type PushConfig struct {
 	AllowPrivate    bool   `json:"-"` // Tests only
 }
 
-// RTCConfig holds native hybrid P2P + LiveKit SFU calling and KyCalendar meeting settings.
+// RTCConfig holds native hybrid P2P + LiveKit SFU calling settings.
 // LiveKit is optional: when unset, P2P WebRTC calls still work directly over /api/v1/ws.
 type RTCConfig struct {
-	LiveKitURL        string   `json:"livekit_url"`
-	LiveKitAPIKey     string   `json:"-"`
-	LiveKitAPISecret  string   `json:"-"`
-	STUNURLs          []string `json:"stun_urls"`
-	MeetingSyncSecret string   `json:"-"`
+	LiveKitURL       string   `json:"livekit_url"`
+	LiveKitAPIKey    string   `json:"-"`
+	LiveKitAPISecret string   `json:"-"`
+	STUNURLs         []string `json:"stun_urls"`
 }
 
 // LiveKitEnabled reports whether LiveKit SFU credentials and endpoint are configured.
@@ -346,7 +347,9 @@ func loadFromEnv(tenancyMode string) (*Config, error) {
 		return nil, errors.New("KY_SESSION_SECRET is required when KY_TENANCY_MODE=multi (every replica must verify the others' challenges)")
 	}
 	if sessionSecret == "" {
-		sessionSecret = generateRandomHex(32)
+		sessionSecret = generateRandomHex(minSigningSecretBytes)
+	} else if len(sessionSecret) < minSigningSecretBytes {
+		return nil, fmt.Errorf("KY_SESSION_SECRET must be at least %d bytes", minSigningSecretBytes)
 	}
 
 	encryptionKey, ok, err := keyfile.FromEnv("KY_ENCRYPTION_KEY", 32)
@@ -392,7 +395,7 @@ func loadFromEnv(tenancyMode string) (*Config, error) {
 	}
 
 	kyIdentityHMAC := getEnv("KY_KYIDENTITY_HMAC_SECRET", "")
-	rtcCfg, err := rtcFromEnv(kyIdentityHMAC)
+	rtcCfg, err := rtcFromEnv()
 	if err != nil {
 		return nil, err
 	}
@@ -556,7 +559,7 @@ func loadFromEnv(tenancyMode string) (*Config, error) {
 }
 
 // rtcFromEnv parses native hybrid P2P + LiveKit SFU settings.
-func rtcFromEnv(fallbackSyncSecret string) (RTCConfig, error) {
+func rtcFromEnv() (RTCConfig, error) {
 	rawURL := strings.TrimSpace(getEnv("KY_LIVEKIT_URL", ""))
 	apiKey := strings.TrimSpace(getEnv("KY_LIVEKIT_API_KEY", ""))
 	apiSecret := strings.TrimSpace(getEnv("KY_LIVEKIT_API_SECRET", ""))
@@ -596,6 +599,9 @@ func rtcFromEnv(fallbackSyncSecret string) (RTCConfig, error) {
 		if strings.ContainsFunc(apiKey, unicode.IsControl) || strings.ContainsFunc(apiSecret, unicode.IsControl) {
 			return RTCConfig{}, errors.New("LiveKit API credentials must not contain control characters")
 		}
+		if len(apiSecret) < minSigningSecretBytes {
+			return RTCConfig{}, fmt.Errorf("KY_LIVEKIT_API_SECRET or KY_LIVEKIT_API_SECRET_FILE must provide at least %d bytes", minSigningSecretBytes)
+		}
 	}
 
 	var stunURLs []string
@@ -614,13 +620,11 @@ func rtcFromEnv(fallbackSyncSecret string) (RTCConfig, error) {
 		}
 	}
 
-	syncSecret := strings.TrimSpace(getEnv("KY_MEETING_SYNC_SECRET", fallbackSyncSecret))
 	return RTCConfig{
-		LiveKitURL:        lkURL,
-		LiveKitAPIKey:     apiKey,
-		LiveKitAPISecret:  apiSecret,
-		STUNURLs:          stunURLs,
-		MeetingSyncSecret: syncSecret,
+		LiveKitURL:       lkURL,
+		LiveKitAPIKey:    apiKey,
+		LiveKitAPISecret: apiSecret,
+		STUNURLs:         stunURLs,
 	}, nil
 }
 
@@ -631,6 +635,10 @@ func rejectLegacyEnvironment() error {
 		name, value, _ := strings.Cut(entry, "=")
 		if rest, ok := strings.CutPrefix(name, "KY_KYSIGNON_"); ok && strings.TrimSpace(value) != "" {
 			return fmt.Errorf("legacy environment variable %s is set; use KY_KYIDENTITY_%s instead", name, rest)
+		}
+		// KyCalendar signs meetings with the suite pair secret (KY_KYCALENDAR_* or KyIdentity).
+		if name == "KY_MEETING_SYNC_SECRET" && strings.TrimSpace(value) != "" {
+			return errors.New("KY_MEETING_SYNC_SECRET is replaced by the KyCalendar pair: set KY_KYCALENDAR_URL and KY_KYCALENDAR_SECRET_FILE, or pair through KyIdentity")
 		}
 		if name == "KY_REGION" && strings.TrimSpace(value) != "" {
 			return errors.New("KY_REGION is replaced by KY_CELLS, the list of cells this deployment serves")

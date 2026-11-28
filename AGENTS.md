@@ -8,9 +8,10 @@ SCIM 2.0, and encrypted KyRecovery backup capsules.
 - `kymessages` is the binary and local image name; `KY_APP_NAME` defaults to
   `KyMessages`. `internal/config.AppVersion` is shared by CLI and capsule paths.
   Preserve explicit legacy service names for existing pairing pins/capsules.
-- Compose is a loopback local preview by default and runs `ghcr.io/busnes-app/kymessage-server:stable`
-  (`KY_IMAGE` pins a verified digest); it never runs an upstream base image. The build overlay
-  builds `kymessages:local`, never pulled. The app never runs as root: the image's `USER` is 10001 (owning
+- Compose binds to loopback by default. Build `kymessages:local` with the build overlay until
+  the first native release. Base Compose and the release workflow use the owner-approved
+  `ghcr.io/busnes-app/kymessages` package (`KY_IMAGE` pins a verified digest). The retired
+  Matrix images use `kymessage-server`. The app never runs as root: the image's `USER` is 10001 (owning
   its own `/app/data` and `/app/backups`); Compose runs it as `KY_UID:KY_GID` (required, the
   owner of `./data` and `./backups`) with `cap_drop: [ALL]`, `no-new-privileges`,
   `read_only: true` and a `/tmp` tmpfs; `scripts/check-compose-proxy.sh` fails if any of that is lost.
@@ -133,7 +134,7 @@ When the user requests a durable behavior change, record it here or in the relev
   overlay. Guide: [docs/Reverse_Proxy_Networking.md](docs/Reverse_Proxy_Networking.md).
 - Voice and video calls use native WebRTC signalling (`internal/rtc`) with configurable STUN
   (`KY_STUN_URLS`) and an optional LiveKit SFU (`KY_LIVEKIT_URL`, `KY_LIVEKIT_API_KEY`,
-  `KY_LIVEKIT_API_SECRET`). KyCalendar meeting rooms (`KY_MEETING_SYNC_SECRET`) admit external
+  `KY_LIVEKIT_API_SECRET`). KyCalendar meeting rooms (signed with the KyCalendar pair secret) admit external
   guests from a waiting room during the meeting.
 - `chat.Hub.Dispatch` sends an event that carries `user_id` only to that user's sockets, even when
   it also names a room (call signals, call migrations with their LiveKit token, lobby decisions);
@@ -156,15 +157,23 @@ When the user requests a durable behavior change, record it here or in the relev
   Suite presence (`internal/presence` decoders, `store.PresenceStore` keyed by tenant and user)
   serves `/api/suite/presence/{lookup,out-of-office,calendar,me}`.
 - End-to-end encryption (`docs/superpowers/specs/2026-11-22-e2ee-design.md`): `web/crypto` is a
-  Rust wasm-bindgen wrapper over vodozemac. Its committed build `web/src/crypto/pkg` must equal
+  Rust wasm-bindgen wrapper over vodozemac. Its generated build `web/src/crypto/pkg` must equal
   `web/crypto/build.sh` output (pinned Rust in `rust-toolchain.toml`, `wasm-bindgen-cli` 0.2.130;
   CI job "Crypto core"). The key server (`internal/api/e2ee_handlers.go`, `store.E2EEStore`)
   holds public keys and Olm ciphertext only; devices sign `api.E2EEDeviceSigned` and
   `api.E2EEOneTimeKeySigned` strings, which clients verify again. Encrypted rooms (E2): the web
   client (`web/src/crypto/engine.ts`, `web/src/chat/e2ee.ts`) sends only `e2ee_room_v1`; the
   server refuses `plain_v1` from everything but `kybot_` tokens (`api.CodeE2EERequired`), and the
-  CSP's one script exception is `'wasm-unsafe-eval'` for the crypto core. No release is published
-  while E2 is merged and E3-E5 are not (spec §10).
+  CSP's one script exception is `'wasm-unsafe-eval'` for the crypto cores. No release is published
+  while E2 is merged and E4-E5 are not (spec §10).
+- E3 identity and recovery is post-quantum (spec §3.1, §9.1; PQC Stack Plan ky-primitives#80):
+  `ky-primitives/{xwing,hybridsig}` v0.11.0 and `internal/e2eeid` run natively on the server.
+  `scripts/build-pqwasm.sh` builds the pinned shared `cmd/pqwasm` command with the product wire
+  adapter `internal/e2eeid/pqwasm/identity.go` into ignored `web/src/pqc/pqc.wasm` (Go 1.27.4).
+  npm test/build/dev generate both Go and Rust cores; no `.wasm` is tracked, including in dist.
+  CI's web job builds the complete dist artifact for server tests; tracked JS/types/dist still
+  pass sync checks. Clients share room keys only with devices their member's pinned master key signed. Migration 68 holds master
+  keys, cross-signatures, the X-Wing key backup and QR pairings; no private key reaches the server.
 - Only the staff org (`KY_STAFF_ORG_ID`) holds administrators (`config.TenancyConfig.MayAdminister`,
   enforced in directory sync and the `admin` middleware). Org-less local operators keep the
   install-wide console; per-org admin pages need a staff-org account.
@@ -208,12 +217,14 @@ When the user requests a durable behavior change, record it here or in the relev
 ## Verification
 
 CI (`.github/workflows/ci.yml`) runs on every push and pull request:
-- `make lint` equivalent: gofmt, `go vet`, `go mod tidy`/`verify`, and `scripts/check-compose-proxy.sh`, and `scripts/check-release-required.sh` (every CI job is in the release workflow's `REQUIRED` list), and `scripts/check-build-tags.sh` (the `kye2e` tag only in `internal/config/gate_*.go`; no build tags in release build inputs)
-- `go test -race` with coverage on SQLite, and the same suite against PostgreSQL 18
+- `make lint` equivalent: gofmt, `go vet`, `go mod tidy`/`verify`, and `scripts/check-compose-proxy.sh`, and `scripts/check-release-required.sh` (every CI job is in the release workflow's `REQUIRED` list), and `scripts/check-build-tags.sh` (the `kye2e` tag only in `internal/config/gate_*.go`; no build tags in release build inputs), and `scripts/check-pqc-tls.sh` (no `CurvePreferences` in non-test Go code, no `tlsmlkem` overrides outside tests/docs, and `TestOutboundPQTLS` passes normally and under `GODEBUG=fips140=on`)
+- `go test -race` with coverage on SQLite, and the same suite against PostgreSQL 18 (30-minute package budgets for the full API integration suite)
 - Bounded fuzzing (`go test -fuzz=… -fuzztime=Nx`, one step per target) of `FuzzClientIP`,
   `FuzzParseTrustedProxies`, `FuzzValidateName` and `FuzzNormalizePNG`; a crasher kept under
   `testdata/fuzz/<Target>/` replays in the normal test run
 - Frontend vitest suite, then typecheck/build plus a check that committed `web/dist` matches source, untracked files included (it is embedded in the binary)
+- Crypto cores: `web/src/crypto/pkg` (Rust/vodozemac) and `web/src/pqc` (Go/WASM, with the
+  `internal/e2eeid` and imported ky-primitives tests run under `GOOS=js GOARCH=wasm`) rebuilt; tracked wrappers are diffed, WASM stays untracked
 - `govulncheck` and `npm audit --audit-level=high`
 - `scripts/backup-acceptance.py` starts its own loopback process and disposable
   SQLite/local-copy directories. It exercises real scheduler ticks (~3 minutes),
@@ -239,6 +250,7 @@ the compose checks. Run the same checks locally with `make ci` (`tidy-check lint
 - [internal/config/AGENTS.md](internal/config/AGENTS.md): Configuration management and environment loader.
 - [internal/store/AGENTS.md](internal/store/AGENTS.md): Pluggable database abstraction layer (SQLite & PostgreSQL).
 - [internal/crypto/AGENTS.md](internal/crypto/AGENTS.md): Cryptographic primitives (AES-256-GCM, HMAC, SHA-256, randomness, PKCE).
+- [internal/e2eeid/AGENTS.md](internal/e2eeid/AGENTS.md): E3 identity formats (master key statements, recovery key, key backup, QR transfer) shared with the browser.
 - [internal/auth/AGENTS.md](internal/auth/AGENTS.md): Authentication, MFA (TOTP), recovery codes, sessions, and CAPTCHA.
 - [internal/sso/AGENTS.md](internal/sso/AGENTS.md): KyIdentity OIDC sign-in and signed directory webhooks.
 - [internal/scim/AGENTS.md](internal/scim/AGENTS.md): SCIM 2.0 user and group provisioning engine.
@@ -263,7 +275,7 @@ The loop closes its `done` channel
 only where it returns, between runs, and `runServer` cancels and waits on that channel after
 `httpServer.Shutdown` and before the store closes, then waits on `api.Server.WaitDetached()` for
 the pair, pin-key, unpair, deposit, export and drill handlers, which detach or run long and can outlive
-`Shutdown`. In `KY_TENANCY_MODE=multi` (refused at startup in this release; `internal/config`) the capsule scheduler returns at once (`backup.MultiTenantOff`, which backup status reports as `scheduler_error`; no audit row), and each other loop runs a tick only while it holds that job's `job_leases` row (`leasedJobs`: jobs `maintenance`, `agent_expiry`, `attachment_sweep`; lease three ticks, renewed each tick; `maintenance` also runs `PruneShared` in multi mode; `poolLoop` runs `pool_report`, and `leasedLoop` runs `tenancy_sync` and `org_purge` every 5 minutes, in multi mode only). A multi-mode start runs `StartupTenancySync` before serving and fails startup when KyIdentity cannot answer and the last recorded sync is older than 24 h. Single mode passes `everyReplica` and runs every tick as before. `kymessages invalidate-grants` runs `InvalidateRestoredGrants` on the configured database, for a PostgreSQL restore (docs/RESTORE.md, multi section).
+`Shutdown`. In `KY_TENANCY_MODE=multi` (refused at startup in this release; `internal/config`) the capsule scheduler returns at once (`backup.MultiTenantOff`, which backup status reports as `scheduler_error`; no audit row), and each other loop runs a tick only while it holds that job's `job_leases` row (`leasedJobs`: jobs `maintenance`, `agent_expiry`, `attachment_sweep`; lease three ticks, renewed each tick; `maintenance` also runs `PruneShared` in multi mode; `poolLoop` runs `pool_report`, and `leasedLoop` runs `tenancy_sync` and `org_purge` every 5 minutes, in multi mode only). A multi-mode start runs `StartupTenancySync` before serving and fails startup when KyIdentity cannot answer and the last recorded sync is older than 24 h. Single mode passes `everyReplica` and runs every tick as before. `kymessages invalidate-grants` runs `InvalidateRestoredGrants` on the configured database, for a PostgreSQL restore (docs/RESTORE.md, multi section), clearing restored grants along with KyIdentity sync freshness/cursors, active customer org admission, and cached storage pool grants so even a <24h backup requires a fresh KyIdentity sync before serving.
 `maintenanceLoop` sweeps expired device pairings, expired suite replay IDs
 (`suite_replay_events`) and to-device mail older than `api.E2EEMailboxTTL` (30 days) every
 minute, each with a 30-second deadline; `agentExpiryLoop` revokes idle or inactive-owner bot tokens every hour; `attachmentSweepLoop` expires staged attachments older than `KY_ATTACHMENTS_PENDING_TTL` at start and every 15 minutes. All background loops join the backup scheduler's wait before the same shutdown drain finishes. Nothing writes

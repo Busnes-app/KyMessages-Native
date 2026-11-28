@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Builds the committed WebAssembly core into web/src/crypto/pkg. CI reruns this and fails if the
-# output differs, so the module shipped in web/dist is the one this source produces.
+# Builds the untracked WebAssembly core and its tracked JS/types from pinned Rust sources.
 set -euo pipefail
 cd "$(dirname "$0")"
+export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
 want=0.2.130
 have=$(wasm-bindgen --version | awk '{print $2}')
 [ "$have" = "$want" ] || { echo "wasm-bindgen-cli $want required, found $have" >&2; exit 1; }

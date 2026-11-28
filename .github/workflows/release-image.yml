@@ -26,7 +26,7 @@ jobs:
       attestations: write
       checks: read
     env:
-      IMAGE_NAME: ghcr.io/busnes-app/kymessage-server
+      IMAGE_NAME: ghcr.io/busnes-app/kymessages
     steps:
       # Red, not skipped: a skipped job is green and leaves a release with no image.
       - name: Validate release version
@@ -99,6 +99,7 @@ jobs:
             End-to-end smoke test
             Docker image build & run
             Crypto core (Rust/WASM)
+            PQC core (Go/WASM)
         run: |
           set -euo pipefail
           sha="$(git rev-parse HEAD)"

@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { newIdentity } from './identity.mjs';
 
 async function login(page) {
   await page.goto('/');
@@ -23,6 +24,20 @@ async function send(page, text) {
   await page.getByLabel('Message input').fill(text);
   await page.getByLabel('Message input').press('Enter');
   expect((await posted).status()).toBe(201);
+}
+
+// E3: room keys reach only devices the account's master key signed. The first browser sets up
+// a fresh identity through the real screens (or resets the one an earlier test made) and reads
+// the recovery key off the screen; the peer verifies itself with that key.
+async function verifyWithRecoveryKey(page, key) {
+  const banner = page.getByRole('status').filter({ hasText: 'Verify this device' });
+  await banner.getByRole('button').click();
+  await page.getByRole('radio', { name: /recovery key/ }).check();
+  await page.getByLabel('Recovery key', { exact: true }).fill(key);
+  await page.getByRole('button', { name: 'Verify', exact: true }).click();
+  // The open dialog hides the banner from the accessibility tree: wait for it to close first.
+  await expect(page.getByRole('dialog')).toHaveCount(0, { timeout: 15_000 });
+  await expect(banner).toHaveCount(0);
 }
 
 async function snapshot(page) {
@@ -63,6 +78,7 @@ for (const broadcast of [true, false]) {
     expect(created.ok()).toBe(true);
     await page.reload();
     await openRoom(page, name);
+    const recoveryKey = await newIdentity(page);
     // A separate profile supplies a genuine peer device and room key, under the same real account.
     const peerContext = await browser.newContext({ baseURL: new URL(page.url()).origin });
     const peer = await peerContext.newPage();
@@ -71,6 +87,7 @@ for (const broadcast of [true, false]) {
     try {
       await login(peer);
       await openRoom(peer, name);
+      await verifyWithRecoveryKey(peer, recoveryKey);
       const history = `history-${name}`;
       await send(peer, history);
       await expect(page.getByRole('region', { name: 'Conversation' }).getByText(history, { exact: true })).toBeVisible();

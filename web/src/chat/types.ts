@@ -129,7 +129,9 @@ export type MessageDeliveryState =
  */
 // `gen` is the key generation (keyGeneration) the open saw, on waiting and on retryable failures:
 // a newer one means keys arrived or the device started since, so the message is worth opening again.
-export type E2EEState = { kind: 'decrypted' } | { kind: 'waiting'; gen?: number } | { kind: 'failed'; reason: string; gen?: number };
+// trust: set when the room key is not vouched for: 'backup' (restored from the key backup) or
+// 'unverified' (from a device its member's master key does not vouch for).
+export type E2EEState = { kind: 'decrypted'; trust?: 'backup' | 'unverified' } | { kind: 'waiting'; gen?: number } | { kind: 'failed'; reason: string; gen?: number };
 
 export interface ChatMessage {
   id: string;

@@ -301,6 +301,29 @@ func seedUserGrants(t *testing.T, st store.Store, userID, hash string) {
 	if err := st.Devices().CreatePairing(ctx, &store.DevicePairing{Secret: "pair-" + userID, UserID: userID, Status: "pending", CreatedAt: now, ExpiresAt: now.Add(time.Minute)}, hash); err != nil {
 		t.Fatal(err)
 	}
+	seedE2EEPairing(t, st, userID, false)
+}
+
+// seedE2EEPairing opens a QR encryption pairing for userID from a verified device, joined and
+// with keys sealed to it when sealed.
+func seedE2EEPairing(t *testing.T, st store.Store, userID string, sealed bool) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now()
+	signedInitiator(t, st, userID, store.DefaultTenantID, "DEVQR_"+userID)
+	p := &store.E2EEPairing{ID: "qr-" + userID, TenantID: store.DefaultTenantID, UserID: userID, InitiatorDevice: "DEVQR_" + userID, MasterVersion: 1, ExpiresAt: now.Add(time.Minute)}
+	if err := st.E2EE().CreatePairing(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	if !sealed {
+		return
+	}
+	if err := st.E2EE().JoinPairing(ctx, store.DefaultTenantID, userID, p.ID, "DEVNEW_"+userID, "eph", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.E2EE().SealPairing(ctx, store.DefaultTenantID, userID, p.ID, p.InitiatorDevice, "sealed-keys", now); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func assertNoGrants(t *testing.T, st store.Store, userID string) {
@@ -314,6 +337,9 @@ func assertNoGrants(t *testing.T, st store.Store, userID string) {
 	}
 	if _, err := st.Devices().GetPairingBySecret(ctx, "pair-"+userID); err == nil {
 		t.Error("device pairing survived")
+	}
+	if _, err := st.E2EE().GetPairing(ctx, store.DefaultTenantID, userID, "qr-"+userID, time.Now()); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("QR encryption pairing survived: %v", err)
 	}
 }
 
@@ -329,6 +355,14 @@ func TestDeleteUserSessionsRevokesEveryGrant(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertNoGrants(t, st, "usr_g")
+	// A QR pairing whose keys were already sealed goes too.
+	seedE2EEPairing(t, st, "usr_g", true)
+	if err := st.Sessions().DeleteUserSessions(context.Background(), "usr_g"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.E2EE().GetPairing(context.Background(), store.DefaultTenantID, "usr_g", "qr-usr_g", time.Now()); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("sealed QR pairing survived: %v", err)
+	}
 }
 
 // Enrolment only moves forward from the expected state; enabling revokes every earlier grant.
