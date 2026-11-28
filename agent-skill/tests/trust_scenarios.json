@@ -1,0 +1,45 @@
+{
+  "about": "Trust scenarios (E2EE spec §8) run through both clients: test_kybot.py Scenarios (kybot.py) and web/src/crypto/trustScenarios.test.ts (engine.ts). Each side builds the scenario by name and must report exactly expect. Members a_dana (devices d1, d2), the sender, a bot of Dana's in a later lookup batch behind 99 filler members.",
+  "scenarios": [
+    {
+      "name": "removal_seen_late",
+      "says": "The batch naming Dana shows her old list (d1, d2); the later batch with her bot shows her newer list without d2. d2 gets no room key.",
+      "expect": {
+        "d1_gets_key": true,
+        "d2_gets_key": false
+      }
+    },
+    {
+      "name": "stale_list_in_later_batch",
+      "says": "The batch naming Dana shows her newer list (d1 only); the later batch with her bot shows the older one (d1, d2). The older list counts for nothing and blocks nothing: d1 gets the room key, d2 does not.",
+      "expect": {
+        "d1_gets_key": true,
+        "d2_gets_key": false
+      }
+    },
+    {
+      "name": "identity_conflict_across_batches",
+      "says": "Dana is pinned. The batch naming her shows her pinned key; the later batch with her bot shows another key. Dana is blocked: nothing goes to her devices or her bot.",
+      "expect": {
+        "d1_gets_key": false,
+        "bot_gets_key": false
+      }
+    },
+    {
+      "name": "delisted_fresh_mail",
+      "says": "Dana removes d2 from her list (its row and cross-signature stay). d2 then tries to send a room key: the server refuses it and nobody reads it.",
+      "expect": {
+        "sent": false,
+        "readable": false
+      }
+    },
+    {
+      "name": "delisted_delayed_mail",
+      "says": "d2 sends a room key while listed; Dana removes d2 before the recipient reads its mail. The key is still read (owner decision 28 Nov 2026: a removed device's earlier mail stays deliverable).",
+      "expect": {
+        "sent": true,
+        "readable": true
+      }
+    }
+  ]
+}

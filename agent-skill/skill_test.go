@@ -91,7 +91,7 @@ func TestZipHoldsTheSkillFolder(t *testing.T) {
 		names = append(names, f.Name)
 	}
 	sort.Strings(names)
-	want := "kymessages/SKILL.md kymessages/references/hermes.md kymessages/references/openclaw.md"
+	want := "kymessages/SKILL.md kymessages/references/hermes.md kymessages/references/openclaw.md kymessages/scripts/kybot.py kymessages/scripts/requirements.txt"
 	if strings.Join(names, " ") != want {
 		t.Fatalf("zip has %v", names)
 	}

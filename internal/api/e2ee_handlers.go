@@ -7,9 +7,13 @@ import (
 	"errors"
 	"net/http"
 	"regexp"
+	"slices"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Busnes-app/ky_server_base/internal/chat"
+	"github.com/Busnes-app/ky_server_base/internal/e2eeid"
 	"github.com/Busnes-app/ky_server_base/internal/store"
 )
 
@@ -209,10 +213,17 @@ func (s *Server) handleE2EEQuery(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		masters, err = s.store.E2EE().ListMasterKeys(r.Context(), tenantID, req.UserIDs)
 	}
+	var bots map[string]e2eeBotDevicesJSON
+	var owners []store.E2EEMasterKey
+	if err == nil {
+		bots, owners, err = s.botLists(r, tenantID, req.UserIDs)
+	}
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to load devices")
 		return
 	}
+	// A bot's owner's master key comes with its list, so a client can check the owner's signature.
+	masters = append(masters, owners...)
 	version := map[string]int64{}
 	masterOut := map[string]e2eeMasterJSON{}
 	for i := range masters {
@@ -231,7 +242,11 @@ func (s *Server) handleE2EEQuery(w http.ResponseWriter, r *http.Request) {
 		}
 		out[d.UserID] = append(out[d.UserID], j)
 	}
-	s.writeJSON(w, http.StatusOK, map[string]any{"tenant_id": tenantID, "devices": out, "master_keys": masterOut})
+	resp := map[string]any{"tenant_id": tenantID, "devices": out, "master_keys": masterOut}
+	if len(bots) > 0 {
+		resp["bot_devices"] = bots
+	}
+	s.writeJSON(w, http.StatusOK, resp)
 }
 
 // POST /api/v1/keys/claim takes one one-time key per named device, to start Olm sessions.
@@ -302,6 +317,15 @@ func (s *Server) handleE2EESendToDevice(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
+	// New mail only from a device on its user's current signed list (spec §8): mail it sent while
+	// listed stays deliverable, but a removed device cannot send more.
+	if listed, err := s.deviceListed(r, tenantID, user.ID, sender); err != nil {
+		s.writeError(w, http.StatusInternalServerError, "Failed to load the device list")
+		return
+	} else if !listed {
+		s.writeError(w, http.StatusForbidden, "This device is not on its signed device list")
+		return
+	}
 	msgs := make([]store.E2EEToDevice, 0, len(req.Messages))
 	recipients := map[string]struct{}{}
 	for _, m := range req.Messages {
@@ -320,7 +344,7 @@ func (s *Server) handleE2EESendToDevice(w http.ResponseWriter, r *http.Request) 
 		}
 		msgs = append(msgs, store.E2EEToDevice{TenantID: tenantID, RecipientUserID: m.UserID, RecipientDeviceID: m.DeviceID,
 			SenderUserID: user.ID, SenderDeviceID: sender.DeviceID,
-			SenderCurve25519: sender.Curve25519, SenderEd25519: sender.Ed25519, SenderSignature: sender.Signature,
+			SenderCurve25519: sender.Curve25519, SenderEd25519: sender.Ed25519, SenderSignature: sender.Signature, SenderMasterSignature: sender.MasterSignature,
 			Type: m.Type, Content: m.Content})
 		recipients[m.UserID] = struct{}{}
 	}
@@ -334,7 +358,23 @@ func (s *Server) handleE2EESendToDevice(w http.ResponseWriter, r *http.Request) 
 	s.writeJSON(w, http.StatusOK, map[string]int{"sent": len(msgs)})
 }
 
-// GET /api/v1/to-device?device_id= reads the caller's oldest unacknowledged device mail.
+// deviceListed says whether d is on userID's current signed list: a person's device list, or
+// for a bot the list its owner signed, with the same keys.
+func (s *Server) deviceListed(r *http.Request, tenantID, userID string, d *store.E2EEDevice) (bool, error) {
+	if strings.HasPrefix(userID, "bot_") {
+		bots, _, err := s.botLists(r, tenantID, []string{userID})
+		return err == nil && slices.Contains(bots[userID].Devices, e2eeid.BotDevice{DeviceID: d.DeviceID, Curve25519: d.Curve25519, Ed25519: d.Ed25519}), err
+	}
+	ms, err := s.store.E2EE().ListMasterKeys(r.Context(), tenantID, []string{userID})
+	if err != nil || len(ms) != 1 {
+		return false, err
+	}
+	var ids []string
+	return json.Unmarshal([]byte(ms[0].DeviceList), &ids) == nil && slices.Contains(ids, d.DeviceID), nil
+}
+
+// GET /api/v1/to-device?device_id=[&after=] reads the caller's oldest unacknowledged device
+// mail, above ID after if given (a client paging past mail it keeps for later).
 func (s *Server) handleE2EEToDevice(w http.ResponseWriter, r *http.Request) {
 	user, _, ok := s.e2eeCaller(w, r)
 	if !ok {
@@ -344,7 +384,16 @@ func (s *Server) handleE2EEToDevice(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	msgs, err := s.store.E2EE().ToDevice(r.Context(), user.ID, dev.DeviceID, e2eeMailboxPage)
+	var after int64
+	if v := r.URL.Query().Get("after"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
+			after = n
+		} else {
+			s.writeError(w, http.StatusBadRequest, "Invalid after")
+			return
+		}
+	}
+	msgs, err := s.store.E2EE().ToDevice(r.Context(), user.ID, dev.DeviceID, after, e2eeMailboxPage)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Failed to read mail")
 		return
@@ -353,8 +402,8 @@ func (s *Server) handleE2EEToDevice(w http.ResponseWriter, r *http.Request) {
 		ID             int64  `json:"id"`
 		SenderUserID   string `json:"sender_user_id"`
 		SenderDeviceID string `json:"sender_device_id"`
-		// The sender device's self-signed keys at send time, so mail from a device signed out
-		// since stays verifiable.
+		// The sender device's self-signed keys (and master cross-signature) at send time, so
+		// mail from a device signed out since stays verifiable.
 		SenderKeys e2eeDeviceJSON `json:"sender_keys"`
 		Type       string         `json:"type"`
 		Content    string         `json:"content"`
@@ -362,7 +411,7 @@ func (s *Server) handleE2EEToDevice(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]mail, len(msgs))
 	for i, m := range msgs {
-		out[i] = mail{m.ID, m.SenderUserID, m.SenderDeviceID, e2eeDeviceJSON{DeviceID: m.SenderDeviceID, Curve25519: m.SenderCurve25519, Ed25519: m.SenderEd25519, Signature: m.SenderSignature}, m.Type, m.Content, m.CreatedAt.UnixMilli()}
+		out[i] = mail{m.ID, m.SenderUserID, m.SenderDeviceID, e2eeDeviceJSON{DeviceID: m.SenderDeviceID, Curve25519: m.SenderCurve25519, Ed25519: m.SenderEd25519, Signature: m.SenderSignature, MasterSignature: m.SenderMasterSignature}, m.Type, m.Content, m.CreatedAt.UnixMilli()}
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	s.writeJSON(w, http.StatusOK, map[string]any{"messages": out})

@@ -104,9 +104,10 @@ type E2EEStore interface {
 	// replicas; with none left it returns the fallback key without removing it, or ErrNotFound.
 	ClaimOneTimeKey(ctx context.Context, userID, deviceID string) (*E2EEOneTimeKey, error)
 	SendToDevice(ctx context.Context, msgs []E2EEToDevice) error
-	// ToDevice reads a device's oldest unacknowledged mail. There is no cursor: on PostgreSQL
-	// IDs are assigned at insert, not commit, so a row with a lower ID can appear later.
-	ToDevice(ctx context.Context, userID, deviceID string, limit int) ([]E2EEToDevice, error)
+	// ToDevice reads a device's oldest unacknowledged mail with an ID above after. Keep after
+	// within one read: on PostgreSQL IDs are assigned at insert, not commit, so a row with a
+	// lower ID can appear later, and a stored cursor would skip it.
+	ToDevice(ctx context.Context, userID, deviceID string, after int64, limit int) ([]E2EEToDevice, error)
 	// AckToDevice deletes exactly the named messages of a device, never one it was not shown.
 	AckToDevice(ctx context.Context, userID, deviceID string, ids []int64) error
 	PruneToDevice(ctx context.Context, before time.Time) error
@@ -173,6 +174,25 @@ type E2EEStore interface {
 	ConsumePairing(ctx context.Context, tenantID, userID, id, newDevice string, now time.Time) (*E2EEPairing, error)
 	DeletePairing(ctx context.Context, tenantID, userID, id string) error
 	PrunePairings(ctx context.Context, now time.Time) error
+
+	// ListBotDevices reads the owner-signed device lists of the named bots in tenantID.
+	ListBotDevices(ctx context.Context, tenantID string, botIDs []string) ([]E2EEBotDevices, error)
+	// PutBotDevices stores b at b.Epoch once proof accepts it against the owner's master key at
+	// b.OwnerVersion (read and locked in the same transaction), while the bot's list is at epoch
+	// expected; ErrE2EEVersion otherwise. expected 0 writes a first list or replaces one another
+	// owner identity (owner or version) signed; within one identity the epoch only rises.
+	PutBotDevices(ctx context.Context, b *E2EEBotDevices, expected int64, proof Proof) error
+	// DeleteUserDevices removes every device of userID, with its keys and mail.
+	DeleteUserDevices(ctx context.Context, userID string) error
+}
+
+// E2EEBotDevices is the device list a bot's owner signed with their master key (E4): Devices is
+// the JSON array of {device_id, curve25519, ed25519}, sorted by device ID.
+type E2EEBotDevices struct {
+	TenantID, BotUserID, OwnerUserID string
+	OwnerVersion, Epoch              int64
+	Devices, Signature               string
+	UpdatedAt                        time.Time
 }
 
 // E2EEMasterKey is a user's encryption identity: the hybrid master public key and its
@@ -255,6 +275,7 @@ type E2EEToDevice struct {
 	// The sender device's self-signed public keys when it sent the mail.
 	SenderCurve25519, SenderEd25519 string
 	SenderSignature                 string
+	SenderMasterSignature           string // its master cross-signature then, if verified
 	Type, Content                   string
 	CreatedAt                       time.Time
 }

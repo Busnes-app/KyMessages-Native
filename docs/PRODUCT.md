@@ -45,9 +45,12 @@ archived under `docs/superpowers/`.
 - Room messages and edits are end-to-end encrypted by the web client (Olm + Megolm, E2 of
   `docs/superpowers/specs/2026-11-22-e2ee-design.md`): each browser is a device with its own
   keys, members' sessions may post only `e2ee_room_v1` envelopes, and the server stores
-  ciphertext it cannot open. Bots (`kybot_` tokens) still post plaintext, shown as "Not encrypted
-  (bot)"; older messages show "Sent before encryption"; files stay plaintext, shown as "File not
-  encrypted", until E5; meeting guests cannot read members' messages. Not released: no encryption
+  ciphertext it cannot open. Bots are devices too (E4): the server refuses plaintext from
+  everyone, and a bot's device gets room keys only once its owner vouches for it ("Your bots",
+  after comparing the code the bot shows); its messages read "Bot, verified by its owner".
+  Files and thumbnails are encrypted in the browser (E5). Older messages show "Sent before
+  encryption" (a bot's older ones "Not encrypted (bot)"), older files "File not encrypted";
+  meeting guests cannot read members' messages. Not released: no encryption
   release is published until E1-E5 ship together. E3 now shares room keys only with devices
   signed by the member's pinned master identity and present on its signed device list;
   an unverified device cannot send new encrypted messages. Because the server cannot read
@@ -154,6 +157,9 @@ archived under `docs/superpowers/`.
 **Agents (bots).**
 - Admins can provision native bot/agent accounts (`agent-<name>`) owned by an organization member,
   minting one-time scoped bearer tokens with generated skill configs for supported agent runtimes.
+- A bot reads and posts through `agent-skill/kymessages/scripts/kybot.py` (vodozemac and
+  `cryptography`), an end-to-end encrypted device whose keys stay with the bot; its owner vouches
+  for each device with their master key, and revoking the bot removes its devices.
 - Agents inherit their owner's organization (`org_id`), follow their owner's offboarding state,
   auto-expire after 90 days of inactivity, and cannot join voice/video calls.
 
@@ -178,9 +184,10 @@ archived under `docs/superpowers/`.
 - Matrix protocol / Synapse / MAS / Element Web / server-to-server federation (retired; see
   `docs/superpowers/` for historical records).
 - A released end-to-end encryption claim, for now: encrypted rooms (E2) and identity/recovery
-  (E3) are built, but bot devices (E4), file encryption (E5) and calls (E6) are not, so no release
-  says "end-to-end encrypted" yet (`docs/superpowers/specs/2026-11-22-e2ee-design.md` §10).
-  Bot messages, files and messages from before the upgrade are stored readable by the operator.
+  (E3), bot devices (E4) and file encryption (E5) are built, but no release says "end-to-end
+  encrypted" until the hostile review of E1-E5 (spec §11) is done; calls (E6) are not built
+  (`docs/superpowers/specs/2026-11-22-e2ee-design.md` §10). Messages and files from before the
+  upgrade are stored readable by the operator.
 - Call recording or third-party hosted calling SaaS.
 
 

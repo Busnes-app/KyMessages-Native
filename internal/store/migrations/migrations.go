@@ -306,6 +306,9 @@ ALTER TABLE mfa_challenges ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';`,
 	// E2EE E5: kept original bodies of edited encrypted messages with files, staged blob deletes.
 	{Version: 69, Name: "message_original_body", SQLite: originalBodySchema, Postgres: originalBodySchema},
 	{Version: 70, Name: "blob_delete_intents", SQLite: blobDeleteIntentsSchema, Postgres: blobDeleteIntentsSchema},
+	// E2EE E4: the device list each bot's owner signed.
+	{Version: 71, Name: "e2ee_bot_devices", SQLite: e2eeBotsSchema, Postgres: e2eeBotsSchema},
+	{Version: 72, Name: "e2ee_mail_sender_master_signature", SQLite: e2eeMailSenderMasterSchema, Postgres: e2eeMailSenderMasterSchema},
 }
 
 const tenantDirectorySchema = `
@@ -544,6 +547,12 @@ const e2eeMailSenderKeysSchema = `
 ALTER TABLE e2ee_to_device ADD COLUMN sender_curve25519 VARCHAR(64) NOT NULL DEFAULT '';
 ALTER TABLE e2ee_to_device ADD COLUMN sender_ed25519 VARCHAR(64) NOT NULL DEFAULT '';
 ALTER TABLE e2ee_to_device ADD COLUMN sender_signature VARCHAR(128) NOT NULL DEFAULT '';
+`
+
+// The sender device's master cross-signature at send time, so a bot can still verify mail
+// from a device that signed out (and left the device list) before the bot read it.
+const e2eeMailSenderMasterSchema = `
+ALTER TABLE e2ee_to_device ADD COLUMN sender_master_signature TEXT NOT NULL DEFAULT '';
 `
 
 const e2eeToDevicePostgres = `

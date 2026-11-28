@@ -199,6 +199,15 @@ jobs:
           dirty="$(git status --porcelain -- web/dist)"
           if [ -n "$dirty" ]; then printf '%s\n' "$dirty"; exit 1; fi
 
+      # The bot device bundle (E4): shared vectors, trust, and Olm/Megolm with web/crypto's core.
+      - name: Bot bundle (Python)
+        env:
+          KYBOT_REQUIRE_INTEROP: "1"
+        run: |
+          python3 -m venv "$RUNNER_TEMP/kybot"
+          "$RUNNER_TEMP/kybot/bin/pip" install --only-binary=:all: -r agent-skill/kymessages/scripts/requirements.txt
+          "$RUNNER_TEMP/kybot/bin/python" -B -m unittest discover -s agent-skill/tests -v
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: web-dist

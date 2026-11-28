@@ -81,6 +81,9 @@ export function attachmentView(msg: ChatMessage): AttachmentView {
   return view;
 }
 
+/** A bot's message from a device its owner vouched for (E4): decrypted and authenticated. */
+const botVerified = (msg: ChatMessage) => msg.e2ee?.kind === 'decrypted' && !msg.e2ee.trust;
+
 /** Why a decrypted message's sender is not vouched for, or nothing when it is. */
 export function trustLabel(msg: ChatMessage): string | null {
   if (msg.e2ee?.kind !== 'decrypted' || !msg.e2ee.trust) return null;
@@ -278,7 +281,11 @@ export const MessageRow: React.FC<MessageRowProps> = ({
           <div className="chat-msg-meta">
             <span className="chat-msg-author">{authorLabel}</span>
             {isWebhookSender(message.sender_id) && <span className="chat-msg-badge">Webhook</span>}
-            {isBotSender(message.sender_id) && <span className="chat-msg-badge">Bot</span>}
+            {isBotSender(message.sender_id) && (
+              <span className="chat-msg-badge" title={botVerified(message) ? 'Sent from a device the bot’s owner vouched for' : undefined}>
+                {botVerified(message) ? 'Bot, verified by its owner' : 'Bot'}
+              </span>
+            )}
             <time className="chat-msg-time" dateTime={new Date(message.created_at).toISOString()}>
               {formatTime(message.created_at)}
             </time>

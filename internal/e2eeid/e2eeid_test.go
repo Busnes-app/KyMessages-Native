@@ -379,6 +379,36 @@ func writeVectors(t *testing.T) {
 	pins := b64.EncodeToString([]byte(`{"usr_bob":"fingerprint"}`))
 	sealedPins := must(t, "pinsSeal", ms, tenant, user, "3", pins).(string)
 	pinsWrite := str(must(t, "signPinsWrite", ms, tenant, user, "1", "3", sealedPins))
+	vs := append(baseVectors(t, tenant, user, device, curve, ed, ms, mp, xs, xp, es, ep, rk, rtext, selfSig, devSig, bkSig, plain, sender, sealedBackup, forgedBackup, devList, digest, reserve, batch, batchW, wrapM, wrapB, pairing, qr, transfer, code, pins, sealedPins, pinsWrite), botVectors(t, ms, mp["public_key"])...)
+	out, err := json.MarshalIndent(vs, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(vectorsPath, append(out, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// botVectors are the E4 bot device list vectors: an owner's master key vouching for its bot's
+// devices.
+func botVectors(t *testing.T, ms, pub string) []vector {
+	const tenant, owner, bot = "00000000-0000-4000-8000-00000000000a", "usr_alice", "bot_helper"
+	const devs = `[{"device_id":"BOTDEVICE1","curve25519":"QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU","ed25519":"MDEyMzQ1Njc4OWFiY2RlZmdoaWprbG1ub3BxcnN0dXY"}]`
+	const evil = `[{"device_id":"BOTDEVICE1","curve25519":"QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU","ed25519":"ZXZpbGV2aWxldmlsZXZpbGV2aWxldmlsZXZpbGV2aWw"}]`
+	sig := must(t, "signBotDevices", ms, tenant, owner, "1", bot, "2", devs).(string)
+	devList := must(t, "signDeviceList", ms, tenant, owner, "1", "2", `["BOTDEVICE1"]`).(string)
+	return []vector{
+		{Name: "bot devices verify", Call: "verifyBotDevices", Args: []string{pub, tenant, owner, "1", bot, "2", devs, sig}, Want: true},
+		{Name: "bot devices at another epoch", Call: "verifyBotDevices", Args: []string{pub, tenant, owner, "1", bot, "3", devs, sig}, Want: false},
+		{Name: "bot devices for another bot", Call: "verifyBotDevices", Args: []string{pub, tenant, owner, "1", "bot_other", "2", devs, sig}, Want: false},
+		{Name: "bot devices vouched by another owner", Call: "verifyBotDevices", Args: []string{pub, tenant, "usr_bob", "1", bot, "2", devs, sig}, Want: false},
+		{Name: "bot devices with a device's key swapped", Call: "verifyBotDevices", Args: []string{pub, tenant, owner, "1", bot, "2", evil, sig}, Want: false},
+		{Name: "bot devices emptied", Call: "verifyBotDevices", Args: []string{pub, tenant, owner, "1", bot, "2", `[]`, sig}, Want: false},
+		{Name: "a device list is no bot device list", Call: "verifyBotDevices", Args: []string{pub, tenant, owner, "1", bot, "2", devs, devList}, Want: false},
+	}
+}
+
+func baseVectors(t *testing.T, tenant, user, device, curve, ed, ms string, mp map[string]string, xs, xp, es, ep, rk, rtext, selfSig, devSig, bkSig, plain, sender, sealedBackup, forgedBackup, devList, digest, reserve, batch, batchW, wrapM, wrapB, pairing string, qr map[string]string, transfer, code, pins, sealedPins, pinsWrite string) []vector {
 
 	tamperedAt := func(s string, i int) string {
 		b, _ := b64.DecodeString(s)
@@ -445,11 +475,5 @@ func writeVectors(t *testing.T) {
 		{Name: "pins under another master key", Call: "pinsOpen", Args: []string{seed("other", e2eeid.MasterSeedBytes), tenant, user, "3", sealedPins}, Error: true},
 		{Name: "transfer to another device", Call: "transferOpen", Args: []string{es, qr["secret"], pairing, "DEVICE_ALICE_1", "DEVICE_ALICE_3", transfer}, Error: true},
 	}
-	out, err := json.MarshalIndent(vs, "", "  ")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(vectorsPath, append(out, '\n'), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	return vs
 }

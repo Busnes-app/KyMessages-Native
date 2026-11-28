@@ -11,7 +11,7 @@
 // entries must carry the master key's MAC. A device that is not verified trusts nobody.
 // Nothing the server says can delete this device's copy of the master and backup seeds.
 import { InboundGroupSession } from './index';
-import { b64, ensurePQC, pqc, PQCUnavailable, unb64, type BackupRef, type Hybrid } from '../pqc/index';
+import { b64, ensurePQC, pqc, PQCUnavailable, unb64, type BackupRef, type BotDevice, type Hybrid } from '../pqc/index';
 import type { CryptoStore } from './store';
 import { backupCoverKey, backupQueueKey, backupRefusedKey, Conflict, IdentityMoved, inboundKey, isObj, isStr, isTransient, parseJSON, sleep, Transient, type InboundRecord } from './records';
 
@@ -194,6 +194,9 @@ const pinKey = (userId: string) => `mpin:${userId}`;
 const changeKey = (userId: string) => `mchg:${userId}`;
 /** The newest device list seen for one identity: scoped to org, user, fingerprint and version. */
 const listKey = (tenantId: string, userId: string, fingerprint: string, version: number) => `dlh:${tenantId}:${userId}:${fingerprint}:${version}`;
+/** The newest owner-signed list seen for one bot, per owner identity (E4). */
+const botKey = (tenantId: string, botId: string, ownerId: string, fingerprint: string) => `blh:${tenantId}:${botId}:${ownerId}:${fingerprint}`;
+const botOwnerKey = (tenantId: string, botId: string) => `bown:${tenantId}:${botId}`;
 const RETIRING = 'identity:retiring';
 const BACKUP_BATCH = 100;
 const BACKUP_PAGE_MAX = 200;
@@ -245,6 +248,26 @@ function memo(fields: string[], check: () => boolean): boolean {
 
 // A tagged hybridsig key is 2000 bytes and a signature 3389; base64 makes them 2667 and 4519.
 const isHybrid = (v: unknown): v is Hybrid => isStr(v, 8192);
+
+/** A bot's device list as the owner signed it (E4), from a key query. */
+export interface BotDeviceList {
+  owner_id: string;
+  version: number;
+  epoch: number;
+  devices: BotDevice[];
+  signature: Hybrid;
+}
+
+const DEVICE_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const isKey = (v: unknown) => isStr(v, 64) && /^[A-Za-z0-9+/]{43}$/.test(v);
+
+/** Whether v is a canonical bot device list: sorted, distinct devices with well-formed keys. */
+export function validBotList(v: unknown): v is BotDeviceList {
+  if (!isObj(v) || !isStr(v.owner_id, 128) || !isHybrid(v.signature) || !Array.isArray(v.devices) || v.devices.length > 100) return false;
+  if (!Number.isSafeInteger(v.version) || (v.version as number) < 1 || !Number.isSafeInteger(v.epoch) || (v.epoch as number) < 1) return false;
+  return v.devices.every((d: unknown, i: number, all: unknown[]) => isObj(d) && isStr(d.device_id, 64) && DEVICE_RE.test(d.device_id)
+    && isKey(d.curve25519) && isKey(d.ed25519) && (i === 0 || (all[i - 1] as BotDevice).device_id < d.device_id));
+}
 
 export function validMaster(v: unknown): v is MasterKeyRecord {
   return isObj(v) && typeof v.version === 'number' && v.version >= 1 && isHybrid(v.master_key) && isHybrid(v.self_signature);
@@ -458,14 +481,18 @@ export class Identity {
    * transaction, so a status check and an unlocked sign-out cannot lower it; a list no newer
    * than the mark is checked without a write.
    */
-  private async observeList(tenantId: string, userId: string, fp: string, version: number, dl: DeviceList | undefined): Promise<'ok' | 'rollback' | 'fork'> {
-    const key = listKey(tenantId, userId, fp, version);
+  private observeList(tenantId: string, userId: string, fp: string, version: number, dl: DeviceList | undefined): Promise<'ok' | 'rollback' | 'fork'> {
+    return this.observeMark(listKey(tenantId, userId, fp, version), dl && { epoch: dl.epoch, digest: pqc.hash('kymessages.device-list', ...dl.device_ids) });
+  }
+
+  /** observeList's mark for any signed list: one epoch and digest per key, only rising. */
+  private async observeMark(key: string, dl: { epoch: number; digest: string } | undefined): Promise<'ok' | 'rollback' | 'fork'> {
     // fork: two lists were seen at this epoch. It stays a fork, whichever of them the server
     // shows next, until a validly signed list at a higher epoch.
     type Mark = { epoch: number; digest: string; fork?: boolean };
     const seen = await this.ctx.store.get<Mark>(key);
     if (!dl) return seen ? 'rollback' : 'ok';
-    const digest = pqc.hash('kymessages.device-list', ...dl.device_ids);
+    const digest = dl.digest;
     const mark = seen && seen.epoch >= dl.epoch ? seen : await this.ctx.store.update<Mark>(key, (cur) => (!cur || dl.epoch > cur.epoch ? { epoch: dl.epoch, digest } : cur));
     if (!mark || mark.epoch > dl.epoch) return 'rollback';
     if (mark.fork) return 'fork';
@@ -489,6 +516,51 @@ export class Identity {
     if (!master.devices.has(d.device_id) || !isHybrid(s)) return false;
     return memo(['device', tenantId, userId, d.device_id, d.curve25519, d.ed25519, master.key, s],
       () => pqc.verifyDevice(master.key, tenantId, userId, d.device_id, d.curve25519, d.ed25519, s));
+  }
+
+  /**
+   * The devices of bot botId that owner (the bot's owner's trusted master key) vouches for, on
+   * the newest owner-signed list seen (E4): by device ID, with their keys. A list that is not
+   * validly signed, older than one seen (a removal undone), forked, or missing once seen vouches
+   * for nothing. A first-seen owner's pin goes into writes when given (staged), else is stored.
+   */
+  async trustedBot(botId: string, ownerId: string, owner: TrustedMaster, tenantId: string, rec: unknown, writes?: [string, unknown][]): Promise<Map<string, BotDevice>> {
+    const none = new Map<string, BotDevice>();
+    // A bot's owner is pinned on first sight: the server cannot later name another member, whose
+    // valid signature would then vouch for devices of its choosing.
+    const pinned = await this.ctx.store.get<string>(botOwnerKey(tenantId, botId));
+    if (pinned !== undefined && pinned !== ownerId) return none;
+    const fp = pqc.fingerprint(owner.key);
+    const valid = validBotList(rec) && rec.owner_id === ownerId;
+    if (valid && !memo(['bot', tenantId, ownerId, String(rec.version), botId, String(rec.epoch), JSON.stringify(rec.devices), owner.key, rec.signature],
+      () => pqc.verifyBotDevices(owner.key, tenantId, ownerId, rec.version, botId, rec.epoch, rec.devices, rec.signature))) return none;
+    // Marked per bot and owner identity: any version of that key, since the list names its version.
+    const seen = await this.observeMark(botKey(tenantId, botId, ownerId, fp), valid ? { epoch: rec.epoch, digest: pqc.hash('kymessages.bot-devices', ...rec.devices.flatMap((d) => [d.device_id, d.curve25519, d.ed25519])) } : undefined);
+    if (seen !== 'ok' || !valid) return none;
+    if (pinned === undefined) {
+      if (writes) writes.push([botOwnerKey(tenantId, botId), ownerId]);
+      else await this.ctx.store.write([[botOwnerKey(tenantId, botId), ownerId]]);
+    }
+    return new Map(rec.devices.map((d) => [d.device_id, d]));
+  }
+
+  /**
+   * The owner's signature over their bot's devices at epoch (E4), by this device's master key:
+   * only a verified device signs, and only for its current identity.
+   */
+  async signBotDevices(botId: string, epoch: number, devices: BotDevice[]): Promise<{ version: number; signature: Hybrid }> {
+    const l = await this.local();
+    if (!l) throw new Error('Only a verified device can vouch for a bot.');
+    const seeds = await this.seeds(l);
+    const sorted = [...devices].sort((a, b) => (a.device_id < b.device_id ? -1 : a.device_id > b.device_id ? 1 : 0));
+    return { version: l.version, signature: pqc.signBotDevices(seeds.master, l.tenant_id, this.ctx.userId, l.version, botId, epoch, sorted) };
+  }
+
+  /** Records a bot list this device published as seen, so the server cannot show an older one. */
+  async publishedBotList(botId: string, tenantId: string, epoch: number, devices: BotDevice[]): Promise<void> {
+    const l = await this.local();
+    if (!l || l.tenant_id !== tenantId) return;
+    await this.observeMark(botKey(tenantId, botId, this.ctx.userId, l.fingerprint), { epoch, digest: pqc.hash('kymessages.bot-devices', ...devices.flatMap((d) => [d.device_id, d.curve25519, d.ed25519])) });
   }
 
   /** After trustedMaster's writes are stored: announce changes. */

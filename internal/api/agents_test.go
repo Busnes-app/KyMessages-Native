@@ -204,9 +204,7 @@ func TestNativeAgentLifecycleAuthGuardrailsAndWS(t *testing.T) {
 	roomID := roomCreated.Room.ID
 
 	// Bot sends and reads a message in the invited room.
-	sendResp := botDo(t, srv, created.Token, "POST", "/api/v1/rooms/"+roomID+"/messages", map[string]string{
-		"body": "Hello from native Triage Bot!",
-	})
+	sendResp := botDo(t, srv, created.Token, "POST", "/api/v1/rooms/"+roomID+"/messages", sealed("Hello from native Triage Bot!", nil))
 	if sendResp.Code != http.StatusCreated {
 		t.Fatalf("bot send message: %d %s", sendResp.Code, sendResp.Body.String())
 	}
@@ -314,7 +312,7 @@ func TestNativeAgentLifecycleAuthGuardrailsAndWS(t *testing.T) {
 	aliceMsgs := decode[struct {
 		Messages []struct{ Body string }
 	}](t, adminDo(t, srv, ownerCookie, "GET", "/api/v1/rooms/"+roomID+"/messages", nil))
-	if len(aliceMsgs.Messages) != 1 || aliceMsgs.Messages[0].Body != "Hello from native Triage Bot!" {
+	if len(aliceMsgs.Messages) != 1 || aliceMsgs.Messages[0].Body != testEnvelope("Hello from native Triage Bot!") {
 		t.Fatalf("bot messages lost after delete: %+v", aliceMsgs)
 	}
 }

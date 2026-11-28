@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"strconv"
 	"testing"
 
 	"github.com/Busnes-app/ky_server_base/internal/api"
@@ -184,7 +185,13 @@ func TestE2EEQueryClaimAndMailStayInTheOrg(t *testing.T) {
 		t.Fatalf("second claim = %v (want the fallback key)", second)
 	}
 
-	// Mail: Alice reaches Bob's device; Carol's device (another org) is refused.
+	// Mail: Alice reaches Bob's device; Carol's device (another org) is refused. Only a device on
+	// its user's signed list sends mail.
+	aliceID := newIdentity(t, orgA, alice.ID)
+	if rec := doBearerJSON(t, srv, http.MethodPut, "/api/v1/keys/master", aliceTok, aliceID.put(t, 0), nil); rec.Code != http.StatusOK {
+		t.Fatalf("identity = %d %s", rec.Code, rec.Body.String())
+	}
+	aliceID.listDevices(t, srv, aliceTok, 1, devs[alice.ID].id)
 	send := func(toUser, toDevice string) int {
 		return doBearerJSON(t, srv, http.MethodPut, "/api/v1/to-device", aliceTok, map[string]any{"device_id": devs[alice.ID].id, "messages": []map[string]string{
 			{"user_id": toUser, "device_id": toDevice, "type": "olm.v1", "content": "ciphertext-for-" + toUser},
@@ -216,6 +223,16 @@ func TestE2EEQueryClaimAndMailStayInTheOrg(t *testing.T) {
 	}
 	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &mail) != nil || len(mail.Messages) != 1 || mail.Messages[0].Content != "ciphertext-for-"+bob.ID {
 		t.Fatalf("bob's mail = %d %s", rec.Code, rec.Body.String())
+	}
+	// after pages past mail the client keeps unacknowledged; a bad after is refused.
+	path := "/api/v1/to-device?device_id=" + devs[bob.ID].id + "&after="
+	if rec := doBearerJSON(t, srv, http.MethodGet, path+strconv.FormatInt(mail.Messages[0].ID, 10), bobTok, nil, nil); rec.Body.String() != `{"messages":[]}`+"\n" {
+		t.Fatalf("after its ID = %s", rec.Body.String())
+	}
+	for _, bad := range []string{"-1", "x"} {
+		if c := doBearerJSON(t, srv, http.MethodGet, path+bad, bobTok, nil, nil).Code; c != http.StatusBadRequest {
+			t.Fatalf("after=%s = %d", bad, c)
+		}
 	}
 	if c := doBearerJSON(t, srv, http.MethodPost, "/api/v1/to-device/ack", bobTok, map[string]any{"device_id": devs[bob.ID].id, "ids": []int64{mail.Messages[0].ID}}, nil).Code; c != http.StatusNoContent {
 		t.Fatalf("ack = %d", c)

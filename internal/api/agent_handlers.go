@@ -367,7 +367,8 @@ func (s *Server) revokeAgent(ctx context.Context, a *store.Agent, state string) 
 		if err == nil {
 			a.TokenHash, a.TokenState = "", state
 			s.disconnectBot(ctx, a.UserID)
-			return nil
+			// Its devices go too, so no colleague's client lists them for new room keys (E4).
+			return s.store.E2EE().DeleteUserDevices(ctx, a.UserID)
 		}
 		if !errors.Is(err, store.ErrNotFound) {
 			return err

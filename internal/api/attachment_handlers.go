@@ -89,13 +89,13 @@ func isAttachmentUploadPath(path string) bool {
 // owned by the uploader that can then be linked via POST /api/v1/rooms/{id}/messages.
 // With encrypted=1 the file is client ciphertext (E5): it must be the only part, and it is stored
 // as application/octet-stream named encrypted.bin, never sniffed, whatever name the client sent.
-// Without it the bytes are sniffed as before; that plaintext path is for bot tokens only.
+// Without it the upload is refused (e2ee_required): since E4 bots encrypt their files too.
 func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Request) {
 	if s.blobs == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "Attachment storage unavailable")
 		return
 	}
-	user, sess, ok := s.currentUser(r)
+	user, _, ok := s.currentUser(r)
 	if !ok {
 		s.writeError(w, http.StatusUnauthorized, "Authentication required")
 		return
@@ -109,8 +109,7 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 		s.writeError(w, http.StatusBadRequest, "The only upload parameter is encrypted=1")
 		return
 	}
-	encrypted := flagged
-	if !encrypted && !plaintextAllowed(user, sess) {
+	if !flagged {
 		s.writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "Files are end-to-end encrypted: upload ciphertext with encrypted=1",
 			"code":  CodeE2EERequired,
@@ -189,10 +188,8 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 			break
 		}
 		_ = part.Close()
-		if encrypted {
-			s.writeError(w, http.StatusBadRequest, "An encrypted upload carries only its file")
-			return
-		}
+		s.writeError(w, http.StatusBadRequest, "An encrypted upload carries only its file")
+		return
 	}
 	if filePart == nil {
 		s.writeError(w, http.StatusBadRequest, "Missing file field in multipart upload")
@@ -259,13 +256,10 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 	}
 
 	attID := "att_" + uuid.Must(uuid.NewV7()).String()
-	var body io.Reader = filePart
-	if encrypted {
-		rawFilename = encryptedFilename
-		// Nothing may follow the ciphertext either: the whole body is checked before the blob is
-		// put in place, so a refused upload never leaves one behind.
-		body = &soleFile{part: filePart, rest: mr}
-	}
+	rawFilename = encryptedFilename
+	// Nothing may follow the ciphertext either: the whole body is checked before the blob is
+	// put in place, so a refused upload never leaves one behind.
+	var body io.Reader = &soleFile{part: filePart, rest: mr}
 	// Durable before any byte is written: if this request dies between the blob and its row, the
 	// sweep erases the blob once the upload's deadline has passed (its commit removes the intent).
 	intentDue := time.Now().Add(responseBudget).UnixMilli()
@@ -273,7 +267,7 @@ func (s *Server) handleChatUploadAttachment(w http.ResponseWriter, r *http.Reque
 		s.writeError(w, http.StatusInternalServerError, "Failed to store uploaded file")
 		return
 	}
-	putRes, err := s.blobs.Put(tenantID, attID, body, res.ReservedBytes, blobs.PutOptions{Opaque: encrypted})
+	putRes, err := s.blobs.Put(tenantID, attID, body, res.ReservedBytes, blobs.PutOptions{Opaque: true})
 	if err != nil {
 		s.abandonUpload(r.Context(), tenantID, attID)
 		var maxErr *http.MaxBytesError

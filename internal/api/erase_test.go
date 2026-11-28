@@ -509,7 +509,7 @@ func TestErasureIncludesOwnedBotContentAcrossCleanupRetry(t *testing.T) {
 			if err := json.Unmarshal(upload.Body.Bytes(), &up); err != nil || upload.Code != http.StatusCreated {
 				t.Fatalf("bot upload: %d %s %v", upload.Code, upload.Body.String(), err)
 			}
-			if r := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room+"/messages", botToken, map[string]any{"body": "owned bot message", "attachment_ids": []string{up.Attachment.ID}}, nil); r.Code != http.StatusCreated {
+			if r := doBearerJSON(t, srv, http.MethodPost, "/api/v1/rooms/"+room+"/messages", botToken, sealed("owned bot message", map[string]any{"attachment_ids": []string{up.Attachment.ID}}), nil); r.Code != http.StatusCreated {
 				t.Fatalf("bot message: %d %s", r.Code, r.Body.String())
 			}
 			bobUpload := doMultipartUpload(t, srv, "/api/v1/rooms/"+room+"/attachments", bobToken, "file", "kept.txt", []byte("other member file"))

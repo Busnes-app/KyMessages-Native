@@ -13,7 +13,7 @@ and the two-layer QR transfer.
   API entries and the backup generation, so the server and the browser sign the same bytes).
   `DeviceListDigest` names a proposed list for its reservation (the browser's `hash` of the same
   fields), which the master key signs as `DeviceListReserveMessage` under
-  `.device-list-reserve.v1`. `ComparisonCode` binds the joining device's ID as well as its ephemeral key.
+  `.device-list-reserve.v1`. `BotDevicesMessage` (`.bot-devices.v1`, E4) is an owner's signature over their bot's devices and keys at an epoch. `ComparisonCode` binds the joining device's ID as well as its ephemeral key.
 - `call.go`: `Call(name, args)`, the string API (unpadded base64; base64url for pairing IDs and
   QR text) that the product adapter exposes to the browser as `kyPQCCall`.
 - `pqwasm/identity.go`: product wire adapter compiled with the pinned `ky-primitives/cmd/pqwasm`

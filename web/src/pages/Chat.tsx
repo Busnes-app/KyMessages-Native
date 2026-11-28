@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Bot,
   Check,
   ChevronDown,
   Copy,
@@ -98,6 +99,7 @@ import { MessageRow, attachmentSummary, attachmentView, editProvenance } from '.
 import { RoomDetailsDrawer, type DrawerTab } from '../components/chat/RoomDetailsDrawer';
 import { CreateChannelModal, SearchModal, StartDMModal } from '../components/chat/ChatModals';
 import { EncryptionIdentityGate, IdentityChangedBanner, useIdentityStatus, VerifyAnotherDevice } from '../components/chat/EncryptionIdentity';
+import { BotDevices } from '../components/chat/BotDevices';
 import { searchIndexFor } from '../chat/searchIndex';
 import { checkRoomIdentities, encryptionReadyFor, keyGeneration, keysArrivedFor, onEncryptionPending, onRoomKeys, openMessages, receiveRoomKeys, retryable, roomMemberLeft, startE2EE } from '../chat/e2ee';
 import { CallAudioLayer, CallStage } from '../components/chat/CallStage';
@@ -123,7 +125,7 @@ interface ChatProps {
   onActiveCallChange?: (summary: ActiveCallSummary | null) => void;
 }
 
-type ActiveModal = 'none' | 'new-channel' | 'new-dm' | 'search' | 'verify-device';
+type ActiveModal = 'none' | 'new-channel' | 'new-dm' | 'search' | 'verify-device' | 'bots';
 
 // What a row says about its encryption state; a retry replaces the row only when this changes.
 const e2eeLabel = (m: ChatMessage) =>
@@ -2186,6 +2188,17 @@ export const Chat: React.FC<ChatProps> = ({
                     <ShieldCheck size={17} />
                   </button>
                 )}
+                {identity.state === 'verified' && (
+                  <button
+                    type="button"
+                    className="chat-icon-btn"
+                    title="Vouch for your bots' devices"
+                    aria-label="Your bots"
+                    onClick={() => setModal('bots')}
+                  >
+                    <Bot size={17} />
+                  </button>
+                )}
                 <button
                   type="button"
                   className={drawerOpen ? 'chat-header-panel-btn active' : 'chat-header-panel-btn'}
@@ -2781,6 +2794,7 @@ export const Chat: React.FC<ChatProps> = ({
       )}
 
       {modal === 'verify-device' && <VerifyAnotherDevice onClose={() => setModal('none')} />}
+      {modal === 'bots' && <BotDevices onClose={() => setModal('none')} />}
       {modal === 'new-channel' && (
         <CreateChannelModal
           directory={directory}

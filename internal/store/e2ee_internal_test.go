@@ -45,7 +45,7 @@ func TestE2EEMailCommittedOutOfIDOrderIsDelivered(t *testing.T) {
 	if err := st.E2EE().SendToDevice(ctx, []E2EEToDevice{{TenantID: "t1", RecipientUserID: "u-b", RecipientDeviceID: "B1", SenderUserID: "u-a", SenderDeviceID: "A1", Type: "olm.v1", Content: "room key from B"}}); err != nil {
 		t.Fatal(err)
 	}
-	seen, err := st.E2EE().ToDevice(ctx, "u-b", "B1", 10)
+	seen, err := st.E2EE().ToDevice(ctx, "u-b", "B1", 0, 10)
 	if err != nil || len(seen) != 1 || seen[0].Content != "room key from B" {
 		t.Fatalf("first read = %+v %v", seen, err)
 	}
@@ -56,7 +56,7 @@ func TestE2EEMailCommittedOutOfIDOrderIsDelivered(t *testing.T) {
 	if err := st.E2EE().AckToDevice(ctx, "u-b", "B1", []int64{seen[0].ID}); err != nil {
 		t.Fatal(err)
 	}
-	late, err := st.E2EE().ToDevice(ctx, "u-b", "B1", 10)
+	late, err := st.E2EE().ToDevice(ctx, "u-b", "B1", 0, 10)
 	if err != nil || len(late) != 1 || late[0].Content != "pre-key from A" || late[0].ID >= seen[0].ID {
 		t.Fatalf("the lower-ID message committed late was lost: %+v %v", late, err)
 	}
