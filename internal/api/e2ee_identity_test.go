@@ -81,6 +81,7 @@ func (i *testIdentity) put(t *testing.T, expected int64) map[string]any {
 // client does: reserve the digest, then put the list.
 func (i *testIdentity) listDevices(t *testing.T, srv http.Handler, tok string, epoch int64, ids ...string) {
 	t.Helper()
+	ids = append([]string{}, ids...) // an empty list, never null
 	digest := e2eeid.DeviceListDigest(ids)
 	reserve := map[string]any{"version": 1, "expected_epoch": epoch - 1, "digest": digest,
 		"signature": i.sign(t, e2eeid.DomainDeviceListReserve, e2eeid.DeviceListReserveMessage(i.tenant, i.user, 1, epoch-1, digest))}
